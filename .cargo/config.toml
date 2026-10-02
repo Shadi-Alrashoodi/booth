@@ -1,0 +1,9 @@
+# Static CRT so booth.exe does not need the Visual C++ runtime installed.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# libopus builds with CMake. The copy that comes with the Visual Studio Build
+# Tools is not on PATH; a CMAKE set in the environment still wins.
+[env]
+CMAKE = { value = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe', force = false }
+CMAKE_TOOLCHAIN_FILE = { value = "cmake/static-crt.cmake", relative = true, force = false }

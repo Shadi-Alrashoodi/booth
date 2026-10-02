@@ -1,0 +1,25 @@
+[package]
+name = "room"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+share.workspace = true
+keys.workspace = true
+invite.workspace = true
+session.workspace = true
+channels.workspace = true
+stats.workspace = true
+net.workspace = true
+voice.workspace = true
+crossbeam-channel.workspace = true
+getrandom.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+# tests/video.rs makes NVENC fail a frame during a share.
+encode = { workspace = true, features = ["fault"] }

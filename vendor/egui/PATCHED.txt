@@ -1,0 +1,107 @@
+egui 0.36.2 from crates.io, with a selection highlight for right-to-left rows.
+
+Why
+egui 0.36.2 draws a selection as one rectangle per row, from the caret at
+one end to the caret at the other. With the right-to-left layout in
+vendor/epaint, the chars between two carets on a row with Arabic in it are
+not always one stretch of the row. On a row that mixes directions, and on
+the first and last rows of a selection over several right-to-left rows,
+the rectangle covered the wrong part, and selected letters outside it
+turned ink on the panel colour and all but disappeared. A two-row Arabic
+message selected whole showed no highlight at all. Copy was right in
+every case. This folder is 0.36.2 with its selection painter changed,
+used through [patch.crates-io] in the workspace Cargo.toml. Drop the
+folder and the patch line once an egui release paints selections on
+bidi text, which will be the release that lays it out (vendor/epaint).
+
+Where it comes from
+The egui-0.36.2.crate in the local cargo cache, no download. Its SHA-256,
+dc938cc27cd911415e1e4d151bc56ff9df063d8db081374e87aeb805ea74b2ba, is the
+checksum Booth's Cargo.lock had for egui 0.36.2 before the patch. Cargo.lock,
+.cargo_vcs_info.json and .cargo-ok left out.
+
+Changed in src/text_selection/visuals.rs
+- A row with a right-to-left glyph gets one rectangle per run of selected
+  glyphs that sit next to each other on the row, the glyphs chosen by char
+  index and walked in x order. A glyph that takes no room, a mark or the
+  rest of a cluster, is drawn over the one before it and neither starts
+  nor splits a run. A mark selected without its letter, which only the
+  keyboard can do, highlights its letter's place: the mark turns the
+  selected text colour like any selected char and would vanish on the
+  bare panel.
+- A run ends where the next glyph on the row starts. Glyphs sit on whole
+  pixels and their advances are not whole, so ending it at the last
+  glyph's own advance would reach up to a pixel into its neighbour, or
+  leave a hairline before it.
+- Every selected glyph on such a row gets the selected text colour by its
+  own vertices, from its first vertex to the next glyph's.
+- A newline selected after such a row shows as in 0.36.2, half the row's
+  height wide, but at the end its paragraph reads towards: on the left of
+  a right-to-left paragraph. That end is where the row's letters end on
+  that side, not the row's width: while the vendored epaint gave a
+  right-to-left row with vowel marks a width short of its letters, a
+  newline put there landed on an unselected word. The paragraph's
+  direction is the lowest bidi level among its glyphs, which its first
+  strong letter has, and so does the whitespace at the end of each of its
+  rows (UAX #9 rule L1); the vendored epaint does not keep the paragraph
+  level itself. A paragraph with an explicit embedding around all of it
+  can come out the wrong way, which only the composer can show.
+- Such a row with nothing on it selected gets no rectangle, where 0.36.2
+  added one with no width.
+- Rows with no right-to-left glyph keep 0.36.2's code: one rectangle from
+  caret to caret, the colour over the chars between them. The part that
+  puts a rectangle into a row's mesh behind its glyphs moved, unchanged,
+  into a function that both kinds of row use. That keeps 0.36.2's slip on
+  a right-aligned row that starts with a space, which the layout hangs
+  left of the row: the space stays out of the highlight, and a selection
+  that ends where that row starts lays a sliver over it.
+- An empty selection, the cursor and the IME underlines are as in 0.36.2.
+
+Other changes to the crate
+- Ten doc examples marked ignore. They include images by paths inside
+  egui's own repository (assets/ferris.png, and eframe/data/icon.png),
+  which the published crate does not carry; 0.36.2 already marks one more
+  the same way.
+- The 24 long dashes in upstream comments and doc text, in six files,
+  replaced with plain punctuation. None was in a string literal.
+- The emoji in upstream comments and doc text, README.md included, replaced
+  with words or code point numbers, or dropped where they only decorated;
+  the warning signs became "Warning:".
+- The emoji in string and char literals, which egui draws, are kept but
+  written as \u{...} escapes, with the joiners and variation selectors
+  that go with them: headings in egui's debug and settings windows, the
+  theme switch, a few icons and warning signs, and some tests. So are the
+  five private-use chars beside the penguin in special_emojis in
+  src/lib.rs: the Windows, Android, Apple and GitHub logos and the word
+  git. That is 45 lines in ten files. The values are the same; checked on
+  2026-10-02 by compiling every changed literal against the one it
+  replaced.
+- OperatingSystem::from_browser_id, which guesses the system from the
+  string a browser identifies itself with, renamed from upstream's name
+  along with its parameter, doc line and warning. Only eframe's web build
+  calls it, under the old name, and Booth does not build for the web.
+- Four lines of doc text in src/context.rs, src/data/output.rs and
+  src/lib.rs reworded, and the build status badge, which shows egui's CI
+  and not this copy, dropped from README.md.
+- No dev-dependencies to remove: the published 0.36.2 has none.
+- The comment cargo puts at the top of Cargo.toml when it publishes a
+  crate is gone; Cargo.toml.orig is still the original.
+- In comments and doc text some stock phrases are put more plainly, a
+  few curly quotes are straight ones, and one test is named
+  widget_text_is_as_small_as_a_string.
+- Everything else is as upstream wrote it, its TODO lines included.
+
+LICENSE-MIT and LICENSE-APACHE are copies of vendor/epaint's, which are
+egui's from github.com/emilk/egui at tag 0.36.2. Both crates' manifests
+name the same two files at the root of that repository, and neither
+published crate carries them, so the texts are the same.
+
+Tests: cargo test -p egui --locked, from the workspace root, runs the
+crate's own tests. The highlight is tested on Booth's fonts in
+crates/app/src/screens/chat/bidi_tests.rs (cargo test -p app --locked):
+inside an Arabic row, on mixed rows, from an Arabic row into an English
+one, over two Arabic rows, a newline after Arabic with vowel marks, a mark
+selected without its letter, in the composer, any selection of the
+property test's texts, and against a copy of 0.36.2's painter, unchanged
+but for its name and with its comments left out, which every row with no
+right-to-left glyph must still match.

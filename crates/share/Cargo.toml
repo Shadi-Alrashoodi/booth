@@ -1,0 +1,23 @@
+[package]
+name = "share"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+capture.workspace = true
+encode.workspace = true
+channels.workspace = true
+decode.workspace = true
+viewer.workspace = true
+net.workspace = true
+stats.workspace = true
+# timeBeginPeriod and timeEndPeriod: a 1 ms timer while a share runs, so the
+# last frame before the screen goes still is not held up to 15 ms longer.
+windows-sys = { workspace = true, features = ["Win32_Media"] }
+
+[dev-dependencies]
+# tests/sharer.rs makes the encoders stall and fail.
+encode = { workspace = true, features = ["fault"] }

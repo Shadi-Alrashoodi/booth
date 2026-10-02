@@ -1,0 +1,3 @@
+# Cases that once failed. proptest runs these first, before new random ones.
+cc 7d19252cbb3167d4cd5db0187dd08fcc511036ece6d6b0bf02746ff7eb3a2623 # shrinks to text = "\u{64e}"
+cc 3a7678b7812bc1504cb7857593956e88dfa9bb308265a1e5d8889a4322224aca # shrinks to text = "Ȟ"

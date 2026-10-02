@@ -1,0 +1,2 @@
+# Cases that once failed. proptest runs these first, before new random ones.
+cc 2c75171cbe807b5b446043854e75373b049f0411b94d9688183a84dc8d3b77d8 # shrinks to len = 620, recut = [(13, 8), (5, 11)], seed = 92885551386702388

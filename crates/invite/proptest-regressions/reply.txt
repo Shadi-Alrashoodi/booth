@@ -1,0 +1,2 @@
+# Cases that once failed. proptest runs these first, before new random ones.
+cc f660381dcec08c0422b7b73feec55a509baaa57798bef1a5559c6f83da7a5e22 # shrinks to edits = [(Index(267344117010283357), 0, 2), (Index(267344117010283357), 0, 1), (Index(12565173499483317768), 252, 0)]

@@ -1,0 +1,18 @@
+[package]
+name = "net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+getrandom.workspace = true
+socket2.workspace = true
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Globalization", "Win32_Networking_WinSock", "Win32_NetworkManagement_Dns", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Security", "Win32_System_Environment", "Win32_System_Threading"] }
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_NetworkManagement_WindowsFirewall", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant"] }
+
+[dev-dependencies]
+proptest.workspace = true
+# GetProcessHandleCount, for the address watch leak test.
+windows-sys = { workspace = true, features = ["Win32_System_Threading"] }

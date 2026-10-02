@@ -1,0 +1,152 @@
+epaint 0.36.2 from crates.io, with right-to-left text ported onto it.
+
+Why
+egui 0.36.2 lays right-to-left runs out left to right, so Arabic and Hebrew
+words come out mirrored and the caret gets lost in them (egui issue 8576).
+The fix upstream is egui pull request 8577, still an unmerged draft on
+2026-09-30, written against egui main, whose text code has moved on since
+0.36.2. This folder is 0.36.2 with that work ported onto it, used through
+[patch.crates-io] in the workspace Cargo.toml. Drop the folder and the patch
+line once an egui release lays out bidi text.
+
+Taken from pull request 8577
+Commit c55da0337f67616ee7be4bfb06b73fdd71ef7f91, adapted to 0.36.2, which
+has a Font in font.rs where the pull request has FontsImpl, and no
+TextRun::raster:
+- bidi levels per layout job with unicode-bidi, the paragraph direction from
+  its first strong character
+- runs split where the level changes, each shaped in its own direction
+- Glyph::bidi_level and Glyph::is_rtl
+- each row put in visual order after line breaking (UAX #9 rule L2), glyphs
+  kept in logical order so a glyph's index is still its char index
+- alignment, backgrounds, underline and strikethrough walk the glyphs by x
+- the overflow character takes the level of the glyph before it
+- its three tests, run on IBM Plex Sans and Plex Sans Arabic from
+  assets/fonts instead of egui's default fonts
+
+Not taken: commit c93e8863e958507056415e2a6dace56e23ba5f3a, which draws a
+cluster with more glyphs than chars as one bitmap. IBM Plex Sans Arabic, the
+only right-to-left font Booth ships, shapes no character into more glyphs
+than characters. Checked on 2026-09-30: every character in its cmap, alone
+and in its joining forms, letters with vowel marks, and every code point up
+to U+2FFFF alone, after a Latin letter and after an Arabic one, with Plex
+Sans first as the app has it; nothing in the Arabic blocks. The dotted
+circle the shaper adds under a mark with no letter before it is turned off
+instead (below). Nor the pull request's change to egui's selection painter:
+egui-wgpu draws the flipped rectangle anyway.
+
+Plex Sans, the Latin face, does give more glyphs than chars for 179 letters
+it has no glyph of its own for, which the shaper builds from a letter and
+its accents: among them the dotted letters of Arabic transliteration (for
+example U+1E25, U+1E63, U+1E0D), U+01E7 and U+021E, some Cyrillic, and
+polytonic Greek. That is 0.36.2's behaviour and is left as it is here; the
+caret, the selection and the copied text after such a letter are one place
+off. Commit c93e886 is what fixes it.
+
+Changed from the pull request
+- A right-to-left run is walked from the end of the shaper's output. The
+  shaper puts a vowel mark before its letter; walked backwards it follows
+  it and moves with it when the row is mirrored.
+- In a right-to-left run the shaper's x offset goes into the glyph's image
+  offset, so each glyph sits on its pen and joined letters stay joined when
+  the row is mirrored.
+- The n-th glyph of a cluster stands for its n-th char, so a letter and its
+  mark each keep their own char.
+- Row::x_offset: where the level changes the caret goes with the higher
+  level, so after "123" or "hello" at the end of an Arabic line it follows
+  the last digit or letter instead of the right end of the row, where the
+  line starts. A caret between a letter and its marks sits at the letter's
+  far edge.
+- Row::char_at takes the nearest caret place, and on a tie one that is not
+  between a letter and its marks.
+- A row with no right-to-left glyph keeps 0.36.2's char_at and x_offset.
+- Shaping asks for no dotted circle under a mark that has no letter before
+  it: the circle would be a glyph without a char.
+- UAX #9 rule L1 before rows are put in visual order: whitespace at the end
+  of a row, and a tab with the whitespace before it, take the paragraph's
+  level, so the space where a line wraps ends the row instead of sitting
+  between two runs. The formatting characters rule X9 removes keep the level
+  of the char before them (section 5.2), also after a tab. A right-to-left
+  paragraph that an override made all left to right goes through this too.
+- A zero-width glyph moves with the glyph before it only when both have the
+  same level, so a direction mark or a control of another level still
+  separates the runs around it. A block that does not advance takes no
+  width, so a joiner that rule L1 moved does not take its letter's.
+- The room a section's leading space or letter spacing leaves between two
+  blocks moves as a space char there would, so it stays between the two
+  sections and never lands inside a word.
+- A space between two right-to-left words stays in their run when their
+  face has a space, instead of each word and each space being a run of its
+  own, shaped one by one. Laying out a 200-message Arabic chat at a new
+  width went from 11.6 ms to 4.5 ms.
+- A row with right-to-left text is as wide as its glyphs reach once it is
+  in visual order. A vowel mark has no width and sits at the left edge of
+  its letter, and the row's width came from its last glyph in logical
+  order, or, when aligned, from the glyph placed rightmost; either could
+  be a mark, and the row came out a letter short. A right-aligned
+  Arabic message whose first letter carries a mark stuck out of the chat
+  column, and out of its label, by that letter: بِسْمِ اللَّهِ الرَّحْمَنِ
+  was 76 wide with ب ending at 79.29. Aligned, such a row's box is rounded
+  out to whole pixels when they fit its line, so right-aligned it ends on
+  its edge instead of up to half a pixel past it, and its text sits up to a
+  pixel further left. Put on whole pixels in visual order, a row can come
+  out a fraction of a point wider than its line, as it could before this
+  change: 300.24 on a line of 300. Rounded out to 301, the galley's rect
+  was cut back to 300 on the right when the galley was rounded, a pixel
+  short of the edge the row is aligned to, and a right-aligned label drew
+  the row a pixel left of itself. Such a row keeps its own width and is
+  placed as 0.36.2 places any row wider than its line: right-aligned, it
+  ends up to half a pixel past its edge, or, when it is half a pixel or
+  more too wide, its rect is cut back the same way and its last letter
+  starts up to a point left of its label.
+  PlacedRow::rect_without_leading_space starts such a row at its leftmost
+  glyph instead of its first, which can be on the right.
+- The overflow character that ends a cut row goes where the last letter
+  ends when the char before it is a right-to-left mark. It went where the
+  mark is, over the letter, and mirroring the row then put letters over
+  each other, as when the room panel cuts a long name short.
+- Thirteen more tests: the caret at the end of a line ending in digits,
+  the caret staying with the run it was typed into, marks on their letters
+  and joins, caret places round-tripping through x, the order unicode-bidi
+  gives, Arabic words in one run, the space where a line wraps, a
+  section's leading space, zero-width chars taking no room, a right-to-left
+  row as wide as its first letter with a mark on it, one a little past its
+  line starting where the galley does, English then Arabic with marks as
+  wide as its letters, and an ellipsis after a mark.
+
+Still as in 0.36.2
+The arrow keys move by char index, in logical order, so Left moves right
+inside Arabic. The selection highlight is drawn by egui, not here; the
+vendored egui next to this crate draws it per run of selected letters (see
+vendor/egui/PATCHED.txt).
+
+Other changes to the crate
+- Cargo.toml: unicode-bidi =0.3.18 added. The dev-dependencies (criterion,
+  mimalloc, similar-asserts) and the benchmark removed: none of them is in
+  Booth's Cargo.lock, and cargo will not test a crate outside the workspace
+  that has dev-dependencies. src/text/fonts.rs uses assert_eq! where it used
+  similar_asserts::assert_eq!. The comment cargo puts at the top when it
+  publishes a crate is gone too; Cargo.toml.orig is still the original.
+- src/text/fonts.rs: the FontDefinitions doc example is marked ignore; it
+  includes a font by a path inside egui's own repository.
+- The 13 upstream tests that need egui's default fonts are ignored unless
+  the default_fonts feature is on. Booth does not build that feature, and
+  the epaint_default_fonts crate is not in its Cargo.lock.
+- The 13 long dashes in upstream comments replaced with plain punctuation.
+- The emoji in 5 upstream comments replaced the same way, by words, a code
+  point or nothing.
+- The emoji in string and char literals, and one en dash, are kept but
+  written as \u{...} escapes: in src/text/font.rs the en dash, U+203C
+  and U+2049 among the chars a CJK line may not start with, in
+  src/text/fonts.rs the white square drawn for a missing glyph, and in
+  src/text/text_layout.rs one test string. The values are the same;
+  checked on 2026-10-02 by compiling every changed literal against the one
+  it replaced.
+- In comments some stock phrases are put more plainly, and one debug
+  assertion's message is reworded.
+- Everything else is as upstream wrote it, its TODO lines included.
+
+LICENSE-MIT and LICENSE-APACHE are egui's, from github.com/emilk/egui at tag
+0.36.2.
+
+Tests: cargo test -p epaint --locked, from the workspace root.

@@ -1,0 +1,77 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+keys = { path = "crates/keys" }
+invite = { path = "crates/invite" }
+session = { path = "crates/session" }
+channels = { path = "crates/channels" }
+stats = { path = "crates/stats" }
+net = { path = "crates/net" }
+room = { path = "crates/room" }
+input = { path = "crates/input" }
+voice = { path = "crates/voice" }
+capture = { path = "crates/capture" }
+encode = { path = "crates/encode" }
+decode = { path = "crates/decode" }
+viewer = { path = "crates/viewer" }
+share = { path = "crates/share" }
+annexb = { path = "crates/annexb" }
+release = { path = "crates/release" }
+
+# Crypto is pinned exactly. blake2 and x25519-dalek match what snow itself uses,
+# so there is one copy of each primitive in the binary.
+snow = { version = "=0.10.0", default-features = false, features = ["use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"] }
+blake2 = "=0.10.6"
+x25519-dalek = { version = "=2.0.1", features = ["static_secrets", "zeroize"] }
+getrandom = "=0.3.4"
+subtle = "2.6"
+zeroize = "1.8"
+
+windows-sys = "0.61"
+# For COM, which windows-sys leaves to the caller: the firewall rules.
+windows = "0.62"
+socket2 = "0.6"
+crossbeam-channel = "0.5"
+opus = "=0.4.0"
+# Forward error correction for video, MIT AND BSD-3-Clause.
+reed-solomon-simd = "=3.1.0"
+# Build only: the NVENC layout test and the FFmpeg field accessors.
+cc = "=1.4.7"
+# Release signatures: made by the release tool, checked by the update check.
+minisign = "=0.10.0"
+minisign-verify = "=0.3.0"
+# Which way a chat message runs: the bidi class of its first strong letter.
+unicode-bidi = { version = "=0.3.18", default-features = false, features = ["hardcoded-data", "std"] }
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "accesskit"] }
+
+proptest = "1.11"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+# No trim-paths, which is not stable on 1.98: tools\release.ps1 has rustc
+# and cl.exe cut this PC's folders out of booth.exe instead.
+
+# Its decoder runs a fixed 65536-point transform per repair, about 4 ms a
+# frame unoptimised; debug builds of the tests and the viewer need it fast.
+[profile.dev.package.reed-solomon-simd]
+opt-level = 3
+
+# egui's text layout places right-to-left runs left to right. epaint 0.36.2
+# with the bidi work from egui pull request 8577 ported onto it, until an egui
+# release carries it.
+[patch.crates-io]
+epaint = { path = "vendor/epaint" }
+# egui 0.36.2 draws a selection as one rectangle per row from caret to caret,
+# which misses the selected letters on a right-to-left or mixed row. Vendored
+# to draw one rectangle per run of selected letters.
+egui = { path = "vendor/egui" }

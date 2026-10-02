@@ -1,0 +1,63 @@
+# cargo deny check, run by tools\release.ps1 before every release.
+# Only what builds booth.exe for Windows x64 is checked; crates that exist
+# only for other targets never reach the release.
+
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+all-features = false
+no-default-features = false
+
+[advisories]
+# Every RustSec advisory fails the release, unmaintained crates included.
+# An entry here needs the advisory id and why it does not reach Booth.
+ignore = []
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+
+[licenses]
+# Anything not listed is refused. That includes every GPL, LGPL and AGPL
+# crate: FFmpeg is the only LGPL part and it is a set of DLLs beside the exe,
+# not a crate. A crate offering a choice, such as self_cell's
+# "Apache-2.0 OR GPL-2.0-only", passes on the permissive half and is used
+# under it.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+]
+# Nothing in the lock is CC0-1.0 today; it stays allowed for when something is.
+unused-allowed-license = "allow"
+confidence-threshold = 0.93
+
+exceptions = [
+    # The Boost license is permissive, with no copyleft and no notice needed
+    # in binaries. Both crates come with arboard, the clipboard crate the
+    # invite copy uses to stay out of clipboard history.
+    { allow = ["BSL-1.0"], crate = "clipboard-win" },
+    { allow = ["BSL-1.0"], crate = "error-code" },
+]
+
+[licenses.private]
+ignore = false
+
+[bans]
+# Duplicates come from egui, wgpu and the windows crates moving at their own
+# pace. They cost build time and size, not safety.
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace crates and the vendored egui and epaint are path dependencies without a
+# version; nothing from a registry may be a wildcard.
+allow-wildcard-paths = true
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
