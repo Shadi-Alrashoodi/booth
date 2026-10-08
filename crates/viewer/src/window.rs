@@ -28,18 +28,19 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_F11};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWL_EXSTYLE, GWL_STYLE,
-    GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowPlacement, HTCLIENT,
-    HWND_TOP, IDC_ARROW, IDC_HAND, IsWindowVisible, LoadCursorW, MINMAXINFO, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SC_KEYMENU, SIZE_MINIMIZED, SPI_GETCLIENTAREAANIMATION,
-    SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetCursor,
-    SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, ShowWindow, SystemParametersInfoW,
-    TranslateMessage, WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WINDOWPLACEMENT, WM_ACTIVATE,
-    WM_ACTIVATEAPP, WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
-    WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_WINDOWPOSCHANGED, WM_XBUTTONDOWN,
+    CreateIcon, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW,
+    GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW,
+    GetWindowPlacement, HICON, HTCLIENT, HWND_TOP, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_HAND,
+    IsWindowVisible, LoadCursorW, MINMAXINFO, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SC_KEYMENU, SIZE_MINIMIZED, SPI_GETCLIENTAREAANIMATION, SW_HIDE, SW_SHOWNOACTIVATE,
+    SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+    SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetCursor, SetWindowLongPtrW,
+    SetWindowPlacement, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage,
+    WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WINDOWPLACEMENT, WM_ACTIVATE, WM_ACTIVATEAPP,
+    WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
+    WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_WINDOWPOSCHANGED, WM_XBUTTONDOWN,
     WM_XBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 use windows::core::{BOOL, HSTRING, w};
@@ -70,19 +71,20 @@ const RELATIVE: u8 = 2;
 // Shared::local while the controller's mouse is on no picture.
 const NOWHERE: u64 = u64::MAX;
 
-// The ink colour the picture's bars and the strip are drawn in, as a
+// The window tone the picture's bars and the strip are drawn in, as a
 // COLORREF (0x00BBGGRR). Shown until the first present covers it.
-const INK: COLORREF = COLORREF(0x0012_1414);
+const WINDOW: COLORREF = COLORREF(0x0012_1414);
 
 // The window never opens bigger than this share of the monitor's work area,
 // and never bigger than the video at one to one.
 const OPEN_SHARE: f64 = 0.8;
 // Small enough to tuck into a corner, big enough that some picture shows
 // above the strip and the strip's longest words that never drop out end
-// before the trace's 132 points: while controlling with the sharer paused,
-// "reconnecting direct controlling Control is paused. composed", about 400
-// points with their gaps. At 100 percent scaling.
-const MIN_CLIENT: (i32, i32) = (560, 180);
+// before the gap and the trace's 148 points: while controlling with the
+// sharer paused, "reconnecting direct controlling Control is paused.
+// composed", 55 characters of Plex Mono at 7.2 points and four gaps, 444
+// points, after the 16 point side. At 100 percent scaling.
+const MIN_CLIENT: (i32, i32) = (620, 180);
 
 // With the setting on, the strip hides in fullscreen until the mouse moves,
 // and hides again once the mouse has been still this long.
@@ -476,6 +478,7 @@ thread_local! {
     // a number.
     static MONITOR: Cell<Option<isize>> = const { Cell::new(None) };
     static BRUSH: Cell<Option<HBRUSH>> = const { Cell::new(None) };
+    static ICON: Cell<Option<HICON>> = const { Cell::new(None) };
 }
 
 #[derive(Clone, Copy)]
@@ -497,12 +500,12 @@ fn run(
     unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     let _ = SHARED.with(|cell| cell.set(Arc::clone(&shared)));
     // SAFETY: a plain GDI call; the brush is deleted when the thread ends.
-    BRUSH.with(|cell| cell.set(Some(unsafe { CreateSolidBrush(INK) })));
+    BRUSH.with(|cell| cell.set(Some(unsafe { CreateSolidBrush(WINDOW) })));
     let hwnd = match create(title, video, show, &shared) {
         Ok(hwnd) => hwnd,
         Err(err) => {
             let _ = opened.send(Err(err));
-            delete_brush();
+            delete_objects();
             return;
         }
     };
@@ -516,14 +519,72 @@ fn run(
             DispatchMessageW(&msg);
         }
     }
-    delete_brush();
+    delete_objects();
 }
 
-fn delete_brush() {
+// The brush and the icon, once the window that used them is gone.
+fn delete_objects() {
     if let Some(brush) = BRUSH.with(|cell| cell.take()) {
         // SAFETY: made in run() and selected into no DC.
         let _ = unsafe { DeleteObject(brush.into()) };
     }
+    if let Some(icon) = ICON.with(|cell| cell.take()) {
+        // SAFETY: made in show_icon() for a window that no longer exists.
+        let _ = unsafe { DestroyIcon(icon) };
+    }
+}
+
+// The mark on its plate in the title bar, the taskbar and Alt+Tab, as the
+// panel has it. Windows does not take over an icon sent with WM_SETICON, so
+// this thread destroys it after the window.
+fn show_icon(hwnd: HWND) {
+    let Some(icon) = crate::ICON.get().and_then(make_icon) else {
+        return;
+    };
+    ICON.with(|cell| cell.set(Some(icon)));
+    let handle = Some(LPARAM(icon.0 as isize));
+    // SAFETY: a live window of this thread and a live icon.
+    unsafe {
+        SendMessageW(hwnd, WM_SETICON, Some(WPARAM(ICON_SMALL as usize)), handle);
+        SendMessageW(hwnd, WM_SETICON, Some(WPARAM(ICON_BIG as usize)), handle);
+    }
+}
+
+// A 32 bit icon from RGBA rows: the colour as BGRA, cleared where nothing
+// covers it, and a mask with a bit set there, for anything that draws icons
+// without their alpha. A mask row is padded to 16 bits, as a monochrome
+// bitmap's rows are.
+fn make_icon(icon: &crate::Icon) -> Option<HICON> {
+    let (width, height) = (icon.width as usize, icon.height as usize);
+    if width == 0 || height == 0 || icon.rgba.len() != width * height * 4 {
+        return None;
+    }
+    let stride = width.div_ceil(16) * 2;
+    let mut mask = vec![0u8; stride * height];
+    let mut color = Vec::with_capacity(icon.rgba.len());
+    for (i, &[r, g, b, a]) in icon.rgba.as_chunks::<4>().0.iter().enumerate() {
+        if a == 0 {
+            color.extend_from_slice(&[0, 0, 0, 0]);
+            let (x, y) = (i % width, i / width);
+            mask[y * stride + x / 8] |= 0x80 >> (x % 8);
+        } else {
+            color.extend_from_slice(&[b, g, r, a]);
+        }
+    }
+    // SAFETY: both arrays are the size one plane of this width and height
+    // takes, the mask at 1 bit and the colour at 32, and outlive the call.
+    unsafe {
+        CreateIcon(
+            None,
+            width as i32,
+            height as i32,
+            1,
+            32,
+            mask.as_ptr(),
+            color.as_ptr(),
+        )
+    }
+    .ok()
 }
 
 fn register() -> Result<(), ViewerError> {
@@ -629,6 +690,7 @@ fn create(
             size_of::<BOOL>() as u32,
         )
     };
+    show_icon(hwnd);
     // SAFETY: a live window.
     shared
         .dpi
@@ -1146,19 +1208,19 @@ mod tests {
     #[test]
     fn opens_at_one_to_one_when_the_video_fits() {
         // 1440p on a 4K monitor at 150 percent: 80 percent of 3840x2088 is
-        // 3072x1670, and the strip is 30 px.
+        // 3072x1670, and the strip is 36 px.
         assert_eq!(
-            opening_client((2560, 1440), (3840, 2088), 30, 144),
-            (2560, 1470)
+            opening_client((2560, 1440), (3840, 2088), 36, 144),
+            (2560, 1476)
         );
     }
 
     #[test]
     fn scales_down_to_fit_keeping_the_aspect() {
-        // 80 percent of 1920x1032 is 1536x825, less 20 for the strip.
-        let (width, height) = opening_client((2560, 1440), (1920, 1032), 20, 96);
-        assert_eq!(height - 20, 805);
-        assert_eq!(width, (2560.0f64 * 805.0 / 1440.0).round() as u32);
+        // 80 percent of 1920x1032 is 1536x825, less 24 for the strip.
+        let (width, height) = opening_client((2560, 1440), (1920, 1032), 24, 96);
+        assert_eq!(height - 24, 801);
+        assert_eq!(width, (2560.0f64 * 801.0 / 1440.0).round() as u32);
     }
 
     #[test]
@@ -1173,12 +1235,12 @@ mod tests {
         );
         shared.set_size(640, 380);
         shared.dpi.store(144, Ordering::Release);
-        // At 144 dpi the band is the bottom 30 rows, 350 to 379.
-        click(&shared, 349);
+        // At 144 dpi the band is the bottom 36 rows, 344 to 379.
+        click(&shared, 343);
         click(&shared, 380);
         assert_eq!(woken.load(Ordering::Relaxed), 0);
         assert!(!shared.take_strip_click());
-        click(&shared, 350);
+        click(&shared, 344);
         assert_eq!(woken.load(Ordering::Relaxed), 1);
         assert!(shared.take_strip_click());
         assert!(!shared.take_strip_click());
@@ -1204,7 +1266,7 @@ mod tests {
         assert_eq!(shared.band(true), Band::Hidden);
         assert!(!in_strip(&shared, 360));
 
-        click(&shared, 349);
+        click(&shared, 343);
         assert_eq!(woken.load(Ordering::Relaxed), 0);
         assert_eq!(shared.band(true), Band::Hidden);
 
@@ -1223,8 +1285,8 @@ mod tests {
 
     #[test]
     fn never_opens_smaller_than_the_minimum() {
-        assert_eq!(opening_client((64, 64), (3840, 2088), 20, 96), (560, 200));
-        assert_eq!(opening_client((64, 64), (3840, 2088), 30, 144), (840, 300));
+        assert_eq!(opening_client((64, 64), (3840, 2088), 24, 96), (620, 204));
+        assert_eq!(opening_client((64, 64), (3840, 2088), 36, 144), (930, 306));
     }
 
     #[test]

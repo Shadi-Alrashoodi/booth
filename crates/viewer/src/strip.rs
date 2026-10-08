@@ -1,9 +1,10 @@
 // The strip along the viewer's bottom edge: the panel's strip with the video
 // numbers and the present path added, drawn with Direct2D over the back
-// buffer. Sizes, gaps, the trace's geometry, the colours and the way numbers
-// keep their slots are the panel's (crates/app/src/strip.rs), in points
-// scaled by the window's DPI and rounded to whole pixels the way egui rounds
-// them.
+// buffer. The 24 point band in window tone with no line over it, Plex Mono
+// at 12 points for every word and number, the 16 point sides, the 12 point
+// gaps, the trace's geometry, the colours and the way numbers keep their
+// slots are the panel's (crates/app/src/strip.rs), in points scaled by the
+// window's DPI and rounded to whole pixels the way egui rounds them.
 
 use stats::{Level, Thresholds, TraceSample};
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
@@ -13,17 +14,17 @@ use windows::Win32::Graphics::Direct2D::{
 };
 
 use crate::error::ViewerError;
-use crate::palette::{self, AMBER, ASH, BAD, Colour, INK, LINE, SAGE, WARN};
+use crate::palette::{self, AMBER, ASH, BAD, Colour, SAGE, WARN, WINDOW};
 use crate::text::Text;
 
-pub(crate) const HEIGHT: f32 = 20.0;
+pub(crate) const HEIGHT: f32 = 24.0;
 const TRACE_SAMPLES: usize = 120;
 const TRACE_HEIGHT: f32 = 16.0;
 const TRACE_TOP_MS: f32 = 100.0;
-// Between words: about three spaces of the strip's text.
-const GAP: f32 = 10.0;
-const SIDE: f32 = 12.0;
-const FONT_SIZE: f32 = 13.0;
+// Between words, the numbers in their slots.
+const GAP: f32 = 12.0;
+const SIDE: f32 = 16.0;
+const FONT_SIZE: f32 = 12.0;
 
 // The strip's numbers as the caller has them: the link's from the room
 // (room::view::Strip, field for field) and the video's from the decode
@@ -476,7 +477,7 @@ fn measured(
     Ok(widths)
 }
 
-// egui's row for a 13 point font: ascent and descent rounded to 1/32 of a
+// egui's row for a 12 point font: ascent and descent rounded to 1/32 of a
 // point, the row rounded to whole pixels, centred in the band and rounded
 // to whole points. Returns the baseline in pixels below the band's top.
 fn baseline(metrics: crate::text::Metrics, scale: f32) -> f32 {
@@ -552,12 +553,9 @@ impl Painter {
             self.context
                 .SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         }
-        self.fill(0.0, top, width, height, INK);
-        // The panel's hairline over the strip: one device pixel per whole
-        // scale step, ending a point below the band's top.
-        let line_bottom = top + scale.round();
-        let thickness = scale.floor().max(1.0);
-        self.fill(0.0, line_bottom - thickness, width, line_bottom, LINE);
+        // No line over it: the band is told apart from the picture by its
+        // tone, as the panel's strip is from the chat above it.
+        self.fill(0.0, top, width, height, WINDOW);
 
         self.text.set_size(FONT_SIZE * scale)?;
         let text = &mut self.text;
@@ -937,7 +935,7 @@ mod tests {
         assert_eq!(wide.len(), 9);
         // Room for the long words and nothing else: every number went.
         let long = texts(
-            154.0 + 3.0 * 7.0 + 36.0 * 7.0 + 4.0 * 7.0 + 20.0,
+            164.0 + 3.0 * 7.0 + 36.0 * 7.0 + 4.0 * 7.0 + 24.0,
             &controlling("Ctrl+Shift+End"),
         );
         assert_eq!(
@@ -983,8 +981,8 @@ mod tests {
 
     #[test]
     fn the_band_scales_with_dpi() {
-        assert_eq!(band_height(96), 20);
-        assert_eq!(band_height(144), 30);
-        assert_eq!(band_height(120), 25);
+        assert_eq!(band_height(96), 24);
+        assert_eq!(band_height(144), 36);
+        assert_eq!(band_height(120), 30);
     }
 }

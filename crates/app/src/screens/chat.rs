@@ -232,15 +232,22 @@ impl Chat {
     // The text to say when Enter was pressed in the composer. Disabled, it
     // keeps what was typed for when the host is back.
     fn composer(&mut self, ui: &mut Ui, enabled: bool) -> Option<String> {
+        // egui fades a disabled scope to half, which would put the field and
+        // its placeholder in colours the theme does not have, and the
+        // placeholder under ash. Disabled, it still takes no keys.
         let response = ui
-            .add_enabled_ui(enabled, |ui| {
-                controls::composer(
-                    ui,
-                    "composer",
-                    &mut self.draft,
-                    messages::MESSAGE_HINT,
-                    DRAFT_CHARS,
-                )
+            .scope(|ui| {
+                ui.visuals_mut().disabled_alpha = 1.0;
+                ui.add_enabled_ui(enabled, |ui| {
+                    controls::composer(
+                        ui,
+                        "composer",
+                        &mut self.draft,
+                        messages::MESSAGE_HINT,
+                        DRAFT_CHARS,
+                    )
+                })
+                .inner
             })
             .inner;
         if response.changed() {

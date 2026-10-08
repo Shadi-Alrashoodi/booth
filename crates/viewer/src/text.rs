@@ -1,4 +1,4 @@
-// The strip's face, IBM Plex Sans Medium, loaded from the same file the
+// The strip's face, IBM Plex Mono Regular, loaded from the same file the
 // panel embeds, through DirectWrite's in-memory loader: nothing is
 // installed and nothing is read from disk. The factory is isolated, so the
 // loader belongs to this viewer alone and goes away with it.
@@ -15,7 +15,7 @@ use windows::core::{HSTRING, w};
 
 use crate::error::ViewerError;
 
-const MEDIUM: &[u8] = include_bytes!("../../../assets/fonts/IBMPlexSans-Medium.ttf");
+const MONO: &[u8] = include_bytes!("../../../assets/fonts/IBMPlexMono-Regular.ttf");
 
 // Laid out strings are kept between frames; the strip shows a few dozen
 // different ones at most, so this is only a guard.
@@ -66,8 +66,8 @@ impl Text {
             let file = loader
                 .CreateInMemoryFontFileReference(
                     &factory,
-                    MEDIUM.as_ptr() as *const _,
-                    MEDIUM.len() as u32,
+                    MONO.as_ptr() as *const _,
+                    MONO.len() as u32,
                     None,
                 )
                 .map_err(fail)?;
@@ -79,7 +79,7 @@ impl Text {
                 .map_err(fail)?;
             if collection.GetFontFamilyCount() == 0 {
                 return Err(ViewerError::other(format!(
-                    "could not {step}: DirectWrite found no font in IBMPlexSans-Medium.ttf"
+                    "could not {step}: DirectWrite found no font in IBMPlexMono-Regular.ttf"
                 )));
             }
             // Whatever DirectWrite calls the family and the weight, they are

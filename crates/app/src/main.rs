@@ -113,6 +113,12 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let mark = icon();
+    viewer::set_icon(viewer::Icon {
+        rgba: mark.rgba,
+        width: mark.width,
+        height: mark.height,
+    });
     // Before any profile, key, socket or firewall check: the loopback needs
     // none of them.
     if let Some(options) = &args.loopback {
@@ -545,9 +551,10 @@ fn native_options() -> eframe::NativeOptions {
     }
 }
 
-// The title bar, taskbar and Alt+Tab icon: the mark in amber on a plate in
-// panel tone, its corners rounded 3/16 of its size. The plate keeps the mark
-// readable on a light taskbar, where amber alone falls to about 2:1.
+// The title bar, taskbar and Alt+Tab icon of the panel and the viewer: the
+// mark in amber on a plate in panel tone, its corners rounded 3/16 of its
+// size. The plate keeps the mark readable on a light taskbar, where amber
+// alone falls to about 2:1.
 fn icon() -> IconData {
     const SIZE: u32 = 32;
     let bars = mark::rects(SIZE);

@@ -213,15 +213,18 @@ impl InRoom {
         {
             self.monitors = None;
         }
-        if let Some(picks) = &self.monitors
-            && let Some(i) = monitor_row(ui, picks)
-        {
-            let pick = &picks[i];
-            self.room.share(pick.fps, Some(pick.id.clone()));
-            step = Some(Step::Remember(pick.id.device_name.clone()));
-            self.monitors = None;
+        // Whether a block in panel tone ends right above the body.
+        let mut block = false;
+        if let Some(picks) = &self.monitors {
+            block = true;
+            if let Some(i) = monitor_row(ui, picks) {
+                let pick = &picks[i];
+                self.room.share(pick.fps, Some(pick.id.clone()));
+                step = Some(Step::Remember(pick.id.device_name.clone()));
+                self.monitors = None;
+            }
         }
-        self.request(ui, view);
+        block |= self.request(ui, view);
         if stats_open {
             self.periods.ask(ui.ctx(), &self.devices);
             let periods = self.periods.periods();
@@ -239,23 +242,24 @@ impl InRoom {
         if !chat_shown(view) {
             let scroll = ScrollArea::vertical().id_salt("room").auto_shrink(false);
             scroll.show(ui, |ui| match view.role {
-                Role::Host => self.host(ui, view, &mut step),
-                Role::Client => self.client(ui, view, &mut step),
+                Role::Host => self.host(ui, view, block, &mut step),
+                Role::Client => self.client(ui, view, block, &mut step),
             });
             return step;
         }
         // At the smallest window the invite block and eight people are taller
         // than the body. They scroll on their own once they would take more
-        // than half of it, so the chat, its composer included, always keeps
-        // the other half.
-        let most = (ui.available_height() / 2.0).max(ROW_HEIGHT);
+        // than half of it, so the chat, its composer included, keeps the
+        // other half, less the 8 px under the last row: they are the list's
+        // edge, not one of its lines.
+        let most = (ui.available_height() / 2.0).max(ROW_HEIGHT) + STEP;
         let scroll = ScrollArea::vertical()
             .id_salt("room")
             .max_height(most)
             .auto_shrink([false, true]);
         scroll.show(ui, |ui| match view.role {
-            Role::Host => self.host(ui, view, &mut step),
-            Role::Client => self.client(ui, view, &mut step),
+            Role::Host => self.host(ui, view, block, &mut step),
+            Role::Client => self.client(ui, view, block, &mut step),
         });
         let enabled = composer_enabled(view);
         self.chat
@@ -287,15 +291,15 @@ impl InRoom {
 
     // The control request block, under the title row whatever the body
     // shows, the stats panel included: who may use this PC is never out
-    // of sight while it is being decided or done.
-    fn request(&mut self, ui: &mut Ui, view: &View) {
+    // of sight while it is being decided or done. True when it shows.
+    fn request(&mut self, ui: &mut Ui, view: &View) -> bool {
         let request = control::request(view, self.control_offered);
         let wait = self.allow_wait.follow(request, Instant::now());
         if let Some(left) = wait {
             ui.ctx().request_repaint_after(left);
         }
         let Some(request) = request else {
-            return;
+            return false;
         };
         match control::request_block(ui, request, &self.panic.words, wait.is_none()) {
             Some(Answer::Allow(number)) => {
@@ -306,21 +310,26 @@ impl InRoom {
             Some(Answer::Stop) => self.room.stop_control(),
             None => {}
         }
+        true
     }
 
-    fn host(&mut self, ui: &mut Ui, view: &View, step: &mut Option<Step>) {
+    // `block` is true when a block in panel tone ends right above.
+    fn host(&mut self, ui: &mut Ui, view: &View, block: bool, step: &mut Option<Step>) {
         if let Some(notice) = &view.notice {
             controls::page(ui, |ui| explain(ui, notice, step));
             return;
         }
+        let mut block = block;
         // Above the invite block, in the window's tone, since a new invite
         // is one of the two ways back.
         if let Some(text) = messages::friends_lost(view.address_changed) {
             controls::page(ui, |ui| {
                 controls::prose(ui, text, theme::body(), CHALK);
             });
+            block = false;
         }
         if let Some(invite) = &view.invite {
+            block = true;
             controls::region(ui, STEP, |ui| {
                 self.invite(ui, invite, view.numbers.local_port, &view.share, step);
                 // A punch from a router that changes ports opens a port
@@ -334,9 +343,13 @@ impl InRoom {
                 }
             });
         }
-        self.people(ui, view);
+        list_top(ui, block);
+        let row_last = self.people(ui, view);
+        // 8 px under a row, which the list has left already, and 16 under
+        // the line about the microphone, so the two sentences stay apart.
         if view.people.iter().all(|person| person.is_you) {
-            controls::gutter(ui, STEP, STEP, |ui| {
+            let top = if row_last { 0.0 } else { STEP };
+            controls::gutter(ui, top, STEP, |ui| {
                 controls::prose(ui, messages::EMPTY_ROOM, theme::body(), ASH);
             });
         }
@@ -461,7 +474,8 @@ impl InRoom {
         }
     }
 
-    fn client(&mut self, ui: &mut Ui, view: &View, step: &mut Option<Step>) {
+    // `block` as for host.
+    fn client(&mut self, ui: &mut Ui, view: &View, block: bool, step: &mut Option<Step>) {
         if view.people.is_empty() {
             match &view.notice {
                 Some(Notice::StillTrying) => self.still_trying(ui, view.reply.as_ref(), step),
@@ -474,10 +488,13 @@ impl InRoom {
             }
             return;
         }
+        let mut block = block;
         if let Some(notice) = &view.notice {
             controls::page(ui, |ui| explain(ui, notice, step));
+            block = false;
         }
         if let Some(reply) = code_in_room(view) {
+            block = true;
             controls::region(ui, SIDE, |ui| {
                 // The title row already has Leave, so New code is the one
                 // button here.
@@ -489,6 +506,7 @@ impl InRoom {
                 }
             });
         }
+        list_top(ui, block);
         self.people(ui, view);
     }
 
@@ -826,6 +844,15 @@ fn monitor_row(ui: &mut Ui, picks: &[Pick]) -> Option<usize> {
     pressed
 }
 
+// 8 px of window tone between a block in panel tone and the first row, as
+// under the last one, so the focus ring around a button on that row stays in
+// the list's tone instead of reaching into the block's.
+fn list_top(ui: &mut Ui, block: bool) {
+    if block {
+        ui.add_space(STEP);
+    }
+}
+
 // While someone shares, their row has Watch for everyone else,
 // which reads Stop watching while this PC watches. None on every other row,
 // and while the host is lost, since nothing could be watched then.
@@ -879,8 +906,8 @@ impl InRoom {
     // Your own row holds the voice buttons, and under it goes why the
     // microphone or the speakers are not running. The list is in the
     // window's tone, 32 px a row, with nothing between rows but their own
-    // height.
-    fn people(&mut self, ui: &mut Ui, view: &View) {
+    // height. True when it ended on a row, with 8 px under it.
+    fn people(&mut self, ui: &mut Ui, view: &View) -> bool {
         let client_link = (view.role == Role::Client).then_some(view.strip.state);
         let gone = matches!(client_link, Some(LinkState::Lost | LinkState::Closed));
         let stale = gone || client_link == Some(LinkState::Reconnecting);
@@ -892,7 +919,10 @@ impl InRoom {
             .map(|person| person.key)
             .collect();
         self.menu.keep_only(&with_menu);
+        // Whether the list ended on a row's own edge, with nothing under it.
+        let mut row_last = false;
         for person in &view.people {
+            row_last = true;
             let same_name = view
                 .people
                 .iter()
@@ -906,6 +936,7 @@ impl InRoom {
                 let paused = paused_line(self.keys);
                 let problem = voice_problem(&view.voice);
                 if paused.is_some() || problem.is_some() {
+                    row_last = false;
                     controls::gutter(ui, 0.0, STEP, |ui| {
                         if let Some(paused) = paused {
                             controls::prose(ui, paused, theme::caption(), WARN);
@@ -976,10 +1007,22 @@ impl InRoom {
                 (Some(RowPress::Control), Some(current)) => self.room.ask_control(current.number),
                 _ => {}
             }
+            let before = ui.cursor().top();
             if let Some(MenuItem::EndControl) = self.menu.show(ui, person.key, &items) {
                 self.room.end_control();
             }
+            // An open menu ends with space of its own under its button.
+            if ui.cursor().top() > before {
+                row_last = false;
+            }
         }
+        // 8 px of window tone under the last row, so the focus ring around a
+        // button on it stays in the list's tone instead of reaching into the
+        // chat's.
+        if row_last {
+            ui.add_space(STEP);
+        }
+        row_last
     }
 
     // Your row is 32 px, with Hold to talk in push-to-talk mode

@@ -21,7 +21,7 @@ use crate::Video;
 use crate::cursor::{Cursor, Local, Pointer};
 use crate::device::{Gpu, Locked};
 use crate::error::ViewerError;
-use crate::palette::INK;
+use crate::palette::WINDOW;
 use crate::picture::{Picture, Placement};
 use crate::strip::{self, Band, Look, Painter, Strip, Sweep};
 
@@ -71,7 +71,9 @@ impl Scene {
                 // Pixels, not DIPs: the strip does its own DPI scaling so it
                 // can round the way the panel does.
                 d2d.SetDpi(96.0, 96.0);
-                let brush = d2d.CreateSolidColorBrush(&INK.d2d(), None).map_err(fail)?;
+                let brush = d2d
+                    .CreateSolidColorBrush(&WINDOW.d2d(), None)
+                    .map_err(fail)?;
                 (factory, d2d_device, d2d, brush)
             }
         };

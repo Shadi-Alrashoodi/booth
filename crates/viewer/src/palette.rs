@@ -1,17 +1,17 @@
-// The colours the viewer draws with. The panel has the same values in
-// crates/app/src/theme.rs.
+// The colours the viewer draws with. The panel has the same values under the
+// same names in crates/app/src/theme.rs.
 
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Colour(pub u32);
 
-pub(crate) const INK: Colour = Colour(0x141412);
-pub(crate) const LINE: Colour = Colour(0x2A2A26);
+// The window tone: the bars around the picture and the strip's band.
+pub(crate) const WINDOW: Colour = Colour(0x141412);
 pub(crate) const ASH: Colour = Colour(0x9A978E);
 pub(crate) const AMBER: Colour = Colour(0xE8912F);
 pub(crate) const SAGE: Colour = Colour(0x6FA86F);
-pub(crate) const WARN: Colour = Colour(0xD9A441);
+pub(crate) const WARN: Colour = Colour(0xCBB04B);
 pub(crate) const BAD: Colour = Colour(0xDE7461);
 
 impl Colour {

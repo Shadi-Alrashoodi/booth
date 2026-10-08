@@ -19,7 +19,7 @@ use crate::Video;
 use crate::control;
 use crate::cursor::{Cursor, CursorKind, CursorShape, Local};
 use crate::device::{self, Gpu};
-use crate::palette::{AMBER, Colour, INK, LINE, SAGE, WARN};
+use crate::palette::{AMBER, Colour, SAGE, WARN, WINDOW};
 use crate::picture::VIEW_IDLE;
 use crate::scene::{Scene, Target};
 use crate::strip::{Band, LinkState, Look, PathWord, PresentPath, Strip, band_height};
@@ -313,9 +313,9 @@ fn a_hidden_strip_gives_the_picture_the_whole_window() {
             "over: the picture moved at {x},{above}"
         );
     }
-    // The strip's own ink, left of its first word.
+    // The strip's own tone, left of its first word.
     assert!(
-        close(over.rgb(2, HEIGHT - 3), INK),
+        close(over.rgb(2, HEIGHT - 3), WINDOW),
         "over: no strip at the bottom"
     );
 }
@@ -397,23 +397,29 @@ fn bars_around_the_picture() {
         return;
     };
     let band = band_height(96);
-    // 800 wide for a 640 wide picture: 80 px of ink each side.
+    // 800 wide for a 640 wide picture: 80 px of window tone each side.
     let (wide, _) = screen.draw((800, HEIGHT + band), None, &plain(), 96);
     for y in [0, HEIGHT / 2, HEIGHT - 1] {
         for x in [0, 79, 720, 799] {
-            assert!(close(wide.rgb(x, y), INK), "wide: {x},{y} is not ink");
+            assert!(
+                close(wide.rgb(x, y), WINDOW),
+                "wide: {x},{y} is not window tone"
+            );
         }
-        assert!(!close(wide.rgb(80, HEIGHT * 7 / 16), INK));
+        assert!(!close(wide.rgb(80, HEIGHT * 7 / 16), WINDOW));
     }
     // 600 tall above the strip for a 360 tall picture: 120 px each end.
     let (tall, _) = screen.draw((WIDTH, 600 + band), None, &plain(), 96);
     for x in [0, WIDTH / 2, WIDTH - 1] {
         for y in [0, 119, 480, 599] {
-            assert!(close(tall.rgb(x, y), INK), "tall: {x},{y} is not ink");
+            assert!(
+                close(tall.rgb(x, y), WINDOW),
+                "tall: {x},{y} is not window tone"
+            );
         }
     }
     // The white bar's top left corner is the picture's first row there.
-    assert!(!close(tall.rgb(0, 120 + HEIGHT * 3 / 8), INK));
+    assert!(!close(tall.rgb(0, 120 + HEIGHT * 3 / 8), WINDOW));
 }
 
 fn colour_pointer() -> CursorShape {
@@ -618,11 +624,11 @@ fn live_strip() -> Strip {
 }
 
 fn is_text(rgb: [u8; 3]) -> bool {
-    off_by(rgb, INK.rgb()) > 40
+    off_by(rgb, WINDOW.rgb()) > 40
 }
 
 #[test]
-fn the_strip_has_its_words_its_hairline_and_its_trace() {
+fn the_strip_has_its_words_and_its_trace_and_no_line() {
     let Some(mut screen) = Offscreen::new() else {
         return;
     };
@@ -661,7 +667,7 @@ fn the_strip_has_its_words_its_hairline_and_its_trace() {
                 "{dpi}: no text where {word:?} goes ({count} pixels)"
             );
         }
-        // Between the words and before the first, nothing but ink.
+        // Between the words and before the first, nothing but window tone.
         let gaps: Vec<(f32, f32)> = spans
             .windows(2)
             .map(|pair| (pair[0].2 + 1.0, pair[1].1 - 1.0))
@@ -670,13 +676,17 @@ fn the_strip_has_its_words_its_hairline_and_its_trace() {
         for (from, to) in gaps {
             assert_eq!(text_in(from, to), 0, "{dpi}: text in the gap {from}..{to}");
         }
-        // The hairline along the band's top edge.
-        let line_row = top + scale.round() as u32 - 1;
-        assert!(close(image.rgb(600, line_row), LINE), "{dpi}: no hairline");
+        // No line along the band's top edge: its first row is window tone.
+        for x in [0, 600, size.0 - 1] {
+            assert!(
+                close(image.rgb(x, top), WINDOW),
+                "{dpi}: a line at {x},{top}"
+            );
+        }
         // A flat 4 ms trace: one sage row near the bottom of the slot, the
         // full 120 samples wide.
-        let slot_left = size.0 as f32 - 132.0 * scale;
-        let row = top + ((2.0 + 14.0) * scale).round() as u32;
+        let slot_left = size.0 as f32 - 136.0 * scale;
+        let row = top + ((4.0 + 14.0) * scale).round() as u32;
         let sage = (0..120)
             .filter(|&i| {
                 let x = (slot_left + (i as f32 + 0.5) * scale) as u32;
@@ -798,14 +808,14 @@ fn kept_words_fit_the_smallest_window() {
                 assert!(words.contains(kept), "{dpi}: {kept} was dropped: {words:?}");
             }
             let end = spans.iter().map(|span| span.2).fold(0.0, f32::max);
-            // The trace starts 132 points from the right, a gap after the words.
-            let trace = width as f32 - 132.0 * scale;
+            // The trace starts 136 points from the right, a gap after the words.
+            let trace = width as f32 - 136.0 * scale;
             println!(
                 "{dpi} dpi, {width} px, {} words: they end at {end:.1}, the trace starts at {trace:.1}",
                 stay.len()
             );
             assert!(
-                end + 10.0 * scale <= trace + 0.5,
+                end + 12.0 * scale <= trace + 0.5,
                 "{dpi} dpi, {width} px wide: the words end at {end} and run into the trace at {trace}: {spans:?}"
             );
         }

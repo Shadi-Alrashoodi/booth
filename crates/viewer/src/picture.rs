@@ -24,7 +24,7 @@ use windows::core::{Interface, s};
 
 use crate::Video;
 use crate::error::ViewerError;
-use crate::palette::INK;
+use crate::palette::WINDOW;
 use crate::shader;
 
 const SOURCE: &str = include_str!("picture.hlsl");
@@ -70,7 +70,7 @@ struct Constants {
     area: [f32; 4],
     source_size: [f32; 2],
     footprint: [f32; 2],
-    ink: [f32; 4],
+    window: [f32; 4],
 }
 
 struct Planes {
@@ -157,8 +157,9 @@ impl Picture {
     }
 
     // Draws `video`, or the copy of the last one when there is none, over
-    // the `region` at the target's top left, and ink where the picture is
-    // not. The caller holds the device lock and has cleared the state.
+    // the `region` at the target's top left, and window tone where the
+    // picture is not. The caller holds the device lock and has cleared the
+    // state.
     pub(crate) fn draw(
         &mut self,
         target: &ID3D11RenderTargetView,
@@ -188,7 +189,7 @@ impl Picture {
                 _ => {
                     // SAFETY: a live view on this device.
                     unsafe {
-                        self.context.ClearRenderTargetView(target, &INK.floats());
+                        self.context.ClearRenderTargetView(target, &WINDOW.floats());
                     }
                     return Ok(None);
                 }
@@ -207,7 +208,7 @@ impl Picture {
                 source.0 as f32 / placement.width.max(1) as f32,
                 source.1 as f32 / placement.height.max(1) as f32,
             ],
-            ink: INK.floats(),
+            window: WINDOW.floats(),
         };
         // SAFETY: every object is alive and made on this device; the
         // constants are the buffer's size and outlive the call.

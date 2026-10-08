@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eframe::egui::{Color32, Rect, ScrollArea, Sense, Ui, vec2};
+use eframe::egui::{Color32, FontId, Rect, ScrollArea, Sense, Ui, pos2, vec2};
 use net::firewall::FirewallState;
 use room::view::{
     AddressChange, ControlNumbers, Latency, Level, MappingWord, NameAnswer, NameView, Numbers,
@@ -15,7 +15,7 @@ use crate::messages;
 use crate::screens::room::addresses_hidden;
 use crate::sound::{Periods, Side};
 use crate::strip;
-use crate::theme::{self, ASH, BAD, CHALK, FIELD_GAP, PANEL, SIDE, WARN};
+use crate::theme::{self, ASH, BAD, CHALK, FIELD_GAP, PANEL, SIDE, STEP, WARN};
 
 // Only there when the microphone makes voice worse by itself, then in warn.
 const MICROPHONE: &str = "Microphone";
@@ -50,40 +50,99 @@ pub fn show(
         showing,
     );
     if let Some(path) = log_file {
-        out.group();
+        out.group(None);
         out.add("Log file", Some(path.display().to_string()));
     }
     // Over the people list and the chat, the whole height between the title
-    // row and the strip, in panel tone. The groups are set apart by space
-    // alone: each line already names itself.
+    // row and the strip, in panel tone.
     let whole = ui.available_rect_before_wrap();
     ui.painter().rect_filled(whole, 0, PANEL);
+    let font = theme::mono();
+    // Never narrower than " min", so the column does not move when the
+    // session age passes its first hour.
+    let gutter = out
+        .lines
+        .iter()
+        .map(|line| width(ui, &line.value[unit_at(&line.value)..], &font))
+        .fold(width(ui, " min", &font), f32::max);
     let scroll = ScrollArea::vertical().id_salt("stats").auto_shrink(false);
     scroll.show(ui, |ui| {
         controls::gutter(ui, SIDE, SIDE, |ui| {
             for (i, line) in out.lines.iter().enumerate() {
-                if i > 0 && out.breaks.contains(&i) {
-                    ui.add_space(FIELD_GAP);
+                match out.start_at(i) {
+                    Some(Start::Group(head)) => {
+                        if i > 0 {
+                            ui.add_space(FIELD_GAP);
+                        }
+                        if let Some(head) = head {
+                            controls::text(ui, head, theme::section(), CHALK);
+                            ui.add_space(STEP);
+                        }
+                    }
+                    Some(Start::Part) => ui.add_space(STEP),
+                    None => {}
                 }
-                let rect = line_rect(ui);
-                let label_width = controls::text_width(ui, line.label, theme::body());
-                let room = (rect.width() - label_width - SIDE).max(0.0);
-                let value = controls::fit_middle(ui, &line.value, &theme::mono(), room);
-                let value_width = controls::text_width(ui, &value, theme::mono());
-                controls::split_row(
-                    ui,
-                    rect,
-                    value_width,
-                    |ui| {
-                        controls::one_line(ui, line.label, theme::body(), ASH);
-                    },
-                    |ui| {
-                        controls::one_line(ui, &value, theme::mono(), value_color(line));
-                    },
-                );
+                value_line(ui, line, gutter);
             }
         });
     });
+}
+
+// Label left in ash, value right. A reading's digits end on one edge, the
+// gutter's width in from the right, and its unit stands in the gutter, so
+// the column lines up on the digits whatever the units are; a value with no
+// unit ends on the same edge.
+fn value_line(ui: &mut Ui, line: &Line, gutter: f32) {
+    let rect = line_rect(ui);
+    let font = theme::mono();
+    let label_width = controls::text_width(ui, line.label, theme::body());
+    let least = rect.left() + label_width + SIDE;
+    let at = unit_at(&line.value);
+    let mut right = rect.right() - gutter + width(ui, &line.value[at..], &font);
+    // Words, an address or a name that would meet the label run on into
+    // the gutter before anything is cut.
+    if at == line.value.len() && right - width(ui, &line.value, &font) < least {
+        right = rect.right();
+    }
+    let value = controls::fit_middle(ui, &line.value, &font, (right - least).max(0.0));
+    let value_width = controls::text_width(ui, &value, font.clone());
+    controls::split_row(
+        ui,
+        Rect::from_min_max(rect.min, pos2(right, rect.bottom())),
+        value_width,
+        |ui| {
+            controls::one_line(ui, line.label, theme::body(), ASH);
+        },
+        |ui| {
+            controls::one_line(ui, &value, font.clone(), value_color(line));
+        },
+    );
+}
+
+// Measured as laid out, not rounded up, so units of different lengths still
+// leave the digits on one edge.
+fn width(ui: &Ui, text: &str, font: &FontId) -> f32 {
+    ui.painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), CHALK)
+        .size()
+        .x
+}
+
+// Where a reading's unit starts: at " ms" in "12.4 ms", at "%" in "0.0%".
+// A value that is not a number with its unit has none, and ends where the
+// digits of the others do.
+fn unit_at(value: &str) -> usize {
+    const UNITS: [&str; 8] = ["ms", "s", "min", "B", "KB", "MB", "kHz", "Mbit/s"];
+    let ends_in_digit = |body: &str| body.ends_with(|c: char| c.is_ascii_digit());
+    if let Some(body) = value.strip_suffix('%')
+        && ends_in_digit(body)
+    {
+        return body.len();
+    }
+    match value.rsplit_once(' ') {
+        Some((body, unit)) if UNITS.contains(&unit) && ends_in_digit(body) => body.len(),
+        _ => value.len(),
+    }
 }
 
 // Label left, number right. A number past its first threshold is in warn
@@ -114,10 +173,24 @@ fn value_color(line: &Line) -> Color32 {
 struct Lines {
     lines: Vec<Line>,
     hide_addresses: bool,
-    // Where each group after the first starts. The link alone is four: how
-    // good it is, where it goes, the session, the traffic. Then chat, voice,
-    // video, control, the router, the log file.
-    breaks: Vec<usize>,
+    // Where each group, and each part of the link's group, starts, by the
+    // index of its first line.
+    starts: Vec<(usize, Start)>,
+    // What the next line starts, when it is the first since a group or a
+    // part began.
+    next: Option<Start>,
+}
+
+// The groups from the top: the link, chat delivery, voice, video, remote
+// control, what the router check found, then the log file. Chat delivery
+// and the log file are one line each that names itself, so they have no
+// head over them. The link is long enough to need its four parts set apart,
+// by a smaller space and no head: how good it is, where it goes, the
+// session, the traffic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Start {
+    Group(Option<&'static str>),
+    Part,
 }
 
 impl Lines {
@@ -125,16 +198,37 @@ impl Lines {
         Lines {
             lines: Vec::new(),
             hide_addresses,
-            breaks: Vec::new(),
+            starts: Vec::new(),
+            next: None,
         }
     }
 
-    // The next line starts a group, unless nothing came since the last one.
-    fn group(&mut self) {
-        let at = self.lines.len();
-        if at > 0 && self.breaks.last() != Some(&at) {
-            self.breaks.push(at);
+    // The next line starts a group under `head`. A group with no lines
+    // shows nothing, its head included.
+    fn group(&mut self, head: Option<&'static str>) {
+        self.next = Some(Start::Group(head));
+    }
+
+    // The next line starts a part of the group it is in, unless it is the
+    // group's first.
+    fn part(&mut self) {
+        if self.next.is_none() {
+            self.next = Some(Start::Part);
         }
+    }
+
+    fn start_at(&self, i: usize) -> Option<Start> {
+        self.starts
+            .iter()
+            .find(|(at, _)| *at == i)
+            .map(|(_, start)| *start)
+    }
+
+    fn push(&mut self, line: Line) {
+        if let Some(start) = self.next.take() {
+            self.starts.push((self.lines.len(), start));
+        }
+        self.lines.push(line);
     }
 
     fn add(&mut self, label: &'static str, value: Option<String>) {
@@ -143,7 +237,7 @@ impl Lines {
 
     fn level(&mut self, label: &'static str, value: Option<String>, level: Level) {
         if let Some(value) = value {
-            self.lines.push(Line {
+            self.push(Line {
                 label,
                 value,
                 level,
@@ -158,7 +252,7 @@ impl Lines {
         if !self.hide_addresses {
             self.add(label, value);
         } else if value.is_some() {
-            self.lines.push(Line {
+            self.push(Line {
                 label,
                 value: String::from(messages::HIDDEN_WHILE_SHARING),
                 level: Level::Good,
@@ -208,6 +302,7 @@ fn build(
     showing: Showing,
 ) -> Lines {
     let mut out = Lines::new(showing.hide_addresses);
+    out.group(Some("Link"));
     let link_label = match role {
         Role::Host => "Slowest link",
         Role::Client => "Host",
@@ -222,11 +317,11 @@ fn build(
     out.add(loss_label(n.loss_from), n.loss_pct.map(percent));
     out.add("Loss inbound, from pings", n.inbound_loss_pct.map(percent));
     out.add("Path", n.path.map(|path| strip::path_word(path).to_owned()));
-    out.group();
+    out.part();
     out.address("Remote address", n.peer_addr.map(|addr| addr.to_string()));
     out.add("Local port", Some(format!("UDP {}", n.local_port)));
     out.add("Firewall", Some(firewall.to_owned()));
-    out.group();
+    out.part();
     out.add("Handshake", n.handshake_ms.map(ms));
     out.add("Connect time", n.connect_ms.map(ms));
     out.add("Reconnect time", n.reconnect_ms.map(ms));
@@ -240,7 +335,7 @@ fn build(
         "Ping interval",
         Some(format!("{} ms", n.ping_interval.as_millis())),
     );
-    out.group();
+    out.part();
     out.add("Packets sent", Some(n.packets_sent.to_string()));
     out.add("Packets received", Some(n.packets_received.to_string()));
     out.add("Bytes sent", Some(bytes(n.bytes_sent)));
@@ -258,9 +353,9 @@ fn build(
     );
     out.add("Ack delay", n.ack_delay_ms.map(ms));
     out.add("Retransmits", Some(n.retransmits.to_string()));
-    out.group();
+    out.group(None);
     out.add("Chat delivery", chat_delivery(n));
-    out.group();
+    out.group(Some("Voice"));
     out.add("Audio period", audio_period(n, audio));
     out.add("Resampled by Windows", audio.and_then(resampled));
     out.level(MICROPHONE, n.microphone.and_then(microphone), Level::Warn);
@@ -306,7 +401,7 @@ fn build(
         (n.voice_dropped > 0).then(|| n.voice_dropped.to_string()),
     );
     // The Video group follows the voice lines.
-    out.group();
+    out.group(Some("Video"));
     if let Some(sharing) = &n.sharing {
         video_out(&mut out, sharing);
     }
@@ -314,11 +409,11 @@ fn build(
         video_in(&mut out, watching);
     }
     video_counts(&mut out, n);
-    out.group();
+    out.group(None);
     if showing.control {
         control(&mut out, &n.control);
     }
-    out.group();
+    out.group(Some("Router check"));
     // What STUN found about the outside port, easy or hard. Not "Port
     // mapping" below, which is the router opening a port on request.
     out.add(
@@ -1078,6 +1173,67 @@ mod tests {
             .collect();
         for label in ["Encoder", "Decode, GPU", "Video packets sent", "Video loss"] {
             assert!(!labels.contains(&label), "{label}");
+        }
+    }
+
+    // Each group under its head, the link's parts set apart with none, and
+    // nothing at all for a group with no lines.
+    #[test]
+    fn groups_and_their_heads() {
+        let n = Numbers {
+            rtt_ms: Some(4.2),
+            local_port: 41000,
+            chat_delivery_last_ms: Some(3.0),
+            send_frame_ms: 5,
+            ..Numbers::default()
+        };
+        let out = build(Role::Host, &n, "allowed", false, 0, None, SHOWING);
+        let starts: Vec<(&str, Start)> = out
+            .starts
+            .iter()
+            .map(|(at, start)| (out.lines[*at].label, *start))
+            .collect();
+        assert_eq!(
+            starts,
+            [
+                ("Round trip", Start::Group(Some("Link"))),
+                ("Local port", Start::Part),
+                ("Rekeys", Start::Part),
+                ("Packets sent", Start::Part),
+                ("Chat delivery", Start::Group(None)),
+                ("Frame size", Start::Group(Some("Voice"))),
+                ("Port mapping", Start::Group(Some("Router check"))),
+            ]
+        );
+    }
+
+    // Only a number and its unit are split, so the digits can end on one
+    // edge; words, an address or a count with a word after it stay whole.
+    #[test]
+    fn readings_split_at_their_unit() {
+        let split = |value: &'static str| value.split_at(unit_at(value));
+        assert_eq!(split("12.4 ms"), ("12.4", " ms"));
+        assert_eq!(split("-1.6 ms"), ("-1.6", " ms"));
+        assert_eq!(split("0.0%"), ("0.0", "%"));
+        assert_eq!(split("1023 B"), ("1023", " B"));
+        assert_eq!(split("2 min 13 s"), ("2 min 13", " s"));
+        assert_eq!(split("3 h 7 min"), ("3 h 7", " min"));
+        assert_eq!(split("11.2 of 15.0 Mbit/s"), ("11.2 of 15.0", " Mbit/s"));
+        assert_eq!(
+            split("about 3.1 ms, average 2.7 ms"),
+            ("about 3.1 ms, average 2.7", " ms")
+        );
+        for whole in [
+            "30",
+            "UDP 41000",
+            "LAN",
+            "192.0.2.44:41000",
+            "Hidden while you share",
+            "118 frames",
+            "5%, seed 1234, 312 dropped",
+            "8 kHz, Bluetooth hands-free",
+        ] {
+            assert_eq!(split(whole), (whole, ""), "{whole}");
         }
     }
 

@@ -1,8 +1,8 @@
 // NV12 (BT.709, limited range) to full range RGB, scaled into the picture's
-// rectangle, with the bars around it in ink. The conversion is the capture
-// shader's run backwards: that one computes Y from the BT.709 weights and U
-// and V from the blue and red differences, so these are the same equations
-// solved for R, G and B.
+// rectangle, with the bars around it in window tone. The conversion is the
+// capture shader's run backwards: that one computes Y from the BT.709
+// weights and U and V from the blue and red differences, so these are the
+// same equations solved for R, G and B.
 //
 // Scaling is an area average, the capture shader's filter: an output pixel
 // is the average of the source pixels under it, each counted by how much of
@@ -23,7 +23,7 @@ cbuffer Picture : register(b0)
     float2 source_size;
     // Source pixels under one target pixel, per axis.
     float2 footprint;
-    float4 ink;
+    float4 window;
 };
 
 Texture2DArray luma : register(t0);
@@ -62,7 +62,7 @@ float4 ps_main(float4 position : SV_Position) : SV_Target
 {
     float2 p = position.xy;
     if (any(p < area.xy) || any(p >= area.zw))
-        return ink;
+        return window;
     float2 start = floor(p - area.xy) * footprint;
     float2 end = start + footprint;
     int2 size = int2(source_size);

@@ -1,4 +1,4 @@
-use eframe::egui::{Label, RichText, Ui};
+use eframe::egui::Ui;
 
 use crate::controls::{self, Button, Lead};
 use crate::messages;
@@ -51,10 +51,7 @@ pub fn show(ui: &mut Ui, ask: &Ask, waiting: bool) -> Option<Answer> {
         let mut answer = None;
         ui.horizontal(|ui| {
             if waiting {
-                let line = RichText::new(messages::FIREWALL_WAITING)
-                    .font(theme::body())
-                    .color(ASH);
-                ui.add(Label::new(line).extend());
+                controls::one_line(ui, messages::FIREWALL_WAITING, theme::body(), ASH);
             } else if Button::new("Allow").role(Role::Primary).show(ui).clicked() {
                 answer = Some(Answer::Allow);
             }
