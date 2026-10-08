@@ -8,35 +8,81 @@ mod json;
 mod licenses;
 mod signing;
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::ffi::{OsStr, OsString};
-use std::fs;
+use std::fs::{self, File};
+use std::io::{self, IsTerminal};
+use std::os::windows::io::AsHandle;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+use signing::Password;
 
 const USAGE: &str = "usage:
   release keygen <secret key file>
       makes a password-protected key pair, writes the secret key to the file,
       which must be outside any git repository, and prints the public key
-  release check-key [--rehearsal] <secret key file> <public key>
+  release check-key [--rehearsal] [--password-stdin] <secret key file> <public key>
       asks for the key's password and refuses the key unless its public half
-      is <public key>, the app's RELEASE_KEY; with --rehearsal it only warns
-  release sign [--rehearsal] <secret key file> <public key> <file>...
+      is <public key>, the app's RELEASE_KEY; with --rehearsal it only warns;
+      with --password-stdin it reads the password once from a pipe instead
+  release sign [--rehearsal] [--password-stdin] <secret key file> <public key> <file>...
       checks the key as check-key does, then writes <file>.minisig for each
       file; the key file must be outside any git repository
   release licenses <repository folder> <output folder>
       writes THIRD-PARTY-LICENSES.txt and the ffmpeg folder into the output folder";
 
+// minisign takes the key's password as a String and frees it without
+// wiping it, whether it read it from the console or was handed it from a
+// pipe, so this tool wipes every block before it is freed, with volatile
+// writes the compiler may not leave out. realloc is GlobalAlloc's own,
+// which moves a block with alloc and dealloc, so a block that grows is
+// wiped as well.
+struct WipeOnFree;
+
+unsafe impl GlobalAlloc for WipeOnFree {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, block: *mut u8, layout: Layout) {
+        for i in 0..layout.size() {
+            unsafe { block.add(i).write_volatile(0) };
+        }
+        unsafe { System.dealloc(block, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: WipeOnFree = WipeOnFree;
+
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let command = args.first().and_then(|a| a.to_str());
-    let rehearsal = args.get(1).is_some_and(|a| a == "--rehearsal");
-    let rest = args.get(1 + usize::from(rehearsal)..).unwrap_or_default();
-    let result = match (command, rehearsal, rest.len()) {
-        (Some("keygen"), false, 1) => keygen(Path::new(&rest[0])),
-        (Some("check-key"), _, 2) => {
-            open_checked_key(Path::new(&rest[0]), &rest[1], rehearsal).map(drop)
+    let mut rest = args.get(1..).unwrap_or_default();
+    let (mut rehearsal, mut password_stdin) = (false, false);
+    loop {
+        match rest.first().and_then(|a| a.to_str()) {
+            Some("--rehearsal") => rehearsal = true,
+            Some("--password-stdin") => password_stdin = true,
+            _ => break,
         }
-        (Some("sign"), _, 3..) => sign(Path::new(&rest[0]), &rest[1], &rest[2..], rehearsal),
+        rest = &rest[1..];
+    }
+    let result = match (command, rehearsal || password_stdin, rest.len()) {
+        (Some("keygen"), false, 1) => keygen(Path::new(&rest[0])),
+        (Some("check-key"), _, 2) => with_password(password_stdin, |password| {
+            open_checked_key(Path::new(&rest[0]), &rest[1], rehearsal, password).map(drop)
+        }),
+        (Some("sign"), _, 3..) => with_password(password_stdin, |password| {
+            sign(
+                Path::new(&rest[0]),
+                &rest[1],
+                &rest[2..],
+                rehearsal,
+                password,
+            )
+        }),
         (Some("licenses"), false, 2) => collect_licenses(Path::new(&rest[0]), Path::new(&rest[1])),
         _ => {
             eprintln!("{USAGE}");
@@ -50,6 +96,27 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+// The pipe is read through its own handle: std reads stdin through a buffer
+// it keeps, unwiped, until the tool exits.
+fn with_password(
+    piped: bool,
+    run: impl FnOnce(Password) -> Result<(), String>,
+) -> Result<(), String> {
+    if !piped {
+        return run(Password::Console);
+    }
+    let stdin = io::stdin();
+    if stdin.is_terminal() {
+        return Err("--password-stdin reads the password from a pipe, and standard input is the console, where the password would show as it is typed; leave out --password-stdin to be asked for it without that".to_string());
+    }
+    let mut pipe = stdin
+        .as_handle()
+        .try_clone_to_owned()
+        .map(File::from)
+        .map_err(|err| format!("could not open standard input to read the password: {err}"))?;
+    run(Password::Piped(&mut pipe))
 }
 
 fn keygen(path: &Path) -> Result<(), String> {
@@ -71,8 +138,9 @@ fn open_checked_key(
     key_path: &Path,
     app_key: &OsStr,
     rehearsal: bool,
+    password: Password,
 ) -> Result<(minisign::SecretKey, String), String> {
-    let key = signing::open_secret_key(key_path)?;
+    let key = signing::open_secret_key(key_path, password)?;
     if !key.has_password {
         eprintln!(
             "warning: {} has no password, so anyone who copies it can sign as Booth; use a key like this only for a test release",
@@ -101,6 +169,7 @@ fn sign(
     app_key: &OsStr,
     files: &[OsString],
     rehearsal: bool,
+    password: Password,
 ) -> Result<(), String> {
     let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
     for file in &files {
@@ -111,7 +180,7 @@ fn sign(
             ));
         }
     }
-    let (secret, id) = open_checked_key(key_path, app_key, rehearsal)?;
+    let (secret, id) = open_checked_key(key_path, app_key, rehearsal, password)?;
     for written in signing::sign_files(&secret, &files)? {
         println!("signed {} with key {id}", written.display());
     }

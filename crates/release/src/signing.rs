@@ -2,12 +2,12 @@
 // writes only the secret half, to a file that must be outside any git
 // repository; the public half is printed for the update check's constant.
 // sign refuses a key inside a repository too, asks for the password (three
-// tries), refuses a key whose public half is not that constant, and signs
-// each file into file.minisig. The secret key never reaches stdout, stderr
-// or a log.
+// tries) or reads it once from a pipe, refuses a key whose public half is
+// not that constant, and signs each file into file.minisig. The secret key
+// and its password never reach stdout, stderr or a log.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,6 +21,16 @@ pub const APP_KEY: &str = r"RELEASE_KEY in crates\app\src\update\mod.rs";
 // A minisign secret key file is about 300 bytes.
 const MOST_KEY_BYTES: u64 = 1024;
 const PASSWORD_TRIES: u32 = 3;
+// minisign takes no longer password at the console either.
+const MOST_PASSWORD_BYTES: usize = 1024;
+
+pub enum Password<'a> {
+    // minisign asks on the console, PASSWORD_TRIES times at most.
+    Console,
+    // Read once, to the end. tools\release.ps1 pipes in the password it
+    // finds in Windows Credential Manager.
+    Piped(&'a mut dyn Read),
+}
 
 pub struct ReleaseKey {
     pub secret: SecretKey,
@@ -164,7 +174,7 @@ pub fn against_app_key(
     }
 }
 
-pub fn open_secret_key(path: &Path) -> Result<ReleaseKey, String> {
+pub fn open_secret_key(path: &Path, password: Password) -> Result<ReleaseKey, String> {
     let absolute = std::path::absolute(path)
         .map_err(|err| format!("could not resolve {}: {err}", path.display()))?;
     if let Some(repository) = absolute.parent().and_then(repository_around) {
@@ -191,19 +201,78 @@ pub fn open_secret_key(path: &Path) -> Result<ReleaseKey, String> {
         .nth(1)
         .and_then(kdf_is_scrypt)
         .ok_or_else(not_a_key)?;
-    let secret = if has_password {
-        // minisign asks for the password on the console each time.
-        with_tries(PASSWORD_TRIES, || {
-            SecretKey::from_box(SecretKeyBox::from(text.clone()), None)
-        })
+    let could_not_open =
+        |err: minisign::PError| format!("could not open the key {}: {err}", path.display());
+    let secret = if !has_password {
+        SecretKey::from_unencrypted_box(SecretKeyBox::from(text)).map_err(could_not_open)
     } else {
-        SecretKey::from_unencrypted_box(SecretKeyBox::from(text))
-    }
-    .map_err(|err| format!("could not open the key {}: {err}", path.display()))?;
+        match password {
+            // minisign asks for the password on the console each time.
+            Password::Console => with_tries(PASSWORD_TRIES, || {
+                SecretKey::from_box(SecretKeyBox::from(text.clone()), None)
+            })
+            .map_err(could_not_open),
+            // A wrong password from a pipe would only come in wrong again.
+            Password::Piped(from) => {
+                let password = read_password(from)?;
+                SecretKey::from_box(SecretKeyBox::from(text), Some(password)).map_err(|err| {
+                    match err.kind() {
+                        ErrorKind::Verify => format!(
+                            "the password from standard input does not open the key {}",
+                            path.display()
+                        ),
+                        _ => could_not_open(err),
+                    }
+                })
+            }
+        }
+    }?;
     Ok(ReleaseKey {
         secret,
         has_password,
     })
+}
+
+// Into one buffer of its own and not with read_to_end, which reads the
+// first bytes into a buffer on the stack that nothing wipes.
+fn read_password(from: &mut dyn Read) -> Result<String, String> {
+    // Room for a byte order mark, a CRLF and one byte more: the longest
+    // password fits with what is stripped from it, and a full buffer leaves
+    // a password one byte too long however much was stripped.
+    let mut bytes = vec![0u8; MOST_PASSWORD_BYTES + 6];
+    let mut len = 0;
+    while len < bytes.len() {
+        match from.read(&mut bytes[len..]) {
+            Ok(0) => break,
+            Ok(n) => len += n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => {
+                return Err(format!(
+                    "could not read the password from standard input: {err}"
+                ));
+            }
+        }
+    }
+    let mut password = &bytes[..len];
+    // Windows PowerShell puts a byte order mark in front of what it pipes to
+    // a program when the console is set to UTF-8.
+    password = password.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(password);
+    // echo and Get-Content end it with a line break, which is no more part
+    // of the password than the Enter that ends it at the console.
+    if let Some(line) = password.strip_suffix(b"\n") {
+        password = line.strip_suffix(b"\r").unwrap_or(line);
+    }
+    if password.len() > MOST_PASSWORD_BYTES {
+        return Err(format!(
+            "the password on standard input is longer than the {MOST_PASSWORD_BYTES} bytes minisign takes, so it is not the key's password"
+        ));
+    }
+    if password.is_empty() {
+        return Err("standard input holds no password; pipe in the key's password, or leave out --password-stdin to be asked for it".to_string());
+    }
+    std::str::from_utf8(password)
+        .map(str::to_string)
+        .map_err(|_| "the password on standard input is not UTF-8 text".to_string())
 }
 
 // A mistyped password at the end of a release should not mean building it
@@ -324,7 +393,7 @@ mod tests {
         fs::write(&manifest, "version = 0.1.0\r\n").unwrap();
         fs::write(&zip, vec![7u8; 100_000]).unwrap();
 
-        let key = open_secret_key(&key_path).unwrap();
+        let key = open_secret_key(&key_path, Password::Console).unwrap();
         assert!(!key.has_password);
         let written = sign_files(&key.secret, &[manifest.clone(), zip.clone()]).unwrap();
         assert_eq!(
@@ -392,7 +461,7 @@ mod tests {
     fn only_release_key_signs() {
         let folder = Folder::new("app-key");
         let (key_path, pk) = throwaway_key(&folder);
-        let key = open_secret_key(&key_path).unwrap();
+        let key = open_secret_key(&key_path, Password::Console).unwrap();
         let found = PublicKey::from_secret_key(&key.secret).unwrap();
         let same = pk.to_base64();
         assert_eq!(against_app_key(&found, &key_path, &same, false), Ok(None));
@@ -495,7 +564,7 @@ mod tests {
         let path = folder.0.join("junk.key");
         fs::write(&path, "untrusted comment: x\nhello\n").unwrap();
         assert!(
-            open_secret_key(&path)
+            open_secret_key(&path, Password::Console)
                 .err()
                 .unwrap()
                 .contains("is not a minisign secret key")
@@ -505,7 +574,7 @@ mod tests {
         let mut big = fs::read(&key).unwrap();
         big.resize(MOST_KEY_BYTES as usize + 1, b'\n');
         fs::write(&path, big).unwrap();
-        let err = open_secret_key(&path).err().unwrap();
+        let err = open_secret_key(&path, Password::Console).err().unwrap();
         assert!(err.contains("larger than a minisign secret key"), "{err}");
     }
 
@@ -514,8 +583,126 @@ mod tests {
         let folder = Folder::new("sign-in-repo");
         fs::create_dir_all(folder.0.join(".git")).unwrap();
         let (key, _) = throwaway_key(&folder);
-        let err = open_secret_key(&key).err().unwrap();
+        let err = open_secret_key(&key, Password::Console).err().unwrap();
         assert!(err.contains("inside the git repository"), "{err}");
+        let mut input = Cursor::new(b"unused".to_vec());
+        let err = open_secret_key(&key, Password::Piped(&mut input))
+            .err()
+            .unwrap();
+        assert!(err.contains("inside the git repository"), "{err}");
+        assert_eq!(input.position(), 0);
+    }
+
+    // A pipe that hands over a byte at a time and is interrupted first.
+    struct Trickle<'a> {
+        bytes: &'a [u8],
+        interrupted: bool,
+    }
+
+    impl Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let Some((first, rest)) = self.bytes.split_first() else {
+                return Ok(0);
+            };
+            buf[0] = *first;
+            self.bytes = rest;
+            Ok(1)
+        }
+    }
+
+    fn read(input: &[u8]) -> Result<String, String> {
+        read_password(&mut Cursor::new(input))
+    }
+
+    // As tools\release.ps1 pipes it from Windows Credential Manager, UTF-8
+    // with nothing around it, and as echo or Windows PowerShell may.
+    #[test]
+    fn reads_piped_password() {
+        let password = "caf\u{e9} au lait 7";
+        for input in [
+            password.to_string(),
+            format!("{password}\n"),
+            format!("{password}\r\n"),
+            format!("\u{feff}{password}"),
+            format!("\u{feff}{password}\r\n"),
+        ] {
+            assert_eq!(read(input.as_bytes()).as_deref(), Ok(password));
+        }
+        // Only one line break goes, and spaces are the password's own, as
+        // they are when it is typed.
+        assert_eq!(read(b" x \n\n").as_deref(), Ok(" x \n"));
+        let longest = "a".repeat(MOST_PASSWORD_BYTES);
+        for input in [longest.clone(), format!("\u{feff}{longest}\r\n")] {
+            assert_eq!(read(input.as_bytes()).as_deref(), Ok(longest.as_str()));
+        }
+        let mut trickle = Trickle {
+            bytes: password.as_bytes(),
+            interrupted: false,
+        };
+        assert_eq!(read_password(&mut trickle).as_deref(), Ok(password));
+    }
+
+    #[test]
+    fn refuses_what_is_not_a_password() {
+        let too_long = "a".repeat(MOST_PASSWORD_BYTES + 1);
+        let around = format!("\u{feff}{too_long}\r\n");
+        let fills_buffer = "a".repeat(MOST_PASSWORD_BYTES + 6);
+        let far_too_long = format!("\u{feff}{}\r\n", "a".repeat(70_000));
+        let cases: [(&[u8], &str); 8] = [
+            (b"", "holds no password"),
+            (b"\r\n", "holds no password"),
+            (b"\xEF\xBB\xBF\n", "holds no password"),
+            (b"r\0i\0g\0h\0t\0\xFF", "not UTF-8"),
+            (too_long.as_bytes(), "longer than the 1024 bytes"),
+            (around.as_bytes(), "longer than the 1024 bytes"),
+            (fills_buffer.as_bytes(), "longer than the 1024 bytes"),
+            (far_too_long.as_bytes(), "longer than the 1024 bytes"),
+        ];
+        for (input, says) in cases {
+            let err = read(input).unwrap_err();
+            assert!(err.contains(says), "{says} missing from: {err}");
+        }
+    }
+
+    #[test]
+    fn opens_with_piped_password() {
+        let folder = Folder::new("piped");
+        let password = "caf\u{e9} au lait 7";
+        let pair = KeyPair::generate_encrypted_keypair(Some(password.to_string())).unwrap();
+        let key_path = folder.0.join("locked.key");
+        write_secret(&key_path, &pair.sk.to_box(Some(KEY_COMMENT)).unwrap()).unwrap();
+        let piped =
+            |input: &[u8]| open_secret_key(&key_path, Password::Piped(&mut Cursor::new(input)));
+
+        let key = piped(format!("{password}\r\n").as_bytes()).unwrap();
+        assert!(key.has_password);
+        assert_eq!(PublicKey::from_secret_key(&key.secret).unwrap(), pair.pk);
+
+        // The whole pipe is the password, read once, so a second line is not
+        // a second try. Nothing read from it goes into the error.
+        let err = piped(format!("wrong\r\n{password}\r\n").as_bytes())
+            .err()
+            .unwrap();
+        assert_eq!(
+            err,
+            format!(
+                "the password from standard input does not open the key {}",
+                key_path.display()
+            )
+        );
+        let err = piped(b"").err().unwrap();
+        assert!(err.contains("holds no password"), "{err}");
+
+        // A key without a password has nothing to read.
+        let (open_path, _) = throwaway_key(&folder);
+        let mut input = Cursor::new(b"unused".to_vec());
+        let key = open_secret_key(&open_path, Password::Piped(&mut input)).unwrap();
+        assert!(!key.has_password);
+        assert_eq!(input.position(), 0);
     }
 
     fn wrong_password() -> minisign::PError {

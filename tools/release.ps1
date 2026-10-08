@@ -13,9 +13,21 @@
 # latest.txt with the SHA-256 of both, and signs latest.txt and nothing
 # else, since it vouches for the other two. The release is those four files
 # in dist\<version>: the zip, the installer, latest.txt and
-# latest.txt.minisig. The key's password is asked for twice, for the check
-# and for signing, three tries each. It uploads and publishes nothing; that
-# stays a step done by hand.
+# latest.txt.minisig. It uploads and publishes nothing; that stays a step
+# done by hand.
+#
+# The key's password is needed twice, for the check and for signing. When it
+# is stored in Windows Credential Manager as the generic credential
+# booth-release, it is read from there each time and piped to the release
+# tool, never shown, written to a file, put on a command line or in an
+# environment variable. Store it once in Control Panel, Credential Manager,
+# Windows Credentials, Add a generic credential, with booth-release as the
+# address and any user name. Anything running under your Windows login can
+# read it, so it is only as safe as that login, which is also all that
+# guards the key file while it is plugged in. Without the credential the
+# password is asked for both times, three tries each. -CredentialTarget
+# reads another credential instead, for a test with a throwaway key, and
+# given a name that has no credential, the password is asked for.
 #
 # dist\<version> is emptied before anything is built, so it never holds an
 # earlier run's files beside this one's, such as an installer latest.txt
@@ -49,7 +61,9 @@
 param(
     [string]$SecretKey,
     [switch]$Rehearsal,
-    [switch]$FfmpegSource
+    [switch]$FfmpegSource,
+    [ValidateNotNullOrEmpty()]
+    [string]$CredentialTarget = 'booth-release'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -60,8 +74,8 @@ $cargoDenyVersion = '0.20.2'
 # through PowerShell, which in Windows PowerShell turns a native program's
 # progress lines on stderr into errors when the output is redirected. The
 # working folder is the repository's, where cargo finds .cargo\config.toml
-# and rust-toolchain.toml.
-function Invoke-Tool([string]$What, [string]$Exe, [string[]]$Arguments, [hashtable]$Environment = @{}) {
+# and rust-toolchain.toml. A password goes in on standard input.
+function Invoke-Tool([string]$What, [string]$Exe, [string[]]$Arguments, [hashtable]$Environment = @{}, [byte[]]$Password) {
     $quoted = foreach ($argument in $Arguments) {
         if ($argument -eq '' -or $argument -match '[\s"]') { '"' + ($argument -replace '"', '\"') + '"' } else { $argument }
     }
@@ -70,8 +84,14 @@ function Invoke-Tool([string]$What, [string]$Exe, [string[]]$Arguments, [hashtab
     $info.Arguments = $quoted -join ' '
     $info.WorkingDirectory = $root
     $info.UseShellExecute = $false
+    $info.RedirectStandardInput = $null -ne $Password
     foreach ($name in $Environment.Keys) { $info.EnvironmentVariables[$name] = $Environment[$name] }
     $process = [System.Diagnostics.Process]::Start($info)
+    if ($null -ne $Password) {
+        # A tool that stops before it reads the password says why itself.
+        [void][ReleasePassword]::Send($process.StandardInput.BaseStream, $Password)
+        $process.StandardInput.Close()
+    }
     $process.WaitForExit()
     if ($process.ExitCode -ne 0) {
         throw "$What failed with exit code $($process.ExitCode); nothing after it was done."
@@ -169,8 +189,8 @@ function Read-FfmpegSource {
     [pscustomobject]$source
 }
 
-if ($FfmpegSource -and ($SecretKey -or $Rehearsal)) {
-    throw '-FfmpegSource builds and signs nothing, so it takes no -SecretKey and no -Rehearsal. Run it on its own: powershell -ExecutionPolicy Bypass -File tools\release.ps1 -FfmpegSource'
+if ($FfmpegSource -and ($SecretKey -or $Rehearsal -or $PSBoundParameters.ContainsKey('CredentialTarget'))) {
+    throw '-FfmpegSource builds and signs nothing, so it takes no -SecretKey, -Rehearsal or -CredentialTarget. Run it on its own: powershell -ExecutionPolicy Bypass -File tools\release.ps1 -FfmpegSource'
 }
 
 $git = Get-Command git -ErrorAction SilentlyContinue
@@ -240,6 +260,113 @@ if (-not (Test-Path -LiteralPath $SecretKey -PathType Leaf)) {
     throw "the release key $SecretKey does not exist. Plug in the drive it is on, or make one with the release tool's keygen."
 }
 $SecretKey = (Resolve-Path -LiteralPath $SecretKey).Path
+
+# The key's password from Windows Credential Manager, as the UTF-8 the
+# release tool reads, or null when there is no such credential. It never
+# becomes a .NET string, which cannot be wiped: the copy CredRead hands back
+# and every array on the way are zeroed, and Send writes to the pipe itself,
+# since FileStream.Write would keep a copy in the stream's own buffer.
+$passwordCode = @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+public static class ReleasePassword {
+    [StructLayout(LayoutKind.Sequential)]
+    struct Credential {
+        public int Flags;
+        public int Type;
+        public IntPtr TargetName;
+        public IntPtr Comment;
+        public uint WrittenLow;
+        public uint WrittenHigh;
+        public int BlobSize;
+        public IntPtr Blob;
+        public int Persist;
+        public int AttributeCount;
+        public IntPtr Attributes;
+        public IntPtr TargetAlias;
+        public IntPtr UserName;
+    }
+
+    const int Generic = 1;
+    const int NotFound = 1168;
+    // A network logon, such as ssh with a key or a task that keeps no
+    // password, has no credential store at all. It is taken as no
+    // credential, so the password is asked for there as it always was.
+    const int NoLogonSession = 1312;
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool CredRead(string target, int type, int flags, out IntPtr credential);
+
+    [DllImport("advapi32.dll")]
+    static extern void CredFree(IntPtr buffer);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool WriteFile(SafeFileHandle file, byte[] bytes, int count, out int written, IntPtr overlapped);
+
+    public static byte[] Read(string target) {
+        IntPtr found;
+        if (!CredRead(target, Generic, 0, out found)) {
+            int error = Marshal.GetLastWin32Error();
+            if (error == NotFound || error == NoLogonSession) return null;
+            throw new Win32Exception(error);
+        }
+        byte[] utf16 = null;
+        char[] text = null;
+        try {
+            Credential credential = (Credential)Marshal.PtrToStructure(found, typeof(Credential));
+            if (credential.BlobSize == 0) throw new InvalidDataException("it holds no password");
+            utf16 = new byte[credential.BlobSize];
+            Marshal.Copy(credential.Blob, utf16, 0, utf16.Length);
+            Marshal.Copy(new byte[utf16.Length], 0, credential.Blob, utf16.Length);
+            if (utf16.Length % 2 != 0) throw new InvalidDataException("its password is not text");
+            text = new UnicodeEncoding(false, false, true).GetChars(utf16);
+            return new UTF8Encoding(false, true).GetBytes(text);
+        } catch (ArgumentException) {
+            throw new InvalidDataException("its password is not text");
+        } finally {
+            if (utf16 != null) Array.Clear(utf16, 0, utf16.Length);
+            if (text != null) Array.Clear(text, 0, text.Length);
+            CredFree(found);
+        }
+    }
+
+    public static bool Send(FileStream pipe, byte[] password) {
+        int written;
+        return WriteFile(pipe.SafeFileHandle, password, password.Length, out written, IntPtr.Zero) && written == password.Length;
+    }
+}
+'@
+if (-not ('ReleasePassword' -as [type])) { Add-Type -TypeDefinition $passwordCode }
+
+# Read again for each use, so the password is not held through the build.
+function Invoke-WithKey([string]$What, [string]$Command, [string[]]$Arguments) {
+    $fix = "store the key's password in it, or remove it with: cmdkey /delete:$CredentialTarget, and the password is asked for instead."
+    try {
+        $password = [ReleasePassword]::Read($CredentialTarget)
+    } catch {
+        throw "could not read the credential $CredentialTarget in Windows Credential Manager: $($_.Exception.InnerException.Message.TrimEnd('.')); $fix"
+    }
+    if ($null -eq $password) {
+        Invoke-Tool $What $releaseTool (@($Command) + $rehearsalArgs + $Arguments)
+        return
+    }
+    Write-Host "the key's password comes from the credential $CredentialTarget in Windows Credential Manager"
+    try {
+        Invoke-Tool $What $releaseTool (@($Command, '--password-stdin') + $rehearsalArgs + $Arguments) -Password $password
+    } catch {
+        # Not $fix: for a throwaway key the credential holds the real key's
+        # password, maybe its only copy, and storing over it or removing it
+        # would lose that key for good.
+        throw "$($_.Exception.Message) If the password in the credential $CredentialTarget is not this key's, as with a throwaway key for a rehearsal, give -CredentialTarget a credential that holds this key's password, or a name with no credential to be asked for it. Change $CredentialTarget only if the password in it was mistyped."
+    } finally {
+        [Array]::Clear($password, 0, $password.Length)
+    }
+}
 
 $manifest = Get-Content -LiteralPath (Join-Path $root 'Cargo.toml')
 $inPackage = $false
@@ -479,7 +606,7 @@ if ($Rehearsal) { $rehearsalArgs = @('--rehearsal') }
 # -p app build the license list describes. Both get the path flags, or the
 # crates they share would be built again for each.
 Invoke-Tool 'the release tool build' 'cargo' (@('build', '--release', '--locked', '-p', 'release') + $buildArgs) $buildEnvironment
-Invoke-Tool 'the release key check' $releaseTool (@('check-key') + $rehearsalArgs + @($SecretKey, $releaseKey))
+Invoke-WithKey 'the release key check' 'check-key' @($SecretKey, $releaseKey)
 
 # --- Third-party files, the build and the zip -----------------------------
 
@@ -566,7 +693,7 @@ if ($installerSha256) {
 }
 Write-Crlf $latest $latestLines
 
-Invoke-Tool 'signing latest.txt' $releaseTool (@('sign') + $rehearsalArgs + @($SecretKey, $releaseKey, $latest))
+Invoke-WithKey 'signing latest.txt' 'sign' @($SecretKey, $releaseKey, $latest)
 
 Remove-Item -LiteralPath $staging -Recurse -Force
 
