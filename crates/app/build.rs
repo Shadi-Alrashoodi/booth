@@ -6,6 +6,7 @@ use std::process::{self, Command};
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=booth.manifest");
+    println!("cargo:rerun-if-changed=assets/booth.ico");
     if env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
         return;
     }
@@ -20,8 +21,8 @@ fn main() {
     // Inside the exe rather than beside it, so there is no second file to
     // lose. The linker's own trustInfo is left out, since booth.manifest has
     // one and is meant to be the whole manifest.
-    let dir = env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
-    let manifest = PathBuf::from(dir).join("booth.manifest");
+    let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"));
+    let manifest = dir.join("booth.manifest");
     println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
     println!(
         "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
@@ -30,23 +31,29 @@ fn main() {
     println!("cargo:rustc-link-arg-bins=/MANIFESTUAC:NO");
 
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
-    let res = version_resource(&out);
+    let res = resources(&out, &dir.join("assets"));
     println!("cargo:rustc-link-arg-bins={}", res.display());
 }
 
-// The company, name and version Windows shows under Properties, Details, and
-// the name Task Manager lists the process under. The version comes from
-// Cargo.toml so it is only ever written in one place.
-fn version_resource(out: &Path) -> PathBuf {
+// The icon, and the company, name and version Windows shows under
+// Properties, Details, and the name Task Manager lists the process under. The
+// version comes from Cargo.toml so it is only ever written in one place.
+fn resources(out: &Path, assets: &Path) -> PathBuf {
     let version = env::var("CARGO_PKG_VERSION").expect("cargo sets CARGO_PKG_VERSION");
     let part = |name: &str| {
         env::var(format!("CARGO_PKG_VERSION_{name}")).expect("cargo sets the version parts")
     };
     let numbers = format!("{},{},{},0", part("MAJOR"), part("MINOR"), part("PATCH"));
+    // Explorer and every shortcut to booth.exe show the first icon in the
+    // exe, and this is the only one. Each size in booth.ico is drawn on its
+    // own grid rather than shrunk from a big one.
+    //
     // 0x40004 and 0x1 are VOS_NT_WINDOWS32 and VFT_APP. winver.h has the
-    // names, but rc.exe started from here has no include path to find it.
+    // names, but rc.exe is not given the SDK's include folders to find it.
     let script = format!(
-        r#"1 VERSIONINFO
+        r#"1 ICON "booth.ico"
+
+1 VERSIONINFO
 FILEVERSION {numbers}
 PRODUCTVERSION {numbers}
 FILEOS 0x40004
@@ -85,10 +92,15 @@ END
         );
         process::exit(1);
     };
-    // A compiled resource file goes to link.exe like an object file.
+    // A compiled resource file goes to link.exe like an object file. The
+    // icon is found by name through /i rather than written into the script
+    // as a path: rc.exe reads the script in the ANSI code page, so a checkout
+    // in a folder whose name is not plain ASCII would not find it.
     let res = out.join("booth.res");
     match Command::new(&rc)
         .arg("/nologo")
+        .arg("/i")
+        .arg(assets)
         .arg("/fo")
         .arg(&res)
         .arg(&source)

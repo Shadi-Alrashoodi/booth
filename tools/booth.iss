@@ -1,6 +1,7 @@
 ; The optional installer. The zip stays the main way to get Booth. This puts
-; the same files in the user's own programs folder, adds a Start menu entry
-; and an uninstaller, and never asks for administrator rights.
+; the same files in the user's own programs folder, adds a Start menu entry,
+; a desktop shortcut unless its box is cleared, and an uninstaller, and never
+; asks for administrator rights.
 ; tools\release.ps1 compiles it with Inno Setup 6.7.3 and passes the version
 ; and the folders:
 ;   ISCC /DAppVersion=0.1.0 /DSourceDir=<the unzipped release> /DOutputDir=<dist\0.1.0> tools\booth.iss
@@ -16,8 +17,9 @@
 #endif
 
 ; Pinned like the other release tools, since its Setup code ships inside the
-; installer. The dark wizard with no pictures needs 6.7.0 or later, and a
-; newer version gets the install and uninstall test before this changes.
+; installer. The dark wizard without bevels and in the window tone needs
+; 6.7.0 or later, and a newer version gets the install and uninstall test
+; before this changes.
 #define InnoVersion "6.7.3"
 #if DecodeVer(Ver) != InnoVersion
   #expr Error("This is Inno Setup " + DecodeVer(Ver) + ", and the installer is tested with " + InnoVersion + ". Install Inno Setup " + InnoVersion + " from jrsoftware.org for this user only, or test the installer with " + DecodeVer(Ver) + " and change InnoVersion in booth.iss.")
@@ -51,11 +53,20 @@ OutputDir={#OutputDir}
 OutputBaseFilename=booth-{#AppVersion}-setup
 Compression=lzma2/max
 SolidCompression=yes
-; Dark like the panel, and without Inno Setup's own pictures, which say
-; nothing about Booth.
-WizardStyle=modern dark
+; The mark on the setup file, its window and the uninstaller.
+SetupIconFile=..\crates\app\assets\booth.ico
+; Dark like the panel, and without the lines across the pages, which the
+; panel no longer draws either. No picture on the last page, since it would
+; say nothing about Booth. The corner picture is the mark on window tone,
+; drawn on whole pixels at each size Setup asks for from 100 to 250 percent,
+; so it picks one instead of scaling one soft. The pages and the space
+; around the picture take the same window tone, #141412, so the picture's
+; own square does not show against the dark style's grey.
+WizardStyle=modern dark hidebevels
+WizardBackColor=#141412
 WizardImageFile=
-WizardSmallImageFile=
+WizardSmallImageFile=installer\mark-58.png,installer\mark-77.png,installer\mark-97.png,installer\mark-116.png,installer\mark-124.png,installer\mark-143.png,installer\mark-159.png
+WizardSmallImageBackColor=#141412
 ; Keys, settings and known hosts live in %LOCALAPPDATA%\Booth, not here, so
 ; uninstalling leaves them for the next install.
 ;
@@ -72,24 +83,60 @@ Type: filesandordirs; Name: "{app}\ffmpeg"
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
 
+[Tasks]
+; Ticked, and a silent install makes the shortcut too. A package manager
+; that wants none passes /MERGETASKS="!desktopicon".
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"
+
 [Icons]
 Name: "{autoprograms}\Booth"; Filename: "{app}\booth.exe"
+Name: "{autodesktop}\Booth"; Filename: "{app}\booth.exe"; Tasks: desktopicon
 
 [Run]
-; Off unless ticked, so the installer starts nothing on its own. Hidden when
-; Setup itself runs as administrator: Booth would start as administrator
-; too, which the panel refuses.
-Filename: "{app}\booth.exe"; Description: "Start Booth"; Flags: nowait postinstall skipifsilent unchecked; Check: not IsAdmin
+; Ticked, so Booth opens when Setup closes, but never after a silent
+; install, where a package manager starts nothing it did not ask for. Hidden
+; when Setup itself runs as administrator: Booth would start as
+; administrator too, which the panel refuses.
+Filename: "{app}\booth.exe"; Description: "Start Booth"; Flags: nowait postinstall skipifsilent; Check: not IsAdmin
 
 [Messages]
 ; Inno Setup's own texts say everything was removed. The keys stay on
 ; purpose, and someone uninstalling to get rid of them on a shared PC needs
-; to know where they are. The headings are sentence case like the panel.
+; to know where they are. Its other texts follow the panel too: headings
+; and titles in sentence case, plain Back and Next with no arrows, and "this
+; PC" where they said "your computer".
+WizardSelectTasks=Select additional tasks
 WizardReady=Ready to install
 WizardPreparing=Preparing to install
+WizardUninstalling=Uninstall status
+ExitSetupTitle=Exit setup
+ButtonBack=&Back
+ButtonNext=&Next
+ReadyLabel1=Setup is now ready to begin installing [name] on this PC.
+PreparingDesc=Setup is preparing to install [name] on this PC.
+InstallingLabel=Please wait while Setup installs [name] on this PC.
+UninstallStatusLabel=Please wait while %1 is removed from this PC.
 FinishedHeadingLabel=[name] is installed
-FinishedLabel=Open [name] from the Start menu.
+FinishedLabel=Open Booth from the Start menu or the desktop shortcut.
 UninstallAppFullTitle=Uninstall %1
 ConfirmUninstall=Remove %1 from this PC?%n%nYour keys, settings and known hosts stay in %%LOCALAPPDATA%%\Booth for the next install. Delete that folder as well to remove them.
 UninstalledAll=%1 was removed. Your keys, settings and known hosts are still in %%LOCALAPPDATA%%\Booth. Delete that folder to remove them.
 UninstalledMost=%1 was removed, but some files in its folder could not be deleted. Delete them by hand. Your keys, settings and known hosts are still in %%LOCALAPPDATA%%\Booth.
+
+[CustomMessages]
+FinishedLabelNoDesktop=Open Booth from the Start menu.
+
+[Code]
+// The finish text points at the desktop shortcut, which is not there when
+// its box was cleared. Literal text in FinishedLabel, not [name], so it is
+// found as written.
+procedure CurPageChanged(CurPageID: Integer);
+var
+  Text: String;
+begin
+  if (CurPageID = wpFinished) and not WizardIsTaskSelected('desktopicon') then begin
+    Text := WizardForm.FinishedLabel.Caption;
+    StringChangeEx(Text, SetupMessage(msgFinishedLabel), CustomMessage('FinishedLabelNoDesktop'), True);
+    WizardForm.FinishedLabel.Caption := Text;
+  end;
+end;
