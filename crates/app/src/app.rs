@@ -36,7 +36,7 @@ use crate::screens::stats;
 use crate::settings::{DEFAULT_PORT, Settings};
 use crate::sound::SettingsAudio;
 use crate::strip::{self, Sweep};
-use crate::theme::{self, INK};
+use crate::theme::{self, WINDOW};
 use crate::tray::{self, Tray};
 use crate::update::{self, Update};
 use crate::{Args, controls, messages, monitors, win};
@@ -1104,7 +1104,7 @@ impl eframe::App for App {
         let mut press = None;
         let mut strip_clicked = false;
         CentralPanel::default()
-            .frame(Frame::new().fill(INK))
+            .frame(Frame::new().fill(WINDOW))
             .show(ui, |ui| {
                 // The screen is laid out before the strip, not in a bottom
                 // panel, so Tab reaches the strip last as it reads.
@@ -1155,13 +1155,15 @@ impl eframe::App for App {
                         }
                         // Usually a frame or two at most, so no words.
                         (Screen::Checking, _) => {
-                            controls::title_row(ui, "Booth", &[]);
+                            controls::title_row(ui, controls::Lead::Mark, &[]);
                         }
                         (Screen::Room(_), None) => {}
                     }
                 });
+                // No line over the strip: it is window tone, and the chat
+                // above it panel tone.
                 ui.scope_builder(UiBuilder::new().max_rect(bottom), |ui| {
-                    controls::hairline(ui, bottom.top() + 1.0);
+                    ui.set_clip_rect(bottom);
                     let shown = view.as_ref().map(|view| &view.strip);
                     strip_clicked = strip::show(ui, shown, &self.sweep, self.scrolling).clicked();
                 });

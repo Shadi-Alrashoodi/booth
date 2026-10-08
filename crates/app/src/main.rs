@@ -7,6 +7,7 @@ mod elevated;
 mod firewall;
 mod hotkeys;
 mod loopback;
+mod mark;
 mod messages;
 mod monitors;
 mod remote;
@@ -544,26 +545,48 @@ fn native_options() -> eframe::NativeOptions {
     }
 }
 
-// The app icon is the strip's trace on a good link: a flat sage line near the
-// bottom of an ink square.
+// The title bar, taskbar and Alt+Tab icon: the mark in amber on a plate in
+// panel tone, its corners rounded 3/16 of its size. The plate keeps the mark
+// readable on a light taskbar, where amber alone falls to about 2:1.
 fn icon() -> IconData {
-    const SIZE: usize = 32;
-    let mut rgba = Vec::with_capacity(SIZE * SIZE * 4);
+    const SIZE: u32 = 32;
+    let bars = mark::rects(SIZE);
+    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
     for y in 0..SIZE {
         for x in 0..SIZE {
-            let color = if (22..25).contains(&y) && (5..27).contains(&x) {
-                theme::SAGE
-            } else {
-                theme::INK
-            };
-            rgba.extend_from_slice(&color.to_array());
+            let on_mark = bars
+                .iter()
+                .any(|[l, t, r, b]| (*l..*r).contains(&x) && (*t..*b).contains(&y));
+            let color = if on_mark { theme::AMBER } else { theme::PANEL };
+            let [r, g, b, _] = color.to_array();
+            rgba.extend_from_slice(&[r, g, b, plate_cover(x, y, SIZE)]);
         }
     }
     IconData {
         rgba,
-        width: SIZE as u32,
-        height: SIZE as u32,
+        width: SIZE,
+        height: SIZE,
     }
+}
+
+// How much of the pixel at x, y the rounded plate covers, from 4 by 4
+// samples, so its corners are smooth without a path renderer.
+fn plate_cover(x: u32, y: u32, size: u32) -> u8 {
+    let side = size as f32;
+    let corner = side * 3.0 / 16.0;
+    let mut inside = 0u32;
+    for sy in 0..4 {
+        for sx in 0..4 {
+            let px = x as f32 + (sx as f32 + 0.5) / 4.0;
+            let py = y as f32 + (sy as f32 + 0.5) / 4.0;
+            let nearest_x = px.clamp(corner, side - corner);
+            let nearest_y = py.clamp(corner, side - corner);
+            if (px - nearest_x).hypot(py - nearest_y) <= corner {
+                inside += 1;
+            }
+        }
+    }
+    (inside * 255 / 16) as u8
 }
 
 #[cfg(test)]

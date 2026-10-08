@@ -1,11 +1,15 @@
 use eframe::egui::{
-    CursorIcon, Id, Key, Rect, Response, ScrollArea, Sense, Ui, WidgetInfo, WidgetType, pos2, vec2,
+    Align, CursorIcon, Id, Key, Layout, Rect, Response, ScrollArea, Sense, Shape, Ui, UiBuilder,
+    WidgetInfo, WidgetType, pos2, vec2,
 };
 use room::KnownHost;
 
-use crate::controls::{self, Button};
+use crate::controls::{self, Button, Lead};
 use crate::messages;
-use crate::theme::{self, ASH, BAD, CHALK, CONTROL_HEIGHT, LINE_STRONG};
+use crate::theme::{
+    self, ASH, BAD, CHALK, CONTROL_HEIGHT, FIELD_GAP, HALF_STEP, PANEL, Role, SECTION_GAP, SIDE,
+    STEP,
+};
 use crate::update::{Shown, Tone};
 
 const ROOM_NAME_CHARS: usize = 32;
@@ -16,7 +20,6 @@ const ROOM_NAME_CHARS: usize = 32;
 const PASTE_CHARS: usize = 2048;
 // A name can be 253 characters; the rule, not the field, says no to more.
 const ADDRESS_CHARS: usize = 512;
-const ROW_GAP: f32 = 4.0;
 
 #[derive(Default)]
 pub struct Start {
@@ -115,10 +118,10 @@ pub fn show(
 ) -> Option<Choice> {
     let settings: Vec<Button> = blocked
         .is_none()
-        .then(|| Button::new("Settings"))
+        .then(|| Button::new("Settings").icon(theme::icons::regular::GEAR_SIX))
         .into_iter()
         .collect();
-    let settings_pressed = controls::title_row(ui, "Booth", &settings).is_some();
+    let settings_pressed = controls::title_row(ui, Lead::Mark, &settings).is_some();
     // Laid out whatever was pressed, so the frame that shows the press is
     // not an empty page. With a few known hosts, one of them open, the page
     // is taller than the window, so it scrolls under the title row.
@@ -127,63 +130,51 @@ pub fn show(
         .show(ui, |ui| {
             controls::page(ui, |ui| {
                 if let Some(reason) = blocked {
-                    controls::text(ui, reason, theme::body(), BAD);
+                    controls::prose(ui, reason, theme::body(), BAD);
                     return None;
                 }
                 let mut choice = None;
+                if notes(ui, start.note.as_ref(), lines, update) {
+                    choice = Some(Choice::Download);
+                }
 
-                if let Some(note) = &start.note {
-                    let color = if note.failed { BAD } else { ASH };
-                    controls::text(ui, note.text.as_str(), theme::body(), color);
-                    ui.add_space(24.0);
-                }
-                for line in lines {
-                    controls::text(ui, line.as_str(), theme::body(), ASH);
-                    ui.add_space(24.0);
-                }
-                if let Some(shown) = update {
-                    if new_version(ui, shown) {
-                        choice = Some(Choice::Download);
-                    }
-                    ui.add_space(24.0);
-                }
                 section(
                     ui,
                     "Host a room",
                     "Make an invite and send it to your friends.",
                 );
-                let name = controls::field(
-                    ui,
-                    "room name",
-                    &mut start.room_name,
-                    "Room name (optional)",
-                    theme::body(),
-                    ROOM_NAME_CHARS,
-                );
-                ui.add_space(8.0);
-                let host = Button::new("Host").enter_target(name.has_focus()).show(ui);
-                if host.clicked() || entered(ui, &name) {
+                let (_, host) = field_row(ui, "Host", |ui| {
+                    controls::field(
+                        ui,
+                        "room name",
+                        &mut start.room_name,
+                        "Room name (optional)",
+                        theme::body(),
+                        ROOM_NAME_CHARS,
+                    )
+                });
+                if host {
                     choice = Some(Choice::Host);
                 }
                 error(ui, start.host_error.as_deref());
 
-                ui.add_space(24.0);
+                ui.add_space(SECTION_GAP);
                 section(ui, "Join a room", "Paste the invite you were sent.");
-                let paste = controls::field(
-                    ui,
-                    "invite",
-                    &mut start.paste,
-                    "Paste invite",
-                    theme::mono(),
-                    PASTE_CHARS,
-                );
+                let (paste, join) = field_row(ui, "Join", |ui| {
+                    controls::field(
+                        ui,
+                        "invite",
+                        &mut start.paste,
+                        "Paste invite",
+                        theme::mono(),
+                        PASTE_CHARS,
+                    )
+                });
                 start.paste_id = Some(paste.id);
                 if paste.changed() {
                     start.join_error = None;
                 }
-                ui.add_space(8.0);
-                let join = Button::new("Join").enter_target(paste.has_focus()).show(ui);
-                if join.clicked() || entered(ui, &paste) {
+                if join {
                     choice = Some(Choice::Join);
                 }
                 error(ui, start.join_error.as_deref());
@@ -202,6 +193,65 @@ pub fn show(
     }
 }
 
+// What came of the firewall prompt, the lines that last for this run and the
+// update check's line, as one block 8 px apart above the two sections. True
+// when Download was pressed.
+fn notes(ui: &mut Ui, note: Option<&Note>, lines: &[String], update: Option<&Shown>) -> bool {
+    let mut said = false;
+    let mut gap = |ui: &mut Ui| {
+        if std::mem::replace(&mut said, true) {
+            ui.add_space(STEP);
+        }
+    };
+    if let Some(note) = note {
+        gap(ui);
+        let color = if note.failed { BAD } else { ASH };
+        controls::prose(ui, note.text.as_str(), theme::body(), color);
+    }
+    for line in lines {
+        gap(ui);
+        controls::prose(ui, line.as_str(), theme::body(), ASH);
+    }
+    let mut download = false;
+    if let Some(shown) = update {
+        gap(ui);
+        download = new_version(ui, shown);
+    }
+    if said {
+        ui.add_space(SECTION_GAP);
+    }
+    download
+}
+
+// A field and the primary that acts on it, on one row 8 px apart, the field
+// taking the rest of the width so Host and Join stand in one column at the
+// right edge. Enter in the field presses the button. Returns the field and
+// whether the button was pressed.
+fn field_row(ui: &mut Ui, verb: &str, field: impl FnOnce(&mut Ui) -> Response) -> (Response, bool) {
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(ui.available_width(), CONTROL_HEIGHT), Sense::hover());
+    let mut button = Button::new(verb).role(Role::Primary);
+    let width = button.width(ui);
+    let field_end = (rect.right() - width - STEP).max(rect.left());
+    let mut left = ui.new_child(
+        UiBuilder::new()
+            .max_rect(Rect::from_min_max(rect.min, pos2(field_end, rect.bottom())))
+            .layout(Layout::top_down(Align::Min)),
+    );
+    let field = field(&mut left);
+    button = button.enter_target(field.has_focus());
+    let mut right = ui.new_child(
+        UiBuilder::new()
+            .max_rect(Rect::from_min_max(
+                pos2(rect.right() - width, rect.top()),
+                rect.max,
+            ))
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    let pressed = button.show(&mut right).clicked() || entered(ui, &field);
+    (field, pressed)
+}
+
 // The hosts joined before, only when there are any. A row joins from its
 // Join button, or from Enter while it has focus; clicking anywhere else on
 // it opens its address in place.
@@ -210,33 +260,39 @@ fn known_hosts(ui: &mut Ui, start: &mut Start) -> Option<Choice> {
     if !shown {
         return None;
     }
-    ui.add_space(24.0);
+    ui.add_space(SECTION_GAP);
     let mut choice = None;
     if !start.known.is_empty() {
-        controls::text(ui, "Known hosts", theme::medium(), CHALK);
-        ui.add_space(8.0);
+        controls::text(ui, "Known hosts", theme::section(), CHALK);
+        ui.add_space(STEP);
     }
     let keys: Vec<[u8; 32]> = start.known.iter().map(|host| *host.host_key()).collect();
     for (i, key) in keys.into_iter().enumerate() {
-        if i > 0 {
-            ui.add_space(ROW_GAP);
-        }
+        let opened = start.opened == Some(key);
+        // Painted once the opened row's height is known, under what it holds.
+        let tone = opened.then(|| (ui.painter().add(Shape::Noop), ui.cursor().top()));
         match host_row(ui, &start.known[i]) {
             Some(Row::Join) => choice = Some(Choice::Rejoin(key)),
             Some(Row::Toggle) => start.toggle(key),
             None => {}
         }
-        if start.opened == Some(key)
-            && let Some(opened) = address(ui, start, key)
-        {
-            choice = Some(opened);
+        if opened && let Some(picked) = address(ui, start, key) {
+            choice = Some(picked);
+        }
+        if let Some((slot, top)) = tone {
+            let column = ui.max_rect();
+            let block = Rect::from_min_max(
+                pos2(column.left() - SIDE, top),
+                pos2(column.right() + SIDE, ui.cursor().top()),
+            );
+            ui.painter().set(slot, Shape::rect_filled(block, 0, PANEL));
         }
     }
     if let Some(forgot) = &start.forgot {
         if !start.known.is_empty() {
-            ui.add_space(12.0);
+            ui.add_space(FIELD_GAP);
         }
-        controls::text(ui, forgot.as_str(), theme::body(), ASH);
+        controls::prose(ui, forgot.as_str(), theme::body(), ASH);
     }
     error(ui, start.known_error.as_deref());
     choice
@@ -247,7 +303,9 @@ enum Row {
     Toggle,
 }
 
-// Room name, the host's fingerprint in a column of its own, and Join.
+// Room name first and bigger, the host's fingerprint in a column of its own
+// just before Join, and Join. Nothing changes under the mouse but the
+// pointer.
 fn host_row(ui: &mut Ui, host: &KnownHost) -> Option<Row> {
     let (rect, _) =
         ui.allocate_exact_size(vec2(ui.available_width(), CONTROL_HEIGHT), Sense::hover());
@@ -260,28 +318,26 @@ fn host_row(ui: &mut Ui, host: &KnownHost) -> Option<Row> {
     let focused = row.has_focus();
     let join = Button::new("Join").enter_target(focused);
     let fingerprint = keys::fingerprint(host.host_key());
-    let mono = theme::mono();
-    let print_width = controls::text_width(ui, &fingerprint, mono.clone());
-    let gap = ui.spacing().item_spacing.x;
-    let right = print_width + 2.0 * gap + join.width(ui);
+    let print = theme::mono_caption();
+    let print_width = controls::text_width(ui, &fingerprint, print.clone());
+    let right = print_width + STEP + join.width(ui);
     let mut pressed = None;
     controls::split_row(
         ui,
         rect,
         right,
         |ui| {
-            controls::one_line(ui, &room, theme::body(), CHALK);
+            controls::one_line(ui, &room, theme::name(), CHALK);
         },
         |ui| {
             if join.show(ui).clicked() {
                 pressed = Some(Row::Join);
             }
-            ui.add_space(gap);
-            controls::one_line(ui, &fingerprint, mono, ASH);
+            controls::one_line(ui, &fingerprint, print, ASH);
         },
     );
     if focused && controls::keyboard_focus(ui) {
-        controls::ring(ui, row_edge(rect), LINE_STRONG);
+        controls::ring(ui, rect);
     }
     if pressed.is_some() {
         return pressed;
@@ -294,22 +350,18 @@ fn host_row(ui: &mut Ui, host: &KnownHost) -> Option<Row> {
     row.clicked().then_some(Row::Toggle)
 }
 
-// The ring goes round the row's text, clear of the Join button's own.
-fn row_edge(rect: Rect) -> Rect {
-    rect.shrink2(vec2(0.0, 1.0))
-}
-
-// The opened row: the address or name typed for it, Save, and Forget.
+// The opened row: the address or name typed for it with its label above,
+// then Save, the field's Enter target, and Forget.
 fn address(ui: &mut Ui, start: &mut Start, key: [u8; 32]) -> Option<Choice> {
-    ui.add_space(8.0);
-    controls::text(ui, messages::ADDRESS_OR_NAME, theme::body(), CHALK);
-    ui.add_space(4.0);
+    ui.add_space(STEP);
+    controls::text(ui, messages::ADDRESS_OR_NAME, theme::body(), ASH);
+    ui.add_space(STEP);
     let field: Response = controls::field(
         ui,
         "known host address",
         &mut start.address,
         messages::MANUAL_HINT,
-        theme::body(),
+        theme::mono(),
         ADDRESS_CHARS,
     );
     ui.ctx()
@@ -323,23 +375,27 @@ fn address(ui: &mut Ui, start: &mut Start, key: [u8; 32]) -> Option<Choice> {
     if field.changed() {
         start.address_error = None;
     }
-    ui.add_space(8.0);
+    error(ui, start.address_error.as_deref());
+    ui.add_space(FIELD_GAP);
     let mut choice = None;
     ui.horizontal(|ui| {
         let save = Button::new("Save").enter_target(field.has_focus()).show(ui);
         if save.clicked() || entered(ui, &field) {
             choice = Some(Choice::SaveAddress(key));
         }
-        if Button::new("Forget").show(ui).clicked() {
+        if Button::new("Forget")
+            .role(Role::Destructive)
+            .show(ui)
+            .clicked()
+        {
             choice = Some(Choice::Forget(key));
         }
     });
-    error(ui, start.address_error.as_deref());
     if just_opened {
         let bottom = pos2(field.rect.right(), ui.cursor().top());
         ui.scroll_to_rect(Rect::from_min_max(field.rect.min, bottom), None);
     }
-    ui.add_space(12.0);
+    ui.add_space(FIELD_GAP);
     choice
 }
 
@@ -352,24 +408,28 @@ fn new_version(ui: &mut Ui, shown: &Shown) -> bool {
         Tone::Quiet => ASH,
         Tone::Problem => BAD,
     };
-    controls::text(ui, shown.text.as_str(), theme::body(), color);
+    controls::prose(ui, shown.text.as_str(), theme::body(), color);
     if !shown.download {
         return false;
     }
-    ui.add_space(8.0);
+    ui.add_space(STEP);
     Button::new("Download").show(ui).clicked()
 }
 
+// The head one step up in Medium chalk, the sentence under it in Regular ash:
+// the two differ in size, weight and colour at once.
 fn section(ui: &mut Ui, name: &str, line: &str) {
-    controls::text(ui, name, theme::medium(), CHALK);
-    controls::text(ui, line, theme::small(), ASH);
-    ui.add_space(8.0);
+    controls::text(ui, name, theme::section(), CHALK);
+    ui.add_space(STEP);
+    controls::prose(ui, line, theme::body(), ASH);
+    ui.add_space(STEP);
 }
 
+// Under the field it belongs to, 4 px down, in caption.
 fn error(ui: &mut Ui, text: Option<&str>) {
     if let Some(text) = text {
-        ui.add_space(8.0);
-        controls::text(ui, text, theme::body(), BAD);
+        ui.add_space(HALF_STEP);
+        controls::prose(ui, text, theme::caption(), BAD);
     }
 }
 

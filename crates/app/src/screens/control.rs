@@ -19,7 +19,7 @@ use room::view::{LinkState, Person, Role, View};
 use crate::controls::{self, Button};
 use crate::messages;
 use crate::remote::Flags;
-use crate::theme::{self, AMBER, ASH, CHALK, CONTROL_HEIGHT, LINE_STRONG, PANEL, ROW_HEIGHT, SIDE};
+use crate::theme::{self, ASH, CHALK, CONTROL_HEIGHT, HALF_STEP, PANEL, ROW_HEIGHT, SIDE, STEP};
 
 // Allow waits this long after a request first shows, and again after
 // another takes its place. The room already refuses an answer to a request
@@ -27,9 +27,6 @@ use crate::theme::{self, AMBER, ASH, CHALK, CONTROL_HEIGHT, LINE_STRONG, PANEL, 
 // a click aimed at the old one lands, and that click would allow whoever
 // asked since.
 pub const ALLOW_AFTER: Duration = Duration::from_millis(500);
-
-// A focused row's ring, drawn inside it: the row is the list's full width.
-const ROW_RING: f32 = 2.0;
 
 // The panic key as the request block uses it: its words, which cannot
 // change inside a room since settings cannot be opened there, and the cut
@@ -200,14 +197,14 @@ pub fn request_block(
     allow_ready: bool,
 ) -> Option<Answer> {
     let mut answer = None;
-    controls::page(ui, |ui| {
+    controls::region(ui, SIDE, |ui| {
         match request {
             Request::Asked { number, name } => {
                 controls::text(ui, messages::wants_control(name), theme::body(), CHALK);
-                ui.add_space(8.0);
-                let allow = Button::new("Allow")
-                    .color(if allow_ready { CHALK } else { ASH })
-                    .enabled(allow_ready);
+                ui.add_space(STEP);
+                // Both secondary and alike: consent to being controlled is
+                // the one choice the panel must not lean on.
+                let allow = Button::new("Allow").enabled(allow_ready);
                 let buttons = [allow, Button::new("Don't allow")];
                 answer = match controls::buttons(ui, &buttons, CONTROL_HEIGHT) {
                     Some(0) => Some(Answer::Allow(number)),
@@ -222,17 +219,16 @@ pub fn request_block(
                     theme::body(),
                     CHALK,
                 );
-                ui.add_space(8.0);
-                let stop = [Button::new("Stop control").color(AMBER)];
+                ui.add_space(STEP);
+                let stop = [Button::new("Stop control").role(theme::Role::Primary)];
                 if controls::buttons(ui, &stop, CONTROL_HEIGHT).is_some() {
                     answer = Some(Answer::Stop);
                 }
             }
         }
-        ui.add_space(8.0);
-        controls::text(ui, messages::panic_stops(panic_key), theme::small(), ASH);
+        ui.add_space(HALF_STEP);
+        controls::text(ui, messages::panic_stops(panic_key), theme::caption(), ASH);
     });
-    controls::hairline(ui, ui.cursor().top());
     answer
 }
 
@@ -285,7 +281,8 @@ impl RowMenu {
     pub fn follow_row(&mut self, ui: &Ui, row: &Response, key: [u8; 32], name: &str) {
         row.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, messages::row_menu(name)));
         if row.has_focus() && controls::keyboard_focus(ui) {
-            controls::border(ui.painter(), row.rect, ROW_RING, LINE_STRONG);
+            // Inside the row, which is the list's full width.
+            controls::ring_within(ui.painter(), row.rect, row.rect);
         }
         let keyboard = row.has_focus()
             && ui.input(|input| {
@@ -339,7 +336,7 @@ impl RowMenu {
             left: SIDE as i8,
             right: SIDE as i8,
             top: 0,
-            bottom: 4,
+            bottom: STEP as i8,
         };
         Frame::new()
             .fill(PANEL)

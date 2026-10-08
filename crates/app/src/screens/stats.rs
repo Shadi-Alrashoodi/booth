@@ -15,7 +15,7 @@ use crate::messages;
 use crate::screens::room::addresses_hidden;
 use crate::sound::{Periods, Side};
 use crate::strip;
-use crate::theme::{self, ASH, BAD, CHALK, SIDE, WARN};
+use crate::theme::{self, ASH, BAD, CHALK, FIELD_GAP, PANEL, SIDE, WARN};
 
 // Only there when the microphone makes voice worse by itself, then in warn.
 const MICROPHONE: &str = "Microphone";
@@ -40,7 +40,7 @@ pub fn show(
         hide_addresses: addresses_hidden(&view.share),
         control: control_offered,
     };
-    let mut lines = lines(
+    let mut out = build(
         view.role,
         &view.numbers,
         firewall,
@@ -50,22 +50,26 @@ pub fn show(
         showing,
     );
     if let Some(path) = log_file {
-        lines.push(Line {
-            label: "Log file",
-            value: path.display().to_string(),
-            level: Level::Good,
-            hidden: false,
-        });
+        out.group();
+        out.add("Log file", Some(path.display().to_string()));
     }
+    // Over the people list and the chat, the whole height between the title
+    // row and the strip, in panel tone. The groups are set apart by space
+    // alone: each line already names itself.
+    let whole = ui.available_rect_before_wrap();
+    ui.painter().rect_filled(whole, 0, PANEL);
     let scroll = ScrollArea::vertical().id_salt("stats").auto_shrink(false);
     scroll.show(ui, |ui| {
-        controls::page(ui, |ui| {
-            for line in &lines {
+        controls::gutter(ui, SIDE, SIDE, |ui| {
+            for (i, line) in out.lines.iter().enumerate() {
+                if i > 0 && out.breaks.contains(&i) {
+                    ui.add_space(FIELD_GAP);
+                }
                 let rect = line_rect(ui);
                 let label_width = controls::text_width(ui, line.label, theme::body());
                 let room = (rect.width() - label_width - SIDE).max(0.0);
-                let value = controls::fit_middle(ui, &line.value, &theme::body(), room);
-                let value_width = controls::text_width(ui, &value, theme::body());
+                let value = controls::fit_middle(ui, &line.value, &theme::mono(), room);
+                let value_width = controls::text_width(ui, &value, theme::mono());
                 controls::split_row(
                     ui,
                     rect,
@@ -74,7 +78,7 @@ pub fn show(
                         controls::one_line(ui, line.label, theme::body(), ASH);
                     },
                     |ui| {
-                        controls::one_line(ui, &value, theme::body(), value_color(line));
+                        controls::one_line(ui, &value, theme::mono(), value_color(line));
                     },
                 );
             }
@@ -110,9 +114,29 @@ fn value_color(line: &Line) -> Color32 {
 struct Lines {
     lines: Vec<Line>,
     hide_addresses: bool,
+    // Where each group after the first starts. The link alone is four: how
+    // good it is, where it goes, the session, the traffic. Then chat, voice,
+    // video, control, the router, the log file.
+    breaks: Vec<usize>,
 }
 
 impl Lines {
+    fn new(hide_addresses: bool) -> Lines {
+        Lines {
+            lines: Vec::new(),
+            hide_addresses,
+            breaks: Vec::new(),
+        }
+    }
+
+    // The next line starts a group, unless nothing came since the last one.
+    fn group(&mut self) {
+        let at = self.lines.len();
+        if at > 0 && self.breaks.last() != Some(&at) {
+            self.breaks.push(at);
+        }
+    }
+
     fn add(&mut self, label: &'static str, value: Option<String>) {
         self.level(label, value, Level::Good);
     }
@@ -159,8 +183,7 @@ struct Showing {
     control: bool,
 }
 
-// Only what has been measured: a number that is not there yet is left out
-// rather than shown as a dash that looks like zero.
+#[cfg(test)]
 fn lines(
     role: Role,
     n: &Numbers,
@@ -170,10 +193,21 @@ fn lines(
     audio: Option<&Periods>,
     showing: Showing,
 ) -> Vec<Line> {
-    let mut out = Lines {
-        lines: Vec::new(),
-        hide_addresses: showing.hide_addresses,
-    };
+    build(role, n, firewall, asking, now_unix, audio, showing).lines
+}
+
+// Only what has been measured: a number that is not there yet is left out
+// rather than shown as a dash that looks like zero.
+fn build(
+    role: Role,
+    n: &Numbers,
+    firewall: &str,
+    asking: bool,
+    now_unix: u64,
+    audio: Option<&Periods>,
+    showing: Showing,
+) -> Lines {
+    let mut out = Lines::new(showing.hide_addresses);
     let link_label = match role {
         Role::Host => "Slowest link",
         Role::Client => "Host",
@@ -188,9 +222,11 @@ fn lines(
     out.add(loss_label(n.loss_from), n.loss_pct.map(percent));
     out.add("Loss inbound, from pings", n.inbound_loss_pct.map(percent));
     out.add("Path", n.path.map(|path| strip::path_word(path).to_owned()));
+    out.group();
     out.address("Remote address", n.peer_addr.map(|addr| addr.to_string()));
     out.add("Local port", Some(format!("UDP {}", n.local_port)));
     out.add("Firewall", Some(firewall.to_owned()));
+    out.group();
     out.add("Handshake", n.handshake_ms.map(ms));
     out.add("Connect time", n.connect_ms.map(ms));
     out.add("Reconnect time", n.reconnect_ms.map(ms));
@@ -204,6 +240,7 @@ fn lines(
         "Ping interval",
         Some(format!("{} ms", n.ping_interval.as_millis())),
     );
+    out.group();
     out.add("Packets sent", Some(n.packets_sent.to_string()));
     out.add("Packets received", Some(n.packets_received.to_string()));
     out.add("Bytes sent", Some(bytes(n.bytes_sent)));
@@ -221,7 +258,9 @@ fn lines(
     );
     out.add("Ack delay", n.ack_delay_ms.map(ms));
     out.add("Retransmits", Some(n.retransmits.to_string()));
+    out.group();
     out.add("Chat delivery", chat_delivery(n));
+    out.group();
     out.add("Audio period", audio_period(n, audio));
     out.add("Resampled by Windows", audio.and_then(resampled));
     out.level(MICROPHONE, n.microphone.and_then(microphone), Level::Warn);
@@ -267,6 +306,7 @@ fn lines(
         (n.voice_dropped > 0).then(|| n.voice_dropped.to_string()),
     );
     // The Video group follows the voice lines.
+    out.group();
     if let Some(sharing) = &n.sharing {
         video_out(&mut out, sharing);
     }
@@ -274,9 +314,11 @@ fn lines(
         video_in(&mut out, watching);
     }
     video_counts(&mut out, n);
+    out.group();
     if showing.control {
         control(&mut out, &n.control);
     }
+    out.group();
     // What STUN found about the outside port, easy or hard. Not "Port
     // mapping" below, which is the router opening a port on request.
     out.add(
@@ -302,7 +344,7 @@ fn lines(
         // refused as well as the ones it took.
         out.address("Name points to", points_to(name));
     }
-    out.lines
+    out
 }
 
 // While this PC's share runs: what its encoder makes and what goes out.
@@ -795,10 +837,7 @@ mod tests {
     }
 
     fn control_lines(c: &ControlNumbers) -> Vec<Line> {
-        let mut out = Lines {
-            lines: Vec::new(),
-            hide_addresses: false,
-        };
+        let mut out = Lines::new(false);
         control(&mut out, c);
         out.lines
     }

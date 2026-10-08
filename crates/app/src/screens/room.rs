@@ -2,9 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use eframe::egui::emath::GuiRounding;
 use eframe::egui::{
-    Align, Color32, FontId, Frame, Key, Layout, Margin, Modifiers, Rect, Response, ScrollArea,
-    Sense, Stroke, Ui, pos2, vec2,
+    Align, Color32, Key, Layout, Modifiers, Rect, Response, ScrollArea, Sense, Stroke, Ui, vec2,
 };
 use invite::ReplyCode;
 use room::Room;
@@ -14,7 +14,7 @@ use room::view::{
 };
 use voice::audio::{AudioError, Choice};
 
-use crate::controls::{self, Button};
+use crate::controls::{self, Button, Lead};
 use crate::hotkeys::{self, Target};
 use crate::messages;
 use crate::monitors::{self, Pick};
@@ -23,10 +23,12 @@ use crate::screens::control::{self, AllowWait, Answer, Decline, MenuItem, PanicK
 use crate::screens::stats;
 use crate::sound::PeriodsAsk;
 use crate::strip;
-use crate::theme::{self, AMBER, ASH, BAD, CHALK, CONTROL_HEIGHT, PANEL, ROW_HEIGHT, SIDE, WARN};
+use crate::theme::{
+    self, AMBER, ASH, BAD, CHALK, CONTROL_HEIGHT, FIELD_GAP, HALF_STEP, QUIET_DOT, ROW_HEIGHT,
+    SIDE, STEP, TALKING, WARN,
+};
 use crate::win;
 
-const TOGGLE_HEIGHT: f32 = 24.0;
 // A reply code is about 110 characters. The cap is the invite field's: far
 // above any code, far below a document pasted by mistake.
 const PASTE_CHARS: usize = 2048;
@@ -199,9 +201,9 @@ impl InRoom {
         let words = share.as_ref().map(ShareVerb::words);
         let mut verbs: Vec<Button> = words.iter().map(VerbWords::button).collect();
         if !ends_here(view) {
-            verbs.push(Button::new(leave_word(view.role)));
+            verbs.push(Button::new(leave_word(view.role)).role(theme::Role::Destructive));
         }
-        match controls::title_row(ui, title, &verbs) {
+        match controls::title_row(ui, Lead::Title(title), &verbs) {
             Some(0) if share.is_some() => self.share_pressed(share.as_ref()),
             Some(_) => step = Some(Step::Leave),
             None => {}
@@ -244,8 +246,9 @@ impl InRoom {
         }
         // At the smallest window the invite block and eight people are taller
         // than the body. They scroll on their own once they would take more
-        // than half of it, so the chat always keeps the other half.
-        let most = ((ui.available_height() - CONTROL_HEIGHT) / 2.0).max(ROW_HEIGHT);
+        // than half of it, so the chat, its composer included, always keeps
+        // the other half.
+        let most = (ui.available_height() / 2.0).max(ROW_HEIGHT);
         let scroll = ScrollArea::vertical()
             .id_salt("room")
             .max_height(most)
@@ -310,19 +313,15 @@ impl InRoom {
             controls::page(ui, |ui| explain(ui, notice, step));
             return;
         }
-        // Above the invite, since a new invite is one of the two ways back.
-        let lost = messages::friends_lost(view.address_changed);
-        if lost.is_some() || view.invite.is_some() {
+        // Above the invite block, in the window's tone, since a new invite
+        // is one of the two ways back.
+        if let Some(text) = messages::friends_lost(view.address_changed) {
             controls::page(ui, |ui| {
-                if let Some(text) = lost {
-                    controls::text(ui, text, theme::body(), CHALK);
-                }
-                let Some(invite) = &view.invite else {
-                    return;
-                };
-                if lost.is_some() {
-                    ui.add_space(16.0);
-                }
+                controls::prose(ui, text, theme::body(), CHALK);
+            });
+        }
+        if let Some(invite) = &view.invite {
+            controls::region(ui, STEP, |ui| {
                 self.invite(ui, invite, view.numbers.local_port, &view.share, step);
                 // A punch from a router that changes ports opens a port
                 // nobody will come to, so the field is not offered then.
@@ -334,12 +333,11 @@ impl InRoom {
                     self.paste_field(ui, view.paste.as_ref(), moved);
                 }
             });
-            controls::hairline(ui, ui.cursor().top());
         }
         self.people(ui, view);
         if view.people.iter().all(|person| person.is_you) {
-            controls::page(ui, |ui| {
-                controls::text(ui, messages::EMPTY_ROOM, theme::body(), ASH);
+            controls::gutter(ui, STEP, STEP, |ui| {
+                controls::prose(ui, messages::EMPTY_ROOM, theme::body(), ASH);
             });
         }
     }
@@ -352,20 +350,21 @@ impl InRoom {
         share: &ShareView,
         step: &mut Option<Step>,
     ) {
-        let rect = row_rect(ui, TOGGLE_HEIGHT);
+        // The head and the lifetime toggle share one row; the toggle is a
+        // ghost, so the row reads as the word Invite first.
+        let rect = row_rect(ui, CONTROL_HEIGHT);
         let toggle = if invite.multi_use {
             Button::new("anyone, 24 h").color(WARN)
         } else {
             Button::new("single use, 10 min")
-        }
-        .height(TOGGLE_HEIGHT);
+        };
         let toggle_width = toggle.width(ui);
         controls::split_row(
             ui,
             rect,
             toggle_width,
             |ui| {
-                controls::one_line(ui, "Invite", theme::medium(), CHALK);
+                controls::one_line(ui, "Invite", theme::section(), CHALK);
             },
             |ui| {
                 if toggle.show(ui).clicked() {
@@ -379,7 +378,7 @@ impl InRoom {
         let dead = invite.used || invite.expired;
         let outdated = outdated_by(invite);
         if !invite.code.is_empty() {
-            ui.add_space(8.0);
+            ui.add_space(STEP);
             // A used or expired code comes with the way to a fresh one
             // instead of Copy. Copy keeps its name after a press: buttons say
             // what they do, and a longer label would move the code over under
@@ -407,7 +406,8 @@ impl InRoom {
             }
         }
 
-        ui.add_space(8.0);
+        // One sentence that belongs to the code above it, in caption, right
+        // under its 32 px row, which already leaves room under the code.
         let line = if invite.used {
             String::from("This invite has been used.")
         } else if invite.expired {
@@ -417,13 +417,13 @@ impl InRoom {
         } else {
             messages::router(invite.router, port)
         };
-        controls::text(ui, line, theme::small(), ASH);
+        controls::text(ui, line, theme::caption(), ASH);
         if let Some(why) = outdated {
-            controls::text(ui, why, theme::small(), ASH);
+            controls::text(ui, why, theme::caption(), ASH);
         }
         if let Some(error) = &self.copy_error {
-            ui.add_space(8.0);
-            controls::text(ui, error.as_str(), theme::body(), BAD);
+            ui.add_space(HALF_STEP);
+            controls::text(ui, error.as_str(), theme::caption(), BAD);
         }
     }
 
@@ -431,7 +431,7 @@ impl InRoom {
     // one line under the field says what came of it. `moved` is this PC's
     // own address having just changed with friends still out.
     fn paste_field(&mut self, ui: &mut Ui, last: Option<&PasteState>, moved: bool) {
-        ui.add_space(12.0);
+        ui.add_space(FIELD_GAP);
         let field = controls::field(
             ui,
             "reply code",
@@ -456,73 +456,65 @@ impl InRoom {
             }
         }
         if let Some((text, color)) = paste_line(self.paste_error.as_deref(), moved, last) {
-            ui.add_space(8.0);
-            controls::text(ui, text, theme::body(), color);
+            ui.add_space(HALF_STEP);
+            controls::text(ui, text, theme::caption(), color);
         }
     }
 
     fn client(&mut self, ui: &mut Ui, view: &View, step: &mut Option<Step>) {
         if view.people.is_empty() {
-            controls::page(ui, |ui| match &view.notice {
+            match &view.notice {
                 Some(Notice::StillTrying) => self.still_trying(ui, view.reply.as_ref(), step),
-                Some(notice) => explain(ui, notice, step),
-                None => {
+                Some(notice) => controls::page(ui, |ui| explain(ui, notice, step)),
+                None => controls::page(ui, |ui| {
                     if Button::new("Cancel").show(ui).clicked() {
                         *step = Some(Step::Leave);
                     }
-                }
-            });
+                }),
+            }
             return;
         }
-        let code = code_in_room(view);
-        if view.notice.is_some() || code.is_some() {
-            controls::page(ui, |ui| {
-                if let Some(notice) = &view.notice {
-                    explain(ui, notice, step);
-                }
-                let Some(reply) = code else {
-                    return;
-                };
-                if view.notice.is_some() {
-                    ui.add_space(16.0);
-                }
+        if let Some(notice) = &view.notice {
+            controls::page(ui, |ui| explain(ui, notice, step));
+        }
+        if let Some(reply) = code_in_room(view) {
+            controls::region(ui, SIDE, |ui| {
                 // The title row already has Leave, so New code is the one
                 // button here.
                 if self.code_block(ui, reply) {
-                    ui.add_space(16.0);
+                    ui.add_space(FIELD_GAP);
                     if Button::new("New code").show(ui).clicked() {
                         *step = Some(Step::NewCode);
                     }
                 }
             });
-            controls::hairline(ui, ui.cursor().top());
         }
         self.people(ui, view);
     }
 
-    // Joining when the host cannot be reached: the code to send back, or the
-    // sentence that says why none would help, under the line that says the
-    // tries go on.
+    // Joining when the host cannot be reached: the code to send back in its
+    // own block, or the sentence that says why none would help, under the
+    // line that says the tries go on.
     fn still_trying(&mut self, ui: &mut Ui, reply: Option<&ReplyView>, step: &mut Option<Step>) {
-        controls::text(
-            ui,
-            messages::notice(&Notice::StillTrying),
-            theme::body(),
-            CHALK,
-        );
+        controls::page(ui, |ui| {
+            let still = messages::notice(&Notice::StillTrying);
+            controls::prose(ui, still, theme::body(), CHALK);
+        });
         let mut expired = false;
+        let mut top = 0.0;
         if let Some(reply) = reply {
-            ui.add_space(16.0);
-            expired = self.code_block(ui, reply);
+            controls::region(ui, SIDE, |ui| expired = self.code_block(ui, reply));
+            top = FIELD_GAP;
         }
-        ui.add_space(16.0);
-        ui.horizontal(|ui| {
-            if expired && Button::new("New code").show(ui).clicked() {
-                *step = Some(Step::NewCode);
-            }
-            if Button::new("Cancel").show(ui).clicked() {
-                *step = Some(Step::Leave);
-            }
+        controls::gutter(ui, top, SIDE, |ui| {
+            ui.horizontal(|ui| {
+                if expired && Button::new("New code").show(ui).clicked() {
+                    *step = Some(Step::NewCode);
+                }
+                if Button::new("Cancel").show(ui).clicked() {
+                    *step = Some(Step::Leave);
+                }
+            });
         });
     }
 
@@ -535,7 +527,7 @@ impl InRoom {
         match reply.state {
             ReplyState::Code { second_router } => {
                 controls::text(ui, messages::SEND_CODE_BACK, theme::body(), CHALK);
-                ui.add_space(8.0);
+                ui.add_space(STEP);
                 if code_row(ui, &reply.code, true, CHALK, &["Copy"]).is_some() {
                     // The code holds no secret, but it does hold this PC's
                     // home address, which history has no use for.
@@ -544,27 +536,27 @@ impl InRoom {
                         .map(|err| messages::copy_error(&err));
                 }
                 if second_router {
-                    ui.add_space(8.0);
-                    controls::text(ui, messages::CODE_SECOND_ROUTER, theme::small(), ASH);
+                    ui.add_space(HALF_STEP);
+                    controls::prose(ui, messages::CODE_SECOND_ROUTER, theme::caption(), ASH);
                 }
             }
             ReplyState::Expired { .. } => {
                 expired = true;
                 controls::text(ui, messages::CODE_EXPIRED, theme::body(), CHALK);
                 if let Some(rung) = messages::reply(reply.state, reply.host_port) {
-                    ui.add_space(8.0);
-                    controls::text(ui, rung, theme::body(), ASH);
+                    ui.add_space(STEP);
+                    controls::prose(ui, rung, theme::body(), ASH);
                 }
             }
             state => {
                 if let Some(why) = messages::reply(state, reply.host_port) {
-                    controls::text(ui, why, theme::body(), CHALK);
+                    controls::prose(ui, why, theme::body(), CHALK);
                 }
             }
         }
         if let Some(error) = &self.copy_error {
-            ui.add_space(8.0);
-            controls::text(ui, error.as_str(), theme::body(), BAD);
+            ui.add_space(HALF_STEP);
+            controls::prose(ui, error.as_str(), theme::caption(), BAD);
         }
         expired
     }
@@ -611,21 +603,21 @@ fn entered(ui: &Ui, field: &Response) -> bool {
 // One sentence for the notice, and the button that is the way out of it when
 // the room cannot go on.
 fn explain(ui: &mut Ui, notice: &Notice, step: &mut Option<Step>) {
-    controls::text(ui, messages::notice(notice), theme::body(), CHALK);
+    controls::prose(ui, messages::notice(notice), theme::body(), CHALK);
     // The room keeps trying under the two about a silent host, and Leave is
     // in the title row.
     let button = match notice {
-        Notice::StillTrying => Some("Cancel"),
+        Notice::StillTrying => Some(Button::new("Cancel")),
         Notice::LostHost | Notice::HostMoved => None,
         Notice::RoomClosed
         | Notice::InviteExpired
         | Notice::SocketFailed
         | Notice::OtherVersion { .. }
-        | Notice::UnversionedHost => Some("Leave"),
+        | Notice::UnversionedHost => Some(Button::new("Leave").role(theme::Role::Destructive)),
     };
-    if let Some(label) = button {
-        ui.add_space(16.0);
-        if Button::new(label).show(ui).clicked() {
+    if let Some(button) = button {
+        ui.add_space(FIELD_GAP);
+        if button.show(ui).clicked() {
             *step = Some(Step::Leave);
         }
     }
@@ -733,7 +725,9 @@ enum ShareVerb {
 
 struct VerbWords {
     text: &'static str,
-    color: Color32,
+    // Stop sharing turns primary, the room's only one: showing your screen
+    // is the one state that must never go unnoticed.
+    role: theme::Role,
     // What a screen reader hears instead of the text.
     label: Option<String>,
     enabled: bool,
@@ -741,16 +735,17 @@ struct VerbWords {
 
 impl ShareVerb {
     fn words(&self) -> VerbWords {
-        let (text, color, label, enabled) = match self {
-            ShareVerb::Share => ("Share", CHALK, None, true),
-            ShareVerb::Starting => ("Starting", ASH, None, false),
-            ShareVerb::StopSharing => ("Stop sharing", AMBER, None, true),
-            ShareVerb::Busy(name) => ("Share", ASH, Some(messages::one_share(name)), false),
-            ShareVerb::StopControl => ("Stop control", AMBER, None, true),
+        use theme::Role::{Primary, Secondary};
+        let (text, role, label, enabled) = match self {
+            ShareVerb::Share => ("Share", Secondary, None, true),
+            ShareVerb::Starting => ("Starting", Secondary, None, false),
+            ShareVerb::StopSharing => ("Stop sharing", Primary, None, true),
+            ShareVerb::Busy(name) => ("Share", Secondary, Some(messages::one_share(name)), false),
+            ShareVerb::StopControl => ("Stop control", Primary, None, true),
         };
         VerbWords {
             text,
-            color,
+            role,
             label,
             enabled,
         }
@@ -759,9 +754,7 @@ impl ShareVerb {
 
 impl VerbWords {
     fn button(&self) -> Button<'_> {
-        let button = Button::new(self.text)
-            .color(self.color)
-            .enabled(self.enabled);
+        let button = Button::new(self.text).role(self.role).enabled(self.enabled);
         match &self.label {
             Some(label) => button.label(label),
             None => button,
@@ -816,15 +809,9 @@ pub fn addresses_hidden(share: &ShareView) -> bool {
 // the narrowest window three of them wrap onto a second line.
 fn monitor_row(ui: &mut Ui, picks: &[Pick]) -> Option<usize> {
     let mut pressed = None;
-    let margin = Margin {
-        left: SIDE as i8,
-        right: SIDE as i8,
-        top: 8,
-        bottom: 8,
-    };
-    Frame::new().inner_margin(margin).show(ui, |ui| {
+    controls::region(ui, STEP, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.y = 8.0;
+            ui.spacing_mut().item_spacing.y = STEP;
             for (i, pick) in picks.iter().enumerate() {
                 if Button::new(&pick.text)
                     .label(&pick.spoken)
@@ -836,7 +823,6 @@ fn monitor_row(ui: &mut Ui, picks: &[Pick]) -> Option<usize> {
             }
         });
     });
-    controls::hairline(ui, ui.cursor().top());
     pressed
 }
 
@@ -891,7 +877,9 @@ impl InRoom {
     // On a client the list is the host's word, so it goes to ash with the
     // link: the numbers while the host is quiet, everything once it is lost.
     // Your own row holds the voice buttons, and under it goes why the
-    // microphone or the speakers are not running.
+    // microphone or the speakers are not running. The list is in the
+    // window's tone, 32 px a row, with nothing between rows but their own
+    // height.
     fn people(&mut self, ui: &mut Ui, view: &View) {
         let client_link = (view.role == Role::Client).then_some(view.strip.state);
         let gone = matches!(client_link, Some(LinkState::Lost | LinkState::Closed));
@@ -918,19 +906,18 @@ impl InRoom {
                 let paused = paused_line(self.keys);
                 let problem = voice_problem(&view.voice);
                 if paused.is_some() || problem.is_some() {
-                    controls::page(ui, |ui| {
+                    controls::gutter(ui, 0.0, STEP, |ui| {
                         if let Some(paused) = paused {
-                            controls::text(ui, paused, theme::small(), WARN);
+                            controls::prose(ui, paused, theme::caption(), WARN);
                         }
                         if let Some(problem) = problem {
-                            controls::text(ui, problem, theme::small(), BAD);
+                            controls::prose(ui, problem, theme::caption(), BAD);
                         }
                     });
                 }
                 continue;
             }
             let rect = row_rect(ui, ROW_HEIGHT);
-            ui.painter().rect_filled(rect, 0, PANEL);
             let items = control::menu_items(view, person, offered);
             if !items.is_empty() {
                 // Under the row's own buttons, which take their clicks first.
@@ -938,9 +925,9 @@ impl InRoom {
                 self.menu.follow_row(ui, &row, person.key, &person.name);
             }
             let rtt = person.rtt_ms.filter(|_| !dim).map(strip::round_trip);
-            let rtt_width = rtt
-                .as_deref()
-                .map_or(0.0, |text| controls::text_width(ui, text, theme::small()));
+            let rtt_width = rtt.as_deref().map_or(0.0, |text| {
+                controls::text_width(ui, text, theme::mono_caption())
+            });
             // Watch, then Control, each the height of its row.
             let mut presses = Vec::with_capacity(2);
             if let Some(word) = watch_word(view, person) {
@@ -964,7 +951,7 @@ impl InRoom {
                 ui,
                 rect.shrink2(vec2(SIDE, 0.0)),
                 right_width,
-                |ui| row_name(ui, person, word, same_name, dim),
+                |ui| row_name(ui, person, Slot::of(person, None), word, same_name, dim),
                 // From the right edge: the round trip keeps its column
                 // whether or not the row has buttons.
                 |ui| {
@@ -974,7 +961,7 @@ impl InRoom {
                         } else {
                             theme::level_color(person.rtt_level)
                         };
-                        controls::one_line(ui, text, theme::small(), color);
+                        controls::one_line(ui, text, theme::mono_caption(), color);
                     }
                     if !buttons.is_empty() {
                         pressed = controls::buttons(ui, &buttons, ROW_HEIGHT);
@@ -993,9 +980,6 @@ impl InRoom {
                 self.room.end_control();
             }
         }
-        if !view.people.is_empty() {
-            controls::hairline(ui, ui.cursor().top());
-        }
     }
 
     // Your row is 32 px, with Hold to talk in push-to-talk mode
@@ -1009,13 +993,12 @@ impl InRoom {
         dim: bool,
     ) {
         let rect = row_rect(ui, CONTROL_HEIGHT);
-        ui.painter().rect_filled(rect, 0, PANEL);
         let pointer_down = ui.input(|input| input.pointer.any_down());
         let hold = hold_shown(voice, self.keys, self.hold.stays(pointer_down));
         let buttons = your_buttons(voice, self.hold.held, hold);
         // Hold to talk keeps its size when it reads Talking, so Mute and
         // Deafen do not move under the mouse.
-        let hold_width = [HOLD, TALKING]
+        let hold_width = [HOLD, TALKING_WORD]
             .iter()
             .map(|text| Button::new(text).width(ui))
             .fold(0.0, f32::max);
@@ -1039,7 +1022,7 @@ impl InRoom {
             ui,
             rect.shrink2(vec2(SIDE, 0.0)),
             width,
-            |ui| row_name(ui, person, word, false, dim),
+            |ui| row_name(ui, person, Slot::of(person, Some(voice)), word, false, dim),
             |ui| {
                 let layout = Layout::left_to_right(Align::Center);
                 ui.allocate_ui_with_layout(vec2(width, rect.height()), layout, |ui| {
@@ -1050,8 +1033,11 @@ impl InRoom {
                             held = response.is_pointer_button_down_on();
                             continue;
                         }
-                        if button.show(ui).clicked() {
-                            let mute = i == usize::from(hold);
+                        let mute = i == usize::from(hold);
+                        // A toggle that is on keeps the control fill, so a
+                        // muted microphone shows without reading the word.
+                        let on = if mute { voice.muted } else { voice.deafened };
+                        if button.on(on).show(ui).clicked() {
                             pressed = Some(if mute {
                                 VoicePress::Mute
                             } else {
@@ -1074,7 +1060,7 @@ impl InRoom {
 }
 
 const HOLD: &str = "Hold to talk";
-const TALKING: &str = "Talking";
+const TALKING_WORD: &str = "Talking";
 
 // The words on your row's buttons, in order, and their colour: Hold to talk
 // when `hold` says it shows, which reads Talking in amber while held and
@@ -1085,7 +1071,7 @@ fn your_buttons(voice: &Voice, held: bool, hold: bool) -> Vec<(&'static str, Col
     let mut buttons = Vec::with_capacity(3);
     if hold {
         buttons.push(if held && voice.sending {
-            (TALKING, AMBER)
+            (TALKING_WORD, AMBER)
         } else {
             (HOLD, CHALK)
         });
@@ -1119,27 +1105,72 @@ fn voice_problem(voice: &Voice) -> Option<String> {
     Some(messages::sentence(&err.to_string()))
 }
 
-// A talking person gets a 2 px amber ring before the name, and
-// the name in Medium. The ring's place is kept on every row, so names do not
-// move when someone starts talking.
-const RING: f32 = 12.0;
-const RING_GAP: f32 = 8.0;
+// The ring slot, 16 px at the left of every row and 8 px before the name,
+// kept on every row so names never move. Talking does not touch the name:
+// Medium is wider than Regular, and a name that grew each time its owner
+// spoke would shove what follows it back and forth.
+const SLOT: f32 = 16.0;
+const DOT: f32 = 4.0;
+// 14 px across on the outside, 2 px thick, 3 px clear of the dot.
+const RING_RADIUS: f32 = 6.0;
+const RING_STROKE: f32 = 2.0;
 
-fn name_font(person: &Person) -> FontId {
-    if person.talking {
-        theme::medium()
-    } else {
-        theme::body()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Slot {
+    Quiet,
+    Talking,
+    Muted,
+    Deafened,
+}
+
+impl Slot {
+    // Only your own mute and deafen are known on this panel, so `voice` is
+    // there for your row alone. Deafened mutes too and says more, and a
+    // muted row never shows the ring.
+    fn of(person: &Person, voice: Option<&Voice>) -> Slot {
+        match voice {
+            Some(voice) if voice.deafened => Slot::Deafened,
+            Some(voice) if voice.muted => Slot::Muted,
+            _ if person.talking => Slot::Talking,
+            _ => Slot::Quiet,
+        }
     }
 }
 
-fn row_name(ui: &mut Ui, person: &Person, word: Option<&str>, same_name: bool, dim: bool) {
-    let (slot, _) = ui.allocate_exact_size(vec2(RING + RING_GAP, RING), Sense::hover());
-    if person.talking && ui.is_rect_visible(slot) {
-        let center = pos2(slot.left() + RING / 2.0, slot.center().y);
-        let stroke = Stroke::new(2.0, AMBER);
-        ui.painter().circle_stroke(center, RING / 2.0 - 1.0, stroke);
+fn paint_slot(ui: &mut Ui, slot: Slot, dim: bool) {
+    let glyph = match slot {
+        Slot::Muted => Some(theme::icons::regular::MICROPHONE_SLASH),
+        Slot::Deafened => Some(theme::icons::regular::EAR_SLASH),
+        Slot::Quiet | Slot::Talking => None,
+    };
+    if let Some(glyph) = glyph {
+        controls::icon(ui, glyph, ASH);
+        return;
     }
+    let (rect, _) = ui.allocate_exact_size(vec2(SLOT, SLOT), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let center = rect.center().round_to_pixels(ui.pixels_per_point());
+    let painter = ui.painter();
+    if slot == Slot::Talking && !dim {
+        painter.circle_filled(center, DOT / 2.0, TALKING);
+        painter.circle_stroke(center, RING_RADIUS, Stroke::new(RING_STROKE, TALKING));
+    } else {
+        let color = if dim { ASH } else { QUIET_DOT };
+        painter.circle_filled(center, DOT / 2.0, color);
+    }
+}
+
+fn row_name(
+    ui: &mut Ui,
+    person: &Person,
+    slot: Slot,
+    word: Option<&str>,
+    same_name: bool,
+    dim: bool,
+) {
+    paint_slot(ui, slot, dim);
     let name = if person.is_you {
         "You"
     } else {
@@ -1151,30 +1182,27 @@ fn row_name(ui: &mut Ui, person: &Person, word: Option<&str>, same_name: bool, d
     let gap = ui.spacing().item_spacing.x;
     let mut reserve = 0.0;
     if fingerprint {
-        let font = theme::mono();
-        reserve += ui.fonts_mut(|fonts| fonts.glyph_width(&font, '0'))
-            * person.fingerprint.len() as f32
-            + gap;
+        reserve += controls::text_width(ui, &person.fingerprint, theme::mono_caption()) + gap;
     }
     if let Some(word) = word {
-        reserve += controls::text_width(ui, word, theme::small()) + gap;
+        reserve += controls::text_width(ui, word, theme::caption()) + gap;
     }
     let name_width = (ui.available_width() - reserve).max(0.0);
     ui.scope(|ui| {
         ui.set_max_width(name_width);
         let color = if dim { ASH } else { CHALK };
-        controls::one_line(ui, name, name_font(person), color);
+        controls::one_line(ui, name, theme::name(), color);
     });
     if fingerprint {
-        controls::one_line(ui, &person.fingerprint, theme::mono(), ASH);
+        controls::one_line(ui, &person.fingerprint, theme::mono_caption(), ASH);
     }
     if let Some(word) = word {
-        controls::one_line(ui, word, theme::small(), ASH);
+        controls::one_line(ui, word, theme::caption(), ASH);
     }
 }
 
 // A full-width row of the Ui it is in: inside the gutter on a page, edge to
-// edge for list rows that carry a fill.
+// edge for list rows.
 fn row_rect(ui: &mut Ui, height: f32) -> Rect {
     ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover())
         .0
@@ -1183,6 +1211,7 @@ fn row_rect(ui: &mut Ui, height: f32) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::Role::{Primary, Secondary};
     use room::ReplyRefused;
     use room::view::{
         ControlView, CurrentShare, Numbers, Party, Paused, Refusal, RouterState, RunningShare,
@@ -1584,14 +1613,32 @@ mod tests {
     }
 
     #[test]
-    fn a_talking_person_is_set_in_medium() {
+    fn the_ring_slot_says_talking_muted_or_deafened() {
         let quiet = person("Mara", false);
         let talking = Person {
             talking: true,
             ..person("Mara", false)
         };
-        assert_eq!(name_font(&quiet), theme::body());
-        assert_eq!(name_font(&talking), theme::medium());
+        assert_eq!(Slot::of(&quiet, None), Slot::Quiet);
+        assert_eq!(Slot::of(&talking, None), Slot::Talking);
+        // Your own row knows its mute and deafen; a muted row never shows
+        // the ring, and deafened, which mutes too, says the more.
+        let you = Person {
+            talking: true,
+            ..person("Tom", true)
+        };
+        let muted = Voice {
+            muted: true,
+            ..Voice::default()
+        };
+        let deafened = Voice {
+            muted: true,
+            deafened: true,
+            ..Voice::default()
+        };
+        assert_eq!(Slot::of(&you, Some(&Voice::default())), Slot::Talking);
+        assert_eq!(Slot::of(&you, Some(&muted)), Slot::Muted);
+        assert_eq!(Slot::of(&you, Some(&deafened)), Slot::Deafened);
     }
 
     // A microphone that cannot open is said under your row, as a sentence,
@@ -1695,18 +1742,18 @@ mod tests {
         }
     }
 
-    fn verb(view: &View) -> Option<(&'static str, Color32, Option<String>, bool)> {
+    fn verb(view: &View) -> Option<(&'static str, theme::Role, Option<String>, bool)> {
         let words = share_verb(view, ON)?.words();
-        Some((words.text, words.color, words.label, words.enabled))
+        Some((words.text, words.role, words.label, words.enabled))
     }
 
-    // Share, Stop sharing in amber while sharing, and
+    // Share, Stop sharing as the room's one primary while sharing, and
     // Share in ash that does nothing while someone else shares, whose
     // accessible name says who. Asked and not granted yet, it says so.
     #[test]
     fn the_title_row_says_what_share_does_now() {
         let idle = live(ShareView::default());
-        assert_eq!(verb(&idle), Some(("Share", CHALK, None, true)));
+        assert_eq!(verb(&idle), Some(("Share", Secondary, None, true)));
         let sharing = live(ShareView {
             own: OwnShare::Sharing {
                 number: 7,
@@ -1715,34 +1762,37 @@ mod tests {
             current: Some(mara_shares(true)),
             ..ShareView::default()
         });
-        assert_eq!(verb(&sharing), Some(("Stop sharing", AMBER, None, true)));
+        assert_eq!(verb(&sharing), Some(("Stop sharing", Primary, None, true)));
         let asking = live(ShareView {
             own: OwnShare::Asking { fps: 120 },
             ..ShareView::default()
         });
-        assert_eq!(verb(&asking), Some(("Starting", ASH, None, false)));
+        assert_eq!(verb(&asking), Some(("Starting", Secondary, None, false)));
         let busy = live(ShareView {
             current: Some(mara_shares(false)),
             ..ShareView::default()
         });
         let spoken = Some(String::from("Share. Mara is sharing. One share at a time."));
-        assert_eq!(verb(&busy), Some(("Share", ASH, spoken.clone(), false)));
+        assert_eq!(
+            verb(&busy),
+            Some(("Share", Secondary, spoken.clone(), false))
+        );
         // Someone else's share wins over an ask the host will refuse.
         let refused = live(ShareView {
             own: OwnShare::Asking { fps: 60 },
             current: Some(mara_shares(false)),
             ..ShareView::default()
         });
-        assert_eq!(verb(&refused), Some(("Share", ASH, spoken, false)));
+        assert_eq!(verb(&refused), Some(("Share", Secondary, spoken, false)));
         // After a refusal, Share is Share again.
         let after = live(ShareView {
             own: OwnShare::Refused(Refusal::TooSoon),
             ..ShareView::default()
         });
-        assert_eq!(verb(&after), Some(("Share", CHALK, None, true)));
+        assert_eq!(verb(&after), Some(("Share", Secondary, None, true)));
     }
 
-    // Stop control takes Share's place, in amber like Stop sharing, and stays
+    // Stop control takes Share's place, primary like Stop sharing, and stays
     // the way out while the room has not yet said the lost host ended it.
     #[test]
     fn stop_control_takes_share_s_place_while_controlling() {
@@ -1761,7 +1811,7 @@ mod tests {
         });
         assert_eq!(
             verb(&controlling),
-            Some(("Stop control", AMBER, None, true))
+            Some(("Stop control", Primary, None, true))
         );
         let lost = View {
             strip: Strip {
@@ -1972,7 +2022,7 @@ mod tests {
     #[test]
     fn one_click_in_the_monitor_list_picks_that_monitor() {
         use crate::controls::tests::{frame, press, release};
-        use eframe::egui::Context;
+        use eframe::egui::{Context, pos2};
         let ctx = Context::default();
         theme::apply(&ctx);
         let picks = picks();
@@ -1980,12 +2030,12 @@ mod tests {
             assert_eq!(monitor_row(ui, &picks), None);
             let first = Button::new(&picks[0].text).width(ui);
             let gap = ui.spacing().item_spacing.x;
-            pos2(SIDE + first + gap + 10.0, 8.0 + CONTROL_HEIGHT / 2.0)
+            pos2(SIDE + first + gap + 10.0, SIDE + CONTROL_HEIGHT / 2.0)
         });
         frame(&ctx, press(second), |ui| monitor_row(ui, &picks));
         let (pressed, _) = frame(&ctx, release(second), |ui| monitor_row(ui, &picks));
         assert_eq!(pressed, Some(1));
-        let first = pos2(SIDE + 10.0, 8.0 + CONTROL_HEIGHT / 2.0);
+        let first = pos2(SIDE + 10.0, SIDE + CONTROL_HEIGHT / 2.0);
         frame(&ctx, press(first), |ui| monitor_row(ui, &picks));
         let (pressed, _) = frame(&ctx, release(first), |ui| monitor_row(ui, &picks));
         assert_eq!(pressed, Some(0));

@@ -1,18 +1,17 @@
-use eframe::egui::emath::GuiRounding;
 use eframe::egui::{
-    Align, CursorIcon, Key, Layout, Rect, Response, ScrollArea, Sense, Ui, UiBuilder, WidgetInfo,
-    WidgetType, pos2, vec2,
+    Align, Key, Layout, Rect, Response, ScrollArea, Sense, Ui, UiBuilder, WidgetType, vec2,
 };
 use input::{Action, Bindings, Chord};
 use room::{BlockedKey, KnownDevice, KnownDevices, TalkMode};
-use voice::audio::{Choice, DeviceList, Direction, Reading};
+use voice::audio::{Choice, DeviceList, Direction};
 
-use crate::controls::{self, Button};
+use crate::controls::{self, Button, Lead};
 use crate::messages;
 use crate::settings::{LEAST_UPLOAD_MBITS, MOST_UPLOAD_MBITS, NAME_CHARS, Settings};
 use crate::sound::SettingsAudio;
 use crate::theme::{
-    self, AMBER, ASH, BAD, CHALK, CONTROL_HEIGHT, LINE, LINE_STRONG, ROW_HEIGHT, SAGE, SIDE, WARN,
+    self, ASH, BAD, CHALK, CONTROL_HEIGHT, FIELD_GAP, HALF_STEP, PANEL, ROW_HEIGHT, Role,
+    SECTION_GAP, SIDE, STEP, WARN,
 };
 use crate::update;
 use crate::win;
@@ -23,13 +22,10 @@ const ADDRESS_NAME_CHARS: usize = 512;
 const PORT_CHARS: usize = 5;
 const STUN_CHARS: usize = 2048;
 const STUN_ROWS: usize = 3;
-// Save and Cancel with the page's gutter above and below them.
+// Save and Cancel on a 64 px bar, with the gutter above and below them.
 const BAR_HEIGHT: f32 = CONTROL_HEIGHT + 2.0 * SIDE;
-// A device's second line, fingerprint and date, in the 13 px mono face.
+// A hotkey's key in words and a device's second line, one body line tall.
 const DETAIL_HEIGHT: f32 = 18.0;
-// The square before each sound device: filled for the chosen one.
-const MARK: f32 = 10.0;
-const METER_HEIGHT: f32 = 4.0;
 // The meter's scale: this far below full scale is an empty bar. Speech
 // peaks sit around -20 to -6 dB, which a linear bar would show as a sliver.
 const METER_FLOOR_DB: f32 = -60.0;
@@ -202,11 +198,12 @@ impl Draft {
     }
 }
 
-// One column in the panel. Save and Cancel sit at the bottom edge rather
-// than after the last setting, so they stay in reach however long the list
-// above them grows; the list scrolls.
+// One column in the panel, label above field, sections told apart by space
+// and their head alone. Save and Cancel sit at the bottom edge on a bar in
+// panel tone rather than after the last setting, so they stay in reach
+// however long the list above them grows; the list scrolls.
 pub fn show(ui: &mut Ui, draft: &mut Draft, audio: &SettingsAudio) -> Option<Press> {
-    controls::title_row(ui, "Settings", &[]);
+    controls::title_row(ui, Lead::Title("Settings"), &[]);
     let rest = ui.available_rect_before_wrap();
     let (list, bar) = rest.split_top_bottom_at_y(rest.bottom() - BAR_HEIGHT);
 
@@ -218,11 +215,11 @@ pub fn show(ui: &mut Ui, draft: &mut Draft, audio: &SettingsAudio) -> Option<Pre
         scroll.show(ui, |ui| {
             controls::page(ui, |ui| {
                 if draft.locked {
-                    controls::text(ui, messages::SETTINGS_LOCKED, theme::body(), WARN);
-                    ui.add_space(24.0);
+                    controls::prose(ui, messages::SETTINGS_LOCKED, theme::body(), WARN);
+                    ui.add_space(SECTION_GAP);
                 }
                 fields.push(name(ui, draft));
-                ui.add_space(24.0);
+                ui.add_space(SECTION_GAP);
                 fields.extend(network(ui, draft));
                 hotkeys(ui, draft);
                 voice(ui, draft, audio);
@@ -230,8 +227,8 @@ pub fn show(ui: &mut Ui, draft: &mut Draft, audio: &SettingsAudio) -> Option<Pre
                 devices(ui, draft);
                 blocked(ui, draft);
                 if let Some(error) = &draft.list_error {
-                    ui.add_space(16.0);
-                    controls::text(ui, error.as_str(), theme::body(), BAD);
+                    ui.add_space(FIELD_GAP);
+                    controls::prose(ui, error.as_str(), theme::body(), BAD);
                 }
             });
         });
@@ -245,12 +242,15 @@ pub fn show(ui: &mut Ui, draft: &mut Draft, audio: &SettingsAudio) -> Option<Pre
 
     let mut press = None;
     ui.scope_builder(UiBuilder::new().max_rect(bar), |ui| {
-        controls::hairline(ui, bar.top() + 1.0);
+        ui.painter().rect_filled(bar, 0, PANEL);
         let row = UiBuilder::new()
             .max_rect(bar.shrink2(vec2(SIDE, 0.0)))
             .layout(Layout::left_to_right(Align::Center));
         ui.scope_builder(row, |ui| {
-            let save = Button::new("Save").enter_target(field_focused).show(ui);
+            let save = Button::new("Save")
+                .role(Role::Primary)
+                .enter_target(field_focused)
+                .show(ui);
             if save.clicked() || entered {
                 press = Some(Press::Save);
             }
@@ -262,9 +262,19 @@ pub fn show(ui: &mut Ui, draft: &mut Draft, audio: &SettingsAudio) -> Option<Pre
     press
 }
 
+fn head(ui: &mut Ui, text: &str) {
+    controls::text(ui, text, theme::section(), CHALK);
+    ui.add_space(STEP);
+}
+
+// A field's name above it, in body ash, 8 px over the field.
+fn label(ui: &mut Ui, text: &str) {
+    controls::text(ui, text, theme::body(), ASH);
+    ui.add_space(STEP);
+}
+
 fn name(ui: &mut Ui, draft: &mut Draft) -> Response {
-    controls::text(ui, "Name", theme::medium(), CHALK);
-    ui.add_space(8.0);
+    head(ui, "Name");
     // Empty means the Windows user name, which the field shows until a
     // name is typed.
     let field = controls::field(
@@ -281,11 +291,9 @@ fn name(ui: &mut Ui, draft: &mut Draft) -> Response {
 }
 
 fn network(ui: &mut Ui, draft: &mut Draft) -> [Response; 2] {
-    controls::text(ui, "Network", theme::medium(), CHALK);
-    ui.add_space(12.0);
+    head(ui, "Network");
 
-    controls::text(ui, "Port", theme::body(), CHALK);
-    ui.add_space(8.0);
+    label(ui, "Port");
     let port = labelled(ui, "port", &mut draft.port, "Port", PORT_CHARS);
     if port.changed() {
         draft.refused.port = false;
@@ -294,9 +302,8 @@ fn network(ui: &mut Ui, draft: &mut Draft) -> [Response; 2] {
         line(ui, messages::PORT_REFUSED, BAD);
     }
 
-    ui.add_space(16.0);
-    controls::text(ui, "STUN servers", theme::body(), CHALK);
-    ui.add_space(8.0);
+    ui.add_space(FIELD_GAP);
+    label(ui, "STUN servers");
     let stun = controls::lines_field(
         ui,
         "stun servers",
@@ -314,10 +321,8 @@ fn network(ui: &mut Ui, draft: &mut Draft) -> [Response; 2] {
         line(ui, messages::NO_STUN, ASH);
     }
 
-    ui.add_space(16.0);
-    controls::text(ui, "Address name", theme::body(), CHALK);
-    controls::text(ui, messages::ADDRESS_NAME_ABOUT, theme::small(), ASH);
-    ui.add_space(8.0);
+    ui.add_space(FIELD_GAP);
+    label(ui, "Address name");
     // The name is already written above the field, so no placeholder
     // repeats it.
     let address = labelled(
@@ -332,21 +337,22 @@ fn network(ui: &mut Ui, draft: &mut Draft) -> [Response; 2] {
     }
     if draft.refused.address_name {
         line(ui, messages::ADDRESS_NAME_REFUSED, BAD);
+    } else {
+        line(ui, messages::ADDRESS_NAME_ABOUT, ASH);
     }
 
     // The update check talks to GitHub, so it sits with the other settings
     // that decide who this PC talks to. Its sentence shows while it is on,
     // the choice that costs something.
-    ui.add_space(16.0);
+    ui.add_space(FIELD_GAP);
     let id = ui.id().with("new versions");
     let on = draft.check_for_new_versions;
     let kind = WidgetType::Checkbox;
-    if mark_row(ui, id, on, "Check for new versions", None, kind).clicked() {
+    if controls::choice_row(ui, id, on, "Check for new versions", None, kind).clicked() {
         draft.check_for_new_versions = !on;
     }
     if draft.check_for_new_versions {
-        ui.add_space(8.0);
-        controls::text(ui, update::CHECK_ABOUT, theme::small(), ASH);
+        line(ui, update::CHECK_ABOUT, ASH);
     }
     if let Some(error) = &draft.error {
         line(ui, error.as_str(), BAD);
@@ -356,38 +362,40 @@ fn network(ui: &mut Ui, draft: &mut Draft) -> [Response; 2] {
 
 // Each action on two lines, its name and Change, then its key in words,
 // since a 360 px column does not hold "Show or hide the panel",
-// "Ctrl+Shift+Space" and a button side by side.
+// "Ctrl+Shift+Space" and a button side by side. The name is the label, in
+// ash; the key is the value, in chalk. While a row waits, its Change keeps
+// the control fill and the key's line asks for the new one.
 fn hotkeys(ui: &mut Ui, draft: &mut Draft) {
-    ui.add_space(24.0);
-    controls::text(ui, "Hotkeys", theme::medium(), CHALK);
+    ui.add_space(SECTION_GAP);
+    head(ui, "Hotkeys");
     if let Some(off) = &draft.hotkeys_off {
-        ui.add_space(8.0);
-        controls::text(ui, off.as_str(), theme::body(), BAD);
+        controls::prose(ui, off.as_str(), theme::body(), BAD);
+        ui.add_space(STEP);
     }
-    ui.add_space(8.0);
     let mut changed = None;
     for (i, action) in Action::ALL.into_iter().enumerate() {
         if i > 0 {
-            ui.add_space(8.0);
+            ui.add_space(FIELD_GAP);
         }
         let rect = row(ui, ROW_HEIGHT);
         let label = messages::hotkey_label(action);
+        let (text, waiting) = key_line(draft, action);
         if draft.hotkeys_off.is_some() {
             let mut left = ui.new_child(
                 UiBuilder::new()
                     .max_rect(rect)
                     .layout(Layout::left_to_right(Align::Center)),
             );
-            controls::one_line(&mut left, label, theme::body(), CHALK);
+            controls::one_line(&mut left, label, theme::body(), ASH);
         } else {
-            let button = Button::new("Change").height(rect.height());
+            let button = Button::new("Change").on(waiting).height(rect.height());
             let width = button.width(ui);
             controls::split_row(
                 ui,
                 rect,
                 width,
                 |ui| {
-                    controls::one_line(ui, label, theme::body(), CHALK);
+                    controls::one_line(ui, label, theme::body(), ASH);
                 },
                 |ui| {
                     let response = button.show(ui);
@@ -400,20 +408,15 @@ fn hotkeys(ui: &mut Ui, draft: &mut Draft) {
                 },
             );
         }
-        let (text, waiting) = key_line(draft, action);
         let rect = row(ui, DETAIL_HEIGHT);
-        let mut line = ui.new_child(
+        let mut key = ui.new_child(
             UiBuilder::new()
                 .max_rect(rect)
                 .layout(Layout::left_to_right(Align::Center)),
         );
-        if waiting {
-            controls::one_line(&mut line, &text, theme::body(), AMBER);
-        } else {
-            controls::one_line(&mut line, &text, theme::medium(), CHALK);
-        }
+        controls::one_line(&mut key, &text, theme::body(), CHALK);
         if let Some(refused) = refused_line(draft, action) {
-            controls::text(ui, refused, theme::body(), BAD);
+            line(ui, &refused, BAD);
         }
     }
     if let Some(action) = changed {
@@ -444,68 +447,63 @@ fn refused_line(draft: &Draft, action: Action) -> Option<String> {
 // and constant-rate voice, each with its one sentence when it is the choice
 // that costs something.
 fn voice(ui: &mut Ui, draft: &mut Draft, audio: &SettingsAudio) {
-    ui.add_space(24.0);
-    controls::text(ui, "Voice", theme::medium(), CHALK);
-    ui.add_space(12.0);
+    ui.add_space(SECTION_GAP);
+    head(ui, "Voice");
     let lists = audio.lists();
     let (inputs, outputs) = match lists {
         Some(Ok(lists)) => (Some(&lists.inputs), Some(&lists.outputs)),
         Some(Err(problem)) => {
-            controls::text(ui, problem.as_str(), theme::body(), BAD);
-            ui.add_space(12.0);
+            controls::prose(ui, problem.as_str(), theme::body(), BAD);
+            ui.add_space(STEP);
             (None, None)
         }
         None => (None, None),
     };
 
-    controls::text(ui, "Input device", theme::body(), CHALK);
-    ui.add_space(8.0);
+    label(ui, "Input device");
     device_list(ui, Direction::Input, &mut draft.input, inputs);
     if let Some(warning) = audio.microphone().and_then(messages::microphone_warning) {
-        ui.add_space(8.0);
-        controls::text(ui, warning, theme::small(), WARN);
+        line(ui, &warning, WARN);
     }
-    ui.add_space(12.0);
-    meter(ui, audio.level());
-    ui.add_space(8.0);
+    ui.add_space(STEP);
+    let level = audio
+        .level()
+        .map_or(0.0, |level| meter_fraction(level.peak));
+    controls::meter(ui, level, "Microphone level");
     match audio.problem() {
-        Some(problem) => controls::text(ui, problem, theme::small(), BAD),
-        None => controls::text(ui, messages::MICROPHONE_OPEN, theme::small(), ASH),
+        Some(problem) => line(ui, problem, BAD),
+        None => line(ui, messages::MICROPHONE_OPEN, ASH),
     };
 
-    ui.add_space(16.0);
-    controls::text(ui, "Output device", theme::body(), CHALK);
-    ui.add_space(8.0);
+    ui.add_space(FIELD_GAP);
+    label(ui, "Output device");
     device_list(ui, Direction::Output, &mut draft.output, outputs);
 
-    ui.add_space(16.0);
-    controls::text(ui, "How you talk", theme::body(), CHALK);
-    ui.add_space(8.0);
+    ui.add_space(FIELD_GAP);
+    label(ui, "How you talk");
     for (mode, name) in [
         (TalkMode::PushToTalk, "Push to talk"),
         (TalkMode::OpenMic, "Open mic"),
     ] {
         let id = ui.id().with(("talk", name));
         let kind = WidgetType::RadioButton;
-        if mark_row(ui, id, draft.talk == mode, name, None, kind).clicked() {
+        if controls::choice_row(ui, id, draft.talk == mode, name, None, kind).clicked() {
             draft.talk = mode;
         }
     }
     if draft.talk == TalkMode::OpenMic {
-        ui.add_space(8.0);
-        controls::text(ui, messages::OPEN_MIC, theme::small(), ASH);
+        line(ui, messages::OPEN_MIC, ASH);
     }
 
-    ui.add_space(16.0);
+    ui.add_space(FIELD_GAP);
     let id = ui.id().with("constant rate");
     let kind = WidgetType::Checkbox;
     let name = "Constant-rate voice";
-    if mark_row(ui, id, draft.constant_rate, name, None, kind).clicked() {
+    if controls::choice_row(ui, id, draft.constant_rate, name, None, kind).clicked() {
         draft.constant_rate = !draft.constant_rate;
     }
     if !draft.constant_rate {
-        ui.add_space(8.0);
-        controls::text(ui, messages::CONSTANT_RATE_OFF, theme::small(), ASH);
+        line(ui, messages::CONSTANT_RATE_OFF, ASH);
     }
 }
 
@@ -513,11 +511,9 @@ fn voice(ui: &mut Ui, draft: &mut Draft, audio: &SettingsAudio) {
 // each with its one sentence when it is the choice that needs one. Like the
 // rest, they apply to the next room.
 fn sharing(ui: &mut Ui, draft: &mut Draft) {
-    ui.add_space(24.0);
-    controls::text(ui, "Sharing", theme::medium(), CHALK);
-    ui.add_space(12.0);
-    controls::text(ui, "Video upload", theme::body(), CHALK);
-    ui.add_space(4.0);
+    ui.add_space(SECTION_GAP);
+    head(ui, "Sharing");
+    controls::text(ui, "Video upload", theme::body(), ASH);
     let id = ui.id().with("video upload");
     let range = LEAST_UPLOAD_MBITS..=MOST_UPLOAD_MBITS;
     controls::slider(
@@ -528,29 +524,26 @@ fn sharing(ui: &mut Ui, draft: &mut Draft) {
         "Mbit/s",
         "Video upload",
     );
-    ui.add_space(4.0);
-    controls::text(ui, messages::UPLOAD_ABOUT, theme::small(), ASH);
+    controls::prose(ui, messages::UPLOAD_ABOUT, theme::caption(), ASH);
 
-    ui.add_space(16.0);
+    ui.add_space(FIELD_GAP);
     let id = ui.id().with("vsync");
     let kind = WidgetType::Checkbox;
-    if mark_row(ui, id, draft.vsync, "Vsync in the viewer", None, kind).clicked() {
+    if controls::choice_row(ui, id, draft.vsync, "Vsync in the viewer", None, kind).clicked() {
         draft.vsync = !draft.vsync;
     }
     if draft.vsync {
-        ui.add_space(8.0);
-        controls::text(ui, messages::VSYNC_ON, theme::small(), ASH);
+        line(ui, messages::VSYNC_ON, ASH);
     }
 
-    ui.add_space(8.0);
+    ui.add_space(STEP);
     let id = ui.id().with("hide strip");
     let name = "Hide the strip in fullscreen";
-    if mark_row(ui, id, draft.hide_strip, name, None, kind).clicked() {
+    if controls::choice_row(ui, id, draft.hide_strip, name, None, kind).clicked() {
         draft.hide_strip = !draft.hide_strip;
     }
-    if let Some(line) = hide_strip_line(draft.hide_strip, win::animations_on()) {
-        ui.add_space(8.0);
-        controls::text(ui, line, theme::small(), ASH);
+    if let Some(note) = hide_strip_line(draft.hide_strip, win::animations_on()) {
+        line(ui, note, ASH);
     }
 }
 
@@ -591,7 +584,7 @@ fn device_list(ui: &mut Ui, direction: Direction, choice: &mut Choice, list: Opt
         let id = ui.id().with((direction, row));
         let selected = row == choice;
         let kind = WidgetType::RadioButton;
-        if mark_row(ui, id, selected, name, note.as_deref(), kind).clicked() {
+        if controls::choice_row(ui, id, selected, name, note.as_deref(), kind).clicked() {
             picked = Some(row.clone());
         }
     }
@@ -608,79 +601,6 @@ fn default_note(list: Option<&DeviceList>) -> Option<String> {
     })
 }
 
-// A radio button or a checkbox in the panel's square shapes: the mark is
-// filled when chosen, and the chosen name is set in Medium, so the choice
-// reads by shape and weight, not by colour.
-fn mark_row(
-    ui: &mut Ui,
-    id: eframe::egui::Id,
-    selected: bool,
-    name: &str,
-    note: Option<&str>,
-    kind: WidgetType,
-) -> Response {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::hover());
-    let response = ui.interact(rect, id, Sense::click());
-    response.widget_info(|| WidgetInfo::selected(kind, true, selected, name));
-    if !ui.is_rect_visible(rect) {
-        return response;
-    }
-    let per_point = ui.pixels_per_point();
-    let mark = Rect::from_center_size(
-        pos2(rect.left() + MARK / 2.0, rect.center().y),
-        vec2(MARK, MARK),
-    )
-    .round_to_pixels(per_point);
-    if selected {
-        controls::fill_pixels(ui.painter(), &[mark], CHALK);
-    } else {
-        controls::border(ui.painter(), mark, 1.0, LINE_STRONG);
-    }
-    let text = Rect::from_min_max(pos2(mark.right() + 8.0, rect.top()), rect.max);
-    let mut row = ui.new_child(
-        UiBuilder::new()
-            .max_rect(text)
-            .layout(Layout::left_to_right(Align::Center)),
-    );
-    let font = if selected {
-        theme::medium()
-    } else {
-        theme::body()
-    };
-    controls::one_line(&mut row, name, font, CHALK);
-    if let Some(note) = note {
-        controls::one_line(&mut row, note, theme::small(), ASH);
-    }
-    if response.has_focus() && controls::keyboard_focus(ui) {
-        controls::ring(ui, rect, LINE_STRONG);
-    }
-    response.on_hover_cursor(CursorIcon::PointingHand)
-}
-
-// A thin bar that follows the peak of the last 50 ms, on a decibel scale.
-// Empty while no microphone is open.
-fn meter(ui: &mut Ui, level: Option<Reading>) {
-    let (rect, response) =
-        ui.allocate_exact_size(vec2(ui.available_width(), METER_HEIGHT), Sense::hover());
-    let fraction = level.map_or(0.0, |level| meter_fraction(level.peak));
-    response.widget_info(|| {
-        let mut info = WidgetInfo::labeled(WidgetType::ProgressIndicator, true, "Microphone level");
-        info.value = Some(f64::from(fraction));
-        info
-    });
-    if !ui.is_rect_visible(rect) {
-        return;
-    }
-    let per_point = ui.pixels_per_point();
-    let track = rect.round_to_pixels(per_point);
-    controls::fill_pixels(ui.painter(), &[track], LINE);
-    if fraction > 0.0 {
-        let mut bar = track;
-        bar.set_right(track.left() + track.width() * fraction);
-        controls::fill_pixels(ui.painter(), &[bar.round_to_pixels(per_point)], SAGE);
-    }
-}
-
 // 0 at METER_FLOOR_DB and below, 1 at full scale.
 fn meter_fraction(peak: f32) -> f32 {
     if peak.is_nan() || peak <= 0.0 {
@@ -690,18 +610,20 @@ fn meter_fraction(peak: f32) -> f32 {
     ((db - METER_FLOOR_DB) / -METER_FLOOR_DB).clamp(0.0, 1.0)
 }
 
-// A field with its name above it, which a screen reader gets as its label.
+// A field for an address or a port, typed in Plex Mono, with its name above
+// it, which a screen reader gets as its label.
 fn labelled(ui: &mut Ui, id: &str, text: &mut String, label: &str, chars: usize) -> Response {
-    let field = controls::field(ui, id, text, "", theme::body(), chars);
+    let field = controls::field(ui, id, text, "", theme::mono(), chars);
     let label = label.to_owned();
     ui.ctx()
         .accesskit_node_builder(field.id, |node| node.set_label(label));
     field
 }
 
+// A help line or an error, half a step under the control it belongs to.
 fn line(ui: &mut Ui, text: &str, color: eframe::egui::Color32) {
-    ui.add_space(8.0);
-    controls::text(ui, text, theme::body(), color);
+    ui.add_space(HALF_STEP);
+    controls::prose(ui, text, theme::caption(), color);
 }
 
 // Only on a PC that has hosted and has any. Each one on two lines, since a
@@ -711,32 +633,33 @@ fn devices(ui: &mut Ui, draft: &mut Draft) {
     if draft.devices.is_empty() {
         return;
     }
-    ui.add_space(24.0);
-    controls::text(ui, "Known devices", theme::medium(), CHALK);
-    ui.add_space(8.0);
+    ui.add_space(SECTION_GAP);
+    head(ui, "Known devices");
     let mut removed = None;
     for (i, device) in draft.devices.iter().enumerate() {
         if i > 0 {
-            ui.add_space(8.0);
+            ui.add_space(STEP);
         }
         let rect = row(ui, ROW_HEIGHT);
-        if with_button(ui, rect, "Remove", |ui| {
+        let remove = Button::new("Remove").role(Role::Destructive);
+        if with_button(ui, rect, remove, |ui| {
             controls::one_line(ui, &device.name, theme::body(), CHALK);
         }) {
             removed = Some(device.key);
         }
         let rect = row(ui, DETAIL_HEIGHT);
         let seen = messages::last_seen(device.last_seen);
-        let seen_width = controls::text_width(ui, &seen, theme::small());
+        let seen_width = controls::text_width(ui, &seen, theme::caption());
         controls::split_row(
             ui,
             rect,
             seen_width,
             |ui| {
-                controls::one_line(ui, &keys::fingerprint(&device.key), theme::mono(), ASH);
+                let print = keys::fingerprint(&device.key);
+                controls::one_line(ui, &print, theme::mono_caption(), ASH);
             },
             |ui| {
-                controls::one_line(ui, &seen, theme::small(), ASH);
+                controls::one_line(ui, &seen, theme::caption(), ASH);
             },
         );
     }
@@ -749,16 +672,12 @@ fn blocked(ui: &mut Ui, draft: &mut Draft) {
     if draft.blocked.is_empty() {
         return;
     }
-    ui.add_space(24.0);
-    controls::text(ui, "Blocked", theme::medium(), CHALK);
-    ui.add_space(8.0);
+    ui.add_space(SECTION_GAP);
+    head(ui, "Blocked");
     let mut unblocked = None;
-    for (i, blocked) in draft.blocked.iter().enumerate() {
-        if i > 0 {
-            ui.add_space(4.0);
-        }
+    for blocked in &draft.blocked {
         let rect = row(ui, ROW_HEIGHT);
-        if with_button(ui, rect, "Unblock", |ui| {
+        if with_button(ui, rect, Button::new("Unblock"), |ui| {
             controls::one_line(ui, &keys::fingerprint(&blocked.key), theme::mono(), CHALK);
         }) {
             unblocked = Some(blocked.key);
@@ -775,8 +694,8 @@ fn row(ui: &mut Ui, height: f32) -> Rect {
 }
 
 // True when the button was pressed.
-fn with_button(ui: &mut Ui, rect: Rect, text: &str, left: impl FnOnce(&mut Ui)) -> bool {
-    let button = Button::new(text).height(rect.height());
+fn with_button(ui: &mut Ui, rect: Rect, button: Button, left: impl FnOnce(&mut Ui)) -> bool {
+    let button = button.height(rect.height());
     let width = button.width(ui);
     let mut pressed = false;
     controls::split_row(ui, rect, width, left, |ui| {
@@ -788,7 +707,7 @@ fn with_button(ui: &mut Ui, rect: Rect, text: &str, left: impl FnOnce(&mut Ui)) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eframe::egui::{Context, RawInput, ViewportId, ViewportInfo};
+    use eframe::egui::{Context, RawInput, ViewportId, ViewportInfo, pos2};
 
     fn typed(address_name: &str) -> Draft {
         Draft {

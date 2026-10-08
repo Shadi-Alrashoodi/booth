@@ -15,7 +15,7 @@ use room::{ChatRefused, Room};
 
 use crate::controls;
 use crate::messages;
-use crate::theme::{self, ASH, BAD, CHALK, CONTROL_HEIGHT, PANEL, SIDE, WARN};
+use crate::theme::{self, ASH, BAD, CHALK, CONTROL_HEIGHT, HALF_STEP, PANEL, SIDE, WARN};
 
 // A line of chat is at most about 70 characters wide. An ordinary sentence
 // gives the width of an ordinary character.
@@ -26,7 +26,7 @@ const MESSAGE_GAP: f32 = 8.0;
 const BODY_LINE: f32 = 18.0;
 const NAME_TO_TIME: f32 = 8.0;
 // The first line keeps clear of the people list, the last of the composer.
-const ENDS: i8 = 12;
+const ENDS: i8 = 16;
 // Far above what one message may be, far below a document pasted by mistake.
 const DRAFT_CHARS: usize = 2048;
 // One formatted time per minute that has a line in it.
@@ -61,7 +61,7 @@ impl Chat {
             draft: String::new(),
             error: None,
             focus_pending: true,
-            bottom: CONTROL_HEIGHT,
+            bottom: CONTROL_HEIGHT + SIDE,
             times: Times::default(),
             heights: Heights::default(),
             names: Names::default(),
@@ -86,20 +86,27 @@ impl Chat {
         area.set_clip_rect(rect.intersect(ui.clip_rect()));
         self.history(&mut area, lines);
 
+        // Still the chat's region: the field sits on its tone with the
+        // gutter either side and 16 px down to the strip. Why a message was
+        // not sent goes half a step under the field, as any field's error.
         let top = ui.cursor().top();
-        if let Some(text) = self.composer(ui, enabled) {
-            self.said(room.say(&text));
-        }
-        if let Some(error) = self.error {
-            Frame::new()
-                .inner_margin(Margin {
-                    left: SIDE as i8,
-                    right: SIDE as i8,
-                    top: 6,
-                    bottom: 6,
-                })
-                .show(ui, |ui| controls::text(ui, error, theme::body(), BAD));
-        }
+        Frame::new()
+            .fill(PANEL)
+            .inner_margin(Margin {
+                left: SIDE as i8,
+                right: SIDE as i8,
+                top: 0,
+                bottom: SIDE as i8,
+            })
+            .show(ui, |ui| {
+                if let Some(text) = self.composer(ui, enabled) {
+                    self.said(room.say(&text));
+                }
+                if let Some(error) = self.error {
+                    ui.add_space(HALF_STEP);
+                    controls::text(ui, error, theme::caption(), BAD);
+                }
+            });
         let bottom = ui.cursor().top() - top;
         if (bottom - self.bottom).abs() > 0.5 {
             self.bottom = bottom;
@@ -183,7 +190,7 @@ impl Chat {
         };
         // A real space before the time and the fingerprint, so a screen
         // reader does not run them together; the rest of each gap is layout.
-        let space = controls::text_width(ui, " ", theme::small());
+        let space = controls::text_width(ui, " ", theme::caption());
         let after_space = (NAME_TO_TIME - space).max(0.0);
         let time = self.times.get(line.at_unix_ms).map(str::to_owned);
         let fingerprint = self
@@ -191,10 +198,13 @@ impl Chat {
             .shared(&line.name)
             .then(|| keys::fingerprint(&line.author));
         let tail = |job: &mut LayoutJob| {
-            let parts = [(&time, theme::small()), (&fingerprint, theme::mono())];
+            let parts = [
+                (&time, theme::mono_caption()),
+                (&fingerprint, theme::mono_caption()),
+            ];
             for (text, font) in parts {
                 if let Some(text) = text {
-                    job.append(" ", 0.0, format(theme::small(), ASH));
+                    job.append(" ", 0.0, format(theme::caption(), ASH));
                     job.append(text, after_space, format(font, ASH));
                 }
             }
@@ -294,14 +304,14 @@ fn system_galley(ui: &Ui, line: &ChatLine, time: Option<&str>, width: f32) -> Ar
     let mut job = LayoutJob::default();
     // The sentence is English, so the line reads left to right even when it
     // starts with an Arabic name, which would otherwise turn it around.
-    job.append(&LTR_MARK.to_string(), 0.0, format(theme::small(), ASH));
+    job.append(&LTR_MARK.to_string(), 0.0, format(theme::caption(), ASH));
     let mut leading = 0.0;
     if let Some(time) = time {
-        job.append(time, 0.0, format(theme::small(), ASH));
+        job.append(time, 0.0, format(theme::mono_caption(), ASH));
         // A real space, so a screen reader does not run the time into the
         // sentence; the rest of the gap is layout, as on a name line.
-        job.append(" ", 0.0, format(theme::small(), ASH));
-        let space = controls::text_width(ui, " ", theme::small());
+        job.append(" ", 0.0, format(theme::caption(), ASH));
+        let space = controls::text_width(ui, " ", theme::caption());
         leading = (NAME_TO_TIME - space).max(0.0);
     }
     job.append(&line.text, leading, format(theme::body(), color));
@@ -605,7 +615,7 @@ mod tests {
             assert_eq!(galley.text(), "\u{200E}21:15 Ines started sharing");
             let sections = &galley.job.sections;
             assert!(sections.iter().all(|section| section.format.color == ASH));
-            assert_eq!(sections[0].format.font_id, theme::small());
+            assert_eq!(sections[0].format.font_id, theme::caption());
             assert_eq!(sections.last().unwrap().format.font_id, theme::body());
             assert_eq!(galley.size().y, BODY_LINE);
 

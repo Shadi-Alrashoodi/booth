@@ -3,51 +3,86 @@ use std::ops::RangeInclusive;
 use eframe::egui::emath::GuiRounding;
 use eframe::egui::{
     Align, Color32, Context, CursorIcon, Event, EventFilter, FontId, Frame, Id, Key,
-    KeyboardShortcut, Label, Layout, Margin, Mesh, Modifiers, Painter, Rect, Response, RichText,
-    ScrollArea, Sense, Stroke, TextEdit, Ui, UiBuilder, Vec2, WidgetInfo, WidgetType, accesskit,
-    pos2, vec2,
+    KeyboardShortcut, Label, LayerId, Layout, Margin, Mesh, Modifiers, Order, Painter, Rect,
+    Response, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextEdit, Ui, UiBuilder,
+    Vec2, WidgetInfo, WidgetType, accesskit, pos2, vec2,
 };
 
+use crate::mark;
 use crate::theme::{
-    self, AMBER, CHALK, CONTROL_HEIGHT, LINE, LINE_STRONG, PANEL, ROW_HEIGHT, SIDE,
+    self, AMBER, ASH, CHALK, CHECK_RADIUS, CONTROL_HEIGHT, CONTROL_RADIUS, EDGE, FIELD_FILL,
+    FIELD_FOCUS, FIELD_HINT, FIELD_TEXT, FOCUS_RING, ICON_SIZE, INK, PANEL, PRIMARY_WIDTH,
+    RING_GAP, RING_RADIUS, RING_WIDTH, ROW_HEIGHT, Role, SIDE, STEP, TEXT_PAD, TITLE_ROW,
+    TOGGLE_ON, TRACK_RADIUS,
 };
 
-const TEXT_PAD: f32 = 12.0;
-// The slider's line is two points of line strong, the colour of anything
-// found by its edge, filled in chalk up to the handle, a chalk bar as tall as
-// a line of text.
-const TRACK: f32 = 2.0;
+// The slider's track and the meter's, and the handle on the slider: a chalk
+// bar as tall as a line of text.
+const TRACK: f32 = 4.0;
 const HANDLE: Vec2 = vec2(6.0, 16.0);
 const COMPOSER_ROWS: f32 = 4.0;
-const FIELD_PAD: i8 = 10;
-const RING_WIDTH: f32 = 2.0;
-const RING_GAP: f32 = 1.0;
+const CHOICE_MARK: f32 = 16.0;
+const RADIO_DOT: f32 = 6.0;
+// Sentences on the start screen, the firewall screen and in settings stop at
+// about this many characters, measured on an ordinary sentence.
+const PROSE_CHARS: f32 = 60.0;
+const SAMPLE: &str = "the quick brown fox jumps over the lazy dog";
 const KEYBOARD_FOCUS: &str = "focus came from the keyboard";
+const FOCUS_LAYER: &str = "focus rings";
 
-// The room name on the left, the verbs for the whole room on the right in
-// reading order, and a hairline under it. The row is as tall as its buttons.
+// What sits at the left of the title row: the mark, on the screens before a
+// room, or the screen's title.
+#[derive(Clone, Copy)]
+pub enum Lead<'a> {
+    Mark,
+    Title(&'a str),
+}
+
+// 48 px in window tone, with its 32 px row in the middle: the mark or the
+// title on the left, the verbs at the right in reading order, and no line
+// under it; what follows starts with its own tone or its own first row.
 // Returns which verb was pressed; one that is not enabled never is.
-pub fn title_row(ui: &mut Ui, title: &str, verbs: &[Button]) -> Option<usize> {
-    let (rect, _) =
-        ui.allocate_exact_size(vec2(ui.available_width(), CONTROL_HEIGHT), Sense::hover());
-    // Under the buttons, so their own borders are the edge they sit on.
-    hairline(ui, rect.bottom());
+pub fn title_row(ui: &mut Ui, lead: Lead, verbs: &[Button]) -> Option<usize> {
+    let (outer, _) = ui.allocate_exact_size(vec2(ui.available_width(), TITLE_ROW), Sense::hover());
+    let rect = outer.shrink2(vec2(SIDE, (TITLE_ROW - CONTROL_HEIGHT) / 2.0));
     // The row is its own clip, so a focus ring on a verb stays inside the
     // window at the top and above the region below, which paints later.
-    let mut row = ui.new_child(UiBuilder::new().max_rect(rect));
-    row.set_clip_rect(rect.intersect(ui.clip_rect()));
+    let mut row = ui.new_child(UiBuilder::new().max_rect(outer));
+    row.set_clip_rect(outer.intersect(ui.clip_rect()));
     let width = buttons_width(&row, verbs);
     let mut pressed = None;
     split_row(
         &mut row,
-        rect.shrink2(vec2(SIDE, 0.0)),
+        rect,
         width,
-        |ui| {
-            one_line(ui, title, theme::title(), CHALK);
+        |ui| match lead {
+            Lead::Mark => {
+                paint_mark(ui);
+            }
+            Lead::Title(title) => {
+                one_line(ui, title, theme::title(), CHALK);
+            }
         },
         |ui| pressed = buttons(ui, verbs, rect.height()),
     );
     pressed
+}
+
+// The mark in amber, 16 px, on whole device pixels.
+fn paint_mark(ui: &mut Ui) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(ICON_SIZE, ICON_SIZE), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let per_point = ui.pixels_per_point();
+        let origin = rect.min.round_to_pixels(per_point);
+        let size = (ICON_SIZE * per_point).round() as u32;
+        let at = |x: u32, y: u32| origin + vec2(x as f32, y as f32) / per_point;
+        let bars: Vec<Rect> = mark::rects(size)
+            .iter()
+            .map(|[l, t, r, b]| Rect::from_min_max(at(*l, *t), at(*r, *b)))
+            .collect();
+        fill_pixels(ui.painter(), &bars, AMBER);
+    }
+    response
 }
 
 // Buttons side by side with the usual gap, as wide as buttons() lays them.
@@ -74,9 +109,9 @@ pub fn buttons(ui: &mut Ui, buttons: &[Button], height: f32) -> Option<usize> {
 }
 
 // One row with a name on the left and one thing `right_width` wide at the
-// right edge. The width is known up front so the left side is laid out
-// first, in reading order for Tab and screen readers, and is what gets cut
-// when the row is narrow.
+// right edge, at least 8 px apart. The width is known up front so the left
+// side is laid out first, in reading order for Tab and screen readers, and
+// is what gets cut when the row is narrow.
 pub fn split_row(
     ui: &mut Ui,
     rect: Rect,
@@ -85,7 +120,7 @@ pub fn split_row(
     right: impl FnOnce(&mut Ui),
 ) {
     let left_end = if right_width > 0.0 {
-        rect.right() - right_width - SIDE
+        rect.right() - right_width - STEP
     } else {
         rect.right()
     };
@@ -129,59 +164,55 @@ pub fn one_line(ui: &mut Ui, text: &str, font: FontId, color: Color32) -> Respon
     )
 }
 
-// The body of a screen: the side gutter, and room above the first line.
+// The body of a screen: the side gutter, and the first line 16 px below the
+// title row's controls, which have 8 of their own under them.
 pub fn page<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    gutter(ui, STEP, SIDE, add)
+}
+
+// The same side gutter with its own space above and below: after a block in
+// panel tone, or for a line that belongs to the row above it.
+pub fn gutter<R>(ui: &mut Ui, top: f32, bottom: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     Frame::new()
         .inner_margin(Margin {
             left: SIDE as i8,
             right: SIDE as i8,
-            top: 16,
-            bottom: 16,
+            top: top as i8,
+            bottom: bottom as i8,
         })
         .show(ui, add)
         .inner
 }
 
-// A 1 px line in the line colour whose bottom edge is at `bottom`.
-pub fn hairline(ui: &Ui, bottom: f32) {
-    let per_point = ui.pixels_per_point();
-    let rect = ui.max_rect();
-    let bottom = bottom.round_to_pixels(per_point);
-    let line = Rect::from_min_max(
-        pos2(rect.left(), bottom - thickness(1.0, per_point)),
-        pos2(rect.right(), bottom),
-    );
-    fill_pixels(ui.painter(), &[line.round_to_pixels(per_point)], LINE);
+// A block set into the window in panel tone, edge to edge with square
+// corners, since it meets the window's straight sides: the invite, a code to
+// send back, a control request, the monitor list. The gutter at the sides
+// and the bottom; `top` is 8 when the first line is a 32 px row, which
+// carries its own space above its words, and 16 when it is a sentence.
+pub fn region<R>(ui: &mut Ui, top: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    Frame::new()
+        .fill(PANEL)
+        .inner_margin(Margin {
+            left: SIDE as i8,
+            right: SIDE as i8,
+            top: top as i8,
+            bottom: SIDE as i8,
+        })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui)
+        })
+        .inner
 }
 
-// A border `width` points thick inside `rect`.
-pub fn border(painter: &Painter, rect: Rect, width: f32, color: Color32) {
-    let per_point = painter.pixels_per_point();
-    fill_pixels(painter, &border_rects(rect, width, per_point), color);
-}
-
-// The four sides of a border on whole device pixels. The width is rounded
-// down to whole pixels and never under one, so at 150 percent a 1 px line is
-// one crisp row in its own colour instead of two rows in a colour between.
-// egui's own strokes land wherever the maths puts them.
-pub fn border_rects(rect: Rect, width: f32, per_point: f32) -> [Rect; 4] {
-    let outer = rect.round_to_pixels(per_point);
-    let t = thickness(width, per_point);
-    let (top, bottom) = (outer.top() + t, outer.bottom() - t);
-    [
-        Rect::from_min_max(outer.min, pos2(outer.right(), top)),
-        Rect::from_min_max(pos2(outer.left(), bottom), outer.max),
-        Rect::from_min_max(pos2(outer.left(), top), pos2(outer.left() + t, bottom)),
-        Rect::from_min_max(pos2(outer.right() - t, top), pos2(outer.right(), bottom)),
-    ]
-}
-
-fn thickness(width: f32, per_point: f32) -> f32 {
+// Whole device pixels, never under one, so at 150 percent a 1 px edge is one
+// crisp row in its own colour instead of two rows in a colour between.
+pub fn thickness(width: f32, per_point: f32) -> f32 {
     (width * per_point).floor().max(1.0) / per_point
 }
 
 // As one mesh, because egui feathers the edges of a filled rect and on a
-// line one pixel thick the feathering is most of the line.
+// bar a few pixels thick the feathering is a visible part of it.
 pub fn fill_pixels(painter: &Painter, rects: &[Rect], color: Color32) {
     let mut mesh = Mesh::default();
     for rect in rects {
@@ -190,12 +221,44 @@ pub fn fill_pixels(painter: &Painter, rects: &[Rect], color: Color32) {
     painter.add(mesh);
 }
 
-// egui's focus look is its pressed look, so the ring is drawn here: 2 px,
-// one pixel clear of the control's own border. Where the clip would cut it
-// (a button that fills the title row) it moves in rather than vanish.
-pub fn ring(ui: &Ui, rect: Rect, color: Color32) {
-    let outer = rect.expand(RING_GAP + RING_WIDTH).intersect(ui.clip_rect());
-    border(ui.painter(), outer, RING_WIDTH, color);
+// egui's focus look is its pressed look, so the ring is drawn here: 2 px of
+// chalk, 2 px clear of the control, rounded 6 around a control rounded 4.
+// Where the clip would cut it (a button in the title row, the strip on the
+// window's bottom edge) it moves in rather than vanish.
+pub fn ring(ui: &Ui, rect: Rect) {
+    ring_within(ui.painter(), rect, ui.clip_rect());
+}
+
+// On a layer above the panel, so a region painted later, like the chat under
+// the last row of people, cannot cover the part that reaches past the row.
+pub fn ring_within(painter: &Painter, rect: Rect, bounds: Rect) {
+    let painter = painter
+        .clone()
+        .with_layer_id(LayerId::new(Order::Foreground, Id::new(FOCUS_LAYER)))
+        .with_clip_rect(bounds);
+    let per_point = painter.pixels_per_point();
+    let width = thickness(RING_WIDTH, per_point);
+    let mut outer = rect.expand(RING_GAP + width);
+    outer.min = outer.min.max(bounds.min);
+    outer.max = outer.max.min(bounds.max);
+    painter.rect_stroke(
+        outer.round_to_pixels(per_point),
+        RING_RADIUS,
+        Stroke::new(width, FOCUS_RING),
+        StrokeKind::Inside,
+    );
+}
+
+// The one edge a field ever has: 1 px of amber just inside it while it has
+// focus, clicked or tabbed to. The fill does not change.
+fn focus_edge(ui: &Ui, rect: Rect) {
+    let per_point = ui.pixels_per_point();
+    ui.painter().rect_stroke(
+        rect.round_to_pixels(per_point),
+        CONTROL_RADIUS,
+        Stroke::new(thickness(1.0, per_point), FIELD_FOCUS),
+        StrokeKind::Inside,
+    );
 }
 
 // egui also focuses a control that was clicked, and a ring left behind after
@@ -237,7 +300,13 @@ pub struct Button<'a> {
     text: &'a str,
     // What a screen reader says, when the text alone does not say enough.
     label: Option<&'a str>,
-    color: Color32,
+    role: Role,
+    // A secondary toggle that is on keeps the control fill.
+    on: bool,
+    // The label's colour in place of the role's, for a word that is live,
+    // a warning, or waiting.
+    color: Option<Color32>,
+    icon: Option<&'a str>,
     height: f32,
     min_width: f32,
     enter_target: bool,
@@ -249,7 +318,10 @@ impl<'a> Button<'a> {
         Button {
             text,
             label: None,
-            color: CHALK,
+            role: Role::Secondary,
+            on: false,
+            color: None,
+            icon: None,
             height: CONTROL_HEIGHT,
             min_width: 0.0,
             enter_target: false,
@@ -257,8 +329,23 @@ impl<'a> Button<'a> {
         }
     }
 
+    pub fn role(mut self, role: Role) -> Button<'a> {
+        self.role = role;
+        self
+    }
+
+    pub fn on(mut self, on: bool) -> Button<'a> {
+        self.on = on;
+        self
+    }
+
     pub fn color(mut self, color: Color32) -> Button<'a> {
-        self.color = color;
+        self.color = Some(color);
+        self
+    }
+
+    pub fn icon(mut self, icon: &'a str) -> Button<'a> {
+        self.icon = Some(icon);
         self
     }
 
@@ -288,34 +375,84 @@ impl<'a> Button<'a> {
         self
     }
 
-    // Set while a field has focus whose Enter presses this button, so the
-    // button carries the amber ring that says so.
+    // Set while a field has focus whose Enter presses this button. A
+    // primary needs no other mark; a secondary shows the fill it has under
+    // the mouse.
     pub fn enter_target(mut self, yes: bool) -> Button<'a> {
         self.enter_target = yes;
         self
     }
 
+    fn icon_width(&self) -> f32 {
+        if self.icon.is_some() {
+            ICON_SIZE + STEP
+        } else {
+            0.0
+        }
+    }
+
     pub fn width(&self, ui: &Ui) -> f32 {
-        (text_width(ui, self.text, theme::body()) + 2.0 * TEXT_PAD)
+        let least = if self.role == Role::Primary {
+            PRIMARY_WIDTH
+        } else {
+            0.0
+        };
+        (text_width(ui, self.text, theme::medium()) + self.icon_width() + 2.0 * TEXT_PAD)
             .max(self.height)
             .max(self.min_width)
+            .max(least)
     }
 
     pub fn show(self, ui: &mut Ui) -> Response {
-        let galley = ui
-            .painter()
-            .layout_no_wrap(self.text.to_owned(), theme::body(), self.color);
         let width = self.width(ui);
         let (rect, response) = ui.allocate_exact_size(vec2(width, self.height), Sense::click());
         let label = self.label.unwrap_or(self.text);
         response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, self.enabled, label));
         if ui.is_rect_visible(rect) {
+            let keyboard = response.has_focus() && keyboard_focus(ui);
+            let look = if self.on { TOGGLE_ON } else { self.role.look() };
+            let lit = response.hovered()
+                || (keyboard && self.role == Role::Destructive)
+                || (self.enter_target && self.role != Role::Primary);
+            let paint = if !self.enabled {
+                theme::Paint {
+                    fill: if self.on {
+                        look.rest.fill
+                    } else {
+                        Color32::TRANSPARENT
+                    },
+                    label: ASH,
+                }
+            } else if response.is_pointer_button_down_on() {
+                look.press
+            } else if lit {
+                look.hover
+            } else {
+                look.rest
+            };
+            let label_color = match self.color {
+                Some(color) if self.enabled && self.role == Role::Secondary => color,
+                _ => paint.label,
+            };
             let painter = ui.painter();
-            border(painter, rect, 1.0, LINE_STRONG);
-            let at = (rect.center() - galley.size() / 2.0).round();
-            painter.galley(at, galley, self.color);
-            if (response.has_focus() && keyboard_focus(ui)) || self.enter_target {
-                ring(ui, rect, AMBER);
+            if paint.fill != Color32::TRANSPARENT {
+                painter.rect_filled(rect, CONTROL_RADIUS, paint.fill);
+            }
+            let galley = painter.layout_no_wrap(self.text.to_owned(), theme::medium(), label_color);
+            let whole = self.icon_width() + galley.size().x;
+            let left = rect.center().x - whole / 2.0;
+            if let Some(icon) = self.icon {
+                let glyph = painter.layout_no_wrap(icon.to_owned(), theme::icon(), label_color);
+                let at = pos2(left, rect.center().y - glyph.size().y / 2.0);
+                painter.galley(at.round(), glyph, label_color);
+            }
+            let at = pos2(
+                left + self.icon_width(),
+                rect.center().y - galley.size().y / 2.0,
+            );
+            painter.galley(at.round(), galley, label_color);
+            if keyboard {
+                ring(ui, rect);
             }
         }
         if self.enabled {
@@ -326,11 +463,25 @@ impl<'a> Button<'a> {
     }
 }
 
+// A glyph from the icon font, 16 px, in the colour of the text it belongs
+// to.
+pub fn icon(ui: &mut Ui, glyph: &str, color: Color32) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(ICON_SIZE, ICON_SIZE), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let galley = ui
+            .painter()
+            .layout_no_wrap(glyph.to_owned(), theme::icon(), color);
+        let at = rect.center() - galley.size() / 2.0;
+        ui.painter().galley(at.round(), galley, color);
+    }
+    response
+}
+
 // A whole number picked along a line, with the number and its unit written
 // at the right, since the line alone does not say how much. Drag or click
 // on the line; with focus, the arrow keys step by one, Page Up and Page Down
-// by ten, Home and End go to the ends. The row is ROW_HEIGHT tall, and all
-// of it left of the number is the target.
+// by ten, Home and End go to the ends. The row is 32 px tall, and all of it
+// left of the number is the target.
 pub fn slider(
     ui: &mut Ui,
     id: Id,
@@ -340,7 +491,7 @@ pub fn slider(
     label: &str,
 ) -> Response {
     let (lowest, highest) = (*range.start(), (*range.end()).max(*range.start()));
-    let widest = text_width(ui, &format!("{highest} {unit}"), theme::body());
+    let widest = text_width(ui, &format!("{highest} {unit}"), theme::mono());
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::hover());
     let track_rect = Rect::from_min_max(
         rect.min,
@@ -418,15 +569,16 @@ pub fn slider(
         )
         .round_to_pixels(per_point)
     };
-    fill_pixels(
-        ui.painter(),
-        &[line(track_rect.left(), track_rect.right())],
-        LINE_STRONG,
+    let painter = ui.painter();
+    painter.rect_filled(
+        line(track_rect.left(), track_rect.right()),
+        TRACK_RADIUS,
+        EDGE,
     );
-    fill_pixels(ui.painter(), &[line(track_rect.left(), at)], CHALK);
+    painter.rect_filled(line(track_rect.left(), at), TRACK_RADIUS, AMBER);
     let handle =
         Rect::from_center_size(pos2(at, rect.center().y), HANDLE).round_to_pixels(per_point);
-    fill_pixels(ui.painter(), &[handle], CHALK);
+    painter.rect_filled(handle, TRACK_RADIUS, CHALK);
     let shown = format!("{next} {unit}");
     let mut text = ui.new_child(
         UiBuilder::new()
@@ -436,9 +588,12 @@ pub fn slider(
             ))
             .layout(Layout::right_to_left(Align::Center)),
     );
-    one_line(&mut text, &shown, theme::body(), CHALK);
+    one_line(&mut text, &shown, theme::mono(), CHALK);
     if response.has_focus() && keyboard_focus(ui) {
-        ring(ui, track_rect, LINE_STRONG);
+        ring(
+            ui,
+            track_rect.shrink2(vec2(0.0, (ROW_HEIGHT - HANDLE.y) / 2.0)),
+        );
     }
     response.on_hover_cursor(CursorIcon::PointingHand)
 }
@@ -452,6 +607,109 @@ fn value_at(x: f32, left: f32, right: f32, lowest: u32, highest: u32) -> u32 {
     lowest + (fraction * (highest - lowest) as f32).round() as u32
 }
 
+// A level along the same 4 px track as the slider, in chalk up to the level:
+// a level is not a verdict, so it is never sage.
+pub fn meter(ui: &mut Ui, fraction: f32, label: &str) {
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), TRACK), Sense::hover());
+    response.widget_info(|| {
+        let mut info = WidgetInfo::labeled(WidgetType::ProgressIndicator, true, label);
+        info.value = Some(f64::from(fraction));
+        info
+    });
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let per_point = ui.pixels_per_point();
+    let track = rect.round_to_pixels(per_point);
+    ui.painter()
+        .rect_filled(track, TRACK_RADIUS, theme::CONTROL);
+    if fraction > 0.0 {
+        let mut bar = track;
+        bar.set_right(track.left() + track.width() * fraction.min(1.0));
+        ui.painter()
+            .rect_filled(bar.round_to_pixels(per_point), TRACK_RADIUS, CHALK);
+    }
+}
+
+// A checkbox for a setting that is on or off, a radio for one of a set: the
+// shape says which kind of choice it is, and the amber fill says which is
+// chosen. The whole 32 px row is the target, the name 8 px after the mark,
+// and a note after the name in caption ash.
+pub fn choice_row(
+    ui: &mut Ui,
+    id: Id,
+    selected: bool,
+    name: &str,
+    note: Option<&str>,
+    kind: WidgetType,
+) -> Response {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::hover());
+    let response = ui.interact(rect, id, Sense::click());
+    response.widget_info(|| WidgetInfo::selected(kind, true, selected, name));
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let per_point = ui.pixels_per_point();
+    let mark = Rect::from_min_size(
+        pos2(rect.left(), rect.center().y - CHOICE_MARK / 2.0),
+        vec2(CHOICE_MARK, CHOICE_MARK),
+    )
+    .round_to_pixels(per_point);
+    let painter = ui.painter();
+    let edge = thickness(1.0, per_point);
+    match (kind, selected) {
+        (WidgetType::RadioButton, false) => {
+            painter.circle_stroke(
+                mark.center(),
+                CHOICE_MARK / 2.0 - edge / 2.0,
+                Stroke::new(edge, EDGE),
+            );
+        }
+        (WidgetType::RadioButton, true) => {
+            painter.circle_filled(mark.center(), CHOICE_MARK / 2.0, AMBER);
+            painter.circle_filled(mark.center(), RADIO_DOT / 2.0, INK);
+        }
+        (_, false) => {
+            painter.rect_stroke(
+                mark,
+                CHECK_RADIUS,
+                Stroke::new(edge, EDGE),
+                StrokeKind::Inside,
+            );
+        }
+        (_, true) => {
+            painter.rect_filled(mark, CHECK_RADIUS, AMBER);
+            let at = |x: f32, y: f32| mark.min + vec2(x, y);
+            painter.add(Shape::line(
+                vec![at(4.0, 8.5), at(7.0, 11.5), at(12.0, 5.0)],
+                Stroke::new(2.0, INK),
+            ));
+        }
+    }
+    let text = Rect::from_min_max(pos2(mark.right() + STEP, rect.top()), rect.max);
+    let mut row = ui.new_child(
+        UiBuilder::new()
+            .max_rect(text)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    one_line(&mut row, name, theme::body(), CHALK);
+    if let Some(note) = note {
+        one_line(&mut row, note, theme::caption(), ASH);
+    }
+    if response.has_focus() && keyboard_focus(ui) {
+        ring(ui, rect);
+    }
+    response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+fn field_frame(vertical: i8) -> Frame {
+    Frame::new()
+        .fill(FIELD_FILL)
+        .corner_radius(CONTROL_RADIUS)
+        .inner_margin(Margin::symmetric(TEXT_PAD as i8, vertical))
+}
+
 pub fn field(
     ui: &mut Ui,
     id: &str,
@@ -463,36 +721,28 @@ pub fn field(
     let output = TextEdit::singleline(text)
         .id_salt(id)
         .char_limit(char_limit)
-        .hint_text(RichText::new(hint).font(theme::body()))
+        .hint_text(RichText::new(hint).font(theme::body()).color(FIELD_HINT))
         .font(font)
-        .text_color(CHALK)
-        .frame(
-            Frame::new()
-                .fill(PANEL)
-                // Keeps the room for the border, which is drawn below on
-                // whole pixels.
-                .stroke(Stroke::new(1.0, Color32::TRANSPARENT))
-                .inner_margin(Margin::symmetric(FIELD_PAD, 0)),
-        )
+        .text_color(FIELD_TEXT)
+        .frame(field_frame(0))
         .vertical_align(Align::Center)
         .desired_width(f32::INFINITY)
         .min_size(vec2(0.0, CONTROL_HEIGHT))
         .show(ui);
     let response = output.response.response;
-    border(ui.painter(), response.rect, 1.0, LINE_STRONG);
-    // A screen reader reads the placeholder as the field's name, since
-    // there is no label above it.
+    // A screen reader reads the placeholder as the field's name, unless the
+    // caller names it after a label above it.
     ui.ctx()
         .accesskit_node_builder(response.id, |node| node.set_label(hint));
-    // A field shows its ring on a click too: the caret alone is easy to lose.
     if response.has_focus() {
-        ring(ui, response.rect, LINE_STRONG);
+        focus_edge(ui, response.rect);
     }
     response
 }
 
-// A field for a short list, one entry per line. Enter starts a new line, so
-// nothing is pressed by it. `label` is what a screen reader calls it.
+// A field for a short list of addresses, one per line, typed in Plex Mono.
+// Enter starts a new line, so nothing is pressed by it. `label` is what a
+// screen reader calls it.
 pub fn lines_field(
     ui: &mut Ui,
     id: &str,
@@ -501,27 +751,22 @@ pub fn lines_field(
     rows: usize,
     char_limit: usize,
 ) -> Response {
-    let font = theme::body();
+    let font = theme::mono();
+    let row = line_height(&font);
     let output = TextEdit::multiline(text)
         .id_salt(id)
         .char_limit(char_limit)
-        .font(font.clone())
-        .text_color(CHALK)
-        .frame(
-            Frame::new()
-                .fill(PANEL)
-                .stroke(Stroke::new(1.0, Color32::TRANSPARENT))
-                .inner_margin(Margin::symmetric(FIELD_PAD, 7)),
-        )
+        .font(font)
+        .text_color(FIELD_TEXT)
+        .frame(field_frame(((CONTROL_HEIGHT - row) / 2.0).floor() as i8))
         .desired_width(f32::INFINITY)
         .desired_rows(rows)
         .show(ui);
     let response = output.response.response;
-    border(ui.painter(), response.rect, 1.0, LINE_STRONG);
     ui.ctx()
         .accesskit_node_builder(response.id, |node| node.set_label(label));
     if response.has_focus() {
-        ring(ui, response.rect, LINE_STRONG);
+        focus_edge(ui, response.rect);
     }
     response
 }
@@ -534,11 +779,11 @@ pub fn right_to_left(text: &str) -> bool {
     unicode_bidi::get_base_direction_full(text) == unicode_bidi::Direction::Rtl
 }
 
-// The chat's field, the width of the panel: one line that grows to four and
-// then scrolls. Shift+Enter starts a new line; plain Enter is left to the
-// caller, which sends. Tab still moves on, as in any other field. What is
-// typed sits at the right edge while it starts with a right-to-left letter,
-// the way the message will show in the chat.
+// The chat's field: one line that grows to four and then scrolls. Shift+Enter
+// starts a new line; plain Enter is left to the caller, which sends. Tab
+// still moves on, as in any other field. What is typed sits at the right
+// edge while it starts with a right-to-left letter, the way the message will
+// show in the chat.
 pub fn composer(
     ui: &mut Ui,
     id: &str,
@@ -550,13 +795,7 @@ pub fn composer(
     let row = ui.fonts_mut(|fonts| fonts.row_height(&font));
     let pad = ((CONTROL_HEIGHT - row) / 2.0).floor();
     let rtl = right_to_left(text);
-    let frame = Frame::new().fill(PANEL).inner_margin(Margin {
-        left: SIDE as i8,
-        right: SIDE as i8,
-        top: pad as i8,
-        bottom: pad as i8,
-    });
-    let shown = frame.show(ui, |ui| {
+    let shown = field_frame(pad as i8).show(ui, |ui| {
         ui.set_min_height(CONTROL_HEIGHT - 2.0 * pad);
         ScrollArea::vertical()
             .id_salt(id)
@@ -566,9 +805,9 @@ pub fn composer(
                 TextEdit::multiline(text)
                     .id_salt(id)
                     .char_limit(char_limit)
-                    .hint_text(RichText::new(hint).font(theme::body()))
+                    .hint_text(RichText::new(hint).font(theme::body()).color(FIELD_HINT))
                     .font(font)
-                    .text_color(CHALK)
+                    .text_color(FIELD_TEXT)
                     .frame(Frame::NONE)
                     .margin(Margin::ZERO)
                     .desired_rows(1)
@@ -588,12 +827,10 @@ pub fn composer(
         ui.ctx().request_repaint();
     }
     let response = shown.inner;
-    let outer = shown.response.rect;
-    border(ui.painter(), outer, 1.0, LINE_STRONG);
     ui.ctx()
         .accesskit_node_builder(response.id, |node| node.set_label(hint));
     if response.has_focus() {
-        ring(ui, outer, LINE_STRONG);
+        focus_edge(ui, shown.response.rect);
     }
     response
 }
@@ -615,9 +852,11 @@ pub fn enter_pressed(ui: &Ui) -> bool {
     })
 }
 
-// The type scale's line height for each size.
+// The type scale's line height for each step.
 pub fn line_height(font: &FontId) -> f32 {
-    if font.size >= 15.0 {
+    if font.size >= 16.0 {
+        24.0
+    } else if font.size >= 14.0 {
         20.0
     } else if font.size >= 13.0 {
         18.0
@@ -634,6 +873,18 @@ pub fn text(ui: &mut Ui, text: impl Into<String>, font: FontId, color: Color32) 
             .color(color)
             .line_height(Some(line_height)),
     )
+}
+
+// A sentence or two, wrapped at about 60 characters however wide the window
+// is: short lines are read at a glance, beside a game.
+pub fn prose(ui: &mut Ui, words: impl Into<String>, font: FontId, color: Color32) -> Response {
+    let sample = text_width(ui, SAMPLE, font.clone());
+    let most = PROSE_CHARS * sample / SAMPLE.chars().count() as f32;
+    ui.scope(|ui| {
+        ui.set_max_width(ui.available_width().min(most));
+        text(ui, words, font, color)
+    })
+    .inner
 }
 
 // Codes are read from both ends when people compare them, so the cut goes in
@@ -751,9 +1002,11 @@ pub(crate) mod tests {
                 .color(theme::ASH)
                 .enabled(false)
                 .label(busy),
-            Button::new("Leave"),
+            Button::new("Leave").role(Role::Destructive),
         ]
     }
+
+    const TUESDAY: Lead = Lead::Title("Tuesday night");
 
     // Share and Leave at the right of the title row in that order. While
     // someone else shares, Share stays in ash, a click on it does nothing,
@@ -764,16 +1017,18 @@ pub(crate) mod tests {
         theme::apply(&ctx);
         ctx.enable_accesskit();
         let busy = "Share. Ines is sharing. One share at a time.";
+        // The middle of the 32 px row inside the 48 px title row.
+        let middle = TITLE_ROW / 2.0;
         let ((share, leave), output) = frame(&ctx, Vec::new(), |ui| {
             let verbs = verbs(busy);
             let width = buttons_width(ui, &verbs);
             let (share, leave) = (verbs[0].width(ui), verbs[1].width(ui));
-            assert_eq!(title_row(ui, "Tuesday night", &verbs), None);
+            assert_eq!(title_row(ui, TUESDAY, &verbs), None);
             // From the right edge, less the gutter, in reading order.
             let right = 360.0 - SIDE;
             (
-                pos2(right - width + share / 2.0, 16.0),
-                pos2(right - leave / 2.0, 16.0),
+                pos2(right - width + share / 2.0, middle),
+                pos2(right - leave / 2.0, middle),
             )
         });
         let nodes = output.accesskit_update.unwrap().nodes;
@@ -785,30 +1040,34 @@ pub(crate) mod tests {
         assert!(spoken.is_disabled());
 
         for (at, pressed) in [(share, None), (leave, Some(1))] {
-            frame(&ctx, press(at), |ui| {
-                title_row(ui, "Tuesday night", &verbs(busy))
-            });
-            let (got, _) = frame(&ctx, release(at), |ui| {
-                title_row(ui, "Tuesday night", &verbs(busy))
-            });
+            frame(&ctx, press(at), |ui| title_row(ui, TUESDAY, &verbs(busy)));
+            let (got, _) = frame(&ctx, release(at), |ui| title_row(ui, TUESDAY, &verbs(busy)));
             assert_eq!(got, pressed, "{at:?}");
         }
-        let (enabled, _) = frame(&ctx, press(share), |ui| {
-            title_row(
-                ui,
-                "Tuesday night",
-                &[Button::new("Share"), Button::new("Leave")],
-            )
+        let enabled = || [Button::new("Share"), Button::new("Leave")];
+        let (got, _) = frame(&ctx, press(share), |ui| title_row(ui, TUESDAY, &enabled()));
+        assert_eq!(got, None);
+        let (got, _) = frame(&ctx, release(share), |ui| {
+            title_row(ui, TUESDAY, &enabled())
         });
-        assert_eq!(enabled, None);
-        let (enabled, _) = frame(&ctx, release(share), |ui| {
-            title_row(
-                ui,
-                "Tuesday night",
-                &[Button::new("Share"), Button::new("Leave")],
-            )
+        assert_eq!(got, Some(0));
+    }
+
+    // Host and Join line up as one column whatever their words.
+    #[test]
+    fn primaries_are_at_least_80_wide() {
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        frame(&ctx, Vec::new(), |ui| {
+            let host = Button::new("Host").role(Role::Primary);
+            let join = Button::new("Join").role(Role::Primary);
+            assert_eq!(host.width(ui), PRIMARY_WIDTH);
+            assert_eq!(join.width(ui), PRIMARY_WIDTH);
+            assert!(Button::new("Join").width(ui) < PRIMARY_WIDTH);
+            let gear = Button::new("Settings").icon(theme::icons::regular::GEAR_SIX);
+            let plain = Button::new("Settings");
+            assert_eq!(gear.width(ui), plain.width(ui) + ICON_SIZE + STEP);
         });
-        assert_eq!(enabled, Some(0));
     }
 
     // The arrow keys step by one, Page Up and Page Down by ten, Home and End
@@ -883,20 +1142,15 @@ pub(crate) mod tests {
         assert!((40..=41).contains(&at), "{at}");
     }
 
+    // One device pixel until the scale reaches 200 percent, never a part of
+    // one.
     #[test]
-    fn borders_land_on_whole_pixels() {
+    fn edges_are_whole_pixels() {
         for per_point in [1.0, 1.25, 1.5, 1.75, 2.0] {
-            let rect = Rect::from_min_max(pos2(12.3, 40.7), pos2(80.1, 72.7));
-            for side in border_rects(rect, 1.0, per_point) {
-                for edge in [side.left(), side.right(), side.top(), side.bottom()] {
-                    let px = edge * per_point;
-                    assert!((px - px.round()).abs() < 1e-3, "{per_point}: {edge}");
-                }
-            }
-            // One device pixel thick until the scale reaches 200 percent.
-            let top = border_rects(rect, 1.0, per_point)[0];
-            let rows = top.height() * per_point;
+            let rows = thickness(1.0, per_point) * per_point;
             assert!((rows - per_point.floor()).abs() < 1e-3, "{per_point}");
+            let ring = thickness(RING_WIDTH, per_point) * per_point;
+            assert!((ring - ring.round()).abs() < 1e-3, "{per_point}");
         }
     }
 }

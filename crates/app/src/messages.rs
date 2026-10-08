@@ -306,7 +306,7 @@ pub fn reply_code_error(err: &CodeError) -> Option<String> {
     }
 }
 
-pub const FIREWALL_ASK: &str = "Windows blocks incoming connections to new programs. To let friends reach you, Booth needs one administrator prompt to let it receive UDP. Nothing else runs as administrator.";
+pub const FIREWALL_ASK: &str = "Windows blocks incoming connections to new programs. One administrator prompt lets Booth receive UDP. Nothing else runs as administrator.";
 pub const FIREWALL_STANDARD_USER: &str = "You are not an administrator on this PC, so the port cannot be opened. Ask an administrator, or join only. Without the rule you will not follow the host if their address changes.";
 pub const FIREWALL_BLOCKED: &str =
     "Windows has a rule that blocks Booth, probably from an earlier prompt. Allow removes it.";

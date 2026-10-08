@@ -1,8 +1,8 @@
-use eframe::egui::Ui;
+use eframe::egui::{Label, RichText, Ui};
 
-use crate::controls::{self, Button};
+use crate::controls::{self, Button, Lead};
 use crate::messages;
-use crate::theme::{self, ASH, CHALK};
+use crate::theme::{self, ASH, CHALK, FIELD_GAP, Role, STEP};
 
 pub struct Ask {
     // Windows already has a Block rule for this exe, which Allow removes.
@@ -21,17 +21,18 @@ pub enum Answer {
     Continue,
 }
 
-// Laid out like the start screen: the reason, then the two verbs. While the
-// administrator prompt is open Allow gives way to a line saying so. Not now
-// stays, for a prompt that went behind another window or a firewall that
-// never answers the helper.
+// The mark alone in the title row, the reason, then the two verbs, and
+// nothing else. While the administrator prompt is open its line takes
+// Allow's place. Not now stays, for a prompt that went behind another window
+// or a firewall that never answers the helper.
 pub fn show(ui: &mut Ui, ask: &Ask, waiting: bool) -> Option<Answer> {
-    controls::title_row(ui, "Booth", &[]);
+    controls::title_row(ui, Lead::Mark, &[]);
     controls::page(ui, |ui| {
         if ask.blocking_all {
-            controls::text(ui, messages::FIREWALL_BLOCKING_ALL, theme::body(), CHALK);
-            ui.add_space(16.0);
+            controls::prose(ui, messages::FIREWALL_BLOCKING_ALL, theme::body(), CHALK);
+            ui.add_space(FIELD_GAP);
             return Button::new("Continue")
+                .role(Role::Primary)
                 .show(ui)
                 .clicked()
                 .then_some(Answer::Continue);
@@ -41,19 +42,20 @@ pub fn show(ui: &mut Ui, ask: &Ask, waiting: bool) -> Option<Answer> {
         } else {
             messages::FIREWALL_ASK
         };
-        controls::text(ui, reason, theme::body(), CHALK);
+        controls::prose(ui, reason, theme::body(), CHALK);
         if ask.blocked {
-            ui.add_space(8.0);
-            controls::text(ui, messages::FIREWALL_BLOCKED, theme::small(), ASH);
+            ui.add_space(STEP);
+            controls::prose(ui, messages::FIREWALL_BLOCKED, theme::caption(), ASH);
         }
-        ui.add_space(16.0);
-        if waiting {
-            controls::text(ui, messages::FIREWALL_WAITING, theme::body(), ASH);
-            ui.add_space(16.0);
-        }
+        ui.add_space(FIELD_GAP);
         let mut answer = None;
         ui.horizontal(|ui| {
-            if !waiting && Button::new("Allow").show(ui).clicked() {
+            if waiting {
+                let line = RichText::new(messages::FIREWALL_WAITING)
+                    .font(theme::body())
+                    .color(ASH);
+                ui.add(Label::new(line).extend());
+            } else if Button::new("Allow").role(Role::Primary).show(ui).clicked() {
                 answer = Some(Answer::Allow);
             }
             if Button::new("Not now").show(ui).clicked() {

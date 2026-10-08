@@ -7,16 +7,15 @@ use room::view::{LinkState, PathWord, Strip, TracePoint};
 use stats::Thresholds;
 
 use crate::controls;
-use crate::theme::{self, AMBER, ASH, BAD, SAGE, SIDE, WARN};
+use crate::theme::{self, ASH, BAD, SAGE, SIDE, WARN};
 
-pub const HEIGHT: f32 = 20.0;
+pub const HEIGHT: f32 = 24.0;
 
 const TRACE_SAMPLES: usize = 120;
 const TRACE_HEIGHT: f32 = 16.0;
 const TRACE_TOP_MS: f32 = 100.0;
-// About three spaces between words.
-const GAP: f32 = 10.0;
-const RING_WIDTH: f32 = 2.0;
+// Between words, the numbers in their slots.
+const GAP: f32 = 12.0;
 
 // Counts every sample the trace has ever shown, so that with Windows
 // animations off each one can be written at a fixed column (total mod 120)
@@ -67,10 +66,11 @@ pub fn show(ui: &mut Ui, strip: Option<&Strip>, sweep: &Sweep, scrolling: bool) 
     let painter = ui.painter_at(rect);
     let slot = trace_slot(rect);
 
-    // On the strip's own edge, clear of the trace slot, and painted first so
-    // the data wins wherever rounding makes the two meet.
+    // The window's edge would cut a ring outside the strip, so it moves in
+    // onto the strip's own edge, clear of the trace slot, and is painted
+    // first so the data wins wherever rounding makes the two meet.
     if response.has_focus() && controls::keyboard_focus(ui) {
-        controls::border(&painter, rect, RING_WIDTH, AMBER);
+        controls::ring_within(&painter, rect, rect);
     }
 
     let words = words(strip);
@@ -84,7 +84,7 @@ pub fn show(ui: &mut Ui, strip: Option<&Strip>, sweep: &Sweep, scrolling: bool) 
         if !kept.contains(&word.part) {
             continue;
         }
-        let galley = painter.layout_no_wrap(word.text, theme::medium(), word.color);
+        let galley = painter.layout_no_wrap(word.text, theme::mono_caption(), word.color);
         // Numbers sit at the right of their slot, so the unit stays put and
         // only the digits change.
         let left = if word.part.is_number() {
@@ -117,7 +117,7 @@ pub fn show(ui: &mut Ui, strip: Option<&Strip>, sweep: &Sweep, scrolling: bool) 
 }
 
 // The fixed 120 by 16 px drawing area at the right edge, centred in the
-// 20 px band, which leaves two rows above and below it for the focus ring.
+// 24 px band, which leaves four rows above and below it for the focus ring.
 // It is placed from the band's top, which is on a whole device pixel, and not
 // rounded in points: at 150 percent that rounding would push the bottom row,
 // the one a good link draws on, half a pixel into the ring.
@@ -178,7 +178,7 @@ struct Word {
 fn slot_width(painter: &Painter, word: &Word) -> f32 {
     let measure = |text: &str| {
         painter
-            .layout_no_wrap(text.to_owned(), theme::medium(), word.color)
+            .layout_no_wrap(text.to_owned(), theme::mono_caption(), word.color)
             .size()
             .x
     };
@@ -444,7 +444,12 @@ mod tests {
             let window_px = 961.0;
             let bottom = window_px / per_point;
             let rect = Rect::from_min_max(pos2(0.0, bottom - HEIGHT), pos2(360.0, bottom));
-            let ring = controls::border_rects(rect, RING_WIDTH, per_point);
+            let width = controls::thickness(theme::RING_WIDTH, per_point);
+            let outer = rect.round_to_pixels(per_point);
+            let ring = [
+                Rect::from_min_max(outer.min, pos2(outer.right(), outer.top() + width)),
+                Rect::from_min_max(pos2(outer.left(), outer.bottom() - width), outer.max),
+            ];
             let slot = trace_slot(rect);
             for row in 0..TRACE_HEIGHT as usize {
                 let sample = Rect::from_min_size(
