@@ -21,7 +21,7 @@ One friend hosts on their own PC, the others join with an invite code, and packe
 
 ## Download
 
-Run the setup, [booth-0.2.0-setup.exe](https://github.com/Shadi-Alrashoodi/booth/releases/latest/download/booth-0.2.0-setup.exe), or unzip [booth-0.2.0-windows-x64.zip](https://github.com/Shadi-Alrashoodi/booth/releases/latest/download/booth-0.2.0-windows-x64.zip) and run booth.exe. Older versions are on the [releases page](https://github.com/Shadi-Alrashoodi/booth/releases). It needs Windows 10 version 2004 or later, or Windows 11, 64-bit, with a DirectX 12 graphics driver.
+Run the setup, [booth-0.2.1-setup.exe](https://github.com/Shadi-Alrashoodi/booth/releases/latest/download/booth-0.2.1-setup.exe), or unzip [booth-0.2.1-windows-x64.zip](https://github.com/Shadi-Alrashoodi/booth/releases/latest/download/booth-0.2.1-windows-x64.zip) and run booth.exe. Older versions are on the [releases page](https://github.com/Shadi-Alrashoodi/booth/releases). It needs Windows 10 version 2004 or later, or Windows 11, 64-bit, with a DirectX 12 graphics driver.
 
 - SmartScreen says "Windows protected your PC" because the exe is not code signed yet: More info, then Run anyway.
 - Booth asks once for administrator rights for its firewall rule: Allow, then Yes.
