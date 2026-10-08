@@ -82,7 +82,11 @@ fn trace_keeps_sequence_order_with_late_pongs_and_expiry() {
     assert_eq!(s.trace, vec![rtt(30), TraceSample::Lost, rtt(20)]);
     assert_eq!(s.lost, 1);
 
-    assert_eq!(stats.pong_received(2, ms(40), t0 + ms(2500)), None);
+    // Counted lost, still timed, and the counts stand.
+    assert_eq!(
+        stats.pong_received(2, ms(40), t0 + ms(2500)),
+        Some(ms(2400))
+    );
     let s = stats.snapshot();
     assert_eq!(s.trace, vec![rtt(30), TraceSample::Lost, rtt(20)]);
     assert_eq!((s.pongs_received, s.lost), (2, 1));
@@ -93,11 +97,35 @@ fn pong_arriving_at_lost_after_is_lost_even_without_a_tick() {
     let mut stats = LinkStats::new();
     let t0 = Instant::now();
     stats.ping_sent(1, t0);
-    assert_eq!(stats.pong_received(1, ms(1900), t0 + LOST_AFTER), None);
+    assert_eq!(
+        stats.pong_received(1, ms(1900), t0 + LOST_AFTER),
+        Some(LOST_AFTER)
+    );
     let s = stats.snapshot();
     assert_eq!(s.trace, vec![TraceSample::Lost]);
     assert_eq!((s.pongs_received, s.lost), (0, 1));
     assert_eq!(s.rtt_ms, None);
+}
+
+// A pong that comes after LATE_FOR, or twice, times nothing; and while a
+// ping waits, how long the oldest has waited is known.
+#[test]
+fn a_late_pong_is_timed_once_and_only_for_a_while() {
+    let mut stats = LinkStats::new();
+    let t0 = Instant::now();
+    stats.ping_sent(1, t0);
+    stats.ping_sent(2, t0 + ms(100));
+    assert_eq!(stats.waiting_for(t0 + ms(1500)), Some(ms(1500)));
+    stats.tick(t0 + ms(2100));
+    assert_eq!(stats.waiting_for(t0 + ms(2100)), None);
+    assert_eq!(
+        stats.pong_received(1, ms(2500), t0 + ms(2500)),
+        Some(ms(2500))
+    );
+    assert_eq!(stats.pong_received(1, ms(2500), t0 + ms(2600)), None);
+    assert_eq!(stats.pong_received(2, ms(9000), t0 + ms(10_100)), None);
+    let s = stats.snapshot();
+    assert_eq!((s.pongs_received, s.lost), (0, 2));
 }
 
 #[test]

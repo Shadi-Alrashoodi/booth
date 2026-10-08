@@ -65,6 +65,52 @@ pub const NEAR_SHARE: f64 = 0.5;
 pub const HEAVY_LOST_PER_HUNDRED: u32 = 20;
 pub const FAR_SECONDS: u32 = 5;
 
+// What got through. Every watcher reports its shard loss over the last 2 s
+// once a second for the parity, before its first picture too, when no frame
+// it lost is reported any other way. A queue the share overflows loses
+// shards and holds the round trip up by its depth, however shallow: behind
+// a router queue of 17 ms a light share at 15 Mbit/s over 5.6 lost 37
+// percent of its shards every second, each frame's burst and every IDR
+// overflowing it, with the median round trip 2 to 6 ms over its floor and
+// no picture to report a loss from, so neither rule above said so, in a
+// simulated link. Loss on a radio link moves no round trip: 12 percent in
+// bursts of 100 ms lost up to 43 percent over 2 s and was past SHARD_QUEUE
+// in one report in ten, and random loss of 12 percent read 11 to 13. So
+// SHARD_QUEUE or more with the round trip past half its margin backs off,
+// as does SHARD_ALONE whatever the round trip does, and SHARD_QUEUE in
+// SHARD_SECONDS reports in a row. The cut is BACKOFF times what arrived,
+// what was sent less the shards lost, which is what the path carried: a
+// share started at 15 Mbit/s on a 2.9 Mbit/s uplink took ten cuts and 20 s
+// of a full queue to get under it by fifths, and two cuts this way. Not
+// while the round trip falls by more than the margin, the queue draining
+// after a cut: the watchers' 2 s still describe the rate before it.
+//
+// Heavy radio loss, 10 percent or more or long bursts of it, can still pass
+// SHARD_ALONE in a single report and cut where nothing queued.
+pub const SHARD_QUEUE: f32 = 25.0;
+pub const SHARD_SECONDS: u32 = 5;
+pub const SHARD_ALONE: f32 = 50.0;
+
+// Frames lost past the parity are the share's queue only beside a sign of
+// one: the round trip past its margin, or SHARD_FRAMES of shards lost. A
+// radio burst of 30 to 100 ms takes out 2 to 12 frames in a row, past any
+// parity, without moving the round trip, and jitter of 20 ms or more drops
+// frames whose packets came more than a frame interval apart with no packet
+// lost at all; at 5 percent loss in 30 ms bursts the loss rule alone cut a
+// 60 Mbit/s link's share to the floor, 20 backoffs and nothing queued. The
+// full margin, not half: jitter of 60 ms on Wi-Fi holds the median about
+// two spreads over the floor, under the margin of four.
+pub const SHARD_FRAMES: f32 = 40.0;
+
+// The oldest ping on the share's links has waited this long for its pong,
+// right after a second whose round trip was past the margin: the queue grew
+// past the last second's pings, which is as far as a round trip can rise,
+// and that second counts as past AT_ONCE_MARGINS times the margin, not as
+// no news. Behind 295 ms of router buffer a drop to 0.5 Mbit/s queued 2.5 s,
+// no pong came back within a second, and the rate climbed to 27 Mbit/s on
+// the empty seconds.
+pub const UNANSWERED_FAR_MS: f32 = 1000.0;
+
 // The heavy loss counts only when HEAVY_SECONDS or more of the window's
 // seconds are heavy on their own: HEAVY_LOST_PER_HUNDRED or more in 100 of
 // the frames sent that second, and LOST_AT_LEAST frames at least. A queue
@@ -114,11 +160,17 @@ pub const LOSS_SECONDS: usize = 5;
 pub const LOST_PER_HUNDRED: u32 = 4;
 pub const LOST_AT_LEAST: u32 = 5;
 
-// A queue shows as a round trip that rises and stays. Each second's median
-// round trip (about 10 pings) has risen when it is past the lowest of the
-// last ROUND_TRIP_FLOOR_OVER by more than the margin, and counts once it
-// has for RISEN_SECONDS in a row: an IDR queues for a ping or two, which
-// the median passes over, and a Wi-Fi retry or scan for a second at most.
+// A queue shows as a round trip that rises and stays. Each second's lower
+// quartile round trip (the third quickest of about 10 pings) has risen when
+// it is past the lowest of the last ROUND_TRIP_FLOOR_OVER by more than the
+// margin, and counts once it has for RISEN_SECONDS in a row: an IDR queues
+// for a ping or two, which the quartile passes over, and a Wi-Fi retry or
+// scan for a second at most. The quartile and not the median: a queue the
+// share built delays every ping waiting behind it, while jitter on a radio
+// delays some and leaves others. Jitter of 40 ms that came in episodes,
+// with the margin learned in the calm between them at its least, held the
+// median past it with nothing queued, and the rule cut 15 Mbit/s to 2.5 and
+// took 55 s to climb back, in a simulated link.
 // Past AT_ONCE_MARGINS times the margin it counts the first second: a step
 // 10 percent past what the link carries queues 100 ms more every second, 2
 // more seconds of it fill a home router's queue and a friend hears it in
@@ -201,12 +253,20 @@ pub const FAST_CLIMB: f64 = 1.15;
 //
 // The climb stops at the rate allowed, so when that is between 8 and 10 the
 // rate never reaches 10. There it steps back up once the rate is back at
-// the rate allowed and the link has been clean for CLIMB_AFTER_SECONDS: a
+// the rate allowed and the link has been clean for STEP_UP_CLEAN_SECONDS: a
 // share that started at that rate would run full size, and a link that
 // carries it is not the one that made it back off.
+//
+// And never before the rate has been clean for STEP_UP_CLEAN_SECONDS in a
+// row, as long as a careful step waits. After the three backoffs of an
+// overload the careful climb only reaches past the last of them, and the
+// fast climb takes the rate past 10 in a second, past what a 10 to 12 Mbit/s
+// link carries: stepping up there put the new encoder's IDR into a full
+// queue, 9 steps in 200 s and freezes of 1 to 5 s in a simulated link.
 pub const STEP_DOWN_BELOW_KBPS: u32 = 8_000;
 pub const STEP_UP_FROM_KBPS: u32 = 10_000;
 pub const STEPS_APART: Duration = Duration::from_secs(10);
+pub const STEP_UP_CLEAN_SECONDS: u32 = 5;
 
 // The encoder is too slow when its median time stays above the frame
 // interval for 3 seconds in a row. P1 is the fastest preset already, so the
@@ -220,7 +280,7 @@ const MOST_LOST_IN_ONE: u32 = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RoundTrip {
-    // The median over the last second and the lowest over the last
+    // The lower quartile over the last second and the lowest over the last
     // ROUND_TRIP_FLOOR_OVER; and over that time too, how far the lower
     // quartile of those within MOST_MARGIN_MS of that lowest is above it.
     pub recent_ms: f32,
@@ -237,7 +297,7 @@ impl RoundTrip {
         self.recent_ms - self.floor_ms
     }
 
-    // How far the median is past the floor and the margin: risen above 0.
+    // How far the quartile is past the floor and the margin: risen above 0.
     pub fn past_margin_ms(&self) -> f32 {
         self.rise_ms() - self.margin_ms()
     }
@@ -266,17 +326,12 @@ pub fn round_trip(pings: &VecDeque<(Instant, Duration)>, now: Instant) -> Option
     span.sort_by(f32::total_cmp);
     let floor_ms = span[0];
     span.retain(|ms| *ms <= floor_ms + MOST_MARGIN_MS);
+    recent.sort_by(f32::total_cmp);
     Some(RoundTrip {
-        recent_ms: median(&mut recent),
+        recent_ms: recent[(recent.len() - 1) / 4],
         floor_ms,
         spread_ms: span[(span.len() - 1) / 4] - floor_ms,
     })
-}
-
-// The lower middle one. Sorts `values`, which is not empty.
-fn median(values: &mut [f32]) -> f32 {
-    values.sort_by(f32::total_cmp);
-    values[(values.len() - 1) / 2]
 }
 
 // Frames the viewers reported lost past the parity since the rate last
@@ -346,6 +401,12 @@ pub struct Second {
     // measures it on its own clock, and a reading taken twice would count a
     // risen second twice.
     pub round_trip: Option<RoundTrip>,
+    // How long the oldest ping on the share's links has waited for its pong,
+    // or None with nothing waiting.
+    pub unanswered_ms: Option<f32>,
+    // The worst watcher's shard loss over its last 2 s, in percent, as last
+    // reported, or None without a report lately.
+    pub shard_loss: Option<f32>,
     // The median encode time, None when nothing was encoded.
     pub encode_ms: Option<f32>,
     pub interval: Duration,
@@ -376,11 +437,12 @@ pub enum Sign {
     // Through the gate, while the share sends under half its rate.
     HeavyLoss,
     FarRoundTrip,
+    ShardLoss,
 }
 
 impl Sign {
     fn through_gate(self) -> bool {
-        matches!(self, Sign::HeavyLoss | Sign::FarRoundTrip)
+        matches!(self, Sign::HeavyLoss | Sign::FarRoundTrip | Sign::ShardLoss)
     }
 }
 
@@ -397,6 +459,7 @@ impl fmt::Display for Sign {
                 f,
                 "a round trip past {AT_ONCE_MARGINS} times the margin for {FAR_SECONDS} s"
             ),
+            Sign::ShardLoss => f.write_str("shards lost to a queue"),
         }
     }
 }
@@ -430,6 +493,8 @@ pub struct Judged {
     pub risen_seconds: u32,
     // Seconds in a row risen past AT_ONCE_MARGINS times the margin.
     pub far_seconds: u32,
+    pub unanswered_ms: Option<f32>,
+    pub shard_loss: Option<f32>,
 }
 
 impl fmt::Display for Judged {
@@ -470,10 +535,24 @@ impl fmt::Display for Judged {
                 if self.far_seconds > 1 {
                     write!(f, " for {} s", self.far_seconds)?;
                 }
-                Ok(())
             }
-            None => f.write_str("no new round trip"),
+            None => match self.unanswered_ms {
+                Some(ms) if ms >= UNANSWERED_FAR_MS => {
+                    write!(f, "no new round trip, a ping unanswered for {ms:.0} ms")?;
+                    if self.far_seconds > 0 {
+                        write!(f, ", past {AT_ONCE_MARGINS} times the margin")?;
+                    }
+                    if self.far_seconds > 1 {
+                        write!(f, " for {} s", self.far_seconds)?;
+                    }
+                }
+                _ => f.write_str("no new round trip")?,
+            },
         }
+        if let Some(percent) = self.shard_loss {
+            write!(f, "; {percent:.1} percent of shards lost")?;
+        }
+        Ok(())
     }
 }
 
@@ -506,6 +585,10 @@ pub struct Rate {
     last_step: Option<Instant>,
     slow: u32,
     backoffs: u32,
+    // The last round trip measured, for a second with none (UNANSWERED_FAR_MS).
+    last_round_trip: Option<RoundTrip>,
+    // Shard loss reports in a row at SHARD_QUEUE or more.
+    shard_high: u32,
 }
 
 impl Rate {
@@ -529,6 +612,8 @@ impl Rate {
             last_step: None,
             slow: 0,
             backoffs: 0,
+            last_round_trip: None,
+            shard_high: 0,
         }
     }
 
@@ -556,6 +641,9 @@ impl Rate {
     // the room and the loopback.
     pub fn describe(&self, decision: &Decision) -> String {
         let what = match (decision.rate_kbps, decision.backoff, decision.let_pass) {
+            (Some(_), Some(Sign::ShardLoss), _) => {
+                format!(", backed off for {}, to what arrived", Sign::ShardLoss)
+            }
             (Some(_), Some(sign), _) if sign.through_gate() => {
                 format!(", backed off for {sign} though not near the rate, from what was sent")
             }
@@ -599,6 +687,30 @@ impl Rate {
         (self.rate_kbps != was).then_some(self.rate_kbps)
     }
 
+    // allow, for a share whose upload carries one copy for each watcher,
+    // when that went from `before` copies to `after`. The new allowance
+    // divides the setting, not what the link showed it carries, so a rate
+    // the link held under the setting is shared out too, and the climb from
+    // there is careful: on a 12 Mbit/s uplink at 8.7 for one watcher, a
+    // second one made 18 Mbit/s of 12, three backoffs, 6.9 s before the
+    // newcomer's first picture and a freeze for the first one, in a
+    // simulated link.
+    pub fn copies(&mut self, allowed_kbps: u32, before: u32, after: u32) -> Option<u32> {
+        let was = self.rate_kbps;
+        self.allow(allowed_kbps);
+        if after > before && before > 0 {
+            let shared = u64::from(was) * u64::from(before) / u64::from(after);
+            let shared = u32::try_from(shared)
+                .unwrap_or(u32::MAX)
+                .max(RATE_FLOOR_KBPS.min(self.allowed_kbps));
+            if shared < self.rate_kbps {
+                self.rate_kbps = shared;
+                self.queued_kbps = Some(shared);
+            }
+        }
+        (self.rate_kbps != was).then_some(self.rate_kbps)
+    }
+
     pub fn second(&mut self, now: Instant, second: &Second) -> Decision {
         let was = self.rate_kbps;
         if self.bytes.len() == NEAR_SECONDS {
@@ -635,23 +747,64 @@ impl Rate {
         let heavy = self.loss.len() == LOSS_SECONDS
             && heavy_loss(frames, lost)
             && heavy_seconds >= HEAVY_SECONDS;
-        // A second with no new round trip leaves the counts as they were.
-        let (mut past, mut far) = (false, false);
+        // A second with no new round trip leaves the counts as they were,
+        // unless a ping has waited past UNANSWERED_FAR_MS right after a rise
+        // past the margin.
+        let (mut past, mut far, mut draining) = (false, false, false);
+        let rise_was = self.rise_before;
         if let Some(rtt) = second.round_trip {
             let (rise, margin) = (rtt.rise_ms(), rtt.margin_ms());
-            let draining = self
+            draining = self
                 .rise_before
                 .is_some_and(|before| before - rise > margin);
             self.rise_before = Some(rise);
+            self.last_round_trip = Some(rtt);
             past = rise > margin;
             far = past && !draining && rise > AT_ONCE_MARGINS * margin;
             self.risen = if past && !draining { self.risen + 1 } else { 0 };
             self.far = if far { self.far + 1 } else { 0 };
         }
-        let measured = second.round_trip.is_some();
+        let gone_far = second.round_trip.is_none()
+            && second
+                .unanswered_ms
+                .is_some_and(|ms| ms >= UNANSWERED_FAR_MS)
+            && rise_was
+                .zip(self.last_round_trip)
+                .is_some_and(|(rise, rtt)| rise > rtt.margin_ms());
+        if gone_far {
+            past = true;
+            far = true;
+            self.risen += 1;
+            self.far += 1;
+        }
+        let measured = second.round_trip.is_some() || gone_far;
         let queued = measured && (self.risen >= RISEN_SECONDS || far);
         let standing = measured && self.far >= FAR_SECONDS;
-        let sign = if !near && heavy {
+        // The last round trip measured, past half its margin or past all of
+        // it, for the shard loss and the frame loss to stand beside.
+        let rise_now = second.round_trip.map(|rtt| rtt.rise_ms()).or(rise_was);
+        let beside = |part: f32| {
+            gone_far
+                || rise_now
+                    .zip(second.round_trip.or(self.last_round_trip))
+                    .is_some_and(|(rise, rtt)| rise > rtt.margin_ms() * part)
+        };
+        let shard = second.shard_loss.unwrap_or(0.0);
+        self.shard_high = if shard >= SHARD_QUEUE {
+            self.shard_high + 1
+        } else {
+            0
+        };
+        let shard_heavy = !draining
+            && (shard >= SHARD_ALONE
+                || (beside(0.5) && shard >= SHARD_QUEUE)
+                || self.shard_high >= SHARD_SECONDS);
+        let corroborated = beside(1.0) || shard >= SHARD_FRAMES;
+        let lossy = lossy && corroborated;
+        let heavy = heavy && corroborated;
+        let sign = if shard_heavy {
+            Some(Sign::ShardLoss)
+        } else if !near && heavy {
             Some(Sign::HeavyLoss)
         } else if !near && standing {
             Some(Sign::FarRoundTrip)
@@ -673,15 +826,26 @@ impl Rate {
             round_trip: second.round_trip,
             risen_seconds: self.risen,
             far_seconds: self.far,
+            unanswered_ms: second.unanswered_ms,
+            shard_loss: second.shard_loss,
         };
 
         let mut decision = Decision::default();
         match sign {
             Some(sign) if near || sign.through_gate() => {
                 self.clean = 0;
-                let from = if near { self.rate_kbps } else { sent_kbps };
+                let from = if sign == Sign::ShardLoss {
+                    let arrived =
+                        f64::from(sent_kbps) * f64::from(100.0 - shard.min(100.0)) / 100.0;
+                    (arrived.round() as u32).min(self.rate_kbps)
+                } else if near {
+                    self.rate_kbps
+                } else {
+                    sent_kbps
+                };
                 if self.back_off(now, from) {
                     decision.backoff = Some(sign);
+                    self.shard_high = 0;
                 }
             }
             Some(sign) => {
@@ -812,13 +976,13 @@ impl Rate {
     }
 
     // Small for the rate, and the rate is back up (STEP_UP_FROM_KBPS), past
-    // the careful climb.
+    // the careful climb, and has held clean there (STEP_UP_CLEAN_SECONDS).
     fn full_size_again(&self) -> bool {
-        self.queued_kbps.is_none()
+        self.clean >= STEP_UP_CLEAN_SECONDS
+            && self.queued_kbps.is_none()
             && (self.rate_kbps >= STEP_UP_FROM_KBPS
                 || (self.allowed_kbps >= STEP_DOWN_BELOW_KBPS
-                    && self.rate_kbps >= self.allowed_kbps
-                    && self.clean >= CLIMB_AFTER_SECONDS))
+                    && self.rate_kbps >= self.allowed_kbps))
     }
 }
 

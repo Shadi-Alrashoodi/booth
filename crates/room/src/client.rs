@@ -1917,6 +1917,7 @@ impl Client {
             }
             Some(Plain::Control(frame)) => self.on_control(frame, now, socket),
             Some(Plain::Chat(frame)) => self.on_chat(frame, now, socket),
+            Some(Plain::Feedback(frame)) => self.on_feedback(frame, now, socket),
             Some(Plain::Voice(payload)) => return self.on_voice(payload, now),
             Some(Plain::Video(payload)) => return self.on_video(payload, now),
             Some(Plain::Cursor(payload)) => return self.on_cursor(payload, now),
@@ -2116,6 +2117,32 @@ impl Client {
         }
     }
 
+    // The host's recover requests, IDR asks and loss reports for this PC's
+    // own share, on their stream; the same messages as on the control one.
+    fn on_feedback(&mut self, frame: &[u8], now: Instant, socket: &Socket) {
+        if self.link.receive_feedback(frame, now).is_err() {
+            self.drops.bad(now);
+            return;
+        }
+        let mut delivered = Vec::new();
+        while let Some(message) = self.link.feedback.next_delivered() {
+            delivered.push(message);
+        }
+        self.flush(now, socket);
+        for bytes in delivered {
+            match Message::decode(&bytes) {
+                Some(
+                    message @ (Message::Recover { .. }
+                    | Message::Idr { .. }
+                    | Message::VideoLoss { .. }),
+                ) => self.on_share_message(message, now),
+                _ => {
+                    self.drops.bad(now);
+                }
+            }
+        }
+    }
+
     fn on_control(&mut self, frame: &[u8], now: Instant, socket: &Socket) {
         if self.link.receive(frame, now).is_err() {
             self.drops.bad(now);
@@ -2132,6 +2159,7 @@ impl Client {
                 match message {
                     Some(Message::Hello { version, .. }) => {
                         self.host_hello = true;
+                        self.link.feedback_read = version >= peer::FEEDBACK_SINCE;
                         if version != invite::VERSION {
                             log!(
                                 self.log,

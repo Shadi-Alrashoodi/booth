@@ -180,10 +180,11 @@ impl Client {
             match back {
                 Back::Recover { share, first, last } if share == number => {
                     let (first, last) = recover_span(first, last);
-                    self.link.queue(&Message::Recover { share, first, last });
+                    self.link
+                        .queue_feedback(&Message::Recover { share, first, last });
                 }
                 Back::Idr { share, seen } if share == number => {
-                    self.link.queue(&Message::Idr {
+                    self.link.queue_feedback(&Message::Idr {
                         share,
                         seen: Some(seen),
                     });
@@ -192,7 +193,7 @@ impl Client {
                 // first nonzero loss at once, and the host holds each to its
                 // own rule, so each goes as it comes.
                 Back::Loss { share, loss } if share == number => {
-                    self.link.queue(&Message::VideoLoss {
+                    self.link.queue_feedback(&Message::VideoLoss {
                         share,
                         loss: permille(loss),
                     });
@@ -538,12 +539,10 @@ impl Client {
     // Once a second, with the voice reports: for this PC's own share's
     // backoff, the round trip to the host, which every packet of it crosses.
     pub(super) fn share_round_trip(&mut self, now: Instant) {
-        let round_trip = self
-            .screen
-            .sharing
-            .number()
-            .and_then(|_| self.link.round_trip(now));
-        self.screen.sharing.set_round_trip(round_trip);
+        let sharing = self.screen.sharing.number().is_some();
+        let round_trip = self.link.round_trip(now).filter(|_| sharing);
+        let unanswered = self.link.unanswered_ms(now).filter(|_| sharing);
+        self.screen.sharing.set_round_trip(round_trip, unanswered);
     }
 
     // A new session, not a rekey: the host started this PC's link over, and

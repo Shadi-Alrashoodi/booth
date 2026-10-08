@@ -224,9 +224,19 @@ fn share(
         }
         let facts = sharing.facts();
         if facts != applied {
+            let before = applied;
             applied = facts;
             if let Some(facts) = facts {
-                apply(&mut sharer, &mut rate, &facts, log, number).map_err(ran)?;
+                apply(
+                    &mut sharer,
+                    &mut rate,
+                    before.as_ref(),
+                    &facts,
+                    sharing.host,
+                    log,
+                    number,
+                )
+                .map_err(ran)?;
             }
         }
         // Nobody watches: nothing is captured, encoded or sent, which
@@ -257,6 +267,7 @@ fn share(
             let lost_here = sharer.numbers().reported_lost_here;
             let excused =
                 lost_here.saturating_sub(std::mem::replace(&mut lost_here_before, lost_here));
+            let (round_trip, unanswered_ms) = sharing.take_round_trip();
             let second = Second {
                 sent: u32::try_from(frames.len()).unwrap_or(u32::MAX),
                 lost: watchers
@@ -264,7 +275,9 @@ fn share(
                     .take()
                     .saturating_sub(u32::try_from(excused).unwrap_or(u32::MAX)),
                 bytes: frames.iter().map(|frame| frame.packet_bytes as u64).sum(),
-                round_trip: sharing.take_round_trip(),
+                round_trip,
+                unanswered_ms,
+                shard_loss: watchers.shard_loss(now),
                 encode_ms: spread(&mut encode_ms).map(|(median, _)| median),
                 interval: Duration::from_secs(1) / sharer.fps(),
                 internet: applied.is_some_and(|facts| facts.internet > 0),
@@ -395,17 +408,30 @@ fn choose(
 }
 
 // The pacer and the packet size follow the host's facts, and the rate
-// follows its rule.
+// follows its rule. The host's own share goes out once for each watcher
+// over the internet, so more of them is more copies on its uplink
+// (Rate::copies); a friend's goes to the host once, and the host's uplink
+// carries the copies.
 fn apply(
     sharer: &mut Sharer,
     rate: &mut Rate,
+    before: Option<&ShareFacts>,
     facts: &ShareFacts,
+    host: bool,
     log: &Log,
     number: u32,
 ) -> Result<(), String> {
     sharer.set_payload(facts.payload())?;
     sharer.set_spread(facts.spread);
-    if let Some(kbps) = rate.allow(facts.rate_kbps) {
+    let changed = match before {
+        Some(before) if host => rate.copies(
+            facts.rate_kbps,
+            u32::from(before.internet),
+            u32::from(facts.internet),
+        ),
+        _ => rate.allow(facts.rate_kbps),
+    };
+    if let Some(kbps) = changed {
         set_bitrate(sharer, kbps, log, number);
     }
     log!(
@@ -603,7 +629,13 @@ struct Watchers<'a> {
     // Every watcher decodes HEVC, as the facts said when the answers were
     // last taken.
     hevc: bool,
+    // The worst watcher's shard loss as last reported, and when it came.
+    shard_loss: Option<(f32, Instant)>,
 }
+
+// Watchers report their shard loss once a second; a report older than two
+// of those is no longer the link's.
+const SHARD_LOSS_FOR: Duration = Duration::from_secs(2);
 
 impl<'a> Watchers<'a> {
     fn new(sharing: &'a Arc<Sharing>, log: &'a Log, number: u32) -> Watchers<'a> {
@@ -619,7 +651,15 @@ impl<'a> Watchers<'a> {
             lost: Lost::default(),
             sent: Vec::new(),
             hevc: true,
+            shard_loss: None,
         }
+    }
+
+    // The newest shard loss report, while it is at most SHARD_LOSS_FOR old.
+    fn shard_loss(&self, now: Instant) -> Option<f32> {
+        self.shard_loss
+            .filter(|&(_, at)| now.saturating_duration_since(at) <= SHARD_LOSS_FOR)
+            .map(|(percent, _)| percent)
     }
 
     fn send_shape(&mut self, shape: Shape) {
@@ -690,7 +730,10 @@ impl Audience for Watchers<'_> {
                     self.shape_again();
                     continue;
                 }
-                Answer::Loss(loss) => Back::Loss(loss),
+                Answer::Loss(loss) => {
+                    self.shard_loss = loss.map(|percent| (percent, Instant::now()));
+                    Back::Loss(loss)
+                }
             };
             self.lost.heard(&back);
             into.push(back);

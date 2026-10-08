@@ -9,6 +9,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 use capture::CursorUpdate;
 use share::rate::Lost;
@@ -62,6 +63,8 @@ pub struct SharerEnd<'a> {
     // lost since it last looked, and the frames sent since.
     pub lost: Lost,
     pub sent: Vec<Sent>,
+    // The viewer's shard loss as last reported, and when.
+    pub shard_loss: Option<(f32, Instant)>,
 }
 
 impl<'a> SharerEnd<'a> {
@@ -71,6 +74,7 @@ impl<'a> SharerEnd<'a> {
             lines,
             lost: Lost::default(),
             sent: Vec::new(),
+            shard_loss: None,
         }
     }
 }
@@ -82,6 +86,9 @@ impl Audience for SharerEnd<'_> {
 
     fn back(&mut self, into: &mut Vec<Back>) {
         for message in lock(&self.link.back).drain(..) {
+            if let Back::Loss(loss) = message {
+                self.shard_loss = loss.map(|percent| (percent, Instant::now()));
+            }
             self.lost.heard(&message);
             into.push(message);
         }

@@ -196,6 +196,13 @@ impl Rating {
                 .saturating_sub(u32::try_from(excused).unwrap_or(u32::MAX)),
             bytes: frames.iter().map(|frame| frame.packet_bytes as u64).sum(),
             round_trip: network.round_trip(now),
+            // The loopback times its round trip from answered pings only.
+            unanswered_ms: None,
+            // As the room's sharer: a report at most 2 s old.
+            shard_loss: end
+                .shard_loss
+                .filter(|&(_, at)| now.saturating_duration_since(at) <= Duration::from_secs(2))
+                .map(|(percent, _)| percent),
             encode_ms: spread(&mut encode_ms).map(|(median, _)| median),
             interval: Duration::from_secs(1) / sharer.fps(),
             internet: self.internet,

@@ -120,7 +120,7 @@ fn spread_frame_timing() {
     let mut clumps = Vec::new();
     let mut held_up = Vec::new();
     for number in 0..20u8 {
-        pacer.put(frame(&pacer, number, 72, 1166), FPS_120, true);
+        pacer.put(frame(&pacer, number, 72, 1166), FPS_120, true, 0);
         let sent = take(&receiver, 72);
         // The next frame starts at another point of the timer's tick.
         let pause = Duration::from_micros(2_100 + 370 * u64::from(number));
@@ -224,10 +224,15 @@ fn spread_frame_timing() {
 #[test]
 fn new_frame_flushes_the_old_one() {
     let (pacer, receiver) = recording();
-    pacer.put(frame(&pacer, 1, 72, 1166), Duration::from_millis(50), true);
+    pacer.put(
+        frame(&pacer, 1, 72, 1166),
+        Duration::from_millis(50),
+        true,
+        0,
+    );
     let early = take(&receiver, 10);
     let put_at = Instant::now();
-    pacer.put(frame(&pacer, 2, 72, 1166), FPS_120, true);
+    pacer.put(frame(&pacer, 2, 72, 1166), FPS_120, true, 0);
     let rest = take(&receiver, 62 + 72);
     let (old, new) = rest.split_at(62);
     // The old frame's packets all went, in order, before the new frame's
@@ -263,7 +268,7 @@ fn new_frame_flushes_the_old_one() {
 fn without_spread_every_packet_goes_at_once() {
     let (pacer, receiver) = recording();
     for number in 0..10u8 {
-        pacer.put(frame(&pacer, number, 72, 1166), FPS_120, false);
+        pacer.put(frame(&pacer, number, 72, 1166), FPS_120, false, 0);
         let sent = take(&receiver, 72);
         let took = sent[71].at - sent[0].at;
         assert!(took < Duration::from_millis(1), "72 packets took {took:?}");
@@ -274,11 +279,11 @@ fn without_spread_every_packet_goes_at_once() {
 #[test]
 fn one_packet_and_empty_frames() {
     let (pacer, receiver) = recording();
-    pacer.put(frame(&pacer, 1, 1, 40), FPS_120, true);
+    pacer.put(frame(&pacer, 1, 1, 40), FPS_120, true, 0);
     let sent = take(&receiver, 1);
     assert_eq!((sent[0].frame, sent[0].len), (1, 40));
-    pacer.put(pacer.burst(), FPS_120, true);
-    pacer.put(frame(&pacer, 2, 3, 40), FPS_120, true);
+    pacer.put(pacer.burst(), FPS_120, true, 0);
+    pacer.put(frame(&pacer, 2, 3, 40), FPS_120, true, 0);
     let sent = take(&receiver, 3);
     assert!(sent.iter().all(|packet| packet.frame == 2));
     assert!(receiver.recv_timeout(Duration::from_millis(20)).is_err());
@@ -288,7 +293,7 @@ fn one_packet_and_empty_frames() {
 #[test]
 fn long_interval_spread_cap() {
     let (pacer, receiver) = recording();
-    pacer.put(frame(&pacer, 1, 10, 100), Duration::from_secs(1), true);
+    pacer.put(frame(&pacer, 1, 10, 100), Duration::from_secs(1), true, 0);
     let sent = take(&receiver, 10);
     let took = sent[9].at - sent[0].at;
     assert!(took < Duration::from_millis(25), "{took:?}");
@@ -301,7 +306,12 @@ fn stop_is_prompt_and_joins_the_thread() {
     let mut worst = Duration::ZERO;
     for _ in 0..20 {
         let (pacer, receiver) = recording();
-        pacer.put(frame(&pacer, 1, 72, 1166), Duration::from_millis(50), true);
+        pacer.put(
+            frame(&pacer, 1, 72, 1166),
+            Duration::from_millis(50),
+            true,
+            0,
+        );
         take(&receiver, 5);
         let start = Instant::now();
         drop(pacer);
@@ -340,11 +350,11 @@ fn unstarted_frames_are_dropped() {
         }
         burst
     };
-    pacer.put(burst(1, 4), FPS_120, true);
+    pacer.put(burst(1, 4), FPS_120, true, 0);
     held.recv_timeout(Duration::from_secs(5))
         .expect("the thread never reached the send function");
     for number in 2..=5 {
-        pacer.put(burst(number, 30), FPS_120, true);
+        pacer.put(burst(number, 30), FPS_120, true, 0);
     }
     gate.send(()).unwrap();
     let sent: Vec<(Instant, u8, u8)> = (0..34)

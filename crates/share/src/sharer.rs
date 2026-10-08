@@ -1214,7 +1214,12 @@ impl Sharer {
         }
         let count = burst.len();
         let discarded = self.pacer.numbers().discarded;
-        self.pacer.put(burst, self.interval, self.setup.spread);
+        self.pacer.put(
+            burst,
+            self.interval,
+            self.setup.spread,
+            self.encoder_bitrate,
+        );
         let now = Instant::now();
         self.answers.went_out(now, again);
         if unit.idr {

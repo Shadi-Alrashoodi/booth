@@ -10,6 +10,12 @@ pub const LOST_AFTER: Duration = Duration::from_secs(2);
 // when the caller stops passing time in; it keeps memory bounded if so.
 const MAX_IN_FLIGHT: usize = 256;
 
+// Pings counted lost are still timed if their pong comes after all, for this
+// long: behind a router queue of 2.5 s every pong is past LOST_AFTER, and
+// the round trip it measures is the one thing that says how deep the queue
+// is. The loss counts stand.
+const LATE_FOR: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LinkSnapshot {
     pub rtt_ms: Option<f32>,
@@ -39,6 +45,9 @@ pub struct LinkStats {
     pings_sent: u64,
     pongs_received: u64,
     lost: u64,
+    // Pings counted lost within LATE_FOR, oldest first: their seq and when
+    // they were sent.
+    late: VecDeque<(u32, Instant)>,
 }
 
 #[derive(Debug)]
@@ -67,6 +76,7 @@ impl LinkStats {
                 oldest.outcome = Some(TraceSample::Lost);
                 self.lost += 1;
                 self.newest_lost = self.newest_lost.max(Some(oldest.index));
+                self.late.push_back((oldest.seq, oldest.sent_at));
             }
             self.finalize();
         }
@@ -84,13 +94,19 @@ impl LinkStats {
     /// peer's time between receiving the ping and answering is not in it.
     /// `at` is when the pong arrived. Returns the time from sending the ping
     /// to `at` on our own clock, peer's time included, or None when the pong
-    /// answers no ping still waiting for one.
+    /// answers no ping still waiting for one. A pong for a ping already
+    /// counted lost is timed too, and changes no count.
     pub fn pong_received(&mut self, seq: u32, rtt: Duration, at: Instant) -> Option<Duration> {
         self.expire(at);
-        let ping = self
+        let Some(ping) = self
             .in_flight
             .iter_mut()
-            .find(|p| p.seq == seq && p.outcome.is_none())?;
+            .find(|p| p.seq == seq && p.outcome.is_none())
+        else {
+            let i = self.late.iter().position(|&(late, _)| late == seq)?;
+            let (_, sent_at) = self.late.remove(i)?;
+            return Some(at.saturating_duration_since(sent_at));
+        };
         let elapsed = at.saturating_duration_since(ping.sent_at);
         // The peer reports its own processing time. Lying about it can shrink
         // the number but never push it past what our own clock saw.
@@ -117,6 +133,15 @@ impl LinkStats {
 
     pub fn tick(&mut self, now: Instant) {
         self.expire(now);
+    }
+
+    /// How long the oldest ping still waiting for its pong has waited, up to
+    /// LOST_AFTER, or None with none waiting.
+    pub fn waiting_for(&self, now: Instant) -> Option<Duration> {
+        self.in_flight
+            .iter()
+            .find(|p| p.outcome.is_none())
+            .map(|p| now.saturating_duration_since(p.sent_at))
     }
 
     pub fn snapshot(&self) -> LinkSnapshot {
@@ -154,7 +179,16 @@ impl LinkStats {
                 ping.outcome = Some(TraceSample::Lost);
                 self.lost += 1;
                 self.newest_lost = self.newest_lost.max(Some(ping.index));
+                self.late.push_back((ping.seq, ping.sent_at));
             }
+        }
+        while self
+            .late
+            .front()
+            .is_some_and(|&(_, sent_at)| now.saturating_duration_since(sent_at) >= LATE_FOR)
+            || self.late.len() > MAX_IN_FLIGHT
+        {
+            self.late.pop_front();
         }
         self.finalize();
     }

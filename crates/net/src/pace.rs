@@ -7,6 +7,16 @@
 // nothing queues. A frame the thread has not started when a newer one comes
 // is dropped, not sent late (put below).
 //
+// Except for a frame too big for half an interval at twice the rate in use,
+// an IDR above all: it is spread at twice the rate, over as many intervals
+// as that takes, and up to WAIT_BEHIND newer frames wait behind it rather
+// than cut it short. An IDR of 6 frames' worth at 2.4 Mbit/s and 60 fps left
+// in 6.3 ms, 37 Mbit/s into a 5.6 Mbit/s uplink with 12 KB of buffer, and
+// lost half its packets every time it was asked for again; a watcher behind
+// a router buffer of 10 to 20 ms never got a picture, in a simulated link.
+// Ordinary frames, which the encoder holds to about one frame's worth, keep
+// the half interval.
+//
 // The thread blocks on the mailbox's event and the high-resolution timer
 // together. A sleep or a timed wait would run on the default 15.6 ms timer,
 // which is longer than a whole 120 fps frame.
@@ -21,6 +31,7 @@
 mod timer;
 
 use std::any::Any;
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
@@ -48,6 +59,10 @@ pub const SPREAD_MARGIN: Duration = Duration::from_millis(2);
 // A frame interval longer than this is not a video frame rate, and spreading
 // over half of it would hold packets back for no reason.
 const LONGEST_SPREAD: Duration = Duration::from_millis(50);
+
+// Newer frames that wait behind a big frame still being spread. One more
+// sends the rest of it and of them at once, as for any frame.
+const WAIT_BEHIND: usize = 2;
 
 // Packets for one frame, each kept whole, in one buffer that is reused.
 #[derive(Default)]
@@ -116,6 +131,8 @@ struct Job {
     burst: Burst,
     interval: Duration,
     spread: bool,
+    // The rate the encoder is set to, in bits per second, or 0 if unknown.
+    rate_bps: u32,
 }
 
 #[derive(Default)]
@@ -220,7 +237,8 @@ impl Pacer {
 
     // Hands one frame to the thread. `interval` is the sharer's frame
     // interval; with `spread` the packets leave evenly over half of it, less
-    // SPREAD_MARGIN, otherwise all at once.
+    // SPREAD_MARGIN, or at twice `rate_bps` if that takes longer, otherwise
+    // all at once.
     //
     // A frame still in the mailbox is dropped for this one. The thread takes
     // a frame within microseconds unless it is held up, by a send that
@@ -228,11 +246,12 @@ impl Pacer {
     // frame interval late already, and sending it first would put this one
     // behind it and pile onto whatever held the thread up. The viewer asks
     // for recovery as for any frame lost on the way.
-    pub fn put(&self, burst: Burst, interval: Duration, spread: bool) {
+    pub fn put(&self, burst: Burst, interval: Duration, spread: bool, rate_bps: u32) {
         let job = Job {
             burst,
             interval,
             spread,
+            rate_bps,
         };
         let mut mailbox = self.shared.lock();
         if mailbox.failed.is_some() {
@@ -283,26 +302,36 @@ impl fmt::Debug for Pacer {
     }
 }
 
-// The frame being sent: packet `next` is the next to go.
+// The frame being sent: packet `next` is the next to go. `long` when the
+// span is past half the interval, at twice the rate (WAIT_BEHIND).
 struct Going {
     job: Job,
     next: usize,
     start: Instant,
     span: Duration,
+    long: bool,
 }
 
 impl Going {
     fn new(job: Job, start: Instant, spreads: bool) -> Going {
-        let span = if spreads && job.spread {
-            (job.interval.min(LONGEST_SPREAD) / 2).saturating_sub(SPREAD_MARGIN)
-        } else {
-            Duration::ZERO
-        };
+        let (mut span, mut long) = (Duration::ZERO, false);
+        if spreads && job.spread {
+            span = (job.interval.min(LONGEST_SPREAD) / 2).saturating_sub(SPREAD_MARGIN);
+            if job.rate_bps > 0 {
+                let bits = job.burst.bytes.len() as u64 * 8;
+                let at_twice =
+                    Duration::from_micros(bits * 1_000_000 / (2 * u64::from(job.rate_bps)));
+                if at_twice > span {
+                    (span, long) = (at_twice, true);
+                }
+            }
+        }
         Going {
             job,
             next: 0,
             start,
             span,
+            long,
         }
     }
 
@@ -373,9 +402,10 @@ fn run(shared: &Shared, timer: &Timer, mut send: impl FnMut(&[u8])) {
     let _ = raise_priority();
     let spreads = timer.high_resolution();
     let mut going: Option<Going> = None;
+    let mut waiting: VecDeque<Job> = VecDeque::with_capacity(WAIT_BEHIND);
     loop {
         if let Err(err) = wait(&shared.signal, going.as_ref().map(|_| timer)) {
-            fail(shared, going.take(), &mut send, err);
+            fail(shared, going.take(), &mut waiting, &mut send, err);
             return;
         }
         let (job, stop) = {
@@ -387,27 +417,48 @@ fn run(shared: &Shared, timer: &Timer, mut send: impl FnMut(&[u8])) {
         }
         let now = Instant::now();
         if let Some(job) = job {
-            if let Some(mut old) = going.take() {
-                old.send_rest(&mut send, shared);
-                shared.cut_short.fetch_add(1, Ordering::Relaxed);
-                recycle(shared, old.job.burst);
-            }
             shared.frames.fetch_add(1, Ordering::Relaxed);
-            going = Some(Going::new(job, now, spreads));
-        }
-        let Some(current) = going.as_mut() else {
-            continue;
-        };
-        current.send_due(now, &mut send, shared);
-        if current.done() {
-            if let Some(done) = going.take() {
-                recycle(shared, done.job.burst);
+            match &going {
+                Some(old) if old.long && !old.done() && waiting.len() < WAIT_BEHIND => {
+                    waiting.push_back(job);
+                }
+                _ => {
+                    if let Some(old) = going.take() {
+                        send_now(old, shared, &mut send);
+                    }
+                    for queued in waiting.drain(..) {
+                        send_now(Going::new(queued, now, false), shared, &mut send);
+                    }
+                    going = Some(Going::new(job, now, spreads));
+                }
             }
-        } else if let Err(err) = timer.set_at(current.next_due()) {
-            fail(shared, going.take(), &mut send, err);
-            return;
+        }
+        // The frame under way, or the next one waiting behind it.
+        while let Some(current) = going.as_mut() {
+            current.send_due(now, &mut send, shared);
+            if current.done() {
+                if let Some(done) = going.take() {
+                    recycle(shared, done.job.burst);
+                }
+                going = waiting.pop_front().map(|job| Going::new(job, now, spreads));
+                continue;
+            }
+            if let Err(err) = timer.set_at(current.next_due()) {
+                fail(shared, going.take(), &mut waiting, &mut send, err);
+                return;
+            }
+            break;
         }
     }
+}
+
+// What is left of a frame goes at once, as a newer frame cuts it short.
+fn send_now(mut going: Going, shared: &Shared, send: &mut impl FnMut(&[u8])) {
+    if !going.done() {
+        going.send_rest(send, shared);
+        shared.cut_short.fetch_add(1, Ordering::Relaxed);
+    }
+    recycle(shared, going.job.burst);
 }
 
 fn recycle(shared: &Shared, burst: Burst) {
@@ -423,9 +474,18 @@ fn keep_spare(mailbox: &mut Mailbox, burst: Burst) {
     }
 }
 
-fn fail(shared: &Shared, going: Option<Going>, send: &mut impl FnMut(&[u8]), err: io::Error) {
+fn fail(
+    shared: &Shared,
+    going: Option<Going>,
+    waiting: &mut VecDeque<Job>,
+    send: &mut impl FnMut(&[u8]),
+    err: io::Error,
+) {
     if let Some(mut going) = going {
         going.send_rest(send, shared);
+    }
+    for job in waiting.drain(..) {
+        Going::new(job, Instant::now(), false).send_rest(send, shared);
     }
     stop_failed(shared, err.to_string());
 }
@@ -488,7 +548,7 @@ mod tests {
         for _ in 0..72 {
             burst.push(&[0; 1166]);
         }
-        pacer.put(burst, Duration::from_nanos(8_333_333), true);
+        pacer.put(burst, Duration::from_nanos(8_333_333), true, 0);
         let sent: Vec<Instant> = (0..72)
             .map(|_| receiver.recv_timeout(Duration::from_secs(5)).unwrap())
             .collect();
@@ -540,6 +600,7 @@ mod tests {
             burst_of(&pacer, 1, 2),
             Duration::from_nanos(8_333_333),
             false,
+            0,
         );
         held.recv_timeout(Duration::from_secs(5)).unwrap();
         for number in 2..=101 {
@@ -547,12 +608,62 @@ mod tests {
                 burst_of(&pacer, number, 30),
                 Duration::from_nanos(8_333_333),
                 false,
+                0,
             );
             assert_eq!(waiting(&pacer), Some(30));
         }
         assert_eq!(pacer.numbers().discarded, 99);
         assert!(pacer.shared.lock().spare.len() <= 4);
         gate.send(()).unwrap();
+    }
+
+    // A frame past half an interval at twice the rate is spread at twice
+    // the rate, and up to WAIT_BEHIND newer frames wait behind it, in order.
+    // One more sends what is left of all of them at once.
+    #[test]
+    fn a_big_frame_spreads_at_twice_the_rate_and_newer_ones_wait() {
+        let (sender, receiver) = mpsc::channel();
+        let pacer = Pacer::start(move |packet: &[u8]| {
+            let _ = sender.send((packet[0], Instant::now()));
+        })
+        .unwrap();
+        let interval = Duration::from_nanos(8_333_333);
+        let big = |number: u8| {
+            let mut burst = pacer.burst();
+            for index in 0..30 {
+                let mut packet = vec![0; 1000];
+                packet[..2].copy_from_slice(&[number, index]);
+                burst.push(&packet);
+            }
+            burst
+        };
+        // 240 000 bits at twice 2 Mbit/s take 60 ms.
+        pacer.put(big(1), interval, true, 2_000_000);
+        thread::sleep(Duration::from_millis(5));
+        // Apart, as frames come, so the mailbox never holds two.
+        pacer.put(burst_of(&pacer, 2, 4), interval, true, 2_000_000);
+        thread::sleep(Duration::from_millis(3));
+        pacer.put(burst_of(&pacer, 3, 4), interval, true, 2_000_000);
+        let got: Vec<(u8, Instant)> = (0..38)
+            .map(|_| receiver.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect();
+        let order: Vec<u8> = got.iter().map(|&(number, _)| number).collect();
+        assert!(order.is_sorted(), "{order:?}");
+        let spread = got[29].1 - got[0].1;
+        assert!(spread >= Duration::from_millis(40), "{spread:?}");
+        assert_eq!(pacer.numbers().cut_short, 0);
+        // Two waiting behind a big frame, and a fourth: it all goes now.
+        pacer.put(big(4), interval, true, 2_000_000);
+        thread::sleep(Duration::from_millis(5));
+        for number in 5..=7 {
+            pacer.put(burst_of(&pacer, number, 4), interval, true, 2_000_000);
+            thread::sleep(Duration::from_millis(3));
+        }
+        let got: Vec<u8> = (0..42)
+            .map(|_| receiver.recv_timeout(Duration::from_secs(5)).unwrap().0)
+            .collect();
+        assert!(got.is_sorted(), "{got:?}");
+        assert_eq!(pacer.numbers().cut_short, 3);
     }
 
     // The send function is the caller's code. When it panics the thread ends,
@@ -568,11 +679,11 @@ mod tests {
         })
         .unwrap();
         let interval = Duration::from_nanos(8_333_333);
-        pacer.put(burst_of(&pacer, 1, 3), interval, false);
+        pacer.put(burst_of(&pacer, 1, 3), interval, false, 0);
         for _ in 0..3 {
             assert_eq!(receiver.recv_timeout(Duration::from_secs(5)), Ok(1));
         }
-        pacer.put(burst_of(&pacer, 2, 3), interval, false);
+        pacer.put(burst_of(&pacer, 2, 3), interval, false, 0);
         // The sender goes with the closure as the thread unwinds; the note
         // is written just after.
         assert!(receiver.recv_timeout(Duration::from_secs(5)).is_err());
@@ -589,7 +700,7 @@ mod tests {
             "the video send thread stopped: it panicked: could not seal packet 0"
         );
         for number in 3..50 {
-            pacer.put(burst_of(&pacer, number, 30), interval, true);
+            pacer.put(burst_of(&pacer, number, 30), interval, true, 0);
             assert_eq!(waiting(&pacer), None);
         }
         assert_eq!(pacer.numbers().frames, 2);

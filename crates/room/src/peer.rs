@@ -20,6 +20,35 @@ use crate::socket::Socket;
 // recently. The same 2 s the strip's voice numbers are counted over.
 pub(crate) const MEDIA_FLOWS_FOR: Duration = stats::STREAM_WINDOW;
 
+// Video feedback, recover requests, IDR asks and loss reports, goes on a
+// stream of its own (Link::queue_feedback), once the other side says it is
+// FEEDBACK_SINCE or later; before that, on the control stream. A watcher
+// behind a 2.5 s queue sent 29 recover requests a second, the control
+// stream carried 25 with 64 in flight, and every control message waited
+// 43 s at the 99th percentile, voice loss reports and room messages too.
+pub(crate) const FEEDBACK_SINCE: invite::Version = invite::Version {
+    major: 0,
+    minor: 2,
+    patch: 2,
+};
+
+// Feedback waiting on its stream, in flight or queued, past which new
+// feedback is held and merged until it drains: recover requests into one
+// span, and the newest IDR ask and loss report. A request that waits behind
+// a full stream is about frames long gone; merged, the feedback above came
+// in 55 to 390 ms at the median and under 3.1 s at the 99th percentile,
+// where it took 1 to 34 s and up to 50 s.
+const FEEDBACK_WAITING: usize = 4;
+
+// A pong after no pong for this long, with more pings than one unanswered
+// in between, ends a loss burst or outage: the control and feedback streams'
+// retransmissions that backed off during it go one timeout from now, as
+// after a silence (Link::path_recovered). During a call nothing is silent
+// for the 2 s a silence takes: a message caught by a 300 ms burst waited
+// out its own backoff, up to 260 ms after the burst ended.
+const PONG_GAP: Duration = Duration::from_millis(250);
+const PINGS_IN_A_GAP: u32 = 3;
+
 // Ping times are monotonic, but counted from the wall clock at the start, so
 // the offset between two PCs is their real clock difference and not how far
 // apart the two programs were started. A watcher turns a sharer's capture
@@ -292,6 +321,7 @@ pub(crate) enum Plain<'a> {
     Ping(PingMessage),
     Control(&'a [u8]),
     Chat(&'a [u8]),
+    Feedback(&'a [u8]),
     Voice(&'a [u8]),
     Video(&'a [u8]),
     Cursor(&'a [u8]),
@@ -303,6 +333,7 @@ pub(crate) fn read_plain(plain: &[u8]) -> Option<Plain<'_>> {
         (Channel::Ping, payload) => PingMessage::decode(payload).ok().map(Plain::Ping),
         (Channel::Control, payload) => Some(Plain::Control(payload)),
         (Channel::Chat, payload) => Some(Plain::Chat(payload)),
+        (Channel::Feedback, payload) => Some(Plain::Feedback(payload)),
         (Channel::Voice, payload) => Some(Plain::Voice(payload)),
         (Channel::Video, payload) => Some(Plain::Video(payload)),
         (Channel::Cursor, payload) => Some(Plain::Cursor(payload)),
@@ -316,6 +347,11 @@ pub(crate) struct Link {
     // line of chat up, or the other way round. It lives as long as the
     // control one: kept across a rekey, started over with a new link.
     pub chat: Reliable,
+    // Video feedback's stream, and whether the other side reads it, which
+    // its Hello says (FEEDBACK_SINCE). Feedback held while it is backed up.
+    pub feedback: Reliable,
+    pub feedback_read: bool,
+    held: Held,
     pub stats: LinkStats,
     pub offset: OffsetEstimator,
     pub next_ping: Instant,
@@ -327,6 +363,55 @@ pub(crate) struct Link {
     // from threads of their own and are not in it (Talk::sent_lately,
     // Sharing::sent_lately).
     last_media: Option<Instant>,
+    // The last pong, and our pings sent since (PONG_GAP).
+    last_pong: Option<Instant>,
+    pings_since_pong: u32,
+}
+
+// Feedback held for the stream (FEEDBACK_WAITING): a recover span from the
+// oldest first frame to the newest last, for one share, and the newest IDR
+// ask and loss report.
+#[derive(Default)]
+struct Held {
+    recover: Option<(u32, u32, u32)>,
+    idr: Option<(u32, Option<u32>)>,
+    loss: Option<(u32, Option<u16>)>,
+}
+
+impl Held {
+    fn is_empty(&self) -> bool {
+        self.recover.is_none() && self.idr.is_none() && self.loss.is_none()
+    }
+
+    // False for a message that is not feedback.
+    fn add(&mut self, message: &Message) -> bool {
+        match *message {
+            Message::Recover { share, first, last } => {
+                self.recover = Some(match self.recover {
+                    Some((held, from, _)) if held == share => (share, from, last),
+                    _ => (share, first, last),
+                });
+            }
+            Message::Idr { share, seen } => self.idr = Some((share, seen)),
+            Message::VideoLoss { share, loss } => self.loss = Some((share, loss)),
+            _ => return false,
+        }
+        true
+    }
+
+    fn take(&mut self) -> Vec<Message> {
+        let mut out = Vec::new();
+        if let Some((share, first, last)) = self.recover.take() {
+            out.push(Message::Recover { share, first, last });
+        }
+        if let Some((share, seen)) = self.idr.take() {
+            out.push(Message::Idr { share, seen });
+        }
+        if let Some((share, loss)) = self.loss.take() {
+            out.push(Message::VideoLoss { share, loss });
+        }
+        out
+    }
 }
 
 impl Link {
@@ -334,6 +419,9 @@ impl Link {
         Link {
             reliable: Reliable::new(),
             chat: Reliable::new(),
+            feedback: Reliable::new(),
+            feedback_read: false,
+            held: Held::default(),
             stats: LinkStats::new(),
             offset: OffsetEstimator::new(),
             next_ping: now,
@@ -341,6 +429,8 @@ impl Link {
             rtt: RttEstimator::new(),
             minute: Minute::new(now),
             last_media: None,
+            last_pong: None,
+            pings_since_pong: 0,
         }
     }
 
@@ -383,21 +473,37 @@ impl Link {
         Ok(())
     }
 
-    // Both streams: a message that waited out an outage goes one normal
+    pub(crate) fn receive_feedback(
+        &mut self,
+        frame: &[u8],
+        now: Instant,
+    ) -> Result<(), ReliableError> {
+        self.feedback.receive(frame, now)?;
+        for delay in self.feedback.ack_delays() {
+            self.minute.ack(now, delay);
+        }
+        Ok(())
+    }
+
+    // Every stream: a message that waited out an outage goes one normal
     // timeout from now, not at the end of its backoff.
     pub(crate) fn path_recovered(&mut self, now: Instant) {
         self.reliable.path_recovered(now);
         self.chat.path_recovered(now);
+        self.feedback.path_recovered(now);
     }
 
     pub(crate) fn next_timeout(&self) -> Option<Instant> {
         let mut soonest = crate::Soonest(self.reliable.next_timeout());
         soonest.add(self.chat.next_timeout());
+        soonest.add(self.feedback.next_timeout());
         soonest.0
     }
 
     pub(crate) fn retransmissions(&self) -> u64 {
-        self.reliable.counters().retransmissions + self.chat.counters().retransmissions
+        self.reliable.counters().retransmissions
+            + self.chat.counters().retransmissions
+            + self.feedback.counters().retransmissions
     }
 
     pub(crate) fn ack_delay_ms(&self, now: Instant) -> Option<f32> {
@@ -419,6 +525,13 @@ impl Link {
 
     pub(crate) fn round_trip(&self, now: Instant) -> Option<share::rate::RoundTrip> {
         self.minute.round_trip(now)
+    }
+
+    // How long the oldest of our pings still out has waited for its pong.
+    pub(crate) fn unanswered_ms(&self, now: Instant) -> Option<f32> {
+        self.stats
+            .waiting_for(now)
+            .map(|waited| waited.as_secs_f32() * 1000.0)
     }
 
     // Stamped when built, not when the timer pass began, so waiting for the
@@ -448,6 +561,7 @@ impl Link {
     fn ping_numbered(&mut self, seq: u32, clock: Clock) -> Vec<u8> {
         let sent = Instant::now();
         self.stats.ping_sent(seq, sent);
+        self.pings_since_pong = self.pings_since_pong.saturating_add(1);
         encode(PingMessage::Ping {
             seq,
             t1: clock.micros(sent),
@@ -481,6 +595,14 @@ impl Link {
         if let Some(elapsed) = self.stats.pong_received(seq, rtt, now) {
             self.rtt.sample(elapsed);
             self.minute.ping(now, elapsed);
+            let gap = self
+                .last_pong
+                .is_some_and(|at| now.saturating_duration_since(at) > PONG_GAP);
+            if gap && self.pings_since_pong >= PINGS_IN_A_GAP {
+                self.path_recovered(now);
+            }
+            self.last_pong = Some(now);
+            self.pings_since_pong = 0;
         }
         self.offset.push(sample);
         true
@@ -502,6 +624,35 @@ impl Link {
     // path, and the caller says whether that matters.
     pub(crate) fn queue_chat(&mut self, message: &[u8]) -> Result<(), ReliableError> {
         self.chat.send(message)
+    }
+
+    // A recover request, an IDR ask or a loss report: on the feedback stream
+    // when the other side reads it, held and merged while that stream is
+    // backed up (FEEDBACK_WAITING); otherwise on the control stream.
+    pub(crate) fn queue_feedback(&mut self, message: &Message) {
+        if !self.feedback_read {
+            self.queue(message);
+            return;
+        }
+        if (!self.held.is_empty() || self.feedback_waiting() >= FEEDBACK_WAITING)
+            && self.held.add(message)
+        {
+            return;
+        }
+        let _ = self.feedback.send(&message.encode());
+    }
+
+    fn feedback_waiting(&self) -> usize {
+        let counters = self.feedback.counters();
+        counters.in_flight + counters.queued
+    }
+
+    fn release_held(&mut self) {
+        if self.feedback_waiting() < FEEDBACK_WAITING {
+            for message in self.held.take() {
+                let _ = self.feedback.send(&message.encode());
+            }
+        }
     }
 
     pub(crate) fn has_unacked(&self) -> bool {
@@ -529,6 +680,10 @@ impl Link {
         }
         while let Some(frame) = self.chat.poll_transmit(now, timeout) {
             send_on(socket, session, Channel::Chat, &frame, to, traffic);
+        }
+        self.release_held();
+        while let Some(frame) = self.feedback.poll_transmit(now, timeout) {
+            send_on(socket, session, Channel::Feedback, &frame, to, traffic);
         }
     }
 
@@ -664,5 +819,160 @@ mod tests {
         assert!(media.answered(new_home, 9, 3_000));
         assert_eq!(media.to(), new_home);
         assert!(!media.answered(new_home, 9, 4_000), "once");
+    }
+
+    // Frames over to the other side's feedback stream and its ack back.
+    fn carry_feedback(link: &mut Link, other: &mut Reliable, now: Instant) -> Vec<Message> {
+        let timeout = Some(Duration::from_millis(100));
+        while let Some(frame) = link.feedback.poll_transmit(now, timeout) {
+            other.receive(&frame, now).unwrap();
+        }
+        let mut read = Vec::new();
+        while let Some(message) = other.next_delivered() {
+            read.push(Message::decode(&message).expect("feedback that decodes"));
+        }
+        while let Some(ack) = other.poll_transmit(now, timeout) {
+            link.receive_feedback(&ack, now).unwrap();
+        }
+        read
+    }
+
+    #[test]
+    fn feedback_goes_on_control_until_the_other_side_reads_it() {
+        let now = Instant::now();
+        let mut link = Link::new(now);
+        link.queue_feedback(&Message::Idr {
+            share: 3,
+            seen: None,
+        });
+        assert_eq!((link.waiting(), link.feedback_waiting()), (1, 0));
+
+        link.feedback_read = true;
+        link.queue_feedback(&Message::Idr {
+            share: 3,
+            seen: None,
+        });
+        assert_eq!((link.waiting(), link.feedback_waiting()), (1, 1));
+    }
+
+    #[test]
+    fn feedback_is_held_and_merged_while_its_stream_is_backed_up() {
+        let now = Instant::now();
+        let mut link = Link::new(now);
+        link.feedback_read = true;
+        let mut other = Reliable::new();
+        let recover = |first, last| Message::Recover {
+            share: 3,
+            first,
+            last,
+        };
+        for frame in 0..FEEDBACK_WAITING as u32 {
+            link.queue_feedback(&recover(frame, frame));
+        }
+        link.queue_feedback(&recover(10, 11));
+        link.queue_feedback(&Message::Idr {
+            share: 3,
+            seen: Some(9),
+        });
+        link.queue_feedback(&recover(14, 16));
+        link.queue_feedback(&Message::VideoLoss {
+            share: 3,
+            loss: Some(120),
+        });
+        link.queue_feedback(&Message::Idr {
+            share: 3,
+            seen: Some(13),
+        });
+        link.release_held();
+        assert_eq!(link.feedback_waiting(), FEEDBACK_WAITING);
+        assert_eq!(carry_feedback(&mut link, &mut other, now).len(), 4);
+        assert_eq!(link.feedback_waiting(), 0);
+
+        // Once drained, what was held goes as three messages: one recover
+        // span from the oldest first frame to the newest last, then the
+        // newest IDR ask and loss report.
+        link.release_held();
+        let read = carry_feedback(&mut link, &mut other, now);
+        assert!(matches!(
+            read.as_slice(),
+            [
+                Message::Recover {
+                    share: 3,
+                    first: 10,
+                    last: 16
+                },
+                Message::Idr {
+                    share: 3,
+                    seen: Some(13)
+                },
+                Message::VideoLoss {
+                    share: 3,
+                    loss: Some(120)
+                },
+            ]
+        ));
+
+        // Nothing held, and room on the stream: straight on.
+        link.queue_feedback(&recover(20, 20));
+        assert_eq!(link.feedback_waiting(), 1);
+    }
+
+    // Pings go every few ms during a call, so a pong after a gap with three
+    // or more unanswered ends a burst. One ping a second on an idle link
+    // never does: there the backoff is what holds retransmissions down.
+    #[test]
+    fn a_pong_after_a_burst_brings_retransmissions_forward() {
+        let ms = Duration::from_millis;
+        let start = Instant::now();
+        let clock = Clock::new(start);
+        let mut link = Link::new(start);
+        let ping = |link: &mut Link| match PingMessage::decode(&link.ping(clock)) {
+            Ok(PingMessage::Ping { seq, t1 }) => (seq, t1),
+            _ => panic!("ping() built something else"),
+        };
+        let pong = |link: &mut Link, (seq, t1): (u32, u64), at: Instant| {
+            let t2 = clock.micros(at);
+            assert!(link.pong(
+                PingMessage::Pong {
+                    seq,
+                    t1,
+                    t2,
+                    t3: t2
+                },
+                at,
+                clock
+            ));
+        };
+
+        let first = ping(&mut link);
+        let heard = Instant::now() + ms(20);
+        pong(&mut link, first, heard);
+
+        // A control message caught by the burst: sent and resent five times,
+        // its timer doubling to the 2 s cap.
+        link.queue(&Message::Idr {
+            share: 3,
+            seen: None,
+        });
+        let mut at = heard;
+        assert!(link.reliable.poll_transmit(at, Some(ms(100))).is_some());
+        for _ in 0..5 {
+            at = link.next_timeout().unwrap();
+            assert!(link.reliable.poll_transmit(at, Some(ms(100))).is_some());
+        }
+        let backed_off = link.next_timeout();
+        assert_eq!(backed_off, Some(heard + ms(5100)));
+
+        let idle = ping(&mut link);
+        let later = Instant::now().max(heard) + ms(1000);
+        pong(&mut link, idle, later);
+        assert_eq!(link.next_timeout(), backed_off);
+
+        let _ = ping(&mut link);
+        let _ = ping(&mut link);
+        let last = ping(&mut link);
+        let after = Instant::now().max(later) + ms(400);
+        pong(&mut link, last, after);
+        assert_eq!(link.next_timeout(), Some(after + ms(100)));
     }
 }

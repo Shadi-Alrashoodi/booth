@@ -10,6 +10,8 @@ pub enum Channel {
     Cursor = 4,
     Input = 5,
     Ping = 6,
+    // Video feedback, a reliable stream of its own beside Control.
+    Feedback = 7,
 }
 
 impl TryFrom<u8> for Channel {
@@ -24,6 +26,7 @@ impl TryFrom<u8> for Channel {
             4 => Channel::Cursor,
             5 => Channel::Input,
             6 => Channel::Ping,
+            7 => Channel::Feedback,
             other => return Err(FrameError::UnknownChannel(other)),
         })
     }

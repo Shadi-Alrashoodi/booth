@@ -823,12 +823,13 @@ fn data_shards_on_the_lan(bytes: f64) -> u16 {
         .max(1.0) as u16
 }
 
-// At 20 percent the parity follows the loss, lost frames are invalidated so
-// the picture keeps moving, and the backoff lowers the rate the encoder is
-// given. The host shares the busy pattern, which sends as much as its rate
-// lets it: the plain one sends a fraction of any rate, where loss is never
-// a queue (share::rate, NEAR_SHARE). The upload setting is low, so the
-// backoff goes a long way down within the run.
+// At 20 percent the parity follows the loss and lost frames are invalidated
+// so the picture keeps moving. The loss is random with no queue behind it:
+// the round trip stays flat and a fifth of the shards lost is under what
+// counts as a queue on its own (share::rate, SHARD_ALONE), so the rate
+// holds. The host shares the busy pattern, which sends as much as its rate
+// lets it, so loss could pass for a queue: the plain one sends a fraction of
+// any rate, where it never does (share::rate, NEAR_SHARE).
 // In HEVC and in H.264, as at 5 percent.
 #[test]
 fn loss_at_20_percent() {
@@ -875,11 +876,10 @@ fn at_20_percent(hevc: bool) {
     let slowest = fps[1..].iter().min().copied().unwrap_or(0);
     assert!(slowest >= 60, "{fps:?}");
     assert!(
-        shared.backoffs > 0 && shared.rate_kbps < shared.allowed_kbps,
+        shared.backoffs == 0 && shared.rate_kbps == shared.allowed_kbps,
         "{shared:?}"
     );
     assert_eq!(shared.allowed_kbps, upload);
-    // NVENC took each lower rate.
     assert_eq!(shared.encoder_kbps, shared.rate_kbps, "{shared:?}");
     host.room().stop_sharing();
     ana.wait_for(WAIT, "the viewer closed", |v| !v.share.viewer_open);

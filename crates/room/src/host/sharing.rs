@@ -542,11 +542,16 @@ impl Host {
     }
 
     // Seals `plain` once for each friend who watches `number` and sends it
-    // where their media goes, with buffers kept for it.
+    // where their media goes, with buffers kept for it. Each packet starts
+    // at the next friend in turn, so a full uplink drops each one's copies
+    // as often.
     fn relay(&mut self, number: u32, plain: &[u8], now: Instant, socket: &Socket) {
         let timers = self.timers;
         let per_second = relay_per_second(self.upload_kbps);
-        for other in &mut self.peers {
+        let count = self.peers.len();
+        self.relay_first = self.relay_first.wrapping_add(1);
+        for k in 0..count {
+            let other = &mut self.peers[(self.relay_first + k) % count];
             if other.share.watching != Some(number) {
                 continue;
             }
@@ -1167,7 +1172,7 @@ impl Host {
     }
 
     // To the sharer: this host's own share takes the answer at once; a
-    // friend's goes over the control channel.
+    // friend's goes over the feedback stream (Link::queue_feedback).
     fn tell_sharer(&mut self, answer: Answer, message: Message, now: Instant, socket: &Socket) {
         let Some(sharer) = self.live.as_ref().map(|live| live.sharer) else {
             return;
@@ -1177,7 +1182,7 @@ impl Host {
             return;
         }
         if let Some(peer) = self.peers.iter_mut().find(|peer| peer.key == sharer) {
-            peer.link.queue(&message);
+            peer.link.queue_feedback(&message);
             peer.flush(socket, now);
         }
     }
@@ -1342,7 +1347,8 @@ impl Host {
 
     // For the rate's backoff (share::rate): the round trip of the link to
     // whoever watches this host's own share that rose the most past its
-    // floor and margin, since the host's uplink carries every one of them.
+    // floor and margin, since the host's uplink carries every one of them,
+    // and the longest any ping on those links has waited for its pong.
     fn share_round_trip(&mut self, now: Instant) {
         let own = *self.identity.public();
         let number = self
@@ -1350,13 +1356,18 @@ impl Host {
             .as_ref()
             .filter(|live| live.sharer == own)
             .map(|live| live.number);
-        let worst = self
-            .peers
-            .iter()
-            .filter(|peer| number.is_some() && peer.share.watching == number)
+        let watching = || {
+            self.peers
+                .iter()
+                .filter(move |peer| number.is_some() && peer.share.watching == number)
+        };
+        let worst = watching()
             .filter_map(|peer| peer.link.round_trip(now))
             .max_by(|a, b| a.past_margin_ms().total_cmp(&b.past_margin_ms()));
-        self.screen.sharing.set_round_trip(worst);
+        let unanswered = watching()
+            .filter_map(|peer| peer.link.unanswered_ms(now))
+            .max_by(f32::total_cmp);
+        self.screen.sharing.set_round_trip(worst, unanswered);
     }
 
     // A frame's capture time sits inside its parity, where this host cannot

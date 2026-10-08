@@ -20,6 +20,13 @@ fn rtt(recent_ms: f32) -> Option<RoundTrip> {
     })
 }
 
+// A round trip past the margin but not twice it: a queue beside frames lost
+// past the parity, which they count as one only next to (SHARD_FRAMES is
+// the other sign).
+fn queue_beside() -> Option<RoundTrip> {
+    rtt(36.0)
+}
+
 // A clean second of a share sending `kbps` of video and parity.
 fn sending(kbps: u32) -> Second {
     Second {
@@ -27,6 +34,8 @@ fn sending(kbps: u32) -> Second {
         lost: 0,
         bytes: bytes(kbps),
         round_trip: rtt(20.0),
+        unanswered_ms: None,
+        shard_loss: None,
         encode_ms: Some(2.5),
         interval: INTERVAL,
         internet: false,
@@ -53,6 +62,7 @@ fn loss_near_the_rate_cuts_a_fifth() {
     let mut rate = Rate::new(15_000);
     let lossy = Second {
         lost: 10,
+        round_trip: queue_beside(),
         ..sending(14_000)
     };
     let decisions = run(&mut rate, start, 0, 5, lossy);
@@ -65,15 +75,16 @@ fn loss_near_the_rate_cuts_a_fifth() {
     assert_eq!(rate.backoffs(), 3);
 }
 
-// Five frames in 100 lost past the parity while sending near
-// the rate is a queue; one frame in a window is not, nor is a frame a
-// second, nor one frame of a still screen's few.
+// Five frames in 100 lost past the parity while sending near the rate, with
+// the round trip past its margin, is a queue; one frame in a window is not,
+// nor is a frame a second, nor one frame of a still screen's few.
 #[test]
 fn five_in_100_lost_backs_off() {
     let start = Instant::now();
     let mut rate = Rate::new(15_000);
     let five = Second {
         lost: 6,
+        round_trip: queue_beside(),
         ..sending(14_000)
     };
     let first = rate.second(start, &five);
@@ -343,6 +354,7 @@ fn the_gate_cuts_from_what_was_sent() {
     let start = Instant::now();
     let light = Second {
         sent: 100,
+        round_trip: queue_beside(),
         ..sending(7_200)
     };
     // 19 in 100 is let pass however long it lasts.
@@ -370,7 +382,7 @@ fn the_gate_cuts_from_what_was_sent() {
     assert_eq!(
         rate.line(&decisions[4]).as_deref(),
         Some(
-            "rate 5760 kbit/s of 15000 allowed, backed off for 20 or more frames in 100 lost in 2 s or more of 5 though not near the rate, from what was sent; sent 7200 kbit/s, 48 percent of 15000; 100 of 500 frames lost over 5 s, 5 s of it at 5 frames and 20 in 100 or more; round trip 20.0 ms against a floor of 18.0 and a margin of 15.0"
+            "rate 5760 kbit/s of 15000 allowed, backed off for 20 or more frames in 100 lost in 2 s or more of 5 though not near the rate, from what was sent; sent 7200 kbit/s, 48 percent of 15000; 100 of 500 frames lost over 5 s, 5 s of it at 5 frames and 20 in 100 or more; round trip 36.0 ms against a floor of 18.0 and a margin of 15.0, risen 5 s"
         )
     );
     // Heavy seconds need a heavy window too: 25 frames of 100 every other
@@ -488,6 +500,7 @@ fn the_gate_cuts_from_what_was_sent() {
     let mut rate = Rate::new(15_000);
     let scarce = Second {
         lost: 50,
+        round_trip: queue_beside(),
         ..sending(800)
     };
     let decisions = run(&mut rate, start, 0, 5, scarce);
@@ -506,9 +519,10 @@ fn heavy_window(judged: &Judged) -> bool {
 // while it lasts, then the first frame after it brings the report of every
 // frame it covered, in one second of the window. That is 20 and 40 frames
 // in 100 of the window, which through the gate cut the rate to the floor;
-// heavy in that one second only, it is let pass as the link's own. So on a
-// still screen's 3 frames a second, where the IDR ask after the report
-// comes the second after it, one frame, which is a third of that second's.
+// heavy in that one second only, and with no queue beside it, it is no sign
+// at all. So on a still screen's 3 frames a second, where the IDR ask after
+// the report comes the second after it, one frame, which is a third of that
+// second's.
 #[test]
 fn an_outage_is_let_pass() {
     let start = Instant::now();
@@ -540,9 +554,9 @@ fn an_outage_is_let_pass() {
             let judged = *rate.judged();
             let case = format!("{outage} s at {sent} frames a second, second {n}: {judged}");
             assert_eq!(decision.backoff, None, "{case}");
+            assert_eq!(decision.let_pass, None, "{case}");
             if heavy_window(&judged) {
                 heavy_before += 1;
-                assert_eq!(decision.let_pass, Some(Sign::Loss), "{case}");
                 assert_eq!(judged.heavy_seconds, 1, "{case}");
             }
             lines.extend(rate.line(&decision));
@@ -551,14 +565,7 @@ fn an_outage_is_let_pass() {
         // stayed in the window.
         assert_eq!(heavy_before, LOSS_SECONDS, "{outage} s at {sent}");
         assert_eq!(rate.rate_kbps(), 15_000);
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(
-            lines[0].contains(&format!(
-                ", not near the rate, loss let pass; sent {kbps} kbit/s"
-            )) && lines[0]
-                .contains(" frames lost over 5 s, 1 s of it at 5 frames and 20 in 100 or more; "),
-            "{lines:?}"
-        );
+        assert!(lines.is_empty(), "{lines:?}");
     }
 }
 
@@ -827,6 +834,8 @@ fn replay(
                     floor_ms: floor_ms(n),
                     spread_ms: 2.0,
                 }),
+                unanswered_ms: None,
+                shard_loss: None,
                 encode_ms: Some(3.0),
                 interval: INTERVAL,
                 internet: true,
@@ -929,12 +938,13 @@ fn climbs_back_after_a_queue() {
             (18, Some(5_948), None),
             (23, Some(6_543), None),
             (28, Some(7_197), None),
-            // Past it and clean for 2 s: fast. Back to full size 23 s after
-            // the queue went, and to the rate allowed 26 s after.
+            // Past it and clean for 2 s: fast. Back to full size once clean
+            // for 5 s, 24 s after the queue went, and to the rate allowed
+            // 26 s after.
             (30, Some(8_277), None),
             (31, Some(9_519), None),
-            (32, Some(10_947), Some(Step::Up)),
-            (33, Some(12_589), None),
+            (32, Some(10_947), None),
+            (33, Some(12_589), Some(Step::Up)),
             (34, Some(14_477), None),
             (35, Some(15_000), None),
         ]
@@ -952,6 +962,7 @@ fn careful_climb_after_one_backoff() {
     // 30 frames: the next time, over 5 s of 120 frames a second, too.
     let lossy = Second {
         lost: 30,
+        round_trip: queue_beside(),
         ..sending(14_000)
     };
     run(&mut rate, start, 0, 1, lossy);
@@ -991,6 +1002,7 @@ fn climbs_while_signs_are_let_pass() {
     let mut rate = Rate::new(15_000);
     let lossy = Second {
         lost: 20,
+        round_trip: queue_beside(),
         ..sending(14_000)
     };
     run(&mut rate, start, 0, 1, lossy);
@@ -1023,6 +1035,7 @@ fn the_backoff_floor() {
     let start = Instant::now();
     let lossy = Second {
         lost: 50,
+        round_trip: queue_beside(),
         ..sending(15_000)
     };
     let mut rate = Rate::new(15_000);
@@ -1047,6 +1060,7 @@ fn the_rate_allowed_follows_watchers_coming_and_going() {
         start,
         &Second {
             lost: 10,
+            round_trip: queue_beside(),
             ..sending(14_000)
         },
     );
@@ -1063,12 +1077,20 @@ fn the_rate_allowed_follows_watchers_coming_and_going() {
         ..sending(14_000)
     };
     let mut rate = Rate::new(15_000);
-    rate.second(at(start, 0), &Second { lost: 10, ..busy });
+    rate.second(
+        at(start, 0),
+        &Second {
+            lost: 10,
+            round_trip: queue_beside(),
+            ..busy
+        },
+    );
     assert_eq!(rate.rate_kbps(), 12_000);
     assert_eq!(rate.allow(7_000), Some(7_000));
     let down = rate.second(at(start, 1), &busy);
     assert_eq!(down.step, Some(Step::Down(SteppedDown::LowRate)));
     assert_eq!(rate.allow(15_000), Some(15_000));
+    run(&mut rate, start, 2, 9, busy);
     assert_eq!(rate.second(at(start, 11), &busy).step, Some(Step::Up));
 }
 
@@ -1088,6 +1110,7 @@ fn steps_down_under_8_and_up_at_10() {
     // One leaves: 15 Mbit/s again, but not within 10 s of the last step.
     rate.allow(15_000);
     assert_eq!(rate.second(at(start, 5), &internet).step, None);
+    run(&mut rate, start, 6, 4, internet);
     assert_eq!(rate.second(at(start, 10), &internet).step, Some(Step::Up));
     assert_eq!(rate.small(), None);
 
@@ -1132,7 +1155,7 @@ fn steps_down_under_8_and_up_at_10() {
 // The old case where the rate never got back to 10: an upload setting of
 // 18 Mbit/s and two watchers over the internet allow 9 each, which never
 // steps down. A lossy second cuts it to 7.2, which does. The careful climb
-// reaches 9 in three steps 5 s apart, and 2 clean seconds at it bring the
+// reaches 9 in three steps 5 s apart, and 5 clean seconds at it bring the
 // share back to full size, 10 s and more after the step down.
 #[test]
 fn steps_up_with_allowed_under_10() {
@@ -1143,6 +1166,7 @@ fn steps_up_with_allowed_under_10() {
     };
     let lossy = Second {
         lost: 10,
+        round_trip: queue_beside(),
         ..internet
     };
     let mut rate = Rate::new(9_000);
@@ -1165,7 +1189,7 @@ fn steps_up_with_allowed_under_10() {
             (6, Some(7_920), None),
             (11, Some(8_712), None),
             (16, Some(9_000), None),
-            (18, None, Some(Step::Up))
+            (21, None, Some(Step::Up))
         ]
     );
 }
@@ -1249,7 +1273,7 @@ fn a_slow_encoder_steps_down_for_good() {
 }
 
 #[test]
-fn round_trip_median_floor_and_spread() {
+fn round_trip_quartile_floor_and_spread() {
     let start = Instant::now();
     let ms = |n: u64| Duration::from_millis(n);
     let mut pings = VecDeque::new();
@@ -1271,7 +1295,7 @@ fn round_trip_median_floor_and_spread() {
         (rtt.recent_ms, rtt.floor_ms, rtt.spread_ms),
         (10.0, 10.0, 0.0)
     );
-    // A second of 40 ms pings: the median rises, and the floor and spread
+    // A second of 40 ms pings: the quartile rises, and the floor and spread
     // over 30 s do not see it.
     for n in 400..410u64 {
         pings.push_back((start + ms(n * 100), ms(40)));
@@ -1292,7 +1316,7 @@ fn round_trip_median_floor_and_spread() {
     let rtt = round_trip(&jittery, start + ms(29_950)).expect("pings");
     assert_eq!(
         (rtt.recent_ms, rtt.floor_ms, rtt.spread_ms),
-        (18.0, 4.0, 9.0)
+        (16.0, 4.0, 9.0)
     );
     assert_eq!(rtt.margin_ms(), 36.0);
     // Half the 30 s spent in a 200 ms queue of the share's own leaves the
@@ -1317,7 +1341,7 @@ fn round_trip_median_floor_and_spread() {
 }
 
 // A cut that was enough leaves a full router's queue to drain for a second
-// or two. Its median falls fast, which is no reason to cut again, and no
+// or two. Its round trip falls fast, which is no reason to cut again, and no
 // time to climb either.
 #[test]
 fn a_queue_draining_after_a_cut_is_not_cut_for_again() {
@@ -1365,6 +1389,7 @@ fn an_early_tick_still_counts() {
     let mut rate = Rate::new(15_000);
     let lossy = Second {
         lost: 20,
+        round_trip: queue_beside(),
         ..sending(14_000)
     };
     let late = start + Duration::from_millis(12);
@@ -1482,4 +1507,201 @@ fn what_a_second_was_judged_on_reads_as_one_clause() {
         rate.describe(&decision)
             .starts_with("rate 12000 kbit/s of 15000 allowed; sent")
     );
+}
+
+// Shard loss past what a radio loses on its own, with nothing reported
+// lost: half the shards whatever the round trip does, a quarter beside a
+// round trip past half its margin, or a quarter in five reports in a row.
+// The cut is to 0.8 of what arrived, not a fifth off the rate.
+#[test]
+fn shards_lost_to_a_queue_cut_to_what_arrived() {
+    let start = Instant::now();
+    let lost = |percent, recent_ms| Second {
+        shard_loss: Some(percent),
+        round_trip: rtt(recent_ms),
+        ..sending(14_000)
+    };
+    let mut rate = Rate::new(15_000);
+    let cut = rate.second(start, &lost(60.0, 20.0));
+    // 40 percent of 14000 arrived.
+    assert_eq!(
+        (cut.rate_kbps, cut.backoff),
+        (Some(4_480), Some(Sign::ShardLoss))
+    );
+    assert!(
+        rate.line(&cut).is_some_and(|line| line
+            .contains("backed off for shards lost to a queue, to what arrived")
+            && line.ends_with("; 60.0 percent of shards lost")),
+        "{:?}",
+        rate.line(&cut)
+    );
+
+    let mut rate = Rate::new(15_000);
+    let cut = rate.second(start, &lost(30.0, 28.0));
+    assert_eq!(cut.backoff, Some(Sign::ShardLoss));
+
+    let mut rate = Rate::new(15_000);
+    let decisions = run(&mut rate, start, 0, 5, lost(30.0, 20.0));
+    assert!(decisions[..4].iter().all(|d| *d == Decision::default()));
+    assert_eq!(
+        (decisions[4].rate_kbps, decisions[4].backoff),
+        (Some(7_840), Some(Sign::ShardLoss))
+    );
+    // Radio loss that comes and goes never makes five in a row.
+    let mut rate = Rate::new(15_000);
+    for n in 0..30 {
+        let percent = if n % 4 == 3 { 10.0 } else { 30.0 };
+        assert_eq!(
+            rate.second(at(start, n), &lost(percent, 20.0)),
+            Decision::default()
+        );
+    }
+}
+
+// While the queue drains after a cut, the watchers' reports still describe
+// the rate before it.
+#[test]
+fn shards_lost_while_the_queue_drains_are_no_sign() {
+    let start = Instant::now();
+    let mut rate = Rate::new(15_000);
+    let second = |recent_ms| Second {
+        shard_loss: Some(60.0),
+        round_trip: rtt(recent_ms),
+        ..sending(14_000)
+    };
+    assert_eq!(
+        rate.second(at(start, 0), &second(200.0)).backoff,
+        Some(Sign::ShardLoss)
+    );
+    rate.second(at(start, 1), &second(200.0));
+    assert_eq!(rate.second(at(start, 2), &second(100.0)).backoff, None);
+    assert_eq!(rate.backoffs(), 1);
+}
+
+// Frames lost past the parity count beside shard loss of SHARD_FRAMES too,
+// not only beside a risen round trip.
+#[test]
+fn frames_lost_beside_shards_lost_back_off() {
+    let start = Instant::now();
+    let mut rate = Rate::new(15_000);
+    let second = |shard_loss| Second {
+        lost: 10,
+        shard_loss,
+        ..sending(14_000)
+    };
+    assert_eq!(rate.second(start, &second(Some(39.0))), Decision::default());
+    let cut = rate.second(at(start, 1), &second(Some(40.0)));
+    assert_eq!(
+        (cut.rate_kbps, cut.backoff),
+        (Some(12_000), Some(Sign::Loss))
+    );
+}
+
+// No pong within the second after a round trip past the margin, with a ping
+// waiting a second or more: the queue grew past the second's pings, and
+// that counts as past twice the margin. A missing reading on its own, or
+// one after a calm second, or with nothing waiting that long, leaves the
+// counts as they were.
+#[test]
+fn a_ping_unanswered_after_a_rise_counts_as_far() {
+    let start = Instant::now();
+    let gone = |unanswered_ms| Second {
+        round_trip: None,
+        unanswered_ms,
+        ..sending(14_000)
+    };
+    let risen = Second {
+        round_trip: rtt(40.0),
+        ..sending(14_000)
+    };
+    let mut rate = Rate::new(15_000);
+    assert_eq!(rate.second(at(start, 0), &risen), Decision::default());
+    let cut = rate.second(at(start, 1), &gone(Some(1_500.0)));
+    assert_eq!(
+        (cut.rate_kbps, cut.backoff),
+        (Some(12_000), Some(Sign::RoundTrip))
+    );
+    assert!(
+        rate.judged()
+            .to_string()
+            .ends_with("no new round trip, a ping unanswered for 1500 ms, past 2 times the margin"),
+        "{}",
+        rate.judged()
+    );
+
+    let mut rate = Rate::new(15_000);
+    rate.second(at(start, 0), &sending(14_000));
+    run(&mut rate, start, 1, 10, gone(Some(1_500.0)));
+    assert_eq!(rate.backoffs(), 0);
+
+    let mut rate = Rate::new(15_000);
+    rate.second(at(start, 0), &risen);
+    run(&mut rate, start, 1, 10, gone(Some(900.0)));
+    assert_eq!(rate.backoffs(), 0);
+    assert_eq!(rate.judged().risen_seconds, 1);
+
+    // Sending under half the rate, five such seconds stand like a round
+    // trip past twice the margin and cut through the gate.
+    let light = Second {
+        sent: 100,
+        ..sending(7_200)
+    };
+    let mut rate = Rate::new(15_000);
+    rate.second(
+        at(start, 0),
+        &Second {
+            round_trip: rtt(40.0),
+            ..light
+        },
+    );
+    let decisions = run(
+        &mut rate,
+        start,
+        1,
+        5,
+        Second {
+            round_trip: None,
+            unanswered_ms: Some(2_000.0),
+            ..light
+        },
+    );
+    assert!(decisions[..4].iter().all(|d| d.backoff.is_none()));
+    assert_eq!(
+        (decisions[4].rate_kbps, decisions[4].backoff),
+        (Some(5_760), Some(Sign::FarRoundTrip))
+    );
+}
+
+// A second watcher on the host's own share: its upload carries two copies,
+// so a rate the link held under the setting is halved with the setting, and
+// the climb from there is careful. A rate the setting held is the new
+// allowance already.
+#[test]
+fn a_second_copy_shares_out_what_the_link_carried() {
+    let start = Instant::now();
+    let mut rate = Rate::new(15_000);
+    assert_eq!(rate.copies(7_500, 1, 2), Some(7_500));
+
+    let mut rate = Rate::new(15_000);
+    rate.second(
+        start,
+        &Second {
+            lost: 10,
+            round_trip: queue_beside(),
+            ..sending(14_000)
+        },
+    );
+    assert_eq!(rate.rate_kbps(), 12_000);
+    assert_eq!(rate.copies(7_500, 1, 2), Some(6_000));
+    assert_eq!(rate.allowed_kbps(), 7_500);
+    // Careful: 10 percent after 5 clean seconds.
+    let climbed: Vec<(u64, u32)> = run(&mut rate, start, 3, 8, sending(6_000))
+        .iter()
+        .zip(3..)
+        .filter_map(|(decision, n)| decision.rate_kbps.map(|kbps| (n, kbps)))
+        .collect();
+    assert_eq!(climbed, [(7, 6_600)]);
+    // Fewer copies is the plain allowance.
+    assert_eq!(rate.copies(15_000, 2, 1), None);
+    assert_eq!(rate.allowed_kbps(), 15_000);
 }

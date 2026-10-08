@@ -479,6 +479,9 @@ pub(crate) struct Host {
     // upload. The cap in the facts is only advice to the sharer; this holds
     // the host to RELAY_SHARE times the setting whatever the sharer sends.
     relay_upload: Bucket,
+    // Where the next relayed packet starts in the list of friends, which
+    // turns with each one as the sharer's own Outbox does.
+    relay_first: usize,
     // The number the next control session gets, and the controller whose
     // session ended last, until when what they sent before the end is let
     // go quietly.
@@ -598,6 +601,7 @@ impl Host {
                 setup.now,
                 sharing::relay_per_second(setup.screen.upload_kbps),
             ),
+            relay_first: 0,
             screen: Screen::new(clock, true, setup.screen, setup.now),
             live: None,
             next_share: 1,
@@ -2525,6 +2529,7 @@ impl Host {
             }
             Some(Plain::Control(frame)) => self.on_control(i, frame, now, socket),
             Some(Plain::Chat(frame)) => self.on_chat(i, frame, now, socket),
+            Some(Plain::Feedback(frame)) => self.on_feedback(i, frame, now, socket),
             Some(Plain::Voice(payload)) => self.on_voice(i, payload, now, socket),
             // Taken above.
             Some(Plain::Video(_) | Plain::Cursor(_) | Plain::Input(_)) | None => {
@@ -2867,6 +2872,35 @@ impl Host {
         to
     }
 
+    // A watcher's recover requests, IDR asks and loss reports on their
+    // stream; the same messages as on the control one, and as hostile.
+    fn on_feedback(&mut self, i: usize, frame: &[u8], now: Instant, socket: &Socket) -> bool {
+        let peer = &mut self.peers[i];
+        if peer.link.receive_feedback(frame, now).is_err() {
+            return self.drops.bad(now);
+        }
+        let mut delivered = Vec::new();
+        while let Some(message) = peer.link.feedback.next_delivered() {
+            delivered.push(message);
+        }
+        peer.flush(socket, now);
+        for bytes in delivered {
+            match Message::decode(&bytes) {
+                Some(
+                    message @ (Message::Recover { .. }
+                    | Message::Idr { .. }
+                    | Message::VideoLoss { .. }),
+                ) => {
+                    self.on_share_message(i, message, now, socket);
+                }
+                _ => {
+                    self.drops.bad(now);
+                }
+            }
+        }
+        true
+    }
+
     fn on_control(&mut self, i: usize, frame: &[u8], now: Instant, socket: &Socket) -> bool {
         let peer = &mut self.peers[i];
         if peer.link.receive(frame, now).is_err() {
@@ -2891,6 +2925,7 @@ impl Host {
                     let first = !self.peers[i].hello;
                     greeted |= first;
                     self.peers[i].hello = true;
+                    self.peers[i].link.feedback_read = version >= peer::FEEDBACK_SINCE;
                     let peer = &self.peers[i];
                     if first
                         && version != invite::VERSION
@@ -3375,6 +3410,7 @@ mod tests {
         session: Option<Session>,
         reliable: Reliable,
         chat: Reliable,
+        feedback: Reliable,
     }
 
     impl Guest {
@@ -3386,6 +3422,7 @@ mod tests {
                 session: None,
                 reliable: Reliable::new(),
                 chat: Reliable::new(),
+                feedback: Reliable::new(),
             }
         }
 
@@ -3462,10 +3499,21 @@ mod tests {
             reached: Option<SocketAddr>,
             now: Instant,
         ) {
+            self.join_as(rig, name, invite::VERSION, reached, now);
+        }
+
+        fn join_as(
+            &mut self,
+            rig: &mut Rig,
+            name: &str,
+            version: Version,
+            reached: Option<SocketAddr>,
+            now: Instant,
+        ) {
             let initiation = self.knock(rig, now);
             self.session = Some(self.answer(initiation, now).expect("the host answers"));
             let hello = Message::Hello {
-                version: invite::VERSION,
+                version,
                 name: name.to_owned(),
                 reached,
             };
@@ -3477,6 +3525,15 @@ mod tests {
             while let Some(frame) = self.reliable.poll_transmit(now, None) {
                 let session = self.session.as_mut().expect("joined");
                 let packet = seal(session, Channel::Control, &frame);
+                rig.deliver(&packet, self.wire.addr(), now);
+            }
+        }
+
+        fn say_feedback(&mut self, rig: &mut Rig, message: &Message, now: Instant) {
+            self.feedback.send(&message.encode()).expect("queued");
+            while let Some(frame) = self.feedback.poll_transmit(now, None) {
+                let session = self.session.as_mut().expect("joined");
+                let packet = seal(session, Channel::Feedback, &frame);
                 rig.deliver(&packet, self.wire.addr(), now);
             }
         }
@@ -3533,15 +3590,22 @@ mod tests {
                 Some(Plain::Chat(frame)) => {
                     let _ = self.chat.receive(frame, now);
                 }
+                Some(Plain::Feedback(frame)) => {
+                    let _ = self.feedback.receive(frame, now);
+                }
                 _ => {}
             }
         }
 
-        // The control messages the host sent since the last look.
+        // The control messages the host sent since the last look, then the
+        // video feedback.
         fn heard(&mut self, now: Instant) -> Vec<Message> {
             self.read(now);
             let mut out = Vec::new();
             while let Some(bytes) = self.reliable.next_delivered() {
+                out.extend(Message::decode(&bytes));
+            }
+            while let Some(bytes) = self.feedback.next_delivered() {
                 out.extend(Message::decode(&bytes));
             }
             out
@@ -3578,6 +3642,7 @@ mod tests {
             self.session = None;
             self.reliable = Reliable::new();
             self.chat = Reliable::new();
+            self.feedback = Reliable::new();
             self.wire.packets();
         }
     }
@@ -6302,6 +6367,67 @@ mod tests {
             }]
         );
         assert_eq!(rig.host.drops.bad, 3);
+    }
+
+    fn messages(stream: &mut Reliable) -> Vec<Message> {
+        let mut out = Vec::new();
+        while let Some(bytes) = stream.next_delivered() {
+            out.extend(Message::decode(&bytes));
+        }
+        out
+    }
+
+    // A sharer whose Hello is older than FEEDBACK_SINCE reads recover
+    // requests on the control stream only, a newer one on the feedback
+    // stream. A watcher's feedback is taken from either, and nothing else
+    // from the feedback stream.
+    #[test]
+    fn feedback_goes_where_the_sharers_version_reads_it() {
+        let older = Version {
+            major: 0,
+            minor: 2,
+            patch: 1,
+        };
+        for (version, on_control) in [(older, true), (peer::FEEDBACK_SINCE, false)] {
+            let start = Instant::now();
+            let mut rig = Rig::new(start);
+            let mut ana = Guest::new();
+            ana.join_as(&mut rig, "Ana", version, None, start);
+            let mut bo = Guest::new();
+            bo.join(&mut rig, "Bo", start);
+            let share = granted(&mut rig, &mut ana, start);
+            bo.say(
+                &mut rig,
+                &Message::Watch {
+                    share,
+                    on: true,
+                    hevc: true,
+                },
+                start,
+            );
+            ana.heard(start);
+            let from = ana.wire.addr();
+            for number in 0..=9 {
+                let packet = sent_video(&mut ana, &frame_packet(number));
+                rig.deliver(&packet, from, start);
+            }
+            let recover = |first, last| Message::Recover { share, first, last };
+            bo.say(&mut rig, &recover(2, 3), start);
+            bo.say_feedback(&mut rig, &recover(6, 7), start);
+            bo.say_feedback(&mut rig, &Message::ShareStop, start);
+            assert_eq!(rig.host.drops.bad, 1, "{version}");
+            assert!(rig.host.live.is_some(), "{version}: still sharing");
+
+            ana.read(start);
+            let (control, feedback) = (messages(&mut ana.reliable), messages(&mut ana.feedback));
+            let (read, unread) = if on_control {
+                (control, feedback)
+            } else {
+                (feedback, control)
+            };
+            assert_eq!(recovers_in(&read), [(2, 3), (6, 7)], "{version}");
+            assert_eq!(recovers_in(&unread), [], "{version}");
+        }
     }
 
     // On their own, or in the facts that count a new watcher.

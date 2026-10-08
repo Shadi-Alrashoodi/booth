@@ -210,8 +210,8 @@ pub struct JitterBuffer {
     // Measured: how far behind the fastest packet lately the play point is.
     depth: i64,
     // What the rules asked for: the minimum at first contact, a frame more
-    // for each grow, a frame less for each shrink. A transmission starts at
-    // this depth. Measured depth above it is excess: the play point fell
+    // for each grow, one or more less for each shrink. A transmission starts
+    // at this depth. Measured depth above it is excess: the play point fell
     // behind (a stalled render side) or started late (a slow first packet),
     // and no late packet asked for it, so it comes off at the next quiet
     // frames instead of one frame per 5 s. Kept at the measured depth, it
@@ -757,11 +757,17 @@ impl JitterBuffer {
     // The buffer's rules, run every 100 ms of played audio. "Late" is
     // measured against the depth being judged: grow when more than 1 percent
     // of the last 2 s would be late at the current depth; shrink when nothing
-    // in the last 5 s would have been late at one frame less, at most one
-    // frame per 5 s. Counting late packets against the depth they arrived at
+    // in the last 5 s would have been late at one frame less, at most once
+    // per 5 s. Counting late packets against the depth they arrived at
     // instead would keep growing for 2 s after one burst, and shrink straight
     // back into the jitter that caused it. Excess comes off under the same
     // clean test without the 5 s wait.
+    //
+    // A shrink takes the buffer down to one frame above the latest packet of
+    // those 5 s in one go, at the next quiet frames, and one frame at a time
+    // from there. After 40 ms of jitter calmed down, one frame per 5 s took
+    // 35 s to come back, every frame of it delay nobody needed; this way took
+    // 18 s, for 113 late frames where there were 96, in a simulated network.
     fn evaluate(&mut self) {
         let late_window = window_frames(self.frame);
         let clean_window = self.frames_in(CLEAN_WINDOW_MS);
@@ -796,7 +802,15 @@ impl JitterBuffer {
         if self.excess() > 0 {
             self.pending = Some(Adjust::Trim);
         } else if self.settled() && self.target > self.min_depth() {
-            self.pending = Some(Adjust::Drop);
+            let latest = self.arrivals.iter().map(|arrival| arrival.lag).max();
+            let spare = latest.map_or(1, |latest| self.play_lag - latest);
+            if spare > 1 {
+                self.target = (self.target - (spare - 1)).max(self.min_depth());
+                self.last_change = Some(self.pulls);
+                self.pending = Some(Adjust::Trim);
+            } else {
+                self.pending = Some(Adjust::Drop);
+            }
         }
     }
 

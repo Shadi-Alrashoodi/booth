@@ -297,9 +297,10 @@ pub struct Sharing {
     // New numbers or news since the view was last made.
     fresh: AtomicBool,
     // The round trip on the share's links, for the rate's backoff, until
-    // the share's thread takes it. The room measures it once a second on
+    // the share's thread takes it, and how long the oldest ping on them has
+    // waited for its pong, in ms. The room measures them once a second on
     // its own clock, and a reading read twice would count twice.
-    round_trip: Mutex<Option<RoundTrip>>,
+    round_trip: Mutex<(Option<RoundTrip>, Option<f32>)>,
     // Plays the share cue in this PC's own speakers.
     cue: OnceLock<Box<dyn Fn(Cue) + Send + Sync>>,
     // The shared monitor on this PC's desktop, while a share of one runs:
@@ -445,6 +446,7 @@ impl Sharing {
             sharing: Arc::clone(self),
             outlets: Arc::new([]),
             generation: u64::MAX,
+            first: 0,
             plain: Vec::with_capacity(1 + MAX_VIDEO),
             sealed: Vec::with_capacity(1 + MAX_VIDEO + session::DATA_OVERHEAD),
         }
@@ -629,8 +631,8 @@ impl Sharing {
         lock(&self.running).clone()
     }
 
-    pub(crate) fn set_round_trip(&self, round_trip: Option<RoundTrip>) {
-        *lock(&self.round_trip) = round_trip;
+    pub(crate) fn set_round_trip(&self, round_trip: Option<RoundTrip>, unanswered_ms: Option<f32>) {
+        *lock(&self.round_trip) = (round_trip, unanswered_ms);
     }
 
     fn monitor(&self) -> Option<MonitorId> {
@@ -661,8 +663,8 @@ impl Sharing {
         self.wake_room();
     }
 
-    fn take_round_trip(&self) -> Option<RoundTrip> {
-        lock(&self.round_trip).take()
+    fn take_round_trip(&self) -> (Option<RoundTrip>, Option<f32>) {
+        std::mem::take(&mut *lock(&self.round_trip))
     }
 
     // Everything this PC's socket sent so far, headers included.
@@ -682,11 +684,16 @@ impl Sharing {
 
 // A sharer's thread's way out: seals each packet for every link in the
 // outlet list and sends it, with buffers of its own, so nothing allocates
-// once it runs.
+// once it runs. Each packet starts at the next outlet in turn: the copies
+// enter the uplink's queue one behind another, and when it is nearly full
+// the last one in is the one dropped. In the same order every time, a
+// second watcher on a link as good as the first's lost 9 to 49 times as
+// many frames, in a simulated link.
 pub struct Outbox {
     sharing: Arc<Sharing>,
     outlets: Arc<[Outlet]>,
     generation: u64,
+    first: usize,
     plain: Vec<u8>,
     sealed: Vec<u8>,
 }
@@ -765,7 +772,10 @@ impl Outbox {
             return 0;
         };
         let mut sent = 0;
-        for outlet in self.outlets.iter() {
+        let count = self.outlets.len();
+        self.first = self.first.wrapping_add(1);
+        for i in 0..count {
+            let outlet = &self.outlets[(self.first + i) % count];
             if outlet.sealer.seal(&self.plain, &mut self.sealed).is_err() {
                 continue;
             }

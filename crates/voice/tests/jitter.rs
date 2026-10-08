@@ -995,6 +995,50 @@ fn a_render_stall_comes_off_in_the_next_pauses() {
     listener.assert_no_clicks();
 }
 
+// 30 ms of jitter for the first 3 s grows the buffer to six frames and more.
+// Once every packet of the last 5 s came on time, the frames none of them
+// needed come off together in the next pauses, down to one above the latest
+// of them, and that one 5 s later: one frame again at 13 s, where one frame
+// per 5 s took until 29 s.
+#[test]
+fn after_jitter_calms_down_the_spare_depth_comes_off_together() {
+    let sent = low_delay(&speech(15.0, -70.0), 0);
+    let mut state = 0x6a09_e667_f3bc_c908u64;
+    let arrive: Vec<Option<u64>> = sent
+        .iter()
+        .map(|packet| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let jitter = if packet.sent_at < 3 * SECOND {
+                state % (6 * TICK + 1)
+            } else {
+                0
+            };
+            Some(packet.sent_at + jitter)
+        })
+        .collect();
+    let mut listener = Listener::new();
+    listener.run(&sent, &arrive, 4 * SECOND, always);
+    let grown = listener.stats();
+    assert!(grown.depth_frames >= 6, "{grown:?}");
+
+    listener.run(&sent, &arrive, 9 * SECOND, always);
+    assert_eq!(listener.stats().depth_frames, 2);
+    listener.run(&sent, &arrive, 15 * SECOND, always);
+    let stats = listener.stats();
+    assert_eq!((stats.depth_frames, stats.late), (1, grown.late));
+    let skipped: Vec<u64> = sent
+        .iter()
+        .filter(|packet| (4 * SECOND..14 * SECOND).contains(&packet.sent_at))
+        .filter(|packet| listener.played_at(packet.seq).is_none())
+        .map(|packet| packet.sent_at)
+        .collect();
+    assert_eq!(skipped.len() as u32, grown.depth_frames - 1);
+    assert!(skipped.iter().all(|&at| in_a_pause(at)), "{skipped:?}");
+    listener.assert_no_clicks();
+}
+
 // A 10 ms stall every 3 s, as a driver with a bad habit would give: each
 // one comes off before the next, so they never add up.
 #[test]
