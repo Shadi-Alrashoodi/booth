@@ -97,6 +97,11 @@ pub struct App {
     tray_clicked: Arc<AtomicBool>,
     // The update check and its download, if the setting is on.
     update: Update,
+    // The window's scale the icons were last loaded for, and whether it had
+    // the focus, as last seen, so the icons and the title's colour change
+    // only when these do.
+    scale: Option<f32>,
+    focused: Option<bool>,
 }
 
 pub struct Setup {
@@ -161,6 +166,12 @@ impl App {
         mut backlog: Backlog,
     ) -> App {
         theme::apply(&cc.egui_ctx);
+        if let Ok(handle) = cc.window_handle()
+            && let RawWindowHandle::Win32(handle) = handle.as_raw()
+        {
+            win::caption_colours(handle.hwnd.get());
+            win::set_window_icons(handle.hwnd.get());
+        }
         let ctx = cc.egui_ctx.clone();
         // Here and not in main: the window toolkit registers for keyboard
         // Raw Input when its event loop starts, and the last registration in
@@ -193,6 +204,8 @@ impl App {
             tray,
             tray_clicked,
             update: Update::off(),
+            scale: None,
+            focused: None,
         };
         // The start screen reads the known hosts each time it opens. The
         // devices are read only in settings and when a room opens, so a list
@@ -751,6 +764,30 @@ impl App {
             .is_ok_and(|setup| setup.config.log.is_some())
     }
 
+    // The title goes to ash while another window has the focus, as the
+    // caption buttons dim, and the icons are loaded again at the sizes a
+    // new DPI asks for. The scale App::new loaded them at is not known yet
+    // there, so the first one seen only counts as the starting point.
+    fn follow_window(&mut self, ctx: &Context, frame: &eframe::Frame) {
+        let (scale, focused) = ctx.input(|input| {
+            let viewport = input.viewport();
+            (viewport.native_pixels_per_point, viewport.focused)
+        });
+        let Some(hwnd) = window(frame) else {
+            return;
+        };
+        let before = std::mem::replace(&mut self.scale, scale);
+        if before.is_some() && scale.is_some() && before != scale {
+            win::set_window_icons(hwnd);
+        }
+        if let Some(focused) = focused
+            && self.focused != Some(focused)
+        {
+            self.focused = Some(focused);
+            win::caption_text(hwnd, focused);
+        }
+    }
+
     // What the update check or its download said since the last pass. The
     // lines wait in the backlog like any other, but outside a room nothing
     // else would write them, and someone who ran --log to see why a check
@@ -1025,6 +1062,7 @@ impl eframe::App for App {
         if self.tray_clicked.swap(false, Ordering::AcqRel) {
             self.show_panel(ctx);
         }
+        self.follow_window(ctx, frame);
         self.follow_update();
         self.follow_hotkeys(ctx);
         // Here, since a request waiting over a game is when it matters, and
@@ -1107,9 +1145,16 @@ impl eframe::App for App {
             .frame(Frame::new().fill(WINDOW))
             .show(ui, |ui| {
                 // The screen is laid out before the strip, not in a bottom
-                // panel, so Tab reaches the strip last as it reads.
+                // panel, so Tab reaches the strip last as it reads. Settings
+                // has none: it never opens in a room, and an empty band under
+                // its bar would cut the bar off from the window's edge.
                 let whole = ui.max_rect();
-                let (body, bottom) = whole.split_top_bottom_at_y(whole.bottom() - strip::HEIGHT);
+                let strip_height = if matches!(self.screen, Screen::Settings { .. }) {
+                    0.0
+                } else {
+                    strip::HEIGHT
+                };
+                let (body, bottom) = whole.split_top_bottom_at_y(whole.bottom() - strip_height);
                 ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
                     ui.set_clip_rect(body);
                     match (&mut self.screen, &view) {
@@ -1162,11 +1207,14 @@ impl eframe::App for App {
                 });
                 // No line over the strip: it is window tone, and the chat
                 // above it panel tone.
-                ui.scope_builder(UiBuilder::new().max_rect(bottom), |ui| {
-                    ui.set_clip_rect(bottom);
-                    let shown = view.as_ref().map(|view| &view.strip);
-                    strip_clicked = strip::show(ui, shown, &self.sweep, self.scrolling).clicked();
-                });
+                if strip_height > 0.0 {
+                    ui.scope_builder(UiBuilder::new().max_rect(bottom), |ui| {
+                        ui.set_clip_rect(bottom);
+                        let shown = view.as_ref().map(|view| &view.strip);
+                        strip_clicked =
+                            strip::show(ui, shown, &self.sweep, self.scrolling).clicked();
+                    });
+                }
             });
         if strip_clicked {
             self.stats_open = !self.stats_open;

@@ -21,7 +21,6 @@ use crate::win;
 const ADDRESS_NAME_CHARS: usize = 512;
 const PORT_CHARS: usize = 5;
 const STUN_CHARS: usize = 2048;
-const STUN_ROWS: usize = 3;
 // Save and Cancel on a 64 px bar, with the gutter above and below them.
 const BAR_HEIGHT: f32 = CONTROL_HEIGHT + 2.0 * SIDE;
 // A hotkey's key in words and a device's second line, one body line tall.
@@ -309,7 +308,6 @@ fn network(ui: &mut Ui, draft: &mut Draft) -> [Response; 2] {
         "stun servers",
         &mut draft.stun_servers,
         "STUN servers",
-        STUN_ROWS,
         STUN_CHARS,
     );
     if stun.changed() {

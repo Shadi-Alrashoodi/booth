@@ -1,19 +1,20 @@
 use std::ops::RangeInclusive;
 
 use eframe::egui::emath::GuiRounding;
+use eframe::egui::text::LayoutJob;
 use eframe::egui::{
     Align, Color32, Context, CursorIcon, Event, EventFilter, FontId, Frame, Id, Key,
     KeyboardShortcut, Label, LayerId, Layout, Margin, Mesh, Modifiers, Order, Painter, Rect,
-    Response, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextEdit, Ui, UiBuilder,
-    Vec2, WidgetInfo, WidgetType, accesskit, pos2, vec2,
+    Response, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextBuffer, TextEdit, Ui,
+    UiBuilder, Vec2, WidgetInfo, WidgetType, accesskit, pos2, vec2,
 };
 
 use crate::mark;
 use crate::theme::{
     self, AMBER, ASH, CHALK, CHECK_RADIUS, CONTROL_HEIGHT, CONTROL_RADIUS, EDGE, FIELD_FILL,
-    FIELD_FOCUS, FIELD_HINT, FIELD_TEXT, FOCUS_RING, ICON_SIZE, INK, PANEL, PRIMARY_WIDTH,
-    RING_GAP, RING_RADIUS, RING_WIDTH, ROW_HEIGHT, Role, SIDE, STEP, TEXT_PAD, TITLE_ROW,
-    TOGGLE_ON, TRACK_RADIUS,
+    FIELD_FOCUS, FIELD_HINT, FIELD_OFF, FIELD_TEXT, FOCUS_RING, ICON_SIZE, INK, PANEL,
+    PRIMARY_WIDTH, RING_GAP, RING_RADIUS, RING_WIDTH, ROW_HEIGHT, Role, SIDE, STEP, TEXT_PAD,
+    TITLE_ROW, TOGGLE_ON, TRACK_RADIUS,
 };
 
 // The slider's track and the meter's, and the handle on the slider: a chalk
@@ -93,14 +94,21 @@ pub fn buttons_width(ui: &Ui, buttons: &[Button]) -> f32 {
 }
 
 // Left to right in a space `height` tall, for the right side of a split_row,
-// which lays out from the right edge. Returns which one was pressed.
+// which lays out from the right edge. Returns which one was pressed. Each
+// button's id comes from its word: by its place alone, Settings on the start
+// screen would take over the id of Leave, which stood in the same place a
+// frame before, and with it the keyboard focus Leave had.
 pub fn buttons(ui: &mut Ui, buttons: &[Button], height: f32) -> Option<usize> {
     let width = buttons_width(ui, buttons);
     let layout = Layout::left_to_right(Align::Center);
     let mut pressed = None;
     ui.allocate_ui_with_layout(vec2(width, height), layout, |ui| {
         for (i, button) in buttons.iter().enumerate() {
-            if button.show(ui).clicked() && button.enabled {
+            let clicked = ui
+                .push_id(button.text, |ui| button.show(ui))
+                .inner
+                .clicked();
+            if clicked && button.enabled {
                 pressed = Some(i);
             }
         }
@@ -164,6 +172,58 @@ pub fn one_line(ui: &mut Ui, text: &str, font: FontId, color: Color32) -> Respon
     )
 }
 
+// The same, painted so its baseline sits at `baseline` when one is given:
+// smaller text after a name on one row, which centring alone would put a
+// pixel or two above the name's baseline. Returns the label and where its
+// baseline is, in points from the top of the window.
+pub fn one_line_on(
+    ui: &mut Ui,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    baseline: Option<f32>,
+) -> (Response, f32) {
+    let line_height = line_height(&font);
+    let label = Label::new(
+        RichText::new(text)
+            .font(font)
+            .color(color)
+            .line_height(Some(line_height)),
+    )
+    .truncate()
+    .show_tooltip_when_elided(false);
+    let (at, galley, response) = label.layout_in_ui(ui);
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, galley.text()));
+    let mut at = at.round_to_pixels(ui.pixels_per_point());
+    let own = galley
+        .rows
+        .first()
+        .and_then(|row| row.glyphs.first().map(|glyph| row.pos.y + glyph.pos.y))
+        .unwrap_or(0.0);
+    if let Some(baseline) = baseline {
+        at.y = baseline - own;
+    }
+    if ui.is_rect_visible(response.rect) {
+        ui.painter().galley(at, galley, color);
+    }
+    (response, at.y + own)
+}
+
+// How far below the top of a row `font`'s baseline sits when the row is laid
+// out at that font's own height, before any rounding.
+pub fn ascent(ui: &Ui, font: &FontId) -> f32 {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(String::from("0"), font.clone(), CHALK);
+    galley
+        .rows
+        .first()
+        .and_then(|row| row.glyphs.first())
+        .map_or(0.0, |glyph| {
+            glyph.font_face_ascent + 0.5 * (glyph.font_height - glyph.font_face_height)
+        })
+}
+
 // The body of a screen: the side gutter, and the first line 16 px below the
 // title row's controls, which have 8 of their own under them.
 pub fn page<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
@@ -186,18 +246,13 @@ pub fn gutter<R>(ui: &mut Ui, top: f32, bottom: f32, add: impl FnOnce(&mut Ui) -
 
 // A block set into the window in panel tone, edge to edge with square
 // corners, since it meets the window's straight sides: the invite, a code to
-// send back, a control request, the monitor list. The gutter at the sides
-// and the bottom; `top` is 8 when the first line is a 32 px row, which
-// carries its own space above its words, and 16 when it is a sentence.
-pub fn region<R>(ui: &mut Ui, top: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+// send back, a control request, the monitor list. The gutter on all four
+// sides, so a 32 px row at the top sits 16 inside it as a sentence does, and
+// the block's top and bottom match.
+pub fn region<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     Frame::new()
         .fill(PANEL)
-        .inner_margin(Margin {
-            left: SIDE as i8,
-            right: SIDE as i8,
-            top: top as i8,
-            bottom: SIDE as i8,
-        })
+        .inner_margin(Margin::same(SIDE as i8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui)
@@ -301,7 +356,8 @@ pub struct Button<'a> {
     // What a screen reader says, when the text alone does not say enough.
     label: Option<&'a str>,
     role: Role,
-    // A secondary toggle that is on keeps the control fill.
+    // A secondary that keeps the control fill at rest: a toggle that is on,
+    // Unmute or Undeafen, or Save while its known host row is open.
     on: bool,
     // The label's colour in place of the role's, for a word that is live,
     // a warning, or waiting.
@@ -414,13 +470,12 @@ impl<'a> Button<'a> {
             let lit = response.hovered()
                 || (keyboard && self.role == Role::Destructive)
                 || (self.enter_target && self.role != Role::Primary);
+            // Disabled is ash with no fill whatever the button would show,
+            // so a toggle left on in a room that has ended does not look
+            // as if it still did something.
             let paint = if !self.enabled {
                 theme::Paint {
-                    fill: if self.on {
-                        look.rest.fill
-                    } else {
-                        Color32::TRANSPARENT
-                    },
+                    fill: Color32::TRANSPARENT,
                     label: ASH,
                 }
             } else if response.is_pointer_button_down_on() {
@@ -742,25 +797,41 @@ pub fn field(
 
 // A field for a short list of addresses, one per line, typed in Plex Mono.
 // Enter starts a new line, so nothing is pressed by it. `label` is what a
-// screen reader calls it.
+// screen reader calls it. As tall as its lines on the body's 18 px, with the
+// same space above and below them as a one-line field, so one line is 32 px
+// and two are 50, and no empty line waits under the last.
 pub fn lines_field(
     ui: &mut Ui,
     id: &str,
     text: &mut String,
     label: &str,
-    rows: usize,
     char_limit: usize,
 ) -> Response {
     let font = theme::mono();
     let row = line_height(&font);
+    let lines = text.split('\n').count();
+    let mut layouter = |ui: &Ui, text: &dyn TextBuffer, wrap_width: f32| {
+        let mut job = LayoutJob::simple(
+            text.as_str().to_owned(),
+            font.clone(),
+            FIELD_TEXT,
+            wrap_width,
+        );
+        job.keep_trailing_whitespace = true;
+        for section in &mut job.sections {
+            section.format.line_height = Some(row);
+        }
+        ui.fonts_mut(|fonts| fonts.layout_job(job))
+    };
     let output = TextEdit::multiline(text)
         .id_salt(id)
         .char_limit(char_limit)
-        .font(font)
-        .text_color(FIELD_TEXT)
+        .font(theme::mono())
+        .layouter(&mut layouter)
         .frame(field_frame(((CONTROL_HEIGHT - row) / 2.0).floor() as i8))
         .desired_width(f32::INFINITY)
-        .desired_rows(rows)
+        .desired_rows(lines)
+        .min_size(vec2(0.0, CONTROL_HEIGHT))
         .show(ui);
     let response = output.response.response;
     ui.ctx()
@@ -783,7 +854,9 @@ pub fn right_to_left(text: &str) -> bool {
 // starts a new line; plain Enter is left to the caller, which sends. Tab
 // still moves on, as in any other field. What is typed sits at the right
 // edge while it starts with a right-to-left letter, the way the message will
-// show in the chat.
+// show in the chat. Disabled, in a Ui that is, it is filled in the window
+// tone and its text is in ash, so it keeps its shape but no longer looks
+// like the place to type.
 pub fn composer(
     ui: &mut Ui,
     id: &str,
@@ -795,8 +868,20 @@ pub fn composer(
     let row = ui.fonts_mut(|fonts| fonts.row_height(&font));
     let pad = ((CONTROL_HEIGHT - row) / 2.0).floor();
     let rtl = right_to_left(text);
-    let shown = field_frame(pad as i8).show(ui, |ui| {
+    let enabled = ui.is_enabled();
+    let frame = if enabled {
+        field_frame(pad as i8)
+    } else {
+        field_frame(pad as i8).fill(FIELD_OFF)
+    };
+    let shown = frame.show(ui, |ui| {
         ui.set_min_height(CONTROL_HEIGHT - 2.0 * pad);
+        // The scroll handle floats over the right edge of what it scrolls,
+        // which here is text: the lines wrap short of it instead. The field's
+        // own padding already keeps it off the field's edge.
+        let scroll = &mut ui.spacing_mut().scroll;
+        scroll.bar_outer_margin = 0.0;
+        scroll.floating_allocated_width = scroll.bar_width + scroll.bar_inner_margin;
         ScrollArea::vertical()
             .id_salt(id)
             .max_height(COMPOSER_ROWS * row)
@@ -807,7 +892,7 @@ pub fn composer(
                     .char_limit(char_limit)
                     .hint_text(RichText::new(hint).font(theme::body()).color(FIELD_HINT))
                     .font(font)
-                    .text_color(FIELD_TEXT)
+                    .text_color(if enabled { FIELD_TEXT } else { ASH })
                     .frame(Frame::NONE)
                     .margin(Margin::ZERO)
                     .desired_rows(1)
@@ -1051,6 +1136,51 @@ pub(crate) mod tests {
             title_row(ui, TUESDAY, &enabled())
         });
         assert_eq!(got, Some(0));
+    }
+
+    // Leave on a room that has ended and Settings on the start screen stand
+    // in the same place in the title row. Their ids come from their words,
+    // so the keyboard focus Leave had does not pass to Settings.
+    #[test]
+    fn a_verb_in_the_same_place_is_another_widget() {
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let node = |word: &str| {
+            let (_, output) = frame(&ctx, Vec::new(), |ui| {
+                title_row(ui, TUESDAY, &[Button::new(word)]);
+            });
+            let nodes = output.accesskit_update.unwrap().nodes;
+            nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(word))
+                .map(|(id, _)| *id)
+                .expect("the verb is there")
+        };
+        let leave = node("Leave");
+        assert_ne!(leave, node("Settings"));
+        assert_eq!(leave, node("Leave"));
+    }
+
+    // The STUN list is as tall as its lines on the body's 18 px, with 7
+    // above and below them as a one-line field has: no empty line under the
+    // last, and an empty list the height of any field.
+    #[test]
+    fn a_list_field_is_as_tall_as_its_lines() {
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        for (text, height) in [
+            ("", CONTROL_HEIGHT),
+            ("stun.cloudflare.com:3478", CONTROL_HEIGHT),
+            ("stun.cloudflare.com:3478\nstun.l.google.com:19302", 50.0),
+            ("a:1\nb:2\nc:3", 68.0),
+        ] {
+            let mut text = String::from(text);
+            let (rect, _) = frame(&ctx, Vec::new(), |ui| {
+                lines_field(ui, "stun", &mut text, "STUN servers", 2048).rect
+            });
+            assert_eq!(rect.height(), height, "{text:?}");
+        }
     }
 
     // Host and Join line up as one column whatever their words.

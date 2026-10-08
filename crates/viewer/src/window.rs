@@ -15,7 +15,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM};
-use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DwmSetWindowAttribute,
+};
 use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteObject, FillRect, GetMonitorInfoW, HBRUSH, HDC, HMONITOR,
     MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
@@ -24,17 +27,18 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor,
-    GetDpiForWindow, MDT_EFFECTIVE_DPI, SetThreadDpiAwarenessContext,
+    GetDpiForWindow, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI, SetThreadDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_F11};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateIcon, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW,
-    GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    GetWindowPlacement, HICON, HTCLIENT, HWND_TOP, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_HAND,
-    IsWindowVisible, LoadCursorW, MINMAXINFO, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SC_KEYMENU, SIZE_MINIMIZED, SPI_GETCLIENTAREAANIMATION, SW_HIDE, SW_SHOWNOACTIVATE,
-    SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
-    SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetCursor, SetWindowLongPtrW,
+    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, GWL_EXSTYLE,
+    GWL_STYLE, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowPlacement,
+    HICON, HTCLIENT, HWND_TOP, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_HAND, IMAGE_ICON,
+    IsWindowVisible, LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MINMAXINFO, MSG, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SC_KEYMENU, SIZE_MINIMIZED, SM_CXICON, SM_CXSMICON,
+    SPI_GETCLIENTAREAANIMATION, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetCursor, SetWindowLongPtrW,
     SetWindowPlacement, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage,
     WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WINDOWPLACEMENT, WM_ACTIVATE, WM_ACTIVATEAPP,
     WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO,
@@ -43,14 +47,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_WINDOWPOSCHANGED, WM_XBUTTONDOWN,
     WM_XBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
-use windows::core::{BOOL, HSTRING, w};
+use windows::core::{BOOL, HSTRING, PCWSTR, w};
 
 use self::remote::{Mouse, button_of, client_point, follow_control, point, pointer};
 use crate::control::{self, Capturing, ControlOut, MouseButton, MouseMode};
 use crate::error::ViewerError;
 use crate::picture::Placement;
 use crate::strip::Band;
-use crate::{Show, strip};
+use crate::{Show, palette, strip};
 
 const CLASS: windows::core::PCWSTR = w!("BoothViewer");
 const WM_FULLSCREEN: u32 = WM_APP + 1;
@@ -71,9 +75,9 @@ const RELATIVE: u8 = 2;
 // Shared::local while the controller's mouse is on no picture.
 const NOWHERE: u64 = u64::MAX;
 
-// The window tone the picture's bars and the strip are drawn in, as a
-// COLORREF (0x00BBGGRR). Shown until the first present covers it.
-const WINDOW: COLORREF = COLORREF(0x0012_1414);
+// The window tone the picture's bars and the strip are drawn in. Shown
+// until the first present covers it.
+const WINDOW: COLORREF = palette::WINDOW.colorref();
 
 // The window never opens bigger than this share of the monitor's work area,
 // and never bigger than the video at one to one.
@@ -81,9 +85,10 @@ const OPEN_SHARE: f64 = 0.8;
 // Small enough to tuck into a corner, big enough that some picture shows
 // above the strip and the strip's longest words that never drop out end
 // before the gap and the trace's 148 points: while controlling with the
-// sharer paused, "reconnecting direct controlling Control is paused.
-// composed", 55 characters of Plex Mono at 7.2 points and four gaps, 444
-// points, after the 16 point side. At 100 percent scaling.
+// sharer paused, "reconnecting", the path word's slot as wide as "relayed",
+// "controlling", "Control is paused." and "composed", 56 characters of Plex
+// Mono at 7.2 points and four gaps, 452 points, after the 16 point side. At
+// 100 percent scaling.
 const MIN_CLIENT: (i32, i32) = (620, 180);
 
 // With the setting on, the strip hides in fullscreen until the mouse moves,
@@ -478,7 +483,8 @@ thread_local! {
     // a number.
     static MONITOR: Cell<Option<isize>> = const { Cell::new(None) };
     static BRUSH: Cell<Option<HBRUSH>> = const { Cell::new(None) };
-    static ICON: Cell<Option<HICON>> = const { Cell::new(None) };
+    // The small icon and the big one.
+    static ICONS: Cell<[Option<HICON>; 2]> = const { Cell::new([None; 2]) };
 }
 
 #[derive(Clone, Copy)]
@@ -522,69 +528,104 @@ fn run(
     delete_objects();
 }
 
-// The brush and the icon, once the window that used them is gone.
+// The brush and the icons, once the window that used them is gone.
 fn delete_objects() {
     if let Some(brush) = BRUSH.with(|cell| cell.take()) {
         // SAFETY: made in run() and selected into no DC.
         let _ = unsafe { DeleteObject(brush.into()) };
     }
-    if let Some(icon) = ICON.with(|cell| cell.take()) {
-        // SAFETY: made in show_icon() for a window that no longer exists.
+    for icon in ICONS.with(|cell| cell.take()).into_iter().flatten() {
+        // SAFETY: made in show_icons() for a window that no longer exists.
         let _ = unsafe { DestroyIcon(icon) };
     }
 }
 
-// The mark on its plate in the title bar, the taskbar and Alt+Tab, as the
-// panel has it. Windows does not take over an icon sent with WM_SETICON, so
-// this thread destroys it after the window.
-fn show_icon(hwnd: HWND) {
-    let Some(icon) = crate::ICON.get().and_then(make_icon) else {
-        return;
-    };
-    ICON.with(|cell| cell.set(Some(icon)));
-    let handle = Some(LPARAM(icon.0 as isize));
-    // SAFETY: a live window of this thread and a live icon.
-    unsafe {
-        SendMessageW(hwnd, WM_SETICON, Some(WPARAM(ICON_SMALL as usize)), handle);
-        SendMessageW(hwnd, WM_SETICON, Some(WPARAM(ICON_BIG as usize)), handle);
+// The title bar in the window tone, and the border in the same tone, so no
+// grey band of Windows' own sits over the picture. The title starts in ash,
+// since a window opened without the focus gets no WM_ACTIVATE, and turns
+// chalk when it is activated. Windows 10 does not know these and refuses
+// them; it keeps its dark title bar.
+fn caption_colours(hwnd: HWND) {
+    for (attribute, colour) in [
+        (DWMWA_CAPTION_COLOR, palette::WINDOW),
+        (DWMWA_TEXT_COLOR, palette::ASH),
+        (DWMWA_BORDER_COLOR, palette::WINDOW),
+    ] {
+        let value = colour.colorref();
+        // SAFETY: a live window and a COLORREF of the size passed.
+        let _ = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                attribute,
+                &value as *const COLORREF as *const _,
+                size_of::<COLORREF>() as u32,
+            )
+        };
     }
 }
 
-// A 32 bit icon from RGBA rows: the colour as BGRA, cleared where nothing
-// covers it, and a mask with a bit set there, for anything that draws icons
-// without their alpha. A mask row is padded to 16 bits, as a monochrome
-// bitmap's rows are.
-fn make_icon(icon: &crate::Icon) -> Option<HICON> {
-    let (width, height) = (icon.width as usize, icon.height as usize);
-    if width == 0 || height == 0 || icon.rgba.len() != width * height * 4 {
-        return None;
-    }
-    let stride = width.div_ceil(16) * 2;
-    let mut mask = vec![0u8; stride * height];
-    let mut color = Vec::with_capacity(icon.rgba.len());
-    for (i, &[r, g, b, a]) in icon.rgba.as_chunks::<4>().0.iter().enumerate() {
-        if a == 0 {
-            color.extend_from_slice(&[0, 0, 0, 0]);
-            let (x, y) = (i % width, i / width);
-            mask[y * stride + x / 8] |= 0x80 >> (x % 8);
-        } else {
-            color.extend_from_slice(&[b, g, r, a]);
+// The caption buttons dim when the window loses the focus, and the title
+// goes to ash with them, as in the panel.
+fn caption_text(hwnd: HWND, active: bool) {
+    let colour = if active { palette::CHALK } else { palette::ASH }.colorref();
+    // SAFETY: a live window and a COLORREF of the size passed.
+    let _ = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_TEXT_COLOR,
+            &colour as *const COLORREF as *const _,
+            size_of::<COLORREF>() as u32,
+        )
+    };
+}
+
+// The mark from booth.ico, the exe's icon resource 1, at the sizes `dpi`
+// asks for, as the panel has it (crates/app/src/win.rs): the title bar, the
+// taskbar and Alt+Tab each show the frame drawn for their size. Windows does
+// not take over an icon sent with WM_SETICON, so this thread destroys each
+// one once the window shows another or is gone. A test exe has no such
+// resource, and its viewer keeps Windows' blank icon.
+fn show_icons(hwnd: HWND, dpi: u32) {
+    // SAFETY: the module of this process, which needs no freeing.
+    let exe = unsafe { GetModuleHandleW(None) }.ok().map(Into::into);
+    for (slot, (kind, metric)) in [(ICON_SMALL, SM_CXSMICON), (ICON_BIG, SM_CXICON)]
+        .into_iter()
+        .enumerate()
+    {
+        // SAFETY: plain calls; resource 1 is named by number, not by a
+        // string the pointer would point at.
+        let loaded = unsafe {
+            let size = GetSystemMetricsForDpi(metric, dpi.max(96));
+            LoadImageW(
+                exe,
+                PCWSTR(std::ptr::without_provenance(1)),
+                IMAGE_ICON,
+                size,
+                size,
+                LR_DEFAULTCOLOR,
+            )
+        };
+        let Ok(loaded) = loaded else {
+            continue;
+        };
+        let icon = HICON(loaded.0);
+        // SAFETY: a live window of this thread and a live icon.
+        unsafe {
+            SendMessageW(
+                hwnd,
+                WM_SETICON,
+                Some(WPARAM(kind as usize)),
+                Some(LPARAM(icon.0 as isize)),
+            );
+        }
+        let mut icons = ICONS.with(|cell| cell.get());
+        let before = icons[slot].replace(icon);
+        ICONS.with(|cell| cell.set(icons));
+        if let Some(before) = before {
+            // SAFETY: made here earlier, and the window shows the new one.
+            let _ = unsafe { DestroyIcon(before) };
         }
     }
-    // SAFETY: both arrays are the size one plane of this width and height
-    // takes, the mask at 1 bit and the colour at 32, and outlive the call.
-    unsafe {
-        CreateIcon(
-            None,
-            width as i32,
-            height as i32,
-            1,
-            32,
-            mask.as_ptr(),
-            color.as_ptr(),
-        )
-    }
-    .ok()
 }
 
 fn register() -> Result<(), ViewerError> {
@@ -690,11 +731,11 @@ fn create(
             size_of::<BOOL>() as u32,
         )
     };
-    show_icon(hwnd);
+    caption_colours(hwnd);
     // SAFETY: a live window.
-    shared
-        .dpi
-        .store(unsafe { GetDpiForWindow(hwnd) }.max(96), Ordering::Release);
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    show_icons(hwnd, dpi);
+    shared.dpi.store(dpi, Ordering::Release);
     record_size(hwnd, shared);
     // SAFETY: a live window. The answer is whether it was visible before.
     unsafe {
@@ -924,8 +965,9 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         // Capture follows the focus: nothing of this PC's keys or mouse is
         // read for the sharer while another window is in front.
         WM_ACTIVATE => {
-            let active =
-                (wparam.0 & 0xffff) as u32 != WA_INACTIVE && (wparam.0 >> 16) & 0xffff == 0;
+            let activated = (wparam.0 & 0xffff) as u32 != WA_INACTIVE;
+            caption_text(hwnd, activated);
+            let active = activated && (wparam.0 >> 16) & 0xffff == 0;
             remote::set_active(active);
             follow_control(hwnd, &shared, false);
             // SAFETY: the default handling, which gives the window the
@@ -964,9 +1006,9 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             LRESULT(0)
         }
         WM_DPICHANGED => {
-            shared
-                .dpi
-                .store((wparam.0 as u32 & 0xffff).max(96), Ordering::Release);
+            let dpi = (wparam.0 as u32 & 0xffff).max(96);
+            shared.dpi.store(dpi, Ordering::Release);
+            show_icons(hwnd, dpi);
             // The band's height follows the DPI even where the client size
             // stays the same.
             shared.mark_changed();

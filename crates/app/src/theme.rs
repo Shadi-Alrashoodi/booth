@@ -202,6 +202,10 @@ impl Role {
 // Fields are filled, with no edge at rest. The amber edge shows whenever the
 // field has focus, since that is where typing goes.
 pub const FIELD_FILL: Color32 = CONTROL;
+// A field that takes nothing for now, the composer while the host is lost:
+// a step darker than the panel it sits on, so it keeps its shape and no word
+// in it floats alone.
+pub const FIELD_OFF: Color32 = WINDOW;
 pub const FIELD_TEXT: Color32 = CHALK;
 pub const FIELD_HINT: Color32 = ASH;
 pub const FIELD_FOCUS: Color32 = AMBER;
@@ -222,7 +226,8 @@ pub fn apply(ctx: &egui::Context) {
     ctx.set_style_of(Theme::Light, style);
     ctx.set_theme(ThemePreference::Dark);
     // The title bar follows the Windows setting unless the window asks;
-    // winit turns this into DWMWA_USE_IMMERSIVE_DARK_MODE.
+    // winit turns this into DWMWA_USE_IMMERSIVE_DARK_MODE. On Windows 11 the
+    // app then paints it in the window tone (win::caption_colours).
     ctx.send_viewport_cmd(ViewportCommand::SetTheme(SystemTheme::Dark));
 }
 
@@ -306,13 +311,23 @@ fn style() -> Style {
     style
 }
 
-// Always drawn, same look whether or not the mouse is over it: no fading in
-// and no widening on hover. egui also lays a gradient over the last lines
-// that follows the scroll offset; the bar already says there is more.
+// A thin handle over the right gutter, with no track and no room of its own,
+// so a list that scrolls keeps the same 16 px sides as one that does not.
+// It sits in the middle of that gutter, 5 px from the window's edge on one
+// side and the content on the other, so it reads as floating over the
+// gutter and not as part of the window's frame. Always drawn, the same width
+// whether or not the mouse is over it: no fading in and no widening on
+// hover. egui also lays a gradient over the last lines that follows the
+// scroll offset; the handle already says there is more.
 fn scroll_style() -> ScrollStyle {
+    const BAR: f32 = 6.0;
     ScrollStyle {
-        bar_width: 6.0,
+        floating: true,
+        bar_width: BAR,
+        floating_width: BAR,
+        floating_allocated_width: 0.0,
         bar_inner_margin: 2.0,
+        bar_outer_margin: (SIDE - BAR) / 2.0,
         dormant_background_opacity: 0.0,
         active_background_opacity: 0.0,
         interact_background_opacity: 0.0,
@@ -344,19 +359,21 @@ fn visuals() -> Visuals {
         expansion: 0.0,
     };
     // Booth paints its own controls; what egui still draws from these is the
-    // scroll bar's handle, in edge, as a mark found by its shape.
-    let control = WidgetVisuals {
-        bg_fill: EDGE,
+    // scroll bar's handle: quiet in raised at rest, so it is never the
+    // brightest shape on the screen, and in edge under the mouse and while
+    // dragged, when it is the thing being used.
+    let handle = |fill| WidgetVisuals {
+        bg_fill: fill,
         weak_bg_fill: WINDOW,
         bg_stroke: Stroke::NONE,
         corner_radius: CornerRadius::same(TRACK_RADIUS),
         fg_stroke: Stroke::new(1.0, CHALK),
         expansion: 0.0,
     };
-    visuals.widgets.inactive = control;
-    visuals.widgets.hovered = control;
-    visuals.widgets.active = control;
-    visuals.widgets.open = control;
+    visuals.widgets.inactive = handle(RAISED);
+    visuals.widgets.hovered = handle(EDGE);
+    visuals.widgets.active = handle(EDGE);
+    visuals.widgets.open = handle(EDGE);
 
     // Selected text turns ink on ash (6.32:1), the way text on amber is ink.
     visuals.selection.bg_fill = ASH;

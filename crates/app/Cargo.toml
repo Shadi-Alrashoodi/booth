@@ -29,6 +29,8 @@ minisign-verify.workspace = true
 unicode-bidi.workspace = true
 eframe.workspace = true
 zeroize.workspace = true
+# Win32_Graphics_Dwm for the title bar in the window tone.
+# Win32_UI_HiDpi for the window icons at the sizes the window's DPI asks for.
 # Win32_Graphics_Gdi only because the tray window's class struct has a background
 # brush in it.
 # Win32_Networking_WinHttp, Win32_Security_Cryptography and
@@ -38,7 +40,7 @@ zeroize.workspace = true
 # Win32_System_Diagnostics_Debug and Win32_System_Kernel only because the
 # kernel's shared page, which has the version a compatibility mode cannot
 # change, is declared with types from them.
-windows-sys = { workspace = true, features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Networking_WinHttp", "Win32_Security", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_Time", "Win32_System_WindowsProgramming", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { workspace = true, features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Networking_WinHttp", "Win32_Security", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_Time", "Win32_System_WindowsProgramming", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 # Already in the tree through egui-winit. Used directly for the one call egui
 # does not offer: keeping the invite out of clipboard history and cloud sync.
 arboard = { version = "=3.6.1", default-features = false }

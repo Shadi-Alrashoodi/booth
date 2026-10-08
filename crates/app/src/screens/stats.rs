@@ -1,7 +1,8 @@
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eframe::egui::{Color32, FontId, Rect, ScrollArea, Sense, Ui, pos2, vec2};
+use eframe::egui::text::LayoutJob;
+use eframe::egui::{Color32, FontId, Label, Rect, ScrollArea, Sense, TextFormat, Ui, pos2, vec2};
 use net::firewall::FirewallState;
 use room::view::{
     AddressChange, ControlNumbers, Latency, Level, MappingWord, NameAnswer, NameView, Numbers,
@@ -58,13 +59,16 @@ pub fn show(
     let whole = ui.available_rect_before_wrap();
     ui.painter().rect_filled(whole, 0, PANEL);
     let font = theme::mono();
-    // Never narrower than " min", so the column does not move when the
-    // session age passes its first hour.
+    // As wide as the widest unit on show, so that unit ends on the content's
+    // right edge and the shorter ones start where it does; never narrower
+    // than " ms", which the round trip always has.
     let gutter = out
         .lines
         .iter()
-        .map(|line| width(ui, &line.value[unit_at(&line.value)..], &font))
-        .fold(width(ui, " min", &font), f32::max);
+        .flat_map(|line| [Some(&line.value), line.under.as_ref()])
+        .flatten()
+        .map(|value| width(ui, &value[unit_at(value)..], &font))
+        .fold(width(ui, " ms", &font), f32::max);
     let scroll = ScrollArea::vertical().id_salt("stats").auto_shrink(false);
     scroll.show(ui, |ui| {
         controls::gutter(ui, SIDE, SIDE, |ui| {
@@ -82,39 +86,73 @@ pub fn show(
                     Some(Start::Part) => ui.add_space(STEP),
                     None => {}
                 }
-                value_line(ui, line, gutter);
+                let font = if line.name {
+                    theme::body()
+                } else {
+                    theme::mono()
+                };
+                let color = value_color(line);
+                value_line(ui, line.label, &line.value, &font, color, gutter);
+                if let Some(under) = &line.under {
+                    value_line(ui, "", under, &font, color, gutter);
+                }
             }
         });
     });
 }
 
 // Label left in ash, value right. A reading's digits end on one edge, the
-// gutter's width in from the right, and its unit stands in the gutter, so
-// the column lines up on the digits whatever the units are; a value with no
-// unit ends on the same edge.
-fn value_line(ui: &mut Ui, line: &Line, gutter: f32) {
+// gutter's width in from the right, and its unit stands in the gutter, its
+// letters starting one space in, so the column lines up on the digits and
+// the units whatever they are; a count with no unit ends on the same edge. Anything else, a word, a name or an address,
+// ends on the content's right edge, where the widest units end.
+fn value_line(ui: &mut Ui, label: &str, value: &str, font: &FontId, color: Color32, gutter: f32) {
     let rect = line_rect(ui);
-    let font = theme::mono();
-    let label_width = controls::text_width(ui, line.label, theme::body());
+    let label_width = controls::text_width(ui, label, theme::body());
     let least = rect.left() + label_width + SIDE;
-    let at = unit_at(&line.value);
-    let mut right = rect.right() - gutter + width(ui, &line.value[at..], &font);
-    // Words, an address or a name that would meet the label run on into
-    // the gutter before anything is cut.
-    if at == line.value.len() && right - width(ui, &line.value, &font) < least {
-        right = rect.right();
-    }
-    let value = controls::fit_middle(ui, &line.value, &font, (right - least).max(0.0));
-    let value_width = controls::text_width(ui, &value, font.clone());
+    let unit = &value[unit_at(value)..];
+    // A unit written against its digits, the % of "0.0%", starts where the
+    // others start after their space, so it stands in their column; the
+    // gap is layout, and the value still reads "0.0%".
+    let gap = if on_digits(value) && !unit.is_empty() && !unit.starts_with(' ') {
+        width(ui, " ", font)
+    } else {
+        0.0
+    };
+    let right = if on_digits(value) {
+        rect.right() - gutter + gap + width(ui, unit, font)
+    } else {
+        rect.right()
+    };
+    let value = if gap > 0.0 {
+        value.to_owned()
+    } else {
+        controls::fit_middle(ui, value, font, (right - least).max(0.0))
+    };
+    let value_width = controls::text_width(ui, &value, font.clone()) + gap;
     controls::split_row(
         ui,
         Rect::from_min_max(rect.min, pos2(right, rect.bottom())),
         value_width,
         |ui| {
-            controls::one_line(ui, line.label, theme::body(), ASH);
+            controls::one_line(ui, label, theme::body(), ASH);
         },
         |ui| {
-            controls::one_line(ui, &value, font.clone(), value_color(line));
+            if gap > 0.0 {
+                let format = TextFormat {
+                    font_id: font.clone(),
+                    color,
+                    line_height: Some(controls::line_height(font)),
+                    ..TextFormat::default()
+                };
+                let at = unit_at(&value);
+                let mut job = LayoutJob::default();
+                job.append(&value[..at], 0.0, format.clone());
+                job.append(&value[at..], gap, format);
+                ui.add(Label::new(job).truncate().show_tooltip_when_elided(false));
+            } else {
+                controls::one_line(ui, &value, font.clone(), color);
+            }
         },
     );
 }
@@ -128,9 +166,15 @@ fn width(ui: &Ui, text: &str, font: &FontId) -> f32 {
         .x
 }
 
+// A reading with its unit, or a count with none: the values whose digits
+// line up in one column.
+fn on_digits(value: &str) -> bool {
+    let count = !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+    count || unit_at(value) < value.len()
+}
+
 // Where a reading's unit starts: at " ms" in "12.4 ms", at "%" in "0.0%".
-// A value that is not a number with its unit has none, and ends where the
-// digits of the others do.
+// A value that is not a number with its unit has none, and this is its end.
 fn unit_at(value: &str) -> usize {
     const UNITS: [&str; 8] = ["ms", "s", "min", "B", "KB", "MB", "kHz", "Mbit/s"];
     let ends_in_digit = |body: &str| body.ends_with(|c: char| c.is_ascii_digit());
@@ -155,6 +199,12 @@ struct Line {
     level: Level,
     // The value is "Hidden while you share" in place of an address.
     hidden: bool,
+    // The value is a person's name, set in Plex Sans as names are
+    // everywhere else, not in the mono of the readings.
+    name: bool,
+    // A second part of the value on the row under it, with no label of its
+    // own, where the two side by side would not fit beside the label.
+    under: Option<String>,
 }
 
 fn color(level: Level) -> Color32 {
@@ -242,6 +292,36 @@ impl Lines {
                 value,
                 level,
                 hidden: false,
+                name: false,
+                under: None,
+            });
+        }
+    }
+
+    fn name(&mut self, label: &'static str, value: Option<String>) {
+        if let Some(value) = value {
+            self.push(Line {
+                label,
+                value,
+                level: Level::Good,
+                hidden: false,
+                name: true,
+                under: None,
+            });
+        }
+    }
+
+    // Two readings that belong together, the second on the row under the
+    // first.
+    fn two_rows(&mut self, label: &'static str, value: Option<(String, String)>) {
+        if let Some((first, second)) = value {
+            self.push(Line {
+                label,
+                value: first,
+                level: Level::Good,
+                hidden: false,
+                name: false,
+                under: Some(second),
             });
         }
     }
@@ -257,6 +337,8 @@ impl Lines {
                 value: String::from(messages::HIDDEN_WHILE_SHARING),
                 level: Level::Good,
                 hidden: true,
+                name: false,
+                under: None,
             });
         }
     }
@@ -307,7 +389,7 @@ fn build(
         Role::Host => "Slowest link",
         Role::Client => "Host",
     };
-    out.add(link_label, n.link_name.clone());
+    out.name(link_label, n.link_name.clone());
     out.add("Round trip", n.rtt_ms.map(ms));
     out.add("Round trip average", n.rtt_avg_ms.map(ms));
     out.add("Round trip min", n.rtt_min_ms.map(ms));
@@ -356,11 +438,13 @@ fn build(
     out.group(None);
     out.add("Chat delivery", chat_delivery(n));
     out.group(Some("Voice"));
-    out.add("Audio period", audio_period(n, audio));
+    // In and out on two rows: on one, with the far side's label beside
+    // them, they do not fit the 360 px panel and are cut in the middle.
+    out.two_rows("Audio period", audio_period(n, audio));
     out.add("Resampled by Windows", audio.and_then(resampled));
     out.level(MICROPHONE, n.microphone.and_then(microphone), Level::Warn);
     out.add("Render latency", n.render_latency_ms.map(ms));
-    out.add("Audio period, far side", far_period(n));
+    out.two_rows("Audio period, far side", far_period(n));
     out.add("Render latency, far side", n.far_render_latency_ms.map(ms));
     out.add("Frame size", frame_size(n));
     out.add(
@@ -705,7 +789,7 @@ fn chat_delivery(n: &Numbers) -> Option<String> {
 
 // This PC's side: what the room's own streams opened, and where one is
 // closed (a muted microphone) what the device said when asked.
-fn audio_period(n: &Numbers, probed: Option<&Periods>) -> Option<String> {
+fn audio_period(n: &Numbers, probed: Option<&Periods>) -> Option<(String, String)> {
     let side = |opened: Option<f32>, probed: Option<&Side>| match (opened, probed) {
         (Some(value), _) => Some(ms(value)),
         (None, Some(Side::Period { ms: value, .. })) => Some(ms(*value as f32)),
@@ -718,19 +802,21 @@ fn audio_period(n: &Numbers, probed: Option<&Periods>) -> Option<String> {
         return None;
     }
     let known = |side: Option<String>| side.unwrap_or_else(|| String::from("not known"));
-    Some(format!("in {}, out {}", known(input), known(output)))
+    Some((
+        format!("in {}", known(input)),
+        format!("out {}", known(output)),
+    ))
 }
 
 // The far side's, as it told the host or the host told this PC.
-fn far_period(n: &Numbers) -> Option<String> {
+fn far_period(n: &Numbers) -> Option<(String, String)> {
     if n.far_audio_in_ms.is_none() && n.far_audio_out_ms.is_none() {
         return None;
     }
     let side = |value: Option<f32>| value.map_or_else(|| String::from("none"), ms);
-    Some(format!(
-        "in {}, out {}",
-        side(n.far_audio_in_ms),
-        side(n.far_audio_out_ms)
+    Some((
+        format!("in {}", side(n.far_audio_in_ms)),
+        format!("out {}", side(n.far_audio_out_ms)),
     ))
 }
 
@@ -856,7 +942,10 @@ mod tests {
     ) -> Vec<(&'static str, String)> {
         lines(role, n, firewall, asking, now_unix, audio, SHOWING)
             .into_iter()
-            .map(|line| (line.label, line.value))
+            .map(|line| match line.under {
+                Some(under) => (line.label, format!("{}\n{under}", line.value)),
+                None => (line.label, line.value),
+            })
             .collect()
     }
 
@@ -928,6 +1017,8 @@ mod tests {
             value: value.to_owned(),
             level,
             hidden: false,
+            name: false,
+            under: None,
         }
     }
 
@@ -1235,6 +1326,55 @@ mod tests {
         ] {
             assert_eq!(split(whole), (whole, ""), "{whole}");
         }
+    }
+
+    // Readings and counts end on the digit column; words, names and
+    // addresses end on the right edge, where the widest units end.
+    #[test]
+    fn only_readings_and_counts_end_on_the_digits() {
+        for reading in ["12.4 ms", "0.0%", "31", "0", "in 10.0 ms", "2 min 13 s"] {
+            assert!(on_digits(reading), "{reading}");
+        }
+        for word in [
+            "Shadi",
+            "LAN",
+            "allowed",
+            "input",
+            "UDP 41801",
+            "192.0.2.44:41000",
+            "in none",
+            "Hidden while you share",
+        ] {
+            assert!(!on_digits(word), "{word}");
+        }
+    }
+
+    // The host's name is a name like any other, in Plex Sans.
+    #[test]
+    fn the_host_is_named_in_sans() {
+        let n = Numbers {
+            link_name: Some(String::from("Ines")),
+            ..Numbers::default()
+        };
+        let host = lines(Role::Client, &n, "allowed", false, 0, None, SHOWING)
+            .into_iter()
+            .find(|line| line.label == "Host")
+            .expect("a Host line");
+        assert!(host.name);
+        let round_trip = Numbers {
+            rtt_ms: Some(4.0),
+            ..Numbers::default()
+        };
+        let lines = lines(
+            Role::Client,
+            &round_trip,
+            "allowed",
+            false,
+            0,
+            None,
+            SHOWING,
+        );
+        assert!(lines.iter().all(|line| !line.name));
     }
 
     #[test]
@@ -1671,7 +1811,7 @@ mod tests {
         };
         assert_eq!(
             audio_lines(Some(&good)),
-            [("Audio period", String::from("in 2.7 ms, out 2.7 ms"))]
+            [("Audio period", String::from("in 2.7 ms\nout 2.7 ms"))]
         );
         // This PC's AirPods: a 16 kHz hands-free microphone.
         let airpods = Periods {
@@ -1687,7 +1827,7 @@ mod tests {
         assert_eq!(
             audio_lines(Some(&airpods)),
             [
-                ("Audio period", String::from("in 10.0 ms, out 10.0 ms")),
+                ("Audio period", String::from("in 10.0 ms\nout 10.0 ms")),
                 ("Resampled by Windows", String::from("input")),
             ]
         );
@@ -1697,7 +1837,7 @@ mod tests {
         };
         assert_eq!(
             audio_lines(Some(&odd)),
-            [("Audio period", String::from("in none, out not known"))]
+            [("Audio period", String::from("in none\nout not known"))]
         );
     }
 
@@ -1813,9 +1953,9 @@ mod tests {
         assert_eq!(
             voice_lines(&n, None),
             [
-                ("Audio period", text("in 2.7 ms, out 10.0 ms")),
+                ("Audio period", text("in 2.7 ms\nout 10.0 ms")),
                 ("Render latency", text("20.0 ms")),
-                ("Audio period, far side", text("in 2.7 ms, out none")),
+                ("Audio period, far side", text("in 2.7 ms\nout none")),
                 ("Render latency, far side", text("6.8 ms")),
                 ("Frame size", text("5 ms with repair copy")),
                 (
@@ -1865,11 +2005,11 @@ mod tests {
         };
         assert_eq!(
             voice_lines(&n, Some(&probed))[0],
-            ("Audio period", String::from("in 10.0 ms, out 2.7 ms"))
+            ("Audio period", String::from("in 10.0 ms\nout 2.7 ms"))
         );
         assert_eq!(
             voice_lines(&n, None)[0],
-            ("Audio period", String::from("in not known, out 2.7 ms"))
+            ("Audio period", String::from("in not known\nout 2.7 ms"))
         );
     }
 

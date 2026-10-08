@@ -85,32 +85,30 @@ pub fn show(ui: &mut Ui, strip: Option<&Strip>, sweep: &Sweep, scrolling: bool) 
             continue;
         }
         let galley = painter.layout_no_wrap(word.text, theme::mono_caption(), word.color);
-        // Numbers sit at the right of their slot, so the unit stays put and
-        // only the digits change.
-        let left = if word.part.is_number() {
-            x + width - galley.size().x
-        } else {
-            x
-        };
+        // Every word starts at the left of its slot, so each reading has a
+        // fixed place and the first sits on the gutter; a short value leaves
+        // the rest of its slot empty after it.
         let y = (rect.center().y - galley.size().y / 2.0).round();
-        painter.galley(pos2(left, y), galley, word.color);
+        painter.galley(pos2(x, y), galley, word.color);
         x += width + GAP;
     }
 
     let mut pixels = Pixels::new(&painter);
+    let empty = match strip.state {
+        LinkState::Live | LinkState::Reconnecting => {
+            empty_columns(strip.trace.len(), sweep.total, scrolling)
+        }
+        LinkState::Connecting | LinkState::Lost | LinkState::Alone | LinkState::Closed => {
+            [true; TRACE_SAMPLES]
+        }
+    };
+    draw_baseline(&mut pixels, slot, &empty);
     match strip.state {
         LinkState::Live => draw_trace(&mut pixels, slot, &strip.trace, sweep, scrolling, None),
         LinkState::Reconnecting => {
             draw_trace(&mut pixels, slot, &strip.trace, sweep, scrolling, Some(ASH))
         }
-        LinkState::Connecting | LinkState::Lost => pixels.fill(
-            Rect::from_min_size(
-                pos2(slot.left(), slot.bottom() - 1.0),
-                vec2(TRACE_SAMPLES as f32, 1.0),
-            ),
-            ASH,
-        ),
-        LinkState::Alone | LinkState::Closed => {}
+        LinkState::Connecting | LinkState::Lost | LinkState::Alone | LinkState::Closed => {}
     }
     pixels.paint(&painter);
     response
@@ -118,6 +116,8 @@ pub fn show(ui: &mut Ui, strip: Option<&Strip>, sweep: &Sweep, scrolling: bool) 
 
 // The fixed 120 by 16 px drawing area at the right edge, centred in the
 // 24 px band, which leaves four rows above and below it for the focus ring.
+// The bottom row, drawn down from its own top (row_span), can reach a device
+// pixel into the four under it, still clear of the ring.
 // It is placed from the band's top, which is on a whole device pixel, and not
 // rounded in points: at 150 percent that rounding would push the bottom row,
 // the one a good link draws on, half a pixel into the ring.
@@ -141,19 +141,18 @@ enum Part {
 }
 
 impl Part {
-    fn is_number(self) -> bool {
-        matches!(self, Part::RoundTrip | Part::Jitter | Part::Loss)
-    }
-
     // The widest value each number normally takes. Its slot is that wide
     // whatever it shows, so going from <1 ms to 1 ms, or from 9 to 10, does
-    // not push the words after it along.
+    // not push the words after it along. The path word's slot is as wide as
+    // "relayed", the longest it will be once a relay comes, so LAN and direct
+    // leave whatever follows them in the same place, as in the viewer.
     fn widest(self) -> &'static [&'static str] {
         match self {
             Part::RoundTrip => &["100 ms", "<1 ms"],
             Part::Jitter => &["\u{b1}99"],
             Part::Loss => &["10.0%"],
-            Part::State | Part::Path => &[],
+            Part::Path => &["relayed"],
+            Part::State => &[],
         }
     }
 }
@@ -168,10 +167,10 @@ struct Word {
     text: String,
     color: Color32,
     // Whether the word gets the room its widest value needs. A live number
-    // does. The last numbers shown while reconnecting do not: the round trip
-    // and jitter stay as they were until a packet comes back, only loss
-    // moves, and at the narrowest window that room is what keeps a number
-    // on screen at all.
+    // does, and the path word always does. The last numbers shown while
+    // reconnecting do not: the round trip and jitter stay as they were until
+    // a packet comes back, only loss moves, and at the narrowest window that
+    // room is what keeps a number on screen at all.
     slot: bool,
 }
 
@@ -220,7 +219,11 @@ fn words(strip: &Strip) -> Vec<Word> {
         })
     };
     let stale = match strip.state {
-        LinkState::Alone | LinkState::Closed => return words,
+        LinkState::Alone => return words,
+        LinkState::Closed => {
+            push(Part::State, String::from("closed"), ASH, false);
+            return words;
+        }
         LinkState::Connecting => {
             push(Part::State, String::from("connecting"), ASH, false);
             return words;
@@ -266,13 +269,10 @@ fn words(strip: &Strip) -> Vec<Word> {
             !stale,
         );
     }
+    // A word, not a reading: colour in the strip is for the numbers, and a
+    // sage word beside them gives them nothing to stand out against.
     if let Some(path) = strip.path {
-        push(
-            Part::Path,
-            path_word(path).to_owned(),
-            color(Default::default()),
-            false,
-        );
+        push(Part::Path, path_word(path).to_owned(), ASH, true);
     }
     words
 }
@@ -305,6 +305,52 @@ fn column(i: usize, count: usize, total: u64, scrolling: bool) -> usize {
     }
 }
 
+// The columns no sample of the current trace is drawn in. A lost ping has a
+// column and stays a gap: loss is shown as data.
+fn empty_columns(len: usize, total: u64, scrolling: bool) -> [bool; TRACE_SAMPLES] {
+    let count = len.min(TRACE_SAMPLES);
+    let mut empty = [true; TRACE_SAMPLES];
+    for i in 0..count {
+        empty[column(i, count, total, scrolling)] = false;
+    }
+    empty
+}
+
+// The flat ash line along the bottom row, wherever there is no sample to
+// draw: the whole slot while connecting, lost, closed or alone, and the
+// columns a new link has not reached yet, so the trace grows over it instead
+// of starting as a stray dash.
+fn draw_baseline(pixels: &mut Pixels, slot: Rect, empty: &[bool; TRACE_SAMPLES]) {
+    let bottom_row = TRACE_HEIGHT - 1.0;
+    let (top, bottom) = row_span(slot.top(), bottom_row, bottom_row, pixels.per_point);
+    let mut start = 0;
+    for run in empty.chunk_by(|a, b| a == b) {
+        let end = start + run.len();
+        if run[0] {
+            pixels.fill(
+                Rect::from_min_max(
+                    pos2(slot.left() + start as f32, top),
+                    pos2(slot.left() + end as f32, bottom),
+                ),
+                ASH,
+            );
+        }
+        start = end;
+    }
+}
+
+// Where rows `upper` to `lower` of the slot go, in points on whole device
+// pixels. Each row is as many device pixels tall as one point rounds to, from
+// the row's own top down: two at 150 percent, so the trace scales with the
+// display as every other stroke does, where one device pixel alone came
+// close to vanishing on a cheap monitor.
+fn row_span(slot_top: f32, upper: f32, lower: f32, per_point: f32) -> (f32, f32) {
+    let rows = per_point.round().max(1.0);
+    let top = ((slot_top + upper) * per_point).round();
+    let bottom = ((slot_top + lower) * per_point).round() + rows;
+    (top / per_point, bottom / per_point)
+}
+
 fn draw_trace(
     pixels: &mut Pixels,
     slot: Rect,
@@ -331,14 +377,15 @@ fn draw_trace(
         });
         // Joined to the sample before with a vertical run, so a jump reads as
         // one jagged line rather than scattered dots.
-        let (top, bottom) = match previous {
+        let (upper, lower) = match previous {
             Some((col, prev_row)) if col + 1 == column => (row.min(prev_row), row.max(prev_row)),
             _ => (row, row),
         };
+        let (top, bottom) = row_span(slot.top(), upper, lower, pixels.per_point);
         pixels.fill(
             Rect::from_min_max(
-                pos2(slot.left() + column as f32, slot.top() + top),
-                pos2(slot.left() + column as f32 + 1.0, slot.top() + bottom + 1.0),
+                pos2(slot.left() + column as f32, top),
+                pos2(slot.left() + column as f32 + 1.0, bottom),
             ),
             color,
         );
@@ -426,6 +473,20 @@ mod tests {
     }
 
     #[test]
+    fn the_baseline_fills_only_columns_with_no_sample() {
+        // Three samples scrolling in from the right.
+        let empty = empty_columns(3, 3, true);
+        assert!(empty[..TRACE_SAMPLES - 3].iter().all(|&e| e));
+        assert!(empty[TRACE_SAMPLES - 3..].iter().all(|&e| !e));
+        // A full trace leaves no room for it.
+        assert!(empty_columns(120, 500, true).iter().all(|&e| !e));
+        assert!(empty_columns(150, 500, false).iter().all(|&e| !e));
+        // Overwriting in place, two samples into a fresh sweep.
+        let empty = empty_columns(2, 2, false);
+        assert!(!empty[0] && !empty[1] && empty[2] && empty[TRACE_SAMPLES - 1]);
+    }
+
+    #[test]
     fn sweep_keeps_a_running_total() {
         let mut sweep = Sweep::default();
         sweep.update(&rtts(&[1.0]));
@@ -435,9 +496,10 @@ mod tests {
     }
 
     // The strip sits on the window's bottom edge, so its top is on a whole
-    // device pixel at every common scale. At each one the focus ring must
-    // leave every row a trace sample can use alone, the bottom row most of
-    // all, since that is where a good link draws.
+    // device pixel at every common scale. At each one every row a trace
+    // sample can use is as many device pixels tall as a point rounds to, and
+    // the focus ring leaves all of them alone, the bottom row most of all,
+    // since that is where a good link draws.
     #[test]
     fn focus_ring_never_covers_the_trace() {
         for per_point in [1.0, 1.25, 1.5, 1.75, 2.0, 2.5] {
@@ -451,13 +513,16 @@ mod tests {
                 Rect::from_min_max(pos2(outer.left(), outer.bottom() - width), outer.max),
             ];
             let slot = trace_slot(rect);
+            let rows = per_point.round().max(1.0);
             for row in 0..TRACE_HEIGHT as usize {
-                let sample = Rect::from_min_size(
-                    pos2(slot.left(), slot.top() + row as f32),
-                    vec2(TRACE_SAMPLES as f32, 1.0),
-                )
-                .round_to_pixels(per_point);
-                assert!(sample.height() > 0.0, "{per_point}: row {row} vanished");
+                let (top, bottom) = row_span(slot.top(), row as f32, row as f32, per_point);
+                let sample = Rect::from_min_max(pos2(slot.left(), top), pos2(slot.right(), bottom))
+                    .round_to_pixels(per_point);
+                let tall = sample.height() * per_point;
+                assert!(
+                    (tall - rows).abs() < 1e-3,
+                    "{per_point}: row {row} is {tall} px"
+                );
                 for side in ring {
                     let across = side.right().min(sample.right()) - side.left().max(sample.left());
                     let down = side.bottom().min(sample.bottom()) - side.top().max(sample.top());

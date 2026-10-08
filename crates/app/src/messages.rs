@@ -306,7 +306,7 @@ pub fn reply_code_error(err: &CodeError) -> Option<String> {
     }
 }
 
-pub const FIREWALL_ASK: &str = "Windows blocks incoming connections to new programs. One administrator prompt lets Booth receive UDP. Nothing else runs as administrator.";
+pub const FIREWALL_ASK: &str = "Windows blocks incoming connections to new programs. To let friends reach you, Booth needs one administrator prompt to let it receive UDP. Nothing else runs as administrator.";
 pub const FIREWALL_STANDARD_USER: &str = "You are not an administrator on this PC, so the port cannot be opened. Ask an administrator, or join only. Without the rule you will not follow the host if their address changes.";
 pub const FIREWALL_BLOCKED: &str =
     "Windows has a rule that blocks Booth, probably from an earlier prompt. Allow removes it.";
@@ -465,7 +465,8 @@ pub fn hotkeys_off(why: &str) -> String {
 
 // A known host's row, opened.
 pub const ADDRESS_OR_NAME: &str = "Address or name";
-pub const MANUAL_HINT: &str = "For example 203.0.113.5:41000 or myroom.duckdns.org";
+// The help line under its field: an example, not a sentence, so no full stop.
+pub const MANUAL_HELP: &str = "For example 203.0.113.5:41000 or myroom.duckdns.org";
 pub const MANUAL_REFUSED: &str = "That is not an address or name Booth can use. Write an address and port like 203.0.113.5:41000, or a name like myroom.duckdns.org.";
 const FORGOT: &str = "Forgot {room}. A new invite is needed to join it again.";
 const DAMAGED: &str = "The list of known {list} could not be read, so Booth started with an empty one. The old file is kept as {file}.";
@@ -1000,9 +1001,9 @@ mod tests {
         ] {
             assert_sentences(sentence);
         }
-        // A placeholder, not a sentence, so no full stop.
-        assert!(MANUAL_HINT.starts_with("For example "), "{MANUAL_HINT}");
-        assert!(MANUAL_HINT.is_ascii() && !MANUAL_HINT.ends_with('.'));
+        // An example, not a sentence, so no full stop.
+        assert!(MANUAL_HELP.starts_with("For example "), "{MANUAL_HELP}");
+        assert!(MANUAL_HELP.is_ascii() && !MANUAL_HELP.ends_with('.'));
     }
 
     #[test]

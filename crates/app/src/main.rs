@@ -113,12 +113,6 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mark = icon();
-    viewer::set_icon(viewer::Icon {
-        rgba: mark.rgba,
-        width: mark.width,
-        height: mark.height,
-    });
     // Before any profile, key, socket or firewall check: the loopback needs
     // none of them.
     if let Some(options) = &args.loopback {
@@ -149,6 +143,7 @@ fn main() -> ExitCode {
         native_options(),
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, setup, firewall, backlog)))),
     );
+    win::drop_window_icons();
     // The window is gone and the room with it, but a router slow to delete
     // the port mapping may still be answering. Returning ends the process
     // and that thread with it, and the forward to this PC would stay open.
@@ -539,7 +534,10 @@ fn native_options() -> eframe::NativeOptions {
             .with_app_id("Booth")
             .with_inner_size([360.0, 640.0])
             .with_min_inner_size([320.0, 400.0])
-            .with_icon(icon()),
+            // Given no icon, eframe puts its own logo on the window a frame
+            // after App::new has set the mark (win::set_window_icons). An
+            // empty one it leaves alone.
+            .with_icon(IconData::default()),
         wgpu_options: WgpuConfiguration {
             // One frame in flight, so a click shows up on the next vblank
             // rather than two behind.
@@ -549,51 +547,6 @@ fn native_options() -> eframe::NativeOptions {
         },
         ..eframe::NativeOptions::default()
     }
-}
-
-// The title bar, taskbar and Alt+Tab icon of the panel and the viewer: the
-// mark in amber on a plate in panel tone, its corners rounded 3/16 of its
-// size. The plate keeps the mark readable on a light taskbar, where amber
-// alone falls to about 2:1.
-fn icon() -> IconData {
-    const SIZE: u32 = 32;
-    let bars = mark::rects(SIZE);
-    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let on_mark = bars
-                .iter()
-                .any(|[l, t, r, b]| (*l..*r).contains(&x) && (*t..*b).contains(&y));
-            let color = if on_mark { theme::AMBER } else { theme::PANEL };
-            let [r, g, b, _] = color.to_array();
-            rgba.extend_from_slice(&[r, g, b, plate_cover(x, y, SIZE)]);
-        }
-    }
-    IconData {
-        rgba,
-        width: SIZE,
-        height: SIZE,
-    }
-}
-
-// How much of the pixel at x, y the rounded plate covers, from 4 by 4
-// samples, so its corners are smooth without a path renderer.
-fn plate_cover(x: u32, y: u32, size: u32) -> u8 {
-    let side = size as f32;
-    let corner = side * 3.0 / 16.0;
-    let mut inside = 0u32;
-    for sy in 0..4 {
-        for sx in 0..4 {
-            let px = x as f32 + (sx as f32 + 0.5) / 4.0;
-            let py = y as f32 + (sy as f32 + 0.5) / 4.0;
-            let nearest_x = px.clamp(corner, side - corner);
-            let nearest_y = py.clamp(corner, side - corner);
-            if (px - nearest_x).hypot(py - nearest_y) <= corner {
-                inside += 1;
-            }
-        }
-    }
-    (inside * 255 / 16) as u8
 }
 
 #[cfg(test)]

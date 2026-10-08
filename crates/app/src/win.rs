@@ -3,9 +3,14 @@ use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr;
+use std::sync::{Mutex, PoisonError};
 
+use eframe::egui::Color32;
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_CANCELLED, FILETIME, HANDLE, HWND, SYSTEMTIME, WAIT_OBJECT_0,
+};
+use windows_sys::Win32::Graphics::Dwm::{
+    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Security::{
     CheckTokenMembership, CreateWellKnownSid, GetTokenInformation, SECURITY_MAX_SID_SIZE,
@@ -16,7 +21,7 @@ use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
 };
 use windows_sys::Win32::System::LibraryLoader::{
-    LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
+    GetModuleHandleW, LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemTime;
 use windows_sys::Win32::System::Threading::{
@@ -24,16 +29,20 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows_sys::Win32::System::WindowsProgramming::GetUserNameW;
+use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::Shell::{
     SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
     ShellExecuteExW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    HWND_TOP, MB_ICONERROR, MB_OK, MessageBoxW, SPI_GETCLIENTAREAANIMATION, SW_HIDE,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow, SetWindowPos,
-    SystemParametersInfoW,
+    DestroyIcon, HWND_TOP, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW,
+    MB_ICONERROR, MB_OK, MessageBoxW, SM_CXICON, SM_CXSMICON, SPI_GETCLIENTAREAANIMATION, SW_HIDE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetForegroundWindow, SetWindowPos,
+    SystemParametersInfoW, WM_SETICON,
 };
 use windows_sys::core::BOOL;
+
+use crate::theme;
 
 // UNLEN is 256 characters, plus the terminating zero.
 const NAME_CHARS: usize = 257;
@@ -98,6 +107,96 @@ pub fn bring_forward(hwnd: isize) {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
         }
+    }
+}
+
+// The title bar in the window tone with chalk text, and the border in the
+// same tone, so no grey band of Windows' own sits over the title row. Windows
+// 10 does not know these and refuses them; it keeps the dark title bar winit
+// asked for.
+pub fn caption_colours(hwnd: isize) {
+    for (attribute, colour) in [
+        (DWMWA_CAPTION_COLOR, theme::WINDOW),
+        (DWMWA_TEXT_COLOR, theme::CHALK),
+        (DWMWA_BORDER_COLOR, theme::WINDOW),
+    ] {
+        dwm_colour(hwnd, attribute as u32, colour);
+    }
+}
+
+// The caption buttons dim when the window loses the focus, and the title
+// goes to ash with them, so with the panel and the viewer both open the
+// title still says which one has the keyboard.
+pub fn caption_text(hwnd: isize, focused: bool) {
+    let colour = if focused { theme::CHALK } else { theme::ASH };
+    dwm_colour(hwnd, DWMWA_TEXT_COLOR as u32, colour);
+}
+
+fn dwm_colour(hwnd: isize, attribute: u32, colour: Color32) {
+    let value = u32::from(colour.r()) | u32::from(colour.g()) << 8 | u32::from(colour.b()) << 16;
+    // SAFETY: the panel's own window, alive while the app runs, and a
+    // COLORREF of the size passed.
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd as HWND,
+            attribute,
+            ptr::from_ref(&value).cast(),
+            size_of::<u32>() as u32,
+        );
+    }
+}
+
+// The panel's two window icons, small and big, as numbers. A window does not
+// take over an icon it is sent, so they are kept until it is gone.
+static WINDOW_ICONS: Mutex<[isize; 2]> = Mutex::new([0; 2]);
+
+// The mark from booth.ico, the exe's icon resource 1 (build.rs), at the
+// sizes this window's DPI asks for, so the title bar, the taskbar and
+// Alt+Tab each show the frame drawn for their size rather than one picture
+// scaled soft. Again whenever the DPI changes.
+pub fn set_window_icons(hwnd: isize) {
+    let hwnd = hwnd as HWND;
+    // SAFETY: a plain query; it answers 0 for a window that is gone.
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    let mut held = WINDOW_ICONS.lock().unwrap_or_else(PoisonError::into_inner);
+    for (slot, (kind, metric)) in [(ICON_SMALL, SM_CXSMICON), (ICON_BIG, SM_CXICON)]
+        .into_iter()
+        .enumerate()
+    {
+        // SAFETY: plain calls. Resource 1 of this exe is booth.ico; a build
+        // without it, like a test, gets null and keeps what it had.
+        let icon = unsafe {
+            let size = GetSystemMetricsForDpi(metric, dpi);
+            LoadImageW(
+                GetModuleHandleW(ptr::null()),
+                ptr::without_provenance(1),
+                IMAGE_ICON,
+                size,
+                size,
+                LR_DEFAULTCOLOR,
+            )
+        };
+        if icon.is_null() {
+            continue;
+        }
+        // SAFETY: the panel's own window and a live icon.
+        unsafe { SendMessageW(hwnd, WM_SETICON, kind as usize, icon as isize) };
+        destroy_icon(std::mem::replace(&mut held[slot], icon as isize));
+    }
+}
+
+// Once the panel's window is gone.
+pub fn drop_window_icons() {
+    let mut held = WINDOW_ICONS.lock().unwrap_or_else(PoisonError::into_inner);
+    for icon in held.iter_mut() {
+        destroy_icon(std::mem::take(icon));
+    }
+}
+
+fn destroy_icon(icon: isize) {
+    if icon != 0 {
+        // SAFETY: an icon LoadImageW made, which no window shows any more.
+        unsafe { DestroyIcon(icon as _) };
     }
 }
 

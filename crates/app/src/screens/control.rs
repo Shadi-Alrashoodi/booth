@@ -197,7 +197,7 @@ pub fn request_block(
     allow_ready: bool,
 ) -> Option<Answer> {
     let mut answer = None;
-    controls::region(ui, SIDE, |ui| {
+    controls::region(ui, |ui| {
         match request {
             Request::Asked { number, name } => {
                 controls::text(ui, messages::wants_control(name), theme::body(), CHALK);

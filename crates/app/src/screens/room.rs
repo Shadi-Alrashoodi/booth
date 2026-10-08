@@ -18,7 +18,7 @@ use crate::controls::{self, Button, Lead};
 use crate::hotkeys::{self, Target};
 use crate::messages;
 use crate::monitors::{self, Pick};
-use crate::screens::chat::Chat;
+use crate::screens::chat::{Chat, Composer};
 use crate::screens::control::{self, AllowWait, Answer, Decline, MenuItem, PanicKey, RowMenu};
 use crate::screens::stats;
 use crate::sound::PeriodsAsk;
@@ -192,17 +192,17 @@ impl InRoom {
         } else {
             view.room_name.as_str()
         };
-        // When the room is over or never started, the way out sits under the
-        // sentence that explains it, and the title row stays empty.
+        // The way out is always at the right of the title row, also when the
+        // room is over or never started, so it is never a lone word under
+        // the sentence that explains why.
         let share = share_verb(view, self.control_offered);
         if share != Some(ShareVerb::Share) {
             self.monitors = None;
         }
         let words = share.as_ref().map(ShareVerb::words);
         let mut verbs: Vec<Button> = words.iter().map(VerbWords::button).collect();
-        if !ends_here(view) {
-            verbs.push(Button::new(leave_word(view.role)).role(theme::Role::Destructive));
-        }
+        let (exit, role) = way_out(view);
+        verbs.push(Button::new(exit).role(role));
         match controls::title_row(ui, Lead::Title(title), &verbs) {
             Some(0) if share.is_some() => self.share_pressed(share.as_ref()),
             Some(_) => step = Some(Step::Leave),
@@ -261,9 +261,8 @@ impl InRoom {
             Role::Host => self.host(ui, view, block, &mut step),
             Role::Client => self.client(ui, view, block, &mut step),
         });
-        let enabled = composer_enabled(view);
         self.chat
-            .show(ui, &view.chat, &view.people, &self.room, enabled);
+            .show(ui, &view.chat, &view.people, &self.room, composer(view));
         step
     }
 
@@ -316,7 +315,7 @@ impl InRoom {
     // `block` is true when a block in panel tone ends right above.
     fn host(&mut self, ui: &mut Ui, view: &View, block: bool, step: &mut Option<Step>) {
         if let Some(notice) = &view.notice {
-            controls::page(ui, |ui| explain(ui, notice, step));
+            controls::page(ui, |ui| explain(ui, notice));
             return;
         }
         let mut block = block;
@@ -330,7 +329,7 @@ impl InRoom {
         }
         if let Some(invite) = &view.invite {
             block = true;
-            controls::region(ui, STEP, |ui| {
+            controls::region(ui, |ui| {
                 self.invite(ui, invite, view.numbers.local_port, &view.share, step);
                 // A punch from a router that changes ports opens a port
                 // nobody will come to, so the field is not offered then.
@@ -363,8 +362,11 @@ impl InRoom {
         share: &ShareView,
         step: &mut Option<Step>,
     ) {
-        // The head and the lifetime toggle share one row; the toggle is a
-        // ghost, so the row reads as the word Invite first.
+        // The head and the lifetime toggle share one row, a head at the left
+        // and a bare verb at the right, as in the title row. The toggle is a
+        // plain secondary in both states: the control fill at rest means a
+        // toggle that is on or a button that Enter presses, and here it read
+        // as on and outweighed Copy.
         let rect = row_rect(ui, CONTROL_HEIGHT);
         let toggle = if invite.multi_use {
             Button::new("anyone, 24 h").color(WARN)
@@ -474,37 +476,27 @@ impl InRoom {
         }
     }
 
-    // `block` as for host.
+    // `block` as for host. Cancel, or Leave once the room has ended, is in
+    // the title row.
     fn client(&mut self, ui: &mut Ui, view: &View, block: bool, step: &mut Option<Step>) {
         if view.people.is_empty() {
             match &view.notice {
                 Some(Notice::StillTrying) => self.still_trying(ui, view.reply.as_ref(), step),
-                Some(notice) => controls::page(ui, |ui| explain(ui, notice, step)),
-                None => controls::page(ui, |ui| {
-                    if Button::new("Cancel").show(ui).clicked() {
-                        *step = Some(Step::Leave);
-                    }
-                }),
+                Some(notice) => controls::page(ui, |ui| explain(ui, notice)),
+                None => {}
             }
             return;
         }
         let mut block = block;
         if let Some(notice) = &view.notice {
-            controls::page(ui, |ui| explain(ui, notice, step));
+            controls::page(ui, |ui| explain(ui, notice));
             block = false;
         }
         if let Some(reply) = code_in_room(view) {
             block = true;
-            controls::region(ui, SIDE, |ui| {
-                // The title row already has Leave, so New code is the one
-                // button here.
-                if self.code_block(ui, reply) {
-                    ui.add_space(FIELD_GAP);
-                    if Button::new("New code").show(ui).clicked() {
-                        *step = Some(Step::NewCode);
-                    }
-                }
-            });
+            if self.code_region(ui, reply) {
+                *step = Some(Step::NewCode);
+            }
         }
         list_top(ui, block);
         self.people(ui, view);
@@ -518,30 +510,25 @@ impl InRoom {
             let still = messages::notice(&Notice::StillTrying);
             controls::prose(ui, still, theme::body(), CHALK);
         });
-        let mut expired = false;
-        let mut top = 0.0;
-        if let Some(reply) = reply {
-            controls::region(ui, SIDE, |ui| expired = self.code_block(ui, reply));
-            top = FIELD_GAP;
+        if let Some(reply) = reply
+            && self.code_region(ui, reply)
+        {
+            *step = Some(Step::NewCode);
         }
-        controls::gutter(ui, top, SIDE, |ui| {
-            ui.horizontal(|ui| {
-                if expired && Button::new("New code").show(ui).clicked() {
-                    *step = Some(Step::NewCode);
-                }
-                if Button::new("Cancel").show(ui).clicked() {
-                    *step = Some(Step::Leave);
-                }
-            });
-        });
     }
 
-    // The code with its Copy button, or what failed once it expired, or why
-    // no code would help. The same block on the joining screen and above
-    // the people list. True when it expired, which is when New code is
-    // offered.
+    // The code block in its panel-tone region. True when New code was
+    // pressed.
+    fn code_region(&mut self, ui: &mut Ui, reply: &ReplyView) -> bool {
+        controls::region(ui, |ui| self.code_block(ui, reply))
+    }
+
+    // The code with its Copy button, or what failed once it expired with
+    // New code beside it, as New invite takes Copy's place on the host, or
+    // why no code would help. The same block on the joining screen and above
+    // the people list. True when New code was pressed.
     fn code_block(&mut self, ui: &mut Ui, reply: &ReplyView) -> bool {
-        let mut expired = false;
+        let mut new_code = false;
         match reply.state {
             ReplyState::Code { second_router } => {
                 controls::text(ui, messages::SEND_CODE_BACK, theme::body(), CHALK);
@@ -559,8 +546,8 @@ impl InRoom {
                 }
             }
             ReplyState::Expired { .. } => {
-                expired = true;
-                controls::text(ui, messages::CODE_EXPIRED, theme::body(), CHALK);
+                let buttons = ["New code"];
+                new_code = code_row(ui, messages::CODE_EXPIRED, false, CHALK, &buttons).is_some();
                 if let Some(rung) = messages::reply(reply.state, reply.host_port) {
                     ui.add_space(STEP);
                     controls::prose(ui, rung, theme::body(), ASH);
@@ -576,7 +563,7 @@ impl InRoom {
             ui.add_space(HALF_STEP);
             controls::prose(ui, error.as_str(), theme::caption(), BAD);
         }
-        expired
+        new_code
     }
 }
 
@@ -618,26 +605,24 @@ fn entered(ui: &Ui, field: &Response) -> bool {
     field.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter))
 }
 
-// One sentence for the notice, and the button that is the way out of it when
-// the room cannot go on.
-fn explain(ui: &mut Ui, notice: &Notice, step: &mut Option<Step>) {
+// One sentence for the notice. The way out of it is in the title row.
+fn explain(ui: &mut Ui, notice: &Notice) {
     controls::prose(ui, messages::notice(notice), theme::body(), CHALK);
-    // The room keeps trying under the two about a silent host, and Leave is
-    // in the title row.
-    let button = match notice {
-        Notice::StillTrying => Some(Button::new("Cancel")),
-        Notice::LostHost | Notice::HostMoved => None,
-        Notice::RoomClosed
-        | Notice::InviteExpired
-        | Notice::SocketFailed
-        | Notice::OtherVersion { .. }
-        | Notice::UnversionedHost => Some(Button::new("Leave").role(theme::Role::Destructive)),
-    };
-    if let Some(button) = button {
-        ui.add_space(FIELD_GAP);
-        if button.show(ui).clicked() {
-            *step = Some(Step::Leave);
-        }
+}
+
+// The last verb in the title row. Cancel while joining, since nothing has
+// been joined yet; Leave once the room has ended, on the host too, since
+// there is no room left to close; otherwise Leave, or Close room on the host.
+fn way_out(view: &View) -> (&'static str, theme::Role) {
+    let joining = view.role == Role::Client
+        && view.people.is_empty()
+        && matches!(view.notice, None | Some(Notice::StillTrying));
+    if joining {
+        ("Cancel", theme::Role::Secondary)
+    } else if ends_here(view) {
+        ("Leave", theme::Role::Destructive)
+    } else {
+        (leave_word(view.role), theme::Role::Destructive)
     }
 }
 
@@ -657,6 +642,18 @@ fn composer_enabled(view: &View) -> bool {
     match view.role {
         Role::Host => view.notice.is_none(),
         Role::Client => matches!(view.strip.state, LinkState::Live | LinkState::Reconnecting),
+    }
+}
+
+// Gone once the room has ended, as Hold to talk goes: a field that can never
+// take anything again would only be a stray word on the chat's tone.
+fn composer(view: &View) -> Composer {
+    if ends_here(view) {
+        Composer::Gone
+    } else if composer_enabled(view) {
+        Composer::Open
+    } else {
+        Composer::Off
     }
 }
 
@@ -827,7 +824,7 @@ pub fn addresses_hidden(share: &ShareView) -> bool {
 // the narrowest window three of them wrap onto a second line.
 fn monitor_row(ui: &mut Ui, picks: &[Pick]) -> Option<usize> {
     let mut pressed = None;
-    controls::region(ui, STEP, |ui| {
+    controls::region(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.y = STEP;
             for (i, pick) in picks.iter().enumerate() {
@@ -851,6 +848,14 @@ fn list_top(ui: &mut Ui, block: bool) {
     if block {
         ui.add_space(STEP);
     }
+}
+
+// Everyone else in the order they joined, which is the order the room gives,
+// and your own row last on every panel, so it and its Mute and Deafen are in
+// the same place whether you host or join.
+fn in_order(people: &[Person]) -> impl Iterator<Item = &Person> {
+    let others = people.iter().filter(|person| !person.is_you);
+    others.chain(people.iter().filter(|person| person.is_you))
 }
 
 // While someone shares, their row has Watch for everyone else,
@@ -921,7 +926,7 @@ impl InRoom {
         self.menu.keep_only(&with_menu);
         // Whether the list ended on a row's own edge, with nothing under it.
         let mut row_last = false;
-        for person in &view.people {
+        for person in in_order(&view.people) {
             row_last = true;
             let same_name = view
                 .people
@@ -932,7 +937,7 @@ impl InRoom {
             let dim = gone || person.reconnecting;
             let word = control::state_word(view, person, offered);
             if person.is_you {
-                self.your_row(ui, &view.voice, person, word, dim);
+                self.your_row(ui, &view.voice, person, word, dim, ends_here(view));
                 let paused = paused_line(self.keys);
                 let problem = voice_problem(&view.voice);
                 if paused.is_some() || problem.is_some() {
@@ -1026,7 +1031,9 @@ impl InRoom {
     }
 
     // Your row is 32 px, with Hold to talk in push-to-talk mode
-    // while the hotkeys cannot do it, then Mute and Deafen.
+    // while the hotkeys cannot do it, then Mute and Deafen. Once the room
+    // has `ended` there is no voice left to send or hear: Hold to talk goes,
+    // and Mute and Deafen stay in place disabled, in ash with no fill.
     fn your_row(
         &mut self,
         ui: &mut Ui,
@@ -1034,10 +1041,11 @@ impl InRoom {
         person: &Person,
         word: Option<&str>,
         dim: bool,
+        ended: bool,
     ) {
         let rect = row_rect(ui, CONTROL_HEIGHT);
         let pointer_down = ui.input(|input| input.pointer.any_down());
-        let hold = hold_shown(voice, self.keys, self.hold.stays(pointer_down));
+        let hold = !ended && hold_shown(voice, self.keys, self.hold.stays(pointer_down));
         let buttons = your_buttons(voice, self.hold.held, hold);
         // Hold to talk keeps its size when it reads Talking, so Mute and
         // Deafen do not move under the mouse.
@@ -1080,7 +1088,7 @@ impl InRoom {
                         // A toggle that is on keeps the control fill, so a
                         // muted microphone shows without reading the word.
                         let on = if mute { voice.muted } else { voice.deafened };
-                        if button.on(on).show(ui).clicked() {
+                        if button.on(on).enabled(!ended).show(ui).clicked() && !ended {
                             pressed = Some(if mute {
                                 VoicePress::Mute
                             } else {
@@ -1231,16 +1239,21 @@ fn row_name(
         reserve += controls::text_width(ui, word, theme::caption()) + gap;
     }
     let name_width = (ui.available_width() - reserve).max(0.0);
-    ui.scope(|ui| {
-        ui.set_max_width(name_width);
-        let color = if dim { ASH } else { CHALK };
-        controls::one_line(ui, name, theme::name(), color);
-    });
+    let baseline = ui
+        .scope(|ui| {
+            ui.set_max_width(name_width);
+            let color = if dim { ASH } else { CHALK };
+            controls::one_line_on(ui, name, theme::name(), color, None).1
+        })
+        .inner;
+    // On the name's baseline: centred in the row, the smaller text would sit
+    // a pixel above it.
     if fingerprint {
-        controls::one_line(ui, &person.fingerprint, theme::mono_caption(), ASH);
+        let print = theme::mono_caption();
+        controls::one_line_on(ui, &person.fingerprint, print, ASH, Some(baseline));
     }
     if let Some(word) = word {
-        controls::one_line(ui, word, theme::caption(), ASH);
+        controls::one_line_on(ui, word, theme::caption(), ASH, Some(baseline));
     }
 }
 
@@ -1376,6 +1389,104 @@ mod tests {
             ..host
         };
         assert!(!chat_shown(&failed) && !composer_enabled(&failed));
+    }
+
+    // Open while the room runs; kept in its shape, taking nothing, while the
+    // host is lost and may come back; gone once the room has ended, when
+    // Hold to talk goes too.
+    #[test]
+    fn the_composer_goes_with_the_room() {
+        assert_eq!(composer(&in_room()), Composer::Open);
+        let lost = View {
+            notice: Some(Notice::LostHost),
+            strip: Strip {
+                state: LinkState::Lost,
+                ..Strip::default()
+            },
+            ..in_room()
+        };
+        assert_eq!(composer(&lost), Composer::Off);
+        let closed = View {
+            notice: Some(Notice::RoomClosed),
+            strip: Strip {
+                state: LinkState::Closed,
+                ..Strip::default()
+            },
+            ..in_room()
+        };
+        assert!(ends_here(&closed));
+        assert_eq!(composer(&closed), Composer::Gone);
+        let host = View {
+            role: Role::Host,
+            ..in_room()
+        };
+        assert_eq!(composer(&host), Composer::Open);
+    }
+
+    // Your own row is last on every panel, the host's included, and the rest
+    // keep the order the room gave them.
+    #[test]
+    fn your_row_is_last() {
+        let names = |people: &[Person]| -> Vec<String> {
+            in_order(people).map(|person| person.name.clone()).collect()
+        };
+        let host = [
+            person("Shadi", true),
+            person("Mara", false),
+            person("Jonas", false),
+        ];
+        assert_eq!(names(&host), ["Mara", "Jonas", "Shadi"]);
+        let client = [
+            person("Mara", false),
+            person("Tom", true),
+            person("Ines", false),
+        ];
+        assert_eq!(names(&client), ["Mara", "Ines", "Tom"]);
+    }
+
+    // The way out is always the title row's last verb: Cancel while joining,
+    // Leave or Close room while the room runs, and Leave alone once it has
+    // ended, on the host too.
+    #[test]
+    fn the_way_out_is_in_the_title_row() {
+        use crate::theme::Role::Destructive;
+        let joining = View {
+            people: Vec::new(),
+            reply: None,
+            ..in_room()
+        };
+        assert_eq!(way_out(&joining), ("Cancel", Secondary));
+        let still = View {
+            notice: Some(Notice::StillTrying),
+            ..joining.clone()
+        };
+        assert_eq!(way_out(&still), ("Cancel", Secondary));
+        let refused = View {
+            notice: Some(Notice::InviteExpired),
+            ..joining
+        };
+        assert_eq!(way_out(&refused), ("Leave", Destructive));
+        assert_eq!(way_out(&in_room()), ("Leave", Destructive));
+        let closed = View {
+            notice: Some(Notice::RoomClosed),
+            strip: Strip {
+                state: LinkState::Closed,
+                ..Strip::default()
+            },
+            ..in_room()
+        };
+        assert_eq!(way_out(&closed), ("Leave", Destructive));
+        assert!(share_verb(&closed, ON).is_none(), "Leave stands alone");
+        let host = View {
+            role: Role::Host,
+            ..in_room()
+        };
+        assert_eq!(way_out(&host), ("Close room", Destructive));
+        let failed = View {
+            notice: Some(Notice::SocketFailed),
+            ..host
+        };
+        assert_eq!(way_out(&failed), ("Leave", Destructive));
     }
 
     #[test]

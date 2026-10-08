@@ -1,14 +1,14 @@
 use eframe::egui::{
-    Align, CursorIcon, Id, Key, Layout, Rect, Response, ScrollArea, Sense, Shape, Ui, UiBuilder,
-    WidgetInfo, WidgetType, pos2, vec2,
+    Align, Color32, CursorIcon, Id, Key, Layout, Rect, Response, ScrollArea, Sense, Shape, Ui,
+    UiBuilder, WidgetInfo, WidgetType, pos2, vec2,
 };
 use room::KnownHost;
 
 use crate::controls::{self, Button, Lead};
 use crate::messages;
 use crate::theme::{
-    self, ASH, BAD, CHALK, CONTROL_HEIGHT, FIELD_GAP, HALF_STEP, PANEL, Role, SECTION_GAP, SIDE,
-    STEP,
+    self, ASH, BAD, CHALK, CONTROL_HEIGHT, FIELD_GAP, HALF_STEP, PANEL, PRIMARY_WIDTH, Role,
+    SECTION_GAP, SIDE, STEP,
 };
 use crate::update::{Shown, Tone};
 
@@ -156,7 +156,7 @@ pub fn show(
                 if host {
                     choice = Some(Choice::Host);
                 }
-                error(ui, start.host_error.as_deref());
+                field_error(ui, "Host", start.host_error.as_deref());
 
                 ui.add_space(SECTION_GAP);
                 section(ui, "Join a room", "Paste the invite you were sent.");
@@ -177,7 +177,7 @@ pub fn show(
                 if join {
                     choice = Some(Choice::Join);
                 }
-                error(ui, start.join_error.as_deref());
+                field_error(ui, "Join", start.join_error.as_deref());
 
                 if let Some(known) = known_hosts(ui, start) {
                     choice = Some(known);
@@ -316,7 +316,10 @@ fn host_row(ui: &mut Ui, host: &KnownHost) -> Option<Row> {
     let room = host.room_name().to_owned();
     row.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &room));
     let focused = row.has_focus();
-    let join = Button::new("Join").enter_target(focused);
+    // As wide as Host and Join above it, so its word stands in their column.
+    let join = Button::new("Join")
+        .enter_target(focused)
+        .min_width(PRIMARY_WIDTH);
     let fingerprint = keys::fingerprint(host.host_key());
     let print = theme::mono_caption();
     let print_width = controls::text_width(ui, &fingerprint, print.clone());
@@ -350,8 +353,12 @@ fn host_row(ui: &mut Ui, host: &KnownHost) -> Option<Row> {
     row.clicked().then_some(Row::Toggle)
 }
 
-// The opened row: the address or name typed for it with its label above,
-// then Save, the field's Enter target, and Forget.
+// The opened row: the address or name typed for it with its label above and
+// an example under it, then Save, the field's Enter target, and Forget. The
+// example is a help line rather than a placeholder, which the field cut short
+// at the default width; the label already names the field. The name row
+// stays on the block's top edge, so opening a row moves nothing, and Save
+// sits 8 above the block's bottom to match.
 fn address(ui: &mut Ui, start: &mut Start, key: [u8; 32]) -> Option<Choice> {
     ui.add_space(STEP);
     controls::text(ui, messages::ADDRESS_OR_NAME, theme::body(), ASH);
@@ -360,7 +367,7 @@ fn address(ui: &mut Ui, start: &mut Start, key: [u8; 32]) -> Option<Choice> {
         ui,
         "known host address",
         &mut start.address,
-        messages::MANUAL_HINT,
+        "",
         theme::mono(),
         ADDRESS_CHARS,
     );
@@ -375,11 +382,18 @@ fn address(ui: &mut Ui, start: &mut Start, key: [u8; 32]) -> Option<Choice> {
     if field.changed() {
         start.address_error = None;
     }
-    error(ui, start.address_error.as_deref());
+    match start.address_error.as_deref() {
+        Some(text) => under_field(ui, text, BAD),
+        None => under_field(ui, messages::MANUAL_HELP, ASH),
+    }
     ui.add_space(FIELD_GAP);
     let mut choice = None;
     ui.horizontal(|ui| {
-        let save = Button::new("Save").enter_target(field.has_focus()).show(ui);
+        // Save is the field's Enter target, and shows it with the control
+        // fill for as long as the row is open, not only while the field has
+        // focus: otherwise it is a box while typing and then a lone word,
+        // set in from the field above it, once focus moves on.
+        let save = Button::new("Save").on(true).show(ui);
         if save.clicked() || entered(ui, &field) {
             choice = Some(Choice::SaveAddress(key));
         }
@@ -395,7 +409,7 @@ fn address(ui: &mut Ui, start: &mut Start, key: [u8; 32]) -> Option<Choice> {
         let bottom = pos2(field.rect.right(), ui.cursor().top());
         ui.scroll_to_rect(Rect::from_min_max(field.rect.min, bottom), None);
     }
-    ui.add_space(FIELD_GAP);
+    ui.add_space(STEP);
     choice
 }
 
@@ -428,9 +442,28 @@ fn section(ui: &mut Ui, name: &str, line: &str) {
 // Under the field it belongs to, 4 px down, in caption.
 fn error(ui: &mut Ui, text: Option<&str>) {
     if let Some(text) = text {
-        ui.add_space(HALF_STEP);
-        controls::prose(ui, text, theme::caption(), BAD);
+        under_field(ui, text, BAD);
     }
+}
+
+// A help line in ash or an error in bad, in the same place.
+fn under_field(ui: &mut Ui, text: &str, color: Color32) {
+    ui.add_space(HALF_STEP);
+    controls::prose(ui, text, theme::caption(), color);
+}
+
+// The same under the field of a field row, wrapped at the field's width, so
+// it stays under the field and does not run on under the `verb` beside it.
+fn field_error(ui: &mut Ui, verb: &str, text: Option<&str>) {
+    if text.is_none() {
+        return;
+    }
+    let button = Button::new(verb).role(Role::Primary).width(ui);
+    let width = (ui.available_width() - button - STEP).max(0.0);
+    ui.scope(|ui| {
+        ui.set_max_width(width);
+        error(ui, text);
+    });
 }
 
 // A single-line field gives up focus on Enter, so that pair is the press.

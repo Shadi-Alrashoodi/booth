@@ -7,8 +7,8 @@ use std::sync::Arc;
 use eframe::egui::containers::scroll_area::ScrollAreaOutput;
 use eframe::egui::text::LayoutJob;
 use eframe::egui::{
-    Align, Frame, Galley, Label, Layout, Margin, Rect, Response, ScrollArea, Sense, TextFormat, Ui,
-    UiBuilder, pos2, vec2,
+    Align, FontId, Frame, Galley, Label, Layout, Margin, Rect, Response, ScrollArea, Sense,
+    TextFormat, Ui, UiBuilder, pos2, vec2,
 };
 use room::view::{ChatLine, LineKind, Person};
 use room::{ChatRefused, Room};
@@ -40,6 +40,18 @@ const ELLIPSIS: char = '\u{2026}';
 const ISOLATE: char = '\u{2068}';
 const END_ISOLATE: char = '\u{2069}';
 const LTR_MARK: char = '\u{200E}';
+
+// What is under the chat's lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Composer {
+    Open,
+    // The host is lost and may come back: the field keeps its shape in the
+    // window tone, takes nothing, and keeps what was typed.
+    Off,
+    // The room has ended. With no field left to type in, the lines run down
+    // to the chat's own 16 px above the strip.
+    Gone,
+}
 
 pub struct Chat {
     draft: String,
@@ -76,7 +88,7 @@ impl Chat {
         lines: &[Arc<ChatLine>],
         people: &[Person],
         room: &Room,
-        enabled: bool,
+        composer: Composer,
     ) {
         self.names.note(people, lines);
         let height = (ui.available_height() - self.bottom).max(0.0);
@@ -90,23 +102,25 @@ impl Chat {
         // gutter either side and 16 px down to the strip. Why a message was
         // not sent goes half a step under the field, as any field's error.
         let top = ui.cursor().top();
-        Frame::new()
-            .fill(PANEL)
-            .inner_margin(Margin {
-                left: SIDE as i8,
-                right: SIDE as i8,
-                top: 0,
-                bottom: SIDE as i8,
-            })
-            .show(ui, |ui| {
-                if let Some(text) = self.composer(ui, enabled) {
-                    self.said(room.say(&text));
-                }
-                if let Some(error) = self.error {
-                    ui.add_space(HALF_STEP);
-                    controls::text(ui, error, theme::caption(), BAD);
-                }
-            });
+        if composer != Composer::Gone {
+            Frame::new()
+                .fill(PANEL)
+                .inner_margin(Margin {
+                    left: SIDE as i8,
+                    right: SIDE as i8,
+                    top: 0,
+                    bottom: SIDE as i8,
+                })
+                .show(ui, |ui| {
+                    if let Some(text) = self.composer(ui, composer == Composer::Open) {
+                        self.said(room.say(&text));
+                    }
+                    if let Some(error) = self.error {
+                        ui.add_space(HALF_STEP);
+                        controls::text(ui, error, theme::caption(), BAD);
+                    }
+                });
+        }
         let bottom = ui.cursor().top() - top;
         if (bottom - self.bottom).abs() > 0.5 {
             self.bottom = bottom;
@@ -182,10 +196,11 @@ impl Chat {
     // the people rows, and the name is what gets cut to make room for it:
     // the fingerprint is what tells the two apart.
     fn name_galley(&mut self, ui: &Ui, line: &ChatLine, width: f32) -> Arc<Galley> {
-        let format = |font_id, color| TextFormat {
+        let format = |font_id: FontId, color| TextFormat {
+            line_height: Some(on_baseline(ui, &font_id, &theme::medium())),
             font_id,
             color,
-            line_height: Some(BODY_LINE),
+            valign: Align::BOTTOM,
             ..TextFormat::default()
         };
         // A real space before the time and the fingerprint, so a screen
@@ -297,10 +312,11 @@ impl Times {
 // ash, or in warn when it is about a share that ran into
 // something. It has no name line: the sentence names whom it is about.
 fn system_galley(ui: &Ui, line: &ChatLine, time: Option<&str>, width: f32) -> Arc<Galley> {
-    let format = |font_id, color| TextFormat {
+    let format = |font_id: FontId, color| TextFormat {
+        line_height: Some(on_baseline(ui, &font_id, &theme::body())),
         font_id,
         color,
-        line_height: Some(BODY_LINE),
+        valign: Align::BOTTOM,
         ..TextFormat::default()
     };
     let color = if line.kind == LineKind::Problem {
@@ -324,6 +340,15 @@ fn system_galley(ui: &Ui, line: &ChatLine, time: Option<&str>, width: f32) -> Ar
     job.append(&line.text, leading, format(theme::body(), color));
     job.wrap.max_width = width;
     ui.painter().layout_job(job)
+}
+
+// The line height that puts `font` on the baseline of `lead`, the font a
+// line of chat is set in, when both are bottom-aligned in one row: the time
+// in Plex Mono 12 after a name in Sans Medium 13 has a smaller ascent, and
+// at the same height it would sit above the name. Shorter by the difference,
+// it is pushed down by exactly that much, and the row keeps lead's height.
+fn on_baseline(ui: &Ui, font: &FontId, lead: &FontId) -> f32 {
+    BODY_LINE - (controls::ascent(ui, lead) - controls::ascent(ui, font))
 }
 
 // The message text is a layout job of its own, so the name above it never

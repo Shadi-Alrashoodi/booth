@@ -19,8 +19,8 @@ mod text;
 mod window;
 
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HWND;
@@ -68,22 +68,6 @@ static HIDE_STRIP: AtomicBool = AtomicBool::new(false);
 
 pub fn hide_strip_in_fullscreen(on: bool) {
     HIDE_STRIP.store(on, Ordering::Relaxed);
-}
-
-// The panel's own window icon, given once as the app starts, for the same
-// reason: the room's share thread and the loopback open viewers without the
-// panel. Until it is given, a viewer has Windows' blank icon.
-static ICON: OnceLock<Icon> = OnceLock::new();
-
-// RGBA, rows from the top, `width` by `height` pixels.
-pub struct Icon {
-    pub rgba: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
-}
-
-pub fn set_icon(icon: Icon) {
-    let _ = ICON.set(icon);
 }
 
 #[derive(Clone)]

@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Direct2D::{
 };
 
 use crate::error::ViewerError;
-use crate::palette::{self, AMBER, ASH, BAD, Colour, SAGE, WARN, WINDOW};
+use crate::palette::{self, AMBER, ASH, BAD, Colour, WARN, WINDOW};
 use crate::text::Text;
 
 pub(crate) const HEIGHT: f32 = 24.0;
@@ -168,6 +168,17 @@ fn column(i: usize, count: usize, total: u64, scrolling: bool) -> usize {
     }
 }
 
+// The columns no sample of the current trace is drawn in. A lost ping has a
+// column and stays a gap: loss is shown as data.
+fn empty_columns(len: usize, total: u64, scrolling: bool) -> [bool; TRACE_SAMPLES] {
+    let count = len.min(TRACE_SAMPLES);
+    let mut empty = [true; TRACE_SAMPLES];
+    for i in 0..count {
+        empty[column(i, count, total, scrolling)] = false;
+    }
+    empty
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Part {
     State,
@@ -184,20 +195,7 @@ enum Part {
 }
 
 impl Part {
-    // Right-aligned in its slot, so the unit stays put and only the digits
-    // change.
-    fn is_number(self) -> bool {
-        matches!(
-            self,
-            Part::RoundTrip
-                | Part::Jitter
-                | Part::Loss
-                | Part::Encode
-                | Part::Decode
-                | Part::EndToEnd
-        )
-    }
-
+    // In ash, with the one space before the value that follows it.
     fn label(self) -> Option<&'static str> {
         match self {
             Part::Encode => Some("enc "),
@@ -209,14 +207,17 @@ impl Part {
 
     // The widest value each number normally takes. Its slot is that wide
     // whatever it shows, so going from 9 to 10 does not push the words after
-    // it along.
+    // it along. The path word's slot is as wide as "relayed", the longest it
+    // will be once a relay comes, so LAN, direct and loop leave enc, dec and
+    // e2e in the same place from one session to the next.
     fn widest(self) -> &'static [&'static str] {
         match self {
             Part::RoundTrip | Part::EndToEnd => &["100 ms", "<1 ms"],
             Part::Jitter => &["\u{b1}99"],
             Part::Loss => &["10.0%"],
-            Part::Encode | Part::Decode => &["99.9"],
-            Part::State | Part::Path | Part::Control | Part::Paused | Part::Present => &[],
+            Part::Encode | Part::Decode => &["99.9 ms"],
+            Part::Path => &["relayed"],
+            Part::State | Part::Control | Part::Paused | Part::Present => &[],
         }
     }
 }
@@ -242,7 +243,8 @@ struct Word {
     text: String,
     colour: Colour,
     // Whether the word gets the room its widest value needs. A live number
-    // does. The last numbers shown while reconnecting do not.
+    // does, and the path word always does. The last numbers shown while
+    // reconnecting do not.
     slot: bool,
     // What it says when even the words that always stay do not fit.
     short: Option<String>,
@@ -262,7 +264,12 @@ fn words(strip: &Strip, present: Option<PresentPath>) -> Vec<Word> {
     // With no numbers the control words still show: this PC's keys go to
     // another whatever the link does.
     let stale = match strip.state {
-        LinkState::Alone | LinkState::Closed => {
+        LinkState::Alone => {
+            control_words(strip, &mut words);
+            return words;
+        }
+        LinkState::Closed => {
+            push(Part::State, String::from("closed"), ASH, false);
             control_words(strip, &mut words);
             return words;
         }
@@ -313,7 +320,8 @@ fn words(strip: &Strip, present: Option<PresentPath>) -> Vec<Word> {
             PathWord::Direct => "direct",
             PathWord::Loop => "loop",
         };
-        push(Part::Path, word.to_string(), colour(Level::Good), false);
+        // A word, not a reading: colour in the strip is for the numbers.
+        push(Part::Path, word.to_string(), ASH, true);
     }
     control_words(strip, &mut words);
     let mut push = |part, text: String, colour, slot| {
@@ -339,10 +347,11 @@ fn words(strip: &Strip, present: Option<PresentPath>) -> Vec<Word> {
             !stale,
         );
     }
-    // Measured here, never stale. Composed is in warn, as relayed is: the
-    // path that is slower than it could be, and F11 is the way out.
+    // Measured here, never stale. Flip is a word like the path word. Composed
+    // is in warn, as relayed is: the path that is slower than it could be,
+    // and F11 is the way out.
     match present {
-        Some(PresentPath::Flip) => push(Part::Present, "flip".to_string(), SAGE, false),
+        Some(PresentPath::Flip) => push(Part::Present, "flip".to_string(), ASH, false),
         Some(PresentPath::Composed) => push(Part::Present, "composed".to_string(), WARN, false),
         None => {}
     }
@@ -389,11 +398,12 @@ fn milliseconds(ms: f32) -> String {
     }
 }
 
+// Encode and decode, with their unit like every other reading: "2.1 ms".
 fn tenths(ms: f32) -> String {
     if ms < 99.95 {
-        format!("{ms:.1}")
+        format!("{ms:.1} ms")
     } else {
-        format!("{ms:.0}")
+        format!("{ms:.0} ms")
     }
 }
 
@@ -492,6 +502,16 @@ fn baseline(metrics: crate::text::Metrics, scale: f32) -> f32 {
     (top * scale).round() + (ascent * scale).round()
 }
 
+// Where rows `upper` to `lower` of the trace slot go, in whole pixels, as
+// the panel places them: each row as many pixels tall as one point rounds
+// to, from the row's own top down, so the trace is two pixels at 150 percent
+// like every other stroke scaled with the display.
+fn row_span(slot_top: f32, upper: f32, lower: f32, scale: f32) -> (f32, f32) {
+    let rows = scale.round().max(1.0);
+    let top = (slot_top + upper * scale).round();
+    (top, (slot_top + lower * scale).round() + rows)
+}
+
 pub(crate) struct Painter {
     context: ID2D1DeviceContext,
     brush: ID2D1SolidColorBrush,
@@ -565,41 +585,59 @@ impl Painter {
             &mut |word: &str| Ok(text.line(word)?.width / scale),
         )?;
         let baseline = top + baseline(self.text.metrics(), scale);
+        // Every word starts at the left of its slot, the value right after
+        // its label's space, so each reading has a fixed place and a short
+        // value leaves the rest of its slot empty after it.
         for placed in &placed {
             let word = &placed.word;
-            let left = placed.x * scale;
+            let mut left = placed.x * scale;
             if let Some(label) = word.part.label() {
-                self.text_at(label, left, baseline, word.colour)?;
+                self.text_at(label, left, baseline, ASH)?;
+                left += self.text.line(label)?.width;
             }
-            let value_left = if word.part.is_number() {
-                let value_width = self.text.line(&word.text)?.width;
-                (placed.x + placed.width) * scale - value_width
-            } else {
-                left
-            };
-            self.text_at(&word.text, value_left, baseline, word.colour)?;
+            self.text_at(&word.text, left, baseline, word.colour)?;
         }
 
         let slot_left = width - (SIDE + TRACE_SAMPLES as f32) * scale;
         let slot_top = top + ((HEIGHT - TRACE_HEIGHT) / 2.0) * scale;
+        let empty = match strip.state {
+            LinkState::Live | LinkState::Reconnecting => {
+                empty_columns(strip.trace.len(), sweep.total, look.scrolling)
+            }
+            LinkState::Connecting | LinkState::Lost | LinkState::Alone | LinkState::Closed => {
+                [true; TRACE_SAMPLES]
+            }
+        };
+        self.baseline(&empty, scale, slot_left, slot_top);
         match strip.state {
             LinkState::Live => self.trace(strip, sweep, look, slot_left, slot_top, None),
             LinkState::Reconnecting => {
                 self.trace(strip, sweep, look, slot_left, slot_top, Some(ASH))
             }
-            LinkState::Connecting | LinkState::Lost => {
-                let y = slot_top + (TRACE_HEIGHT - 1.0) * scale;
+            LinkState::Connecting | LinkState::Lost | LinkState::Alone | LinkState::Closed => {}
+        }
+        Ok(())
+    }
+
+    // The flat ash line along the slot's bottom row wherever there is no
+    // sample to draw, as in the panel's strip.
+    fn baseline(&self, empty: &[bool; TRACE_SAMPLES], scale: f32, slot_left: f32, slot_top: f32) {
+        let bottom_row = TRACE_HEIGHT - 1.0;
+        let (top, bottom) = row_span(slot_top, bottom_row, bottom_row, scale);
+        let mut start = 0;
+        for run in empty.chunk_by(|a, b| a == b) {
+            let end = start + run.len();
+            if run[0] {
                 self.fill(
-                    slot_left,
-                    y,
-                    slot_left + TRACE_SAMPLES as f32 * scale,
-                    y + scale,
+                    slot_left + start as f32 * scale,
+                    top,
+                    slot_left + end as f32 * scale,
+                    bottom,
                     ASH,
                 );
             }
-            LinkState::Alone | LinkState::Closed => {}
+            start = end;
         }
-        Ok(())
     }
 
     fn trace(
@@ -633,13 +671,8 @@ impl Painter {
                 _ => (row, row),
             };
             let x = slot_left + column as f32 * scale;
-            self.fill(
-                x,
-                slot_top + upper * scale,
-                x + scale,
-                slot_top + (lower + 1.0) * scale,
-                colour,
-            );
+            let (top, bottom) = row_span(slot_top, upper, lower, scale);
+            self.fill(x, top, x + scale, bottom, colour);
             previous = Some((column, row));
         }
     }
@@ -719,6 +752,7 @@ impl Painter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::palette::SAGE;
 
     fn rtts(values: &[f32]) -> Vec<TraceSample> {
         values.iter().map(|&ms| TraceSample::Rtt(ms)).collect()
@@ -763,12 +797,41 @@ mod tests {
         assert_eq!(
             texts,
             [
-                "4 ms", "\u{b1}0", "0.0%", "LAN", "2.1", "1.4", "11 ms", "flip"
+                "4 ms", "\u{b1}0", "0.0%", "LAN", "2.1 ms", "1.4 ms", "11 ms", "flip"
             ]
         );
         let labels: Vec<Option<&str>> = words.iter().map(|word| word.part.label()).collect();
         assert_eq!(labels[4..7], [Some("enc "), Some("dec "), Some("e2e ")]);
-        assert_eq!(words[7].colour, SAGE);
+        // Colour is for the numbers: the path word and flip are words, in
+        // ash, and the labels before the video numbers are drawn in ash too.
+        let colours: Vec<Colour> = words.iter().map(|word| word.colour).collect();
+        assert_eq!(colours, [SAGE, SAGE, SAGE, ASH, SAGE, SAGE, SAGE, ASH]);
+    }
+
+    #[test]
+    fn closed_says_so_and_alone_says_nothing() {
+        let closed = Strip {
+            state: LinkState::Closed,
+            ..live()
+        };
+        let words = words(&closed, Some(PresentPath::Flip));
+        assert_eq!(words.len(), 1);
+        assert_eq!((words[0].text.as_str(), words[0].colour), ("closed", ASH));
+        let alone = Strip {
+            state: LinkState::Alone,
+            ..live()
+        };
+        assert!(words_of(&alone).is_empty());
+    }
+
+    #[test]
+    fn the_baseline_fills_only_columns_with_no_sample() {
+        let empty = empty_columns(3, 3, true);
+        assert!(empty[..TRACE_SAMPLES - 3].iter().all(|&e| e));
+        assert!(empty[TRACE_SAMPLES - 3..].iter().all(|&e| !e));
+        assert!(empty_columns(120, 500, true).iter().all(|&e| !e));
+        let empty = empty_columns(2, 2, false);
+        assert!(!empty[0] && !empty[1] && empty[2]);
     }
 
     // No network, so no round trip, jitter or trace: those words are left
@@ -785,7 +848,10 @@ mod tests {
             .into_iter()
             .map(|word| word.text)
             .collect();
-        assert_eq!(texts, ["0.0%", "loop", "2.1", "1.4", "11 ms", "composed"]);
+        assert_eq!(
+            texts,
+            ["0.0%", "loop", "2.1 ms", "1.4 ms", "11 ms", "composed"]
+        );
     }
 
     #[test]
@@ -844,8 +910,8 @@ mod tests {
                 "0.0%",
                 "LAN",
                 "controlling, Ctrl+Alt+F12 releases",
-                "2.1",
-                "1.4",
+                "2.1 ms",
+                "1.4 ms",
                 "11 ms",
                 "flip"
             ]
@@ -933,9 +999,10 @@ mod tests {
         let wide = texts(2000.0, &controlling("Ctrl+Shift+End"));
         assert!(wide.contains(&String::from("controlling, Ctrl+Shift+End releases")));
         assert_eq!(wide.len(), 9);
-        // Room for the long words and nothing else: every number went.
+        // Room for the long words and nothing else: every number went. LAN
+        // takes the slot "relayed" needs.
         let long = texts(
-            164.0 + 3.0 * 7.0 + 36.0 * 7.0 + 4.0 * 7.0 + 24.0,
+            164.0 + 7.0 * 7.0 + 36.0 * 7.0 + 4.0 * 7.0 + 24.0,
             &controlling("Ctrl+Shift+End"),
         );
         assert_eq!(
@@ -965,6 +1032,39 @@ mod tests {
         let slow = place(words(&slow, None), 1200.0, &mut measure).unwrap();
         let starts = |placed: &[Placed]| placed.iter().map(|p| p.x).collect::<Vec<_>>();
         assert_eq!(starts(&fast), starts(&slow));
+    }
+
+    // Over a real link the path word changes between sessions; what follows
+    // it stays put, 12 points after a slot as wide as "relayed".
+    #[test]
+    fn the_path_word_keeps_its_slot() {
+        let starts = |path| {
+            let strip = Strip {
+                path: Some(path),
+                ..live()
+            };
+            place(words(&strip, None), 1200.0, &mut measure)
+                .unwrap()
+                .iter()
+                .map(|p| p.x)
+                .collect::<Vec<_>>()
+        };
+        let lan = starts(PathWord::Lan);
+        assert_eq!(lan, starts(PathWord::Direct));
+        assert_eq!(lan, starts(PathWord::Loop));
+        assert_eq!(lan[4] - lan[3], 7.0 * 7.0 + GAP);
+    }
+
+    #[test]
+    fn trace_rows_are_whole_pixels_a_point_tall() {
+        // At 150 percent a row is two pixels from its own top down, and the
+        // bottom row ends a pixel past the slot, clear of the band's edge.
+        let slot_top = 1000.0 + 4.0 * 1.5;
+        assert_eq!(row_span(slot_top, 0.0, 0.0, 1.5), (1006.0, 1008.0));
+        assert_eq!(row_span(slot_top, 15.0, 15.0, 1.5), (1029.0, 1031.0));
+        assert_eq!(row_span(slot_top, 3.0, 15.0, 1.5), (1011.0, 1031.0));
+        assert_eq!(row_span(1004.0, 15.0, 15.0, 1.0), (1019.0, 1020.0));
+        assert_eq!(row_span(1008.0, 15.0, 15.0, 2.0), (1038.0, 1040.0));
     }
 
     #[test]
