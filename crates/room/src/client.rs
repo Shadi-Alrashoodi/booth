@@ -2,7 +2,7 @@
 // through silence and address changes.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use channels::{Channel, PingMessage};
@@ -53,6 +53,11 @@ const SUMMARY_EVERY: Duration = Duration::from_secs(5);
 // to NAME_FOR, in case its address changed.
 const NAME_EVERY: Duration = Duration::from_secs(2);
 const NAME_FOR: Duration = Duration::from_secs(60);
+
+// One for the whole program, not one per join. The host drops a stamp from
+// this key that is not newer than the last it took, so a rejoin after the
+// clock stepped back would go unanswered until the clock caught up.
+static STAMPS: Mutex<TimestampSource> = Mutex::new(TimestampSource::new());
 
 struct Attempt {
     initiation: Initiation,
@@ -336,7 +341,6 @@ pub(crate) struct Client {
     // When Notice::StillTrying shows if nothing answers before then.
     still_trying_at: Option<Instant>,
     secret: Option<Zeroizing<[u8; 32]>>,
-    stamps: TimestampSource,
     // What a host under load sent back, for the tries that follow.
     cookies: Jar,
     // What this PC's own router looks like from outside, for the reply code.
@@ -506,7 +510,6 @@ impl Client {
             fast_until: Some(setup.joined + FAST_PHASE),
             still_trying_at: Some(setup.joined + setup.timers.still_trying_after),
             secret: start.secret,
-            stamps: TimestampSource::new(),
             cookies: Jar::default(),
             stun: Stun::new(
                 None,
@@ -1211,7 +1214,10 @@ impl Client {
             &self.host_key,
             &psk,
             kind,
-            self.stamps.next_stamp(),
+            STAMPS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .next_stamp(),
             index,
             cookie.as_ref(),
         );
@@ -1265,6 +1271,22 @@ impl Client {
             from: moved.from,
             to: moved.to,
         });
+        // A code on show carries the old outside address, so the host's
+        // punches would go there and hold it for this key.
+        let code = self
+            .reply
+            .as_ref()
+            .is_some_and(|reply| matches!(reply.state, ReplyState::Code { .. }));
+        if code && self.reply_in_room {
+            self.reply = None;
+            self.reply_in_room = false;
+        } else if code {
+            log!(
+                self.log,
+                "the reply code on show is made again with the new address"
+            );
+            self.make_reply(now);
+        }
         if self.state != LinkState::Connecting {
             // Stamped the way Link::ping stamps a ping, when it is built.
             self.own_moved = Some(self.clock.micros(Instant::now()));
@@ -1281,12 +1303,13 @@ impl Client {
         if self.reply.is_some() {
             return;
         }
+        // Another friend's word, which the host cannot check: a hint for
+        // the log, never a reason to leave the code out.
         if self.mapped_verified {
             log!(
                 self.log,
-                "no code above the people list: the invite says the host's port is mapped and a friend came in through it, so the host takes this pc back as it is"
+                "the invite says the host's port is mapped and a friend came in through it; the code shows all the same"
             );
-            return;
         }
         if self.reached_mapped {
             log!(
@@ -1597,6 +1620,22 @@ impl Client {
             );
             return self.drops.bad(now);
         };
+        // A copy sent first from anywhere else would take control and voice
+        // there, and the host, which waits for this PC's first packet on the
+        // session, would never send the one that brings them back. The port
+        // may differ, as a punch's does.
+        let known = self.punch_sources.contains(&from.ip())
+            || self.host_addr.is_some_and(|addr| addr.ip() == from.ip());
+        if !known {
+            self.refused(
+                "handshake response",
+                packet,
+                from,
+                now,
+                "it came from no address the host has",
+            );
+            return self.drops.bad(now);
+        }
         let session = match self.attempts[at].initiation.finish(packet, now) {
             Ok(session) => session.with_timers(self.session_timers),
             Err(err) => {
@@ -1856,9 +1895,9 @@ impl Client {
                         "the host answered a ping sent after this pc's outside address changed, so it hears the new one"
                     );
                 }
-                if let PingMessage::Pong { t1, .. } = pong
+                if let PingMessage::Pong { seq, t1, .. } = pong
                     && let Some(media) = self.media.as_mut()
-                    && media.answered(from, t1)
+                    && media.answered(from, seq, t1)
                 {
                     log!(
                         self.log,
@@ -2299,7 +2338,14 @@ impl Client {
         let Some(session) = self.sessions.current.as_mut() else {
             return;
         };
-        let ping = self.link.ping(self.clock);
+        let ping = match self.media.as_mut().filter(|media| media.checks(&targets)) {
+            Some(media) => {
+                let (ping, seq) = self.link.probe(self.clock);
+                media.probed(seq);
+                ping
+            }
+            None => self.link.ping(self.clock),
+        };
         peer::send_on(
             socket,
             session,
@@ -4280,4 +4326,6 @@ mod tests {
         );
         assert_eq!(asks(&rig), 1);
     }
+
+    mod answers;
 }

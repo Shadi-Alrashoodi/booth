@@ -347,8 +347,11 @@ impl Holding {
 // A UPnP forward that was already there can have any lease left, so the
 // floor matters for it too.
 fn renew_at(lifetime: u32, least: u32) -> Option<Instant> {
+    // A lease of 0 never runs out, but a router that restarts forgets it
+    // all the same, and only a renewal finds that out.
+    let lifetime = if lifetime == 0 { LIFETIME } else { lifetime };
     let half = Duration::from_secs(u64::from(lifetime.max(least) / 2));
-    (lifetime > 0).then(|| Instant::now() + half)
+    Some(Instant::now() + half)
 }
 
 type Wan = Option<(Protocol, Ipv4Addr)>;

@@ -19,6 +19,8 @@ pub(crate) const MAX_NAME_CHARS: usize = 32;
 pub(crate) const MAX_NAME_BYTES: usize = 64;
 pub(crate) const PERSON_FALLBACK: &str = "Friend";
 pub(crate) const ROOM_FALLBACK: &str = "Room";
+// More combining marks in a row than any script puts on one letter.
+const MAX_MARKS: usize = 4;
 
 // Eight people in a room, the host included. More has never been tested.
 pub(crate) const MAX_CLIENTS: usize = 7;
@@ -698,7 +700,11 @@ impl Message {
                 let mut heard = Vec::with_capacity(count);
                 for _ in 0..count {
                     let slot = r.u8()?;
-                    if usize::from(slot) >= MAX_ROSTER {
+                    // One report per talker, as a client sends: each can
+                    // send that talker a WorstLoss.
+                    if usize::from(slot) >= MAX_ROSTER
+                        || heard.iter().any(|&(seen, _)| seen == slot)
+                    {
                         return None;
                     }
                     heard.push((slot, r.lost()?));
@@ -1006,6 +1012,7 @@ fn period(bytes: [u8; 4]) -> Option<Option<Duration>> {
 // U+202E can make a name read as someone else's.
 pub(crate) fn clean(text: &str, fallback: &str) -> String {
     let kept: String = text.chars().filter(|c| !is_hidden(*c)).collect();
+    let kept = drop_stacked_marks(&kept);
     let mut out = String::new();
     for c in kept.trim().chars().take(MAX_NAME_CHARS) {
         if out.len() + c.len_utf8() > MAX_NAME_BYTES {
@@ -1019,6 +1026,27 @@ pub(crate) fn clean(text: &str, fallback: &str) -> String {
     } else {
         out.to_owned()
     }
+}
+
+// The shaper stacks combining marks, and a letter with dozens of them draws
+// far above or below its line, over other people's rows and messages. The
+// marks past MAX_MARKS in a row go. Plex Sans Arabic draws the Arabic symbols
+// U+FBB2 to U+FBC2 as marks and stacks them too, though Unicode does not
+// count them as marks.
+pub(crate) fn drop_stacked_marks(text: &str) -> String {
+    let mut run = 0;
+    text.chars()
+        .filter(|c| {
+            if unicode_bidi::bidi_class(*c) == unicode_bidi::BidiClass::NSM
+                || matches!(c, '\u{FBB2}'..='\u{FBC2}')
+            {
+                run += 1;
+            } else {
+                run = 0;
+            }
+            run <= MAX_MARKS
+        })
+        .collect()
 }
 
 // Control characters, every format character (General_Category Cf), the rest

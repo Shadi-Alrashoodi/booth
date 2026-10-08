@@ -50,7 +50,8 @@ use voice::codec::Mode;
 
 use crate::chat;
 use crate::config::Timers;
-use crate::control::{LossPermille, PERMILLE, Periods};
+use crate::control::{LossPermille, MAX_ROSTER, PERMILLE, Periods};
+use crate::limit::Bucket;
 use crate::log::{Log, log};
 use crate::peer::{Clock, MEDIA_FLOWS_FOR};
 use crate::socket::Socket;
@@ -69,6 +70,11 @@ pub(crate) const HEARD_LATELY: Duration = Duration::from_secs(2);
 // the last reference, and the decoder with it, goes on this thread and not
 // the render thread.
 const RETIRED_FOR: Duration = Duration::from_secs(2);
+// New talkers a second: each is a decoder and its buffers, kept RETIRED_FOR
+// after it goes. A roster that names new people with every message, which
+// only a hostile host sends, would otherwise make thousands a second.
+const NEW_EARS_PER_SECOND: f64 = MAX_ROSTER as f64;
+const NEW_EAR_BURST: f64 = (2 * MAX_ROSTER) as f64;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TalkMode {
@@ -509,6 +515,7 @@ pub(crate) struct Talk {
     // The talker heard most recently, for the numbers.
     latest: Option<[u8; 32]>,
     dropped: u64,
+    new_ears: Bucket,
 }
 
 impl Talk {
@@ -534,6 +541,7 @@ impl Talk {
             published: Vec::new(),
             latest: None,
             dropped: 0,
+            new_ears: Bucket::full(now, NEW_EAR_BURST),
         }
     }
 
@@ -576,6 +584,10 @@ impl Talk {
     ) -> bool {
         let at = match self.talkers.iter().position(|talker| talker.key == key) {
             Some(at) => at,
+            None if !self.new_ears.take(now, NEW_EARS_PER_SECOND, NEW_EAR_BURST) => {
+                self.dropped += 1;
+                return false;
+            }
             None => match Ear::new() {
                 Ok(ear) => {
                     let ear = Arc::new(Mutex::new(ear));

@@ -34,12 +34,20 @@ pub(super) struct Grant {
     // The controller's own number for its ask, which it hears back.
     ask: u32,
     pub allowed: bool,
+    // What the controller was last told of an administrator window.
+    paused: bool,
 }
+
+// An administrator window comes to the front or goes as fast as someone
+// switches windows. Each word goes on to the controller's control stream.
+const PAUSED_PER_SECOND: f64 = 10.0;
+const PAUSED_BURST: f64 = 10.0;
 
 // What a friend may send of remote control.
 pub(super) struct PeerControl {
     input: Bucket,
     asks: Bucket,
+    paused: Bucket,
 }
 
 impl PeerControl {
@@ -47,6 +55,7 @@ impl PeerControl {
         PeerControl {
             input: Bucket::full(now, INPUT_BURST),
             asks: Bucket::full(now, ASK_BURST),
+            paused: Bucket::full(now, PAUSED_BURST),
         }
     }
 }
@@ -562,11 +571,22 @@ impl Host {
         let Some(grant) = live
             .control
             .as_ref()
-            .filter(|grant| grant.allowed && grant.number == number)
+            .filter(|grant| grant.allowed && grant.number == number && grant.paused != paused)
         else {
             return false;
         };
         let (controller, ask) = (grant.controller, grant.ask);
+        if !self.peers[i]
+            .control
+            .paused
+            .take(now, PAUSED_PER_SECOND, PAUSED_BURST)
+        {
+            self.screen.dropped += 1;
+            return false;
+        }
+        if let Some(grant) = self.grant_numbered_mut(share, number) {
+            grant.paused = paused;
+        }
         log!(
             self.log,
             "control {number}: an administrator window in front on the sharer's pc: {}",
@@ -792,6 +812,7 @@ impl Host {
                 name,
                 ask,
                 allowed: false,
+                paused: false,
             });
         }
         number

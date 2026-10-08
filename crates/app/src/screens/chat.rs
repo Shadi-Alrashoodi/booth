@@ -746,7 +746,8 @@ mod tests {
     }
 
     // At the narrowest window a long name would push the fingerprint out of
-    // the line, so the name is cut instead.
+    // the line, so the name is cut instead, down to its ellipsis if need be:
+    // the fingerprint is what tells two people with one name apart.
     #[test]
     fn the_name_is_cut_before_the_fingerprint() {
         let ctx = Context::default();
@@ -761,7 +762,7 @@ mod tests {
             let text = galley.text();
             assert!(text.ends_with(&fingerprint), "{text}");
             assert!(
-                text.starts_with("\u{2068}Wolf") && text.contains(ELLIPSIS),
+                text.starts_with(ISOLATE) && text.contains(ELLIPSIS) && !text.contains(long),
                 "{text}"
             );
             assert!(galley.size().x <= 240.0, "{}", galley.size().x);

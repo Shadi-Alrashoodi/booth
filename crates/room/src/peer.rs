@@ -226,12 +226,22 @@ pub(crate) struct MediaPath {
     // ping clock at the move: a pong for a ping sent before it proves
     // nothing about the new address.
     checking: Option<(SocketAddr, u64)>,
+    // The seqs of the last pings sent to that address alone. The peer holds
+    // the session keys and can seal a pong for any ping it can guess, so
+    // these are random, and only someone at that address has seen them.
+    probes: [Option<u32>; PROBES],
 }
+
+const PROBES: usize = 4;
 
 impl MediaPath {
     // A handshake answered from `to` is a round trip there too.
     pub(crate) fn new(to: SocketAddr) -> MediaPath {
-        MediaPath { to, checking: None }
+        MediaPath {
+            to,
+            checking: None,
+            probes: [None; PROBES],
+        }
     }
 
     pub(crate) fn to(&self) -> SocketAddr {
@@ -241,6 +251,7 @@ impl MediaPath {
     // The peer's packets now come from `addr`. True when a ping should go
     // there now, so media follows a real move within a round trip.
     pub(crate) fn moved(&mut self, addr: SocketAddr, at_us: u64) -> bool {
+        self.probes = [None; PROBES];
         if addr == self.to {
             self.checking = None;
             return false;
@@ -249,13 +260,27 @@ impl MediaPath {
         true
     }
 
-    // A pong the link took, from `from`, for the ping sent at `t1`. True
+    // A ping to `to` checks the new address when it goes there and nowhere
+    // else; it is then sent as a Link::probe.
+    pub(crate) fn checks(&self, to: &[SocketAddr]) -> bool {
+        self.checking.is_some_and(|(addr, _)| to == [addr])
+    }
+
+    pub(crate) fn probed(&mut self, seq: u32) {
+        self.probes.rotate_right(1);
+        self.probes[0] = Some(seq);
+    }
+
+    // A pong the link took, from `from`, for ping `seq` sent at `t1`. True
     // when media moved.
-    pub(crate) fn answered(&mut self, from: SocketAddr, t1: u64) -> bool {
+    pub(crate) fn answered(&mut self, from: SocketAddr, seq: u32, t1: u64) -> bool {
         match self.checking {
-            Some((addr, since)) if addr == from && t1 >= since => {
+            Some((addr, since))
+                if addr == from && t1 >= since && self.probes.contains(&Some(seq)) =>
+            {
                 self.to = addr;
                 self.checking = None;
+                self.probes = [None; PROBES];
                 true
             }
             _ => false,
@@ -401,6 +426,26 @@ impl Link {
     pub(crate) fn ping(&mut self, clock: Clock) -> Vec<u8> {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
+        self.ping_numbered(seq, clock)
+    }
+
+    // A ping for MediaPath to check a new address with, and its seq: random,
+    // from the half of the numbers behind the running count, which the
+    // peer's ping numbers set aside as a stray. On a new link it is the
+    // first ping the peer counts, so the count starts there instead.
+    pub(crate) fn probe(&mut self, clock: Clock) -> (Vec<u8>, u32) {
+        let seq = if self.next_seq == 0 {
+            let seq = u32::from_le_bytes(random());
+            self.next_seq = seq.wrapping_add(1);
+            seq
+        } else {
+            let back = 256 + (u32::from_le_bytes(random()) >> 2);
+            self.next_seq.wrapping_sub(back)
+        };
+        (self.ping_numbered(seq, clock), seq)
+    }
+
+    fn ping_numbered(&mut self, seq: u32, clock: Clock) -> Vec<u8> {
         let sent = Instant::now();
         self.stats.ping_sent(seq, sent);
         encode(PingMessage::Ping {
@@ -596,20 +641,28 @@ mod tests {
         // A copied packet from elsewhere, and pongs that prove nothing: from
         // another address, or for a ping sent before the move.
         assert!(media.moved(copier, 1_000));
-        assert!(!media.answered(home, 2_000));
-        assert!(!media.answered(copier, 999));
+        assert!(media.checks(&[copier]));
+        media.probed(7);
+        assert!(!media.answered(home, 7, 2_000));
+        assert!(!media.answered(copier, 7, 999));
         assert_eq!(media.to(), home);
         // The friend's next packet takes the address back, and nothing is
         // left to check.
         assert!(!media.moved(home, 1_500));
-        assert!(!media.answered(copier, 2_000));
+        assert!(!media.checks(&[home]));
+        assert!(!media.answered(copier, 7, 2_000));
         assert_eq!(media.to(), home);
 
         // A real move: the ping sent after it is answered from there.
         let new_home: SocketAddr = "198.51.100.7:41000".parse().unwrap();
         assert!(media.moved(new_home, 3_000));
-        assert!(media.answered(new_home, 3_000));
+        assert!(
+            !media.checks(&[new_home, home]),
+            "a ping to both proves nothing"
+        );
+        media.probed(9);
+        assert!(media.answered(new_home, 9, 3_000));
         assert_eq!(media.to(), new_home);
-        assert!(!media.answered(new_home, 4_000), "once");
+        assert!(!media.answered(new_home, 9, 4_000), "once");
     }
 }

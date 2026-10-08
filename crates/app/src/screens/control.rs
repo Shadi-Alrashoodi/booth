@@ -105,8 +105,16 @@ fn host_lost(view: &View) -> bool {
 // controls this PC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request<'a> {
-    Asked { number: u32, name: &'a str },
-    Controlled { name: &'a str },
+    // `key` is the asker's as the roster has it now, all zeros when this PC
+    // could not tell: a name alone is whatever that friend chose.
+    Asked {
+        number: u32,
+        name: &'a str,
+        key: [u8; 32],
+    },
+    Controlled {
+        name: &'a str,
+    },
 }
 
 pub fn request(view: &View, offered: bool) -> Option<Request<'_>> {
@@ -120,6 +128,7 @@ pub fn request(view: &View, offered: bool) -> Option<Request<'_>> {
     control.asked_by.as_ref().map(|asked| Request::Asked {
         number: asked.number,
         name: &asked.name,
+        key: asked.key,
     })
 }
 
@@ -199,8 +208,13 @@ pub fn request_block(
     let mut answer = None;
     controls::region(ui, |ui| {
         match request {
-            Request::Asked { number, name } => {
+            Request::Asked { number, name, key } => {
                 controls::text(ui, messages::wants_control(name), theme::body(), CHALK);
+                // Anyone in the room can take any name, so the fingerprint
+                // says who asks, as on the people rows.
+                if key != [0; 32] {
+                    controls::text(ui, keys::fingerprint(&key), theme::mono(), ASH);
+                }
                 ui.add_space(STEP);
                 // Both secondary and alike: consent to being controlled is
                 // the one choice the panel must not lean on.
@@ -550,7 +564,8 @@ mod tests {
             request(&asked, ON),
             Some(Request::Asked {
                 number: 3,
-                name: "Tom"
+                name: "Tom",
+                key: TOM,
             })
         );
         let controlled = own_share(ControlView {
@@ -580,10 +595,12 @@ mod tests {
         let tom = Request::Asked {
             number: 3,
             name: "Tom",
+            key: TOM,
         };
         let jonas = Request::Asked {
             number: 4,
             name: "Jonas",
+            key: [5; 32],
         };
         let mut wait = AllowWait::default();
         assert_eq!(wait.follow(None, t), None);
@@ -677,6 +694,7 @@ mod tests {
         let tom = Request::Asked {
             number: 3,
             name: "Tom",
+            key: TOM,
         };
         let draw = |ready| move |ui: &mut Ui| request_block(ui, tom, "Ctrl+Shift+End", ready);
         let (_, output) = frame(&ctx, Vec::new(), draw(false));

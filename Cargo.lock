@@ -680,6 +680,7 @@ version = "0.2.0"
 dependencies = [
  "proptest",
  "reed-solomon-simd",
+ "zeroize",
 ]
 
 [[package]]
@@ -2812,6 +2813,7 @@ dependencies = [
  "session",
  "share",
  "stats",
+ "unicode-bidi",
  "voice",
  "zeroize",
 ]

@@ -676,7 +676,14 @@ impl Screen {
         if codec != self.decoder.codec() && !self.other_codec(codec, number, idr, report)? {
             return Ok(());
         }
-        let decoded = match self.decoder.decode(frame.access_unit) {
+        let setups = self.decoder.setups();
+        let result = self.decoder.decode(frame.access_unit);
+        // A new size or profile sets FFmpeg's decoder and surfaces up again,
+        // which costs what a new decoder does and counts as one.
+        if setups > 0 && self.decoder.setups() > setups {
+            self.set_up_again(number)?;
+        }
+        let decoded = match result {
             Ok(Some(decoded)) => decoded,
             Ok(None) => {
                 return self.lost(
@@ -835,6 +842,26 @@ impl Screen {
         if !std::mem::replace(&mut self.codec_said, true) {
             report(Report::Line(Line::Log(line)));
         }
+    }
+
+    // FFmpeg set its decoder and surfaces up again for a stream that had
+    // them. Past NEW_DECODERS_PER_GAP within a SWITCH_GAP each one is a
+    // hold, and a stream that keeps doing it ends the watch.
+    fn set_up_again(&mut self, number: u32) -> Result<(), String> {
+        let now = Instant::now();
+        if let Some(until) = self.new_decoders.until(now)
+            && self
+                .new_decoders
+                .held(number, until, now)
+                .is_some_and(|holds| holds >= HOLDS_TO_STOP)
+        {
+            return Err(format!(
+                "the share kept changing size, more than {NEW_DECODERS_PER_GAP} times in {} s, which a Booth sharer does not do",
+                SWITCH_GAP.as_secs()
+            ));
+        }
+        self.new_decoders.made(now);
+        Ok(())
     }
 
     // This viewer takes no HEVC from now on, and the sharer hears it once.

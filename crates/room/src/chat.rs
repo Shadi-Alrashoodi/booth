@@ -189,6 +189,7 @@ pub(crate) fn clean_text(text: &str) -> Result<String, ChatRefused> {
         let line = line.strip_suffix('\r').unwrap_or(line);
         for part in line.split('\r') {
             let kept: String = part.chars().filter(|c| !control::is_hidden(*c)).collect();
+            let kept = control::drop_stacked_marks(&kept);
             let kept = if kept.trim().is_empty() {
                 empty_run += 1;
                 if empty_run > MAX_EMPTY_RUN {

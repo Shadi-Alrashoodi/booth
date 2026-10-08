@@ -4,6 +4,7 @@ use eframe::egui::{
 use input::{Action, Bindings, Chord};
 use room::{BlockedKey, KnownDevice, KnownDevices, TalkMode};
 use voice::audio::{Choice, DeviceList, Direction};
+use zeroize::Zeroize;
 
 use crate::controls::{self, Button, Lead};
 use crate::messages;
@@ -148,6 +149,9 @@ impl Draft {
 
     fn remove(&mut self, key: [u8; 32]) {
         self.devices.retain(|device| device.key != key);
+        // retain leaves a copy of the last device, secret and all, past the
+        // end.
+        self.devices.spare_capacity_mut().zeroize();
         self.removed.push(key);
     }
 

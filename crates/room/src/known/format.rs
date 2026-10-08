@@ -332,13 +332,14 @@ fn u64_le(r: &mut Reader) -> Result<u64, Malformed> {
     r.array().map(u64::from_le_bytes).ok_or(shape(CUT_SHORT))
 }
 
-// Names are written cleaned, so one that cleaning would change was not.
+// Names are written cleaned, so one that cleaning would change was not. One
+// written before cleaning cut stacked marks loads with them cut.
 fn clean_text(r: &mut Reader) -> Result<String, Malformed> {
-    let text = r.text().ok_or(shape(CUT_SHORT))?;
-    if text.is_empty() || control::clean(text, "") != text {
+    let text = control::drop_stacked_marks(r.text().ok_or(shape(CUT_SHORT))?);
+    if text.is_empty() || control::clean(&text, "") != text {
         return Err(shape("a name in it is not one Booth would have written"));
     }
-    Ok(text.to_owned())
+    Ok(text)
 }
 
 fn end(r: &Reader) -> Result<(), Malformed> {

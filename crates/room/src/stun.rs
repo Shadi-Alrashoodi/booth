@@ -10,6 +10,7 @@ use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::{Duration, Instant};
 
+use invite::{Candidate, CandidateKind};
 use net::stun::{self, Family, Mapping, StunError};
 
 use crate::log::{Log, list, log, secs};
@@ -92,6 +93,9 @@ pub(crate) enum NotOurs {
     // round that is over, or a second copy.
     Late,
     Stranger,
+    // An answer that sees this PC at a private, loopback or other address
+    // nobody on the internet could see it at.
+    Inside(SocketAddr),
 }
 
 impl fmt::Display for NotOurs {
@@ -104,6 +108,12 @@ impl fmt::Display for NotOurs {
                 f.write_str("a stun answer from a server we asked, to no open question")
             }
             NotOurs::Stranger => f.write_str("stun from someone this pc never asked"),
+            NotOurs::Inside(addr) => {
+                write!(
+                    f,
+                    "a stun answer that sees this pc at {addr}, not on the internet"
+                )
+            }
         }
     }
 }
@@ -172,6 +182,11 @@ impl Stun {
             Ok(answer) => answer,
             Err(err) => return Answer::NotOurs(NotOurs::Unreadable(err)),
         };
+        // A server on the internet only ever sees this PC at an address an
+        // invite could carry. Anything else would pass for a second router.
+        if !seen_from_outside(mapped) {
+            return Answer::NotOurs(NotOurs::Inside(mapped));
+        }
         let Some(at) = self
             .requests
             .iter()
@@ -186,8 +201,16 @@ impl Stun {
         self.requests.swap_remove(at);
         self.answers.push((from, mapped));
         log!(self.log, "stun answer from {from}: seen as {mapped}");
+        // A server that sees what it saw last time says nothing new. With
+        // hard mapping each server sees its own port, and taking whichever
+        // came last would tell every friend new addresses every round.
+        let repeat = self
+            .seen
+            .iter()
+            .any(|(asked, seen)| *asked == from && same_place(*seen, mapped));
         let moved = self.held_against_before(from, mapped, now);
         match mapped {
+            _ if repeat => {}
             SocketAddr::V4(v4) => {
                 self.public_v4 = Some(v4);
                 self.public = Some(mapped);
@@ -246,9 +269,10 @@ impl Stun {
 
     // The address may have changed: every server is asked now, and again
     // every stun_retry while a family stays silent, for up to CHECK_FOR. A
-    // round already out, or the first one, answers the same question, so
-    // nothing more goes out then, but a round out that ends unanswered is
-    // tried again all the same. Without servers there is no one to ask.
+    // round already out, or the first one, goes on, so nothing more goes out
+    // then, but a round out left before the change and can come back the old
+    // way, so its answers do not end the check and it is tried again after
+    // stun_retry all the same. Without servers there is no one to ask.
     // Returns true when a round went out.
     pub(crate) fn check(&mut self, now: Instant, socket: &Socket) -> bool {
         if self.phase != Phase::Settled || self.servers.is_empty() {
@@ -422,6 +446,12 @@ impl Stun {
     // this round gave an outside address in before. A family no question
     // could leave this PC for has nothing to wait for.
     fn every_family_back(&self) -> bool {
+        // A round that left before the check began can come back the old way
+        // and show the old address, so it answers nothing.
+        let after_change = match (self.round_started, self.check_until) {
+            (Some(started), Some(until)) => started + CHECK_FOR >= until,
+            _ => false,
+        };
         let asked = self
             .answers
             .iter()
@@ -437,7 +467,7 @@ impl Stun {
         for (_, mapped) in &self.answers {
             waiting[usize::from(mapped.is_ipv6())] = false;
         }
-        !self.answers.is_empty() && waiting == [false; 2]
+        after_change && !self.answers.is_empty() && waiting == [false; 2]
     }
 
     // A round of an address check ended with a family still silent.
@@ -549,6 +579,16 @@ impl Stun {
             log!(self.log, "{what}: no answer from {}", list(&silent));
         }
     }
+}
+
+// The invite's own rule for a public address, so nothing kept here as the
+// outside address could not go in an invite.
+fn seen_from_outside(mapped: SocketAddr) -> bool {
+    let kind = match mapped {
+        SocketAddr::V4(_) => CandidateKind::Public,
+        SocketAddr::V6(_) => CandidateKind::Ipv6,
+    };
+    crate::known::usable(&Candidate { kind, addr: mapped })
 }
 
 // A received IPv6 address can carry a flow label or scope the answer's
@@ -990,4 +1030,6 @@ mod tests {
         );
         assert_eq!(stun.next_deadline(), Some(third + every));
     }
+
+    mod review;
 }

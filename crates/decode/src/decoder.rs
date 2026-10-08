@@ -122,6 +122,10 @@ pub struct Decoder {
     // predict from, where the H.264 decoder gives none, so until then HEVC
     // access units other than IDRs do not reach FFmpeg.
     had_idr: bool,
+    // Times the format callback chose d3d11va, each time FFmpeg set its
+    // video decoder and surface pool up afresh: the first IDR, then each
+    // new size or profile.
+    setups: Cell<u64>,
 }
 
 // SAFETY: with one thread FFmpeg's decoder has no thread of its own and no
@@ -193,6 +197,7 @@ impl Decoder {
             sent: 0,
             timing: Timing::new(device, &context, &multithread),
             had_idr: false,
+            setups: Cell::new(0),
         };
 
         // SAFETY: returns a new reference, or null when out of memory.
@@ -256,6 +261,13 @@ impl Decoder {
 
     pub fn codec(&self) -> Codec {
         self.codec
+    }
+
+    /// How many times FFmpeg has set its decoder and surfaces up for this
+    /// stream: once for the first IDR, and again for each new size or
+    /// profile, which costs what a new decoder does.
+    pub fn setups(&self) -> u64 {
+        self.setups.get()
     }
 
     /// Decodes one access unit (Annex B, the whole frame) and returns its
@@ -501,6 +513,9 @@ impl Decoder {
     // its own, so this is asked after every access unit.
     fn refusal(&self) -> Option<DecodeError> {
         let why = self.choice.replace(0);
+        if why == booth_chose_d3d11 {
+            self.setups.set(self.setups.get() + 1);
+        }
         if why == 0 || why == booth_chose_d3d11 {
             return None;
         }

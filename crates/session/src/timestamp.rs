@@ -63,8 +63,9 @@ pub struct TimestampSource {
 }
 
 impl TimestampSource {
-    pub fn new() -> TimestampSource {
-        TimestampSource::default()
+    // const, so a program can keep one source in a static for every join.
+    pub const fn new() -> TimestampSource {
+        TimestampSource { last: None }
     }
 
     pub fn next_stamp(&mut self) -> Tai64N {

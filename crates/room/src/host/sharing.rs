@@ -44,6 +44,14 @@ const ENDED_GRACE: Duration = Duration::from_secs(1);
 // program that joins and leaves in a loop.
 const KEPT_FOR: Duration = Duration::from_secs(10);
 const MOST_KEPT: usize = 16;
+// A friend's share passed on over internet paths may take this many times
+// the upload setting, a second of it at once: a share keeping to its cap
+// sends about 112 percent of it with the parity, and IDRs a quarter more.
+const RELAY_SHARE: f64 = 2.0;
+
+pub(super) fn relay_per_second(upload_kbps: u32) -> f64 {
+    f64::from(upload_kbps) * 1000.0 / 8.0 * RELAY_SHARE
+}
 
 // The share in the room now.
 pub(super) struct Live {
@@ -537,8 +545,22 @@ impl Host {
     // where their media goes, with buffers kept for it.
     fn relay(&mut self, number: u32, plain: &[u8], now: Instant, socket: &Socket) {
         let timers = self.timers;
+        let per_second = relay_per_second(self.upload_kbps);
         for other in &mut self.peers {
             if other.share.watching != Some(number) {
+                continue;
+            }
+            // Over the upload: the watcher sees loss, and the sharer backs
+            // off as for any full link.
+            if other.path != crate::view::PathWord::Lan
+                && !self.relay_upload.take_many(
+                    now,
+                    (plain.len() + session::DATA_OVERHEAD) as f64,
+                    per_second,
+                    per_second,
+                )
+            {
+                self.screen.dropped += 1;
                 continue;
             }
             let Some(session) = other.sessions.current.as_mut() else {

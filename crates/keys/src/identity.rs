@@ -90,11 +90,12 @@ impl fmt::Debug for Identity {
     }
 }
 
-/// First 48 bits of BLAKE2s-256 over the public key, as "a7f3 9c21 0d4e".
-/// 48 bits puts a key made to match a chosen fingerprint about 2^48 tries
-/// away, out of reach, while staying short enough to read aloud.
+/// First 80 bits of BLAKE2s-256 over the public key, as
+/// "a7f3 9c21 0d4e 3bc2 b593". At 48 bits a key made to match a chosen
+/// fingerprint was a few days of one graphics card away; 80 bits puts it out
+/// of reach while staying short enough to read aloud.
 pub fn fingerprint(public: &[u8; 32]) -> String {
     let digest: [u8; 32] = Blake2s256::digest(public).into();
-    let [a, b, c, d, e, f, ..] = digest;
-    format!("{a:02x}{b:02x} {c:02x}{d:02x} {e:02x}{f:02x}")
+    let [a, b, c, d, e, f, g, h, i, j, ..] = digest;
+    format!("{a:02x}{b:02x} {c:02x}{d:02x} {e:02x}{f:02x} {g:02x}{h:02x} {i:02x}{j:02x}")
 }

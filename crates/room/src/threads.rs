@@ -58,6 +58,11 @@ const DEVICES_WAIT: Duration = Duration::from_millis(100);
 // first STUN round can settle, and every address it has is asked each
 // round, so a list pasted from the web would slow both.
 const MAX_STUN_SERVERS: usize = 4;
+// A friend's program can send something the panel shows with every packet,
+// a ping, an ack or a new name, and a view built for each would keep the
+// state lock for it. The receive thread builds one at most this often; what
+// came in between is shown by the timer thread at the end of the gap.
+const VIEW_GAP: Duration = Duration::from_millis(10);
 
 pub(crate) enum Side {
     Host(Box<Host>),
@@ -367,6 +372,10 @@ struct State {
     // What the timer thread is waiting for, so the receive thread knows when
     // a new deadline needs it woken.
     planned: Option<Instant>,
+    // When the receive thread last built the view, and whether a change
+    // since is waiting for the timer thread (VIEW_GAP).
+    view_built: Option<Instant>,
+    view_owed: bool,
 }
 
 struct Shared {
@@ -439,7 +448,24 @@ fn after_step(shared: &Shared, state: &mut State, now: Instant) {
 fn next_deadline(state: &State) -> Option<Instant> {
     let mut soonest = Soonest(state.side.next_deadline());
     soonest.add(state.side.save_due());
+    if state.view_owed {
+        soonest.add(state.view_built.map(|at| at + VIEW_GAP));
+    }
     soonest.0
+}
+
+// True when the receive thread builds the view now. Within VIEW_GAP of the
+// last one it is owed instead.
+fn view_due(state: &mut State, now: Instant) -> bool {
+    if state
+        .view_built
+        .is_some_and(|at| now.saturating_duration_since(at) < VIEW_GAP)
+    {
+        state.view_owed = true;
+        return false;
+    }
+    state.view_built = Some(now);
+    true
 }
 
 pub(crate) struct Threads {
@@ -530,6 +556,8 @@ impl Threads {
             state: Mutex::new(State {
                 side,
                 planned: None,
+                view_built: None,
+                view_owed: false,
             }),
             view: Mutex::new(view),
             stop: AtomicBool::new(false),
@@ -933,7 +961,8 @@ fn receive(shared: &Shared) {
         };
         let (changed, wake) = {
             let mut state = lock(&shared.state);
-            let changed = state.side.on_packet(packet, from, now, &shared.socket);
+            let changed = state.side.on_packet(packet, from, now, &shared.socket)
+                && view_due(&mut state, now);
             after_step(shared, &mut state, now);
             let next = next_deadline(&state);
             let wake = next.is_some_and(|at| state.planned.is_none_or(|planned| at < planned));
@@ -1058,7 +1087,9 @@ fn timers(shared: &Arc<Shared>, inbox: &Receiver<Command>, timer: Timer) {
         let now = Instant::now();
         let (changed, planned, name) = {
             let mut state = lock(&shared.state);
-            let changed = state.side.on_timer(now, &shared.socket) || changed_by_command;
+            // A view the receive thread held back goes with this pass.
+            let owed = std::mem::take(&mut state.view_owed);
+            let changed = state.side.on_timer(now, &shared.socket) || changed_by_command || owed;
             // Commands change the state too, and each one is followed by a
             // pass through here.
             after_step(shared, &mut state, now);

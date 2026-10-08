@@ -7,7 +7,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use channels::{Channel, PingMessage};
 use crossbeam_channel::{Sender, TrySendError};
@@ -70,6 +70,11 @@ const ROSTER_GAP: Duration = Duration::from_millis(250);
 // them reach this PC the same packet arrives twice, one path's delay apart,
 // and the second copy is not a replay worth showing.
 const COPY_WINDOW: Duration = Duration::from_secs(1);
+// Stamps are not kept between runs. A known device's initiation stamped
+// more than this before the room opened is an old one sent again and is not
+// answered. A day covers a client clock set some hours wrong; one saved
+// within the day is still answered once.
+const STAMP_FLOOR: Duration = Duration::from_secs(24 * 60 * 60);
 // How long the sessions of someone who said Bye are still recognised. The
 // second copy of the Bye leaves right behind the first; this also covers a
 // ping or two that was already on a slow path.
@@ -87,11 +92,19 @@ const LOST_KEPT: usize = 64;
 // Friends whose silence began within this of each other went quiet together,
 // which looks like this PC's own network and not theirs.
 const TOGETHER: Duration = Duration::from_secs(1);
+// A friend reports what it lost once a second. Each report can queue a
+// WorstLoss for every talker, so past this rate they are left out.
+const VOICE_REPORTS_PER_SECOND: f64 = 4.0;
+const VOICE_REPORT_BURST: f64 = 4.0;
 // A friend sends 200 voice frames a second at most, 5 ms each. Past this
 // rate the host drops what comes, since each frame goes on to everyone; the
 // burst covers a friend's capture thread catching up after a stall.
 const VOICE_PER_SECOND: f64 = 250.0;
 const VOICE_BURST: f64 = 100.0;
+// What limit.rs gives any one address, for initiations from the address and
+// port a friend in the room is at.
+const REKEYS_PER_SECOND: f64 = 10.0;
+const REKEY_BURST: f64 = 20.0;
 
 struct Peer {
     key: [u8; 32],
@@ -117,12 +130,17 @@ struct Peer {
     slot: u8,
     // How many more voice frames this friend may send (VOICE_PER_SECOND).
     voice: Bucket,
+    // How many more initiations may come from `addr` (REKEYS_PER_SECOND).
+    handshakes: Bucket,
     // What the capture thread sent on this link.
     voice_out: Arc<Sent>,
     // What this friend said of their audio, and what they were last told
     // of the host's.
     periods: Option<Periods>,
     told_periods: Option<Periods>,
+    // How many more loss reports this friend may send
+    // (VOICE_REPORTS_PER_SECOND).
+    voice_reports: Bucket,
     // The link's jitter is past 5 ms, so a time through its clock offset is
     // only about right. Worked out once a timer pass, not per voice packet.
     jittery: bool,
@@ -159,9 +177,11 @@ impl Peer {
             says: Bucket::full(now, chat::SAY_BURST),
             slot,
             voice: Bucket::full(now, VOICE_BURST),
+            handshakes: Bucket::full(now, REKEY_BURST),
             voice_out: Arc::default(),
             periods: None,
             told_periods: None,
+            voice_reports: Bucket::full(now, VOICE_REPORT_BURST),
             jittery: false,
             share: PeerShare::new(now),
             control: PeerControl::new(now),
@@ -231,6 +251,19 @@ impl Peer {
         }
     }
 
+    // While media checks the address control goes to, the ping is a probe,
+    // the one kind whose answer moves media there.
+    fn send_ping(&mut self, socket: &Socket, clock: Clock) {
+        let ping = if self.media.checks(&[self.addr]) {
+            let (ping, seq) = self.link.probe(clock);
+            self.media.probed(seq);
+            ping
+        } else {
+            self.link.ping(clock)
+        };
+        self.send(socket, Channel::Ping, &ping);
+    }
+
     fn has_live_session(&self, now: Instant) -> bool {
         self.sessions
             .current
@@ -246,6 +279,9 @@ struct Pending {
     key: [u8; 32],
     kind: InitKind,
     created: Instant,
+    // Where the response went: the one address the handshake made a round
+    // trip to.
+    answered_at: SocketAddr,
 }
 
 struct KeyRecord {
@@ -439,6 +475,10 @@ pub(crate) struct Host {
     video_sealed: Vec<u8>,
     // This host's upload setting, which the bitrate rule divides.
     upload_kbps: u32,
+    // What a friend's share passed on over internet paths takes of that
+    // upload. The cap in the facts is only advice to the sharer; this holds
+    // the host to RELAY_SHARE times the setting whatever the sharer sends.
+    relay_upload: Bucket,
     // The number the next control session gets, and the controller whose
     // session ended last, until when what they sent before the end is let
     // go quietly.
@@ -458,11 +498,13 @@ impl Host {
             .router
             .and_then(|gateway| router::carrier_nat(gateway.local));
         // A known device rejoins with the secret it was given, whenever this
-        // room opened.
-        let mut keys = HashMap::new();
+        // room opened. Sized once, as the known lists are: a map that grows
+        // frees its old table, secrets and all, without wiping it.
+        let mut keys = HashMap::with_capacity(MAX_KEYS);
         for device in setup.devices.devices() {
             let mut record = KeyRecord::new(setup.now);
             record.secret = Some(device.secret.clone());
+            record.stamp = stamp_floor();
             keys.insert(device.key, record);
         }
         let cookies = Gate::new(
@@ -552,6 +594,10 @@ impl Host {
             voice_sealed: Vec::with_capacity(talk::MAX_VOICE + 1 + session::DATA_OVERHEAD),
             last_slot: 0,
             upload_kbps: setup.screen.upload_kbps,
+            relay_upload: Bucket::full(
+                setup.now,
+                sharing::relay_per_second(setup.screen.upload_kbps),
+            ),
             screen: Screen::new(clock, true, setup.screen, setup.now),
             live: None,
             next_share: 1,
@@ -662,6 +708,10 @@ impl Host {
                         now.local
                     );
                     self.router = Some(now);
+                    // The mapping forwards to the old address, which the
+                    // router can give to another device. No outside change
+                    // may follow to have it made again.
+                    self.remap();
                 }
                 Ok(_) => {}
                 Err(_) => log!(
@@ -1055,8 +1105,7 @@ impl Host {
                 // This PC may have started talking since the ping was planned.
                 peer.link.next_ping = peer.link.next_ping.min(now + every);
                 if now >= peer.link.next_ping {
-                    let ping = peer.link.ping(clock);
-                    peer.send(socket, Channel::Ping, &ping);
+                    peer.send_ping(socket, clock);
                     peer.link.next_ping = now + every;
                     changed = true;
                 }
@@ -1459,8 +1508,7 @@ impl Host {
             if peer.sessions.current.is_none() {
                 continue;
             }
-            let ping = peer.link.ping(clock);
-            peer.send(socket, Channel::Ping, &ping);
+            peer.send_ping(socket, clock);
             peer.link.next_ping = now + peer.link.ping_every(sending, now, &self.timers);
             pinged.push(peer.addr);
         }
@@ -1758,15 +1806,34 @@ impl Host {
         // before any key math and says whether the length or the key was
         // wrong.
         let has_mac1 = self.cookies.has_valid_mac1(packet);
+        // The address and port a friend in the room is at has a bucket of its
+        // own. The one for the IP alone is shared with everyone behind the
+        // same NAT and with anyone spoofing it, and the table it lives in
+        // fills up with strangers.
+        let friend = if has_mac1 {
+            self.peers
+                .iter_mut()
+                .find(|peer| peer.addr == from)
+                .map(|peer| peer.handshakes.take(now, REKEYS_PER_SECOND, REKEY_BURST))
+        } else {
+            None
+        };
+        if friend == Some(false) {
+            self.stray(packet, from, now, "initiation, dropped: rate limited");
+            return self.drops.bad(now);
+        }
         if has_mac1 {
             let under_load = self.cookies.count(now);
             self.note_load(now);
             if under_load && !self.cookies.has_valid_mac2(packet, from, now) {
-                return self.send_cookie(packet, from, now, socket);
+                return self.send_cookie(packet, from, friend.is_some(), now, socket);
             }
         }
+        // Without mac1 read_initiation drops it before any key math, so it
+        // spends no tokens: junk from many or spoofed sources would use up
+        // the budget every join and rejoin needs.
         let in_room = self.peers.iter().any(|peer| peer.addr.ip() == from.ip());
-        if !self.limit.allow(from.ip(), in_room, now) {
+        if has_mac1 && friend.is_none() && !self.limit.allow(from.ip(), in_room, now) {
             self.stray(packet, from, now, "initiation, dropped: rate limited");
             return self.drops.bad(now);
         }
@@ -1831,8 +1898,11 @@ impl Host {
             };
         }
         // The punches opened this host's router for that one friend. Anyone
-        // else who can send from their address keeps out of it.
-        if let Some(owner) = self.punches.held_for_other(from, &key, now) {
+        // else who can send from their address keeps out of it with an
+        // invite; a key with a secret of its own takes nothing from them.
+        if matches!(kind, InitKind::Invite(_))
+            && let Some(owner) = self.punches.held_for_other(from, &key, now)
+        {
             if self.log_stray(from, now) {
                 self.log.line(format!(
                     "{}: initiation ({}) from {}, dropped: {from} was punched open for {} only",
@@ -1894,18 +1964,16 @@ impl Host {
         record.stamp = Some(stamp);
         record.accepted = Some((packet.to_vec(), now));
         record.last_seen = now;
-        let by_invite = if let InitKind::Invite(id) = kind {
-            record.invited = true;
-            self.invites.admit(&id, key);
-            true
-        } else {
-            false
-        };
+        // Message 1 shows the key but not the invite secret, which IKpsk2
+        // mixes in at the end of message 2. The invite is spent in confirm,
+        // once a packet under the new keys shows the client had it.
+        let by_invite = matches!(kind, InitKind::Invite(_));
         self.pending.push(Pending {
             session: session.with_timers(self.session_timers),
             key,
             kind,
             created: now,
+            answered_at: from,
         });
         let trimmed = self.trim_pending(&key);
         if self.log_stray(from, now) {
@@ -1927,6 +1995,7 @@ impl Host {
         &mut self,
         packet: &[u8],
         from: SocketAddr,
+        friend: bool,
         now: Instant,
         socket: &Socket,
     ) -> bool {
@@ -1936,7 +2005,15 @@ impl Host {
         // every one.
         let line =
             self.log.is_on() && self.cookies.line_due(from.ip(), now) && self.log_stray(from, now);
-        let outcome = match self.limit.allow_cookie(from.ip(), now) {
+        // A friend's own bucket was spent on the way in. The cap is for
+        // everyone else, so a flood that keeps it used up cannot stop a
+        // rekey.
+        let allowed = if friend {
+            Ok(())
+        } else {
+            self.limit.allow_cookie(from.ip(), now)
+        };
+        let outcome = match allowed {
             Ok(()) => match self.cookies.reply(packet, from, now) {
                 Ok(reply) => match socket.send_to(&reply, from) {
                     Ok(_) => {
@@ -2061,10 +2138,16 @@ impl Host {
 
     // A key that was answered and has not confirmed yet holds a seat, so two
     // joining at the same moment cannot both be answered for the last one.
+    // Not with an invite: anyone with its id gets that answer, secret or
+    // not, and confirm turns away whoever finds the room full.
     fn seats_taken(&self, key: &[u8; 32]) -> usize {
         let mut waiting: Vec<&[u8; 32]> = Vec::new();
         for p in &self.pending {
-            if p.key != *key && !self.is_peer(&p.key) && !waiting.contains(&&p.key) {
+            if p.key != *key
+                && !matches!(p.kind, InitKind::Invite(_))
+                && !self.is_peer(&p.key)
+                && !waiting.contains(&&p.key)
+            {
                 waiting.push(&p.key);
             }
         }
@@ -2118,17 +2201,18 @@ impl Host {
             trimmed = Some("too many pending handshakes for this key, its oldest was let go");
         }
         if self.pending.len() > PENDING_TOTAL {
-            // A stranger's try goes first, then a friend's older one, so a
-            // flood of new keys cannot push out the rekey a friend in the
-            // room is about to confirm.
-            let newest_of_its_key = |i: usize| {
-                !self.pending[i + 1..]
-                    .iter()
-                    .any(|later| later.key == self.pending[i].key)
-            };
+            // The key holding the most tries lets its oldest go, a
+            // stranger's before a friend's, so a flood of new keys cannot
+            // push out the rekey a friend in the room is about to confirm,
+            // and friends holding many tries cannot push out a newcomer's
+            // one. Backwards, so a tie goes to the oldest.
+            let tries = |k: &[u8; 32]| self.pending.iter().filter(|p| p.key == *k).count();
             let at = (0..self.pending.len())
-                .find(|&i| !self.is_peer(&self.pending[i].key))
-                .or_else(|| (0..self.pending.len()).find(|&i| !newest_of_its_key(i)))
+                .rev()
+                .max_by_key(|&i| {
+                    let k = &self.pending[i].key;
+                    (tries(k), !self.is_peer(k))
+                })
                 .unwrap_or(0);
             self.pending.remove(at);
             trimmed = Some("too many pending handshakes, one was let go");
@@ -2173,8 +2257,10 @@ impl Host {
             let roamed = which == Which::Current && received.newest && from != peer.addr;
             let was_at = peer.addr;
             let back = peer.heard(from, roamed, now, self.timers.quiet_after(), self.clock);
-            if roamed {
-                log!(self.log, "{}: moved from {was_at} to {from}", who(peer));
+            // Within the per-source limit: a friend can move with every packet.
+            if roamed && self.log.is_on() && self.booth_lines.allow(from.ip(), now, &self.log) {
+                self.log
+                    .line(format!("{}: moved from {was_at} to {from}", who(peer)));
             }
             if let Some(silence) = back {
                 log!(
@@ -2238,10 +2324,30 @@ impl Host {
         socket: &Socket,
     ) -> Option<usize> {
         let Pending {
-            session, key, kind, ..
+            session,
+            key,
+            kind,
+            answered_at,
+            ..
         } = self.pending.remove(p);
         // The client keeps the first answer it gets and forgets its other tries.
         self.pending.retain(|other| other.key != key);
+        // Two keys can be answered on one single-use invite. The first to
+        // confirm takes it.
+        if let InitKind::Invite(id) = kind {
+            if !self.invites.admit(&id, key) {
+                log!(
+                    self.log,
+                    "{from}: handshake from {} finished, dropped: its invite let in another key first",
+                    keys::fingerprint(&key)
+                );
+                self.drops.bad(now);
+                return None;
+            }
+            if let Some(record) = self.keys.get_mut(&key) {
+                record.invited = true;
+            }
+        }
         let invited = match self.keys.get_mut(&key) {
             Some(record) => {
                 record.last_seen = now;
@@ -2306,8 +2412,14 @@ impl Host {
                     return None;
                 }
                 let slot = self.free_slot();
-                self.peers
-                    .push(Peer::new(key, from, session, invited, slot, now));
+                // The packet that confirmed can come from anywhere. Media
+                // starts where the response went and follows it to `from`
+                // once a ping there is answered, as for any move.
+                let mut peer = Peer::new(key, answered_at, session, invited, slot, now);
+                if from != answered_at {
+                    peer.move_to(from, now, clock);
+                }
+                self.peers.push(peer);
                 self.limits_back(self.peers.len() - 1, now);
                 let peer = &self.peers[self.peers.len() - 1];
                 log!(
@@ -2400,8 +2512,8 @@ impl Host {
             Some(Plain::Ping(pong)) => {
                 if !peer.link.pong(pong, now, clock) {
                     self.drops.bad(now);
-                } else if let PingMessage::Pong { t1, .. } = pong
-                    && peer.media.answered(from, t1)
+                } else if let PingMessage::Pong { seq, t1, .. } = pong
+                    && peer.media.answered(from, seq, t1)
                 {
                     log!(
                         self.log,
@@ -2818,7 +2930,17 @@ impl Host {
                         );
                     }
                 }
-                Some(Message::VoiceLoss(heard)) => self.took_losses(i, &heard, now, socket),
+                Some(Message::VoiceLoss(heard)) => {
+                    // Over the limit a report is left out: the next one says
+                    // the same a second later.
+                    if self.peers[i].voice_reports.take(
+                        now,
+                        VOICE_REPORTS_PER_SECOND,
+                        VOICE_REPORT_BURST,
+                    ) {
+                        self.took_losses(i, &heard, now, socket);
+                    }
+                }
                 Some(Message::Periods(periods)) => self.peers[i].periods = Some(periods),
                 Some(Message::OtherHello {
                     protocol,
@@ -3103,6 +3225,13 @@ fn worst(peers: &[Peer], snapshots: &[LinkSnapshot]) -> Option<usize> {
             .cmp(&badness(b))
             .then_with(|| rtt(a).total_cmp(&rtt(b)))
     })
+}
+
+// The oldest stamp a known device's first initiation this run may carry.
+fn stamp_floor() -> Option<Tai64N> {
+    SystemTime::now()
+        .checked_sub(STAMP_FLOOR)
+        .map(Tai64N::from_system_time)
 }
 
 fn new_secret() -> Zeroizing<[u8; 32]> {
@@ -3691,7 +3820,7 @@ mod tests {
     }
 
     #[test]
-    fn the_last_seat_is_answered_once() {
+    fn the_last_seat_goes_to_the_first_to_confirm() {
         let start = Instant::now();
         let mut rig = Rig::new(start);
         for i in 0..MAX_CLIENTS - 1 {
@@ -3699,21 +3828,28 @@ mod tests {
         }
         assert_eq!(rig.host.peers.len(), MAX_CLIENTS - 1);
 
+        // Answers to an invite hold no seat: one with a wrong secret would
+        // hold it as well as one with the right one.
+        let mut stranger = Guest::new();
+        let kind = InitKind::Invite(rig.invite.invite_id);
+        let from = stranger.wire.addr();
+        stranger.initiate(&mut rig, kind, &[0x5a; 32], from, start);
         let mut first = Guest::new();
         let mut second = Guest::new();
         let a = first.knock(&mut rig, start);
         let b = second.knock(&mut rig, start);
-        assert!(first.answer(a, start).is_some());
-        assert!(
-            second.answer(b, start).is_none(),
-            "two new keys were answered for one seat"
-        );
-
-        // An answer nobody finished gives its seat back when it runs out.
-        let later = start + PENDING_LIFETIME;
-        rig.tick(later);
-        let b = second.knock(&mut rig, later);
-        assert!(second.answer(b, later).is_some());
+        first.session = Some(first.answer(a, start).expect("first answered"));
+        second.session = Some(second.answer(b, start).expect("second answered"));
+        let hello = |name: &str| Message::Hello {
+            version: invite::VERSION,
+            name: name.to_owned(),
+            reached: None,
+        };
+        first.say(&mut rig, &hello("First"), start);
+        second.say(&mut rig, &hello("Second"), start);
+        assert_eq!(rig.host.peers.len(), MAX_CLIENTS);
+        assert!(rig.host.is_peer(first.identity.public()));
+        assert!(!rig.host.is_peer(second.identity.public()));
     }
 
     #[test]
@@ -5093,16 +5229,18 @@ mod tests {
         let bo = Guest::new();
         let id = Answers::Invite(rig.invite.invite_id);
 
-        // Answered but not yet confirmed: the invite is Ana's now.
+        // Answered is not enough: message 1 says nothing of the secret.
         let initiation = ana.knock(&mut rig, start);
         assert!(ana.answer(initiation, start).is_some());
         let for_bo = code_for(&bo, id, Some(bo.wire.addr()));
+        assert!(rig.host.accept_reply(&for_bo, start).is_ok());
+
+        // Confirmed under the new keys: the invite is Ana's now.
+        ana.join(&mut rig, "Ana", start);
         assert_eq!(
             rig.host.accept_reply(&for_bo, start),
             Err(ReplyRefused::InviteNotLive)
         );
-        let for_ana = code_for(&ana, id, Some(ana.wire.addr()));
-        assert!(rig.host.accept_reply(&for_ana, start).is_ok());
     }
 
     #[test]
@@ -6618,4 +6756,8 @@ mod tests {
         rig.deliver(&packet, from, start + Duration::from_secs(2));
         assert_eq!(rig.host.drops.bad, 1);
     }
+
+    mod admission;
+    mod limits;
+    mod media;
 }

@@ -57,6 +57,13 @@ Changed in src/text_selection/visuals.rs
   that ends where that row starts lays a sliver over it.
 - An empty selection, the cursor and the IME underlines are as in 0.36.2.
 
+Changed in src/text_selection/text_cursor_state.rs
+- ccursor_previous_word clamps the cursor to the text's char count before
+  taking it from the end. A letter IBM Plex Sans builds from two glyphs,
+  such as U+01E9, gives the galley one more cursor place than the text
+  has chars, and a double click or Ctrl+Left there underflowed, which a
+  debug build stops on.
+
 Other changes to the crate
 - Ten doc examples marked ignore. They include images by paths inside
   egui's own repository (assets/ferris.png, and eframe/data/icon.png),

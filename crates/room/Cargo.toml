@@ -18,6 +18,8 @@ voice.workspace = true
 crossbeam-channel.workspace = true
 getrandom.workspace = true
 zeroize.workspace = true
+# Which chars are combining marks, for the cut in control::clean.
+unicode-bidi.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use invite::{Candidate, Invite, MAX_CANDIDATES, Mapping};
 use keys::KeyError;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::log::{Log, log};
 
@@ -521,7 +521,9 @@ pub(crate) fn hosts(dir: &Path) -> Result<Vec<KnownHost>, KnownError> {
         return Err(problem);
     }
     let mut hosts = opened.list;
-    hosts.sort_by_key(|host| std::cmp::Reverse(host.last_seen));
+    // Unstable: the stable sort copies every record, secret and all, into a
+    // buffer it frees without wiping.
+    hosts.sort_unstable_by_key(|host| std::cmp::Reverse(host.last_seen));
     Ok(hosts)
 }
 
@@ -529,6 +531,8 @@ pub(crate) fn forget_host(dir: &Path, host_key: &[u8; 32]) -> Result<(), KnownEr
     edit_hosts(dir, |hosts| {
         let before = hosts.len();
         hosts.retain(|host| host.host_key != *host_key);
+        // retain leaves a copy of the last record past the end.
+        hosts.spare_capacity_mut().zeroize();
         hosts.len() != before
     })
 }
@@ -570,7 +574,7 @@ pub(crate) fn devices(dir: &Path) -> Result<KnownDevices, KnownError> {
     }
     let mut list = opened.list;
     list.devices
-        .sort_by_key(|device| std::cmp::Reverse(device.last_seen));
+        .sort_unstable_by_key(|device| std::cmp::Reverse(device.last_seen));
     list.blocked
         .sort_by_key(|blocked| std::cmp::Reverse(blocked.since));
     Ok(list)
@@ -581,6 +585,7 @@ pub(crate) fn remove_device(dir: &Path, key: &[u8; 32]) -> Result<(), KnownError
     edit_devices(dir, |list| {
         let before = list.devices.len();
         list.devices.retain(|device| device.key != *key);
+        list.devices.spare_capacity_mut().zeroize();
         list.devices.len() != before
     })
 }

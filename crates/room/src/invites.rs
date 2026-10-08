@@ -276,13 +276,19 @@ impl Invites {
             .map(|entry| entry.secret.clone())
     }
 
-    pub(crate) fn admit(&mut self, id: &[u8; 8], key: [u8; 32]) {
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == *id)
-            && !entry.admitted.contains(&key)
-            && entry.admitted.len() < entry.keys()
-        {
-            entry.admitted.push(key);
+    // True when the invite has let `key` in, now or before.
+    pub(crate) fn admit(&mut self, id: &[u8; 8], key: [u8; 32]) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == *id) else {
+            return false;
+        };
+        if entry.admitted.contains(&key) {
+            return true;
         }
+        if entry.admitted.len() >= entry.keys() {
+            return false;
+        }
+        entry.admitted.push(key);
+        true
     }
 
     // Returns true when the invite on show just expired.

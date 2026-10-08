@@ -458,6 +458,14 @@ impl Client {
             .iter()
             .find(|entry| entry.controlling)
             .map(|entry| entry.key);
-        self.screen.remote.view(controller)
+        let mut view = self.screen.remote.view(controller);
+        // The asker as the roster has their slot now: a request can come
+        // before the roster that names them, and a slot can change hands.
+        if let (Some(asked), Some(here)) = (view.asked_by.as_mut(), self.screen.remote.here())
+            && let Some(entry) = self.roster.entries.iter().find(|e| e.slot == here.slot)
+        {
+            asked.key = entry.key;
+        }
+        view
     }
 }

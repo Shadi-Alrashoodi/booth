@@ -444,14 +444,16 @@ fn video_reaches_only_the_watchers() {
     for packet in &last {
         outbox.video(packet);
     }
+    // Kept across looks: the copies can come in over more than one.
+    let mut video: Vec<Vec<u8>> = Vec::new();
     let ana_slot = poll(WAIT, "Eve's copies", || {
-        let video: Vec<Vec<u8>> = eve
-            .received()
-            .into_iter()
-            .filter(|(channel, _)| *channel == Channel::Video)
-            .map(|(_, payload)| payload)
-            .collect();
-        (video.len() >= last.len()).then_some(video)
+        video.extend(
+            eve.received()
+                .into_iter()
+                .filter(|(channel, _)| *channel == Channel::Video)
+                .map(|(_, payload)| payload),
+        );
+        (video.len() >= last.len()).then(|| video.clone())
     });
     for (relayed, packet) in ana_slot.iter().zip(&last) {
         assert_eq!(relayed[0], 2, "Relayed");

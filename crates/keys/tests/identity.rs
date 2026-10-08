@@ -147,9 +147,9 @@ fn debug_does_not_show_the_secret() {
 #[test]
 fn fingerprint_format() {
     let fp = Identity::generate().fingerprint();
-    assert_eq!(fp.len(), 14);
+    assert_eq!(fp.len(), 24);
     let groups: Vec<&str> = fp.split(' ').collect();
-    assert_eq!(groups.len(), 3);
+    assert_eq!(groups.len(), 5);
     for group in groups {
         assert_eq!(group.len(), 4);
         assert!(
@@ -163,9 +163,9 @@ fn fingerprint_format() {
 #[test]
 fn fingerprint_is_stable() {
     // Expected values from `openssl dgst -blake2s256` over the same 32 bytes.
-    assert_eq!(fingerprint(&[0u8; 32]), "320b 5ea9 9e65");
+    assert_eq!(fingerprint(&[0u8; 32]), "320b 5ea9 9e65 3bc2 b593");
     let counting: [u8; 32] = std::array::from_fn(|i| i as u8);
-    assert_eq!(fingerprint(&counting), "0582 5607 d7fd");
+    assert_eq!(fingerprint(&counting), "0582 5607 d7fd f2d8 2ef4");
 
     let identity = Identity::generate();
     assert_eq!(identity.fingerprint(), fingerprint(identity.public()));

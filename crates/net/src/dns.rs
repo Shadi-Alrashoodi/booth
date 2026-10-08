@@ -16,9 +16,9 @@ use windows_sys::Win32::Foundation::{
     DNS_ERROR_RCODE_NAME_ERROR, DNS_INFO_NO_RECORDS, ERROR_SUCCESS,
 };
 use windows_sys::Win32::NetworkManagement::Dns::{
-    DNS_QUERY_BYPASS_CACHE, DNS_QUERY_NO_MULTICAST, DNS_QUERY_NO_NETBT, DNS_QUERY_TREAT_AS_FQDN,
-    DNS_RECORDA, DNS_RECORDW, DNS_TYPE_A, DNS_TYPE_AAAA, DNS_TYPE_CNAME, DNS_TYPE_NS, DnsFree,
-    DnsFreeRecordList, DnsQuery_W, DnsSectionAnswer,
+    DNS_PTR_DATAW, DNS_QUERY_BYPASS_CACHE, DNS_QUERY_NO_MULTICAST, DNS_QUERY_NO_NETBT,
+    DNS_QUERY_TREAT_AS_FQDN, DNS_RECORDA, DNS_RECORDW, DNS_TYPE_A, DNS_TYPE_AAAA, DNS_TYPE_CNAME,
+    DNS_TYPE_NS, DnsFree, DnsFreeRecordList, DnsQuery_W, DnsSectionAnswer,
 };
 use windows_sys::Win32::Networking::WinSock::{
     SO_RANDOMIZE_PORT, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAEMSGSIZE, setsockopt,
@@ -643,32 +643,45 @@ fn system_query(name: &str, kind: Kind, fresh: bool) -> Result<Vec<SystemRecord>
     // DNS_RECORDW, the same layout with UTF-16 names.
     let mut cur = first.cast::<DNS_RECORDW>().cast_const();
     while !cur.is_null() {
-        // SAFETY: `cur` is the head or a pNext written by DnsQuery_W, and the
-        // list is freed only after this loop.
-        let record = unsafe { &*cur };
-        // SAFETY: both members of Flags are one u32; DW reads it whole.
-        let section = unsafe { record.Flags.DW } & 0b11;
-        let data = match (record.wType, record.wDataLength) {
-            // SAFETY: wType and the matching length say which member of Data
-            // DnsQuery_W filled.
+        // Windows allocates each record as its header plus wDataLength bytes,
+        // 36 for an A record against 88 for a whole DNS_RECORDW, so no
+        // reference to a whole record is made: fields are read one at a time.
+        // SAFETY: `cur` is the head or a pNext written by DnsQuery_W, the list
+        // is freed only after this loop, and these all sit in the header.
+        // Both members of Flags are one u32; DW reads it whole.
+        let (next, owner, kind, len, flags) = unsafe {
+            (
+                (*cur).pNext,
+                (*cur).pName,
+                (*cur).wType,
+                (*cur).wDataLength,
+                (*cur).Flags.DW,
+            )
+        };
+        let section = flags & 0b11;
+        let data = match (kind, usize::from(len)) {
+            // SAFETY: wType says which member of Data DnsQuery_W filled, and
+            // wDataLength that all of it is there.
             (DNS_TYPE_A, 4) => SystemData::Ip(IpAddr::V4(Ipv4Addr::from(
-                unsafe { record.Data.A.IpAddress }.to_ne_bytes(),
+                unsafe { (*cur).Data.A.IpAddress }.to_ne_bytes(),
             ))),
             // SAFETY: as above.
             (DNS_TYPE_AAAA, 16) => SystemData::Ip(IpAddr::V6(Ipv6Addr::from(unsafe {
-                record.Data.AAAA.Ip6Address.IP6Byte
+                (*cur).Data.AAAA.Ip6Address.IP6Byte
             }))),
             // SAFETY: as above.
-            (DNS_TYPE_NS, _) => SystemData::Name(read(unsafe { record.Data.NS.pNameHost })),
+            (DNS_TYPE_NS, len) if len >= size_of::<DNS_PTR_DATAW>() => {
+                SystemData::Name(read(unsafe { (*cur).Data.NS.pNameHost }))
+            }
             _ => SystemData::Other,
         };
         records.push(SystemRecord {
-            owner: read(record.pName),
-            kind: record.wType,
+            owner: read(owner),
+            kind,
             answer: section == ANSWER_SECTION,
             data,
         });
-        cur = record.pNext;
+        cur = next;
     }
     if !first.is_null() {
         // SAFETY: `first` came from DnsQuery_W, nothing read from the list is

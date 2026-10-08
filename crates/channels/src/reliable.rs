@@ -2,6 +2,8 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::time::{Duration, Instant};
 
+use zeroize::Zeroizing;
+
 mod wire;
 
 #[cfg(test)]
@@ -27,7 +29,8 @@ const MAX_ACK_DELAYS: usize = 2 * WINDOW;
 
 #[derive(Debug)]
 struct Sent {
-    message: Vec<u8>,
+    // Wiped when it goes: a PeerSecret sits in one until it is acked.
+    message: Zeroizing<Vec<u8>>,
     // When it first went out, for the ack delay.
     first_sent: Instant,
     deadline: Instant,
@@ -49,7 +52,7 @@ pub struct ReliableCounters {
 
 #[derive(Debug)]
 pub struct Reliable {
-    queue: VecDeque<Vec<u8>>,
+    queue: VecDeque<Zeroizing<Vec<u8>>>,
     // in_flight[i] carries sequence send_base + i. It runs from the oldest
     // message not known to be received to the newest one sent, so its length
     // is the span the window limits, not the count of unacked messages.
@@ -115,7 +118,7 @@ impl Reliable {
         if self.queue.len() + self.in_flight.len() >= MAX_QUEUED {
             return Err(ReliableError::Full);
         }
-        self.queue.push_back(message.to_vec());
+        self.queue.push_back(Zeroizing::new(message.to_vec()));
         Ok(())
     }
 
@@ -253,7 +256,7 @@ impl Reliable {
             .iter()
             .filter(|sent| !sent.acked)
             .map(|sent| sent.message.as_slice())
-            .chain(self.queue.iter().map(Vec::as_slice))
+            .chain(self.queue.iter().map(|message| message.as_slice()))
     }
 
     fn current_ack(&self) -> Ack {

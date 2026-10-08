@@ -180,7 +180,10 @@ fn ccursor_next_line(text: &str, ccursor: CCursor) -> CCursor {
 pub fn ccursor_previous_word(text: &str, ccursor: CCursor) -> CCursor {
     let num_chars = CharIndex(text.chars().count());
     let reversed: String = text.graphemes(true).rev().collect();
-    let boundary = next_word_boundary_char_index(&reversed, num_chars - ccursor.index);
+    // A letter the font builds from two glyphs gives the galley more places
+    // than its text has chars, so a cursor from it can be past the last one.
+    let from_end = num_chars - ccursor.index.min(num_chars);
+    let boundary = next_word_boundary_char_index(&reversed, from_end);
     CCursor {
         index: num_chars - boundary.min(num_chars),
         prefer_next_row: true,
