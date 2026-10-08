@@ -16,6 +16,9 @@
 # latest.txt.minisig. It uploads and publishes nothing; that stays a step
 # done by hand.
 #
+# The zip's and the installer's names carry the version, so the two download
+# links in README.md change with each version.
+#
 # The key's password is needed twice, for the check and for signing. When it
 # is stored in Windows Credential Manager as the generic credential
 # booth-release, it is read from there each time and piped to the release
