@@ -11,6 +11,7 @@ use std::process::Command;
 
 use crate::expression;
 use crate::ffmpeg::Ffmpeg;
+use crate::fonts::{self, Fonts};
 use crate::json::{self, Value};
 
 // Which licenses a crate may be used under is cargo deny's call (deny.toml).
@@ -66,7 +67,7 @@ const CODE: &[&str] = &[
 ];
 
 const TARGET: &str = "x86_64-pc-windows-msvc";
-const RULE: &str = "------------------------------------------------------------------------";
+pub const RULE: &str = "------------------------------------------------------------------------";
 const DOUBLE_RULE: &str =
     "========================================================================";
 
@@ -617,7 +618,7 @@ fn flatten(text: &str) -> String {
     out
 }
 
-fn decode(bytes: &[u8]) -> String {
+pub fn decode(bytes: &[u8]) -> String {
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
     match std::str::from_utf8(bytes) {
         Ok(text) => text.to_string(),
@@ -645,33 +646,6 @@ pub fn normalize(text: &str) -> String {
         .rposition(|l| !l.is_empty())
         .map_or(first, |i| i + 1);
     lines[first..last].join("\n")
-}
-
-pub struct Fonts {
-    pub files: Vec<String>,
-    pub license: String,
-}
-
-pub fn read_fonts(dir: &Path) -> Result<Fonts, String> {
-    let mut files: Vec<String> = fs::read_dir(dir)
-        .map_err(|err| format!("could not list {}: {err}", dir.display()))?
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| {
-            let lower = n.to_lowercase();
-            lower.ends_with(".ttf") || lower.ends_with(".otf")
-        })
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(format!("{} has no fonts", dir.display()));
-    }
-    let ofl = dir.join("OFL.txt");
-    let bytes = fs::read(&ofl).map_err(|err| format!("could not read {}: {err}", ofl.display()))?;
-    Ok(Fonts {
-        files,
-        license: normalize(&decode(&bytes)),
-    })
 }
 
 fn read_copied(root: &Path) -> Result<Vec<CopiedCode>, String> {
@@ -734,7 +708,7 @@ pub fn collect(root: &Path, metadata: &str, tree: &str) -> Result<(Collected, Ff
         manual.extend(note);
     }
     let copied = read_copied(root)?;
-    let fonts = read_fonts(&root.join("assets").join("fonts"))?;
+    let fonts = fonts::read(&root.join("assets").join("fonts"), &packages)?;
     let ffmpeg = Ffmpeg::read(&root.join("third_party").join("ffmpeg"))?;
     let file = render(&version, &crates, &copied, &fonts, &ffmpeg);
     Ok((
@@ -841,16 +815,7 @@ pub fn render(
     }
 
     heading(&mut out, "3. Fonts");
-    out.push_str(&wrap(
-        &format!(
-            "booth.exe embeds these font files: {}. They are under the SIL Open Font License 1.1:",
-            fonts.files.join(", ")
-        ),
-        "",
-    ));
-    out.push('\n');
-    out.push_str(&fonts.license);
-    out.push_str("\n\n");
+    out.push_str(&fonts.notice());
 
     heading(&mut out, "4. FFmpeg");
     out.push_str(&ffmpeg.notice());

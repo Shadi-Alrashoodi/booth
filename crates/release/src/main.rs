@@ -4,6 +4,7 @@
 
 mod expression;
 mod ffmpeg;
+mod fonts;
 mod json;
 mod licenses;
 mod signing;
