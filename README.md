@@ -46,7 +46,7 @@ cargo build --release --locked -p app
 
 ## Security
 
-Booth has no accounts and no cloud: voice, video and chat go straight between each friend's PC and the host's, over UDP, encrypted even on a LAN. Each connection starts with a Noise handshake (Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s) in which both sides prove who they are. The crypto is the snow, dalek and RustCrypto crates, not my own; the code around it has had no outside audit. The host decrypts and forwards everything in the room, so only join a host you trust. To learn your outside address, Booth asks two public STUN servers, Cloudflare's and Google's unless you change them in Settings; they see that address and nothing else. Besides those, Booth contacts only github.com, and only if you turn on Check for new versions in Settings. Report a security problem privately from the Security tab on GitHub.
+Booth has no accounts and no cloud: voice, video and chat go straight between each friend's PC and the host's, over UDP, encrypted even on a LAN. Each connection starts with a Noise handshake (Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s) in which both sides prove who they are. The crypto is the snow, dalek and RustCrypto crates, not my own; the code around it has had no outside audit. The host decrypts and forwards everything in the room, so only join a host you trust. To learn your outside address, Booth asks two public STUN servers, Cloudflare's and Google's unless you change them in Settings; they see that address and nothing else. Besides those, Booth contacts only GitHub (github.com and its download host), and only if you turn on Check for new versions in Settings. Report a security problem privately from the Security tab on GitHub.
 
 ## License
 
