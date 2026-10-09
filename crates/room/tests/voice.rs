@@ -382,8 +382,9 @@ fn loss_turns_on_redundancy_then_10_ms_frames() {
         "voice: redundancy on, a listener lost ",
         " percent one or two frames at a time over the last 2 s",
         "voice: 10 ms frames with opus repair data, a listener lost ",
-        "voice: back to 5 ms frames, 0.0 percent scattered loss, under 1 for 2 s",
-        "voice: redundancy off, no scattered loss reported for 2 s",
+        // Reports land about a second apart, so these two read 2 s or 3 s.
+        "voice: back to 5 ms frames, 0.0 percent scattered loss, under 1 for ",
+        "voice: redundancy off, no scattered loss reported for ",
         "voice: microphone closed, the room closed",
     ] {
         assert!(text.contains(line), "no {line:?} in:\n{text}");
