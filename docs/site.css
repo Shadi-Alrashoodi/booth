@@ -154,26 +154,36 @@ main {
 .layout {
   display: grid;
   grid-template-columns: minmax(0, 32em) 544px;
-  grid-template-rows: auto 1fr;
-  grid-template-areas:
-    "intro shot"
-    "rest shot";
   justify-content: space-between;
   column-gap: 48px;
 }
 
-.intro {
-  grid-area: intro;
-}
-
-.rest {
-  grid-area: rest;
-}
-
 .shot {
-  grid-area: shot;
   align-self: start;
   margin-bottom: 48px;
+}
+
+.more {
+  display: grid;
+  grid-template-columns: 720px minmax(0, 1fr);
+  column-gap: 48px;
+  align-items: start;
+}
+
+.share {
+  margin-bottom: 48px;
+}
+
+.license {
+  max-width: 48em;
+  padding-bottom: 32px;
+  color: var(--ash);
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.license a {
+  color: var(--ash);
 }
 
 .lead {
@@ -246,37 +256,12 @@ main {
   color: var(--ash);
 }
 
+.caption + .caption {
+  margin-top: 8px;
+}
+
 .nowrap {
   white-space: nowrap;
-}
-
-.keys {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  column-gap: 24px;
-  row-gap: 4px;
-}
-
-.keys dd {
-  margin: 0;
-  color: var(--ash);
-}
-
-.measured p,
-.column {
-  max-width: 32em;
-}
-
-.measured figure {
-  margin-top: 24px;
-}
-
-.measured figcaption {
-  max-width: 32em;
-  margin-top: 8px;
-  color: var(--ash);
-  font-size: 14px;
-  line-height: 20px;
 }
 
 .strip {
@@ -302,23 +287,24 @@ main {
 }
 
 @media (max-width: 1079px) {
-  .layout {
+  .layout,
+  .more {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto;
-    grid-template-areas:
-      "intro"
-      "shot"
-      "rest";
   }
 
   .intro,
-  .rest {
+  .notes {
     max-width: 32em;
   }
 
   .shot img {
     width: 100%;
     max-width: 544px;
+  }
+
+  .share img {
+    width: 100%;
+    max-width: 720px;
   }
 }
 
@@ -348,10 +334,6 @@ main {
 
   .strip {
     padding: 0 16px;
-  }
-
-  .keys {
-    column-gap: 16px;
   }
 
   .strip span:nth-child(2) {
