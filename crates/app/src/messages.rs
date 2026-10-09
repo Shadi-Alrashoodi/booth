@@ -185,7 +185,7 @@ pub fn router(state: RouterState, port: u16) -> String {
             "There is another router between you and the internet (your provider's, or a box in front of yours). A code sent back may still work; otherwise use IPv6, Tailscale or WireGuard, or bridge the front box."
         }
         RouterState::CarrierNat => {
-            "This PC is behind your provider's shared address. Friends on the same network, Tailscale or WireGuard can join."
+            "This PC is behind your provider's shared address. Friends can join from the same network, or over Tailscale or WireGuard."
         }
     };
     String::from(text)
@@ -197,7 +197,7 @@ pub const ADDRESS_CHANGED_SINCE: &str = "Your address changed since this invite 
 
 // The host's side of an address change mid-session. The friends' side is in
 // the notices.
-pub const CODES_CANNOT_HELP: &str = "Your address changed. A code from a friend will not help; they need the new address (address name in settings) or a new invite.";
+pub const CODES_CANNOT_HELP: &str = "Your address changed, so a code from a friend will not help. Friends need a new invite, or an address name set in settings.";
 
 // With a name set, the friends did look it up; it led somewhere else.
 pub fn friends_lost(changed: Option<AddressChanged>) -> Option<&'static str> {
@@ -235,10 +235,10 @@ pub fn reply(state: ReplyState, port: Option<u16>) -> Option<String> {
             "The host's router changes ports for every connection. Ask them to forward {port}, or connect over IPv6, Tailscale or WireGuard."
         ),
         ReplyState::OwnHard => String::from(
-            "Your router changes ports for every connection, so a code back will not help. Use IPv6, Tailscale or WireGuard.",
+            "Your router changes ports for every connection, so a code sent back will not help. Use IPv6, Tailscale or WireGuard.",
         ),
         ReplyState::NoAddress => format!(
-            "Could not learn your outside address, so a code back cannot help. Ask the host to forward {port}, or connect over IPv6, Tailscale or WireGuard."
+            "Could not learn your outside address, so a code sent back will not help. Ask the host to forward {port}, or connect over IPv6, Tailscale or WireGuard."
         ),
         ReplyState::Expired {
             second_router: false,
@@ -306,7 +306,7 @@ pub fn reply_code_error(err: &CodeError) -> Option<String> {
     }
 }
 
-pub const FIREWALL_ASK: &str = "Windows blocks incoming connections to new programs. To let friends reach you, Booth needs one administrator prompt to let it receive UDP. Nothing else runs as administrator.";
+pub const FIREWALL_ASK: &str = "Windows blocks incoming connections to new programs. For friends to reach you, Booth needs one administrator prompt to let it receive UDP. Nothing else runs as administrator.";
 pub const FIREWALL_STANDARD_USER: &str = "You are not an administrator on this PC, so the port cannot be opened. Ask an administrator, or join only. Without the rule you will not follow the host if their address changes.";
 pub const FIREWALL_BLOCKED: &str =
     "Windows has a rule that blocks Booth, probably from an earlier prompt. Allow removes it.";
@@ -363,7 +363,7 @@ pub fn firewall_prompt_error(err: &io::Error) -> String {
 
 pub const RUNNING_ELEVATED: &str = "Booth was started as administrator. Start it again the usual way, not with Run as administrator. The firewall step asks for administrator by itself when it needs it.";
 
-pub const ADDRESS_NAME_ABOUT: &str = "If you run dynamic DNS, put the name here so friends can find you again after your address changes. Nothing here updates it; your own dynamic DNS client does.";
+pub const ADDRESS_NAME_ABOUT: &str = "If you run dynamic DNS, put the name here so friends can find you again after your address changes. Booth does not update it; your dynamic DNS client does.";
 // One sentence for every way a name can fail: the rules behind it (a number
 // at the end, localhost) are not worth a lesson each on this screen.
 pub const ADDRESS_NAME_REFUSED: &str = "That is not an address name Booth can use. Use letters, digits, hyphens and dots, like myroom.example.net.";
@@ -453,7 +453,7 @@ pub fn row_menu(name: &str) -> String {
 }
 
 // While this PC is controlled.
-pub const SETTINGS_LOCKED: &str = "The hotkeys, the panic key and the sharing settings cannot change while someone controls this PC. Stop control, then save again.";
+pub const SETTINGS_LOCKED: &str = "The hotkeys, the panic key and the sharing settings cannot change while someone controls this PC. Stop control, then press Save again.";
 
 // Nothing can read a new key or act on one; the buttons still work.
 pub fn hotkeys_off(why: &str) -> String {
@@ -468,7 +468,7 @@ pub const ADDRESS_OR_NAME: &str = "Address or name";
 // The help line under its field: an example, not a sentence, so no full stop.
 pub const MANUAL_HELP: &str = "For example 203.0.113.5:41000 or myroom.example.net";
 pub const MANUAL_REFUSED: &str = "That is not an address or name Booth can use. Write an address and port like 203.0.113.5:41000, or a name like myroom.example.net.";
-const FORGOT: &str = "Forgot {room}. A new invite is needed to join it again.";
+const FORGOT: &str = "Forgot {room}. You need a new invite to join it again.";
 const DAMAGED: &str = "The list of known {list} could not be read, so Booth started with an empty one. The old file is kept as {file}.";
 
 pub fn forgot(room: &str) -> String {
@@ -553,7 +553,7 @@ pub fn settings_error(err: &SaveError) -> String {
     }
 }
 
-pub const ANYONE: &str = "Anyone who sees this code can join until tomorrow.";
+pub const ANYONE: &str = "Anyone who sees this code can join for 24 hours.";
 pub const EMPTY_ROOM: &str = "Send the invite to your friends.";
 // In place of the invite code and the stats panel's address lines, from the
 // ask until the capture has closed.
@@ -1100,7 +1100,7 @@ mod tests {
     fn known_list_lines() {
         assert_eq!(
             forgot("Tuesday night"),
-            "Forgot Tuesday night. A new invite is needed to join it again."
+            "Forgot Tuesday night. You need a new invite to join it again."
         );
         let devices = damaged(&DamagedList {
             list: List::Devices,

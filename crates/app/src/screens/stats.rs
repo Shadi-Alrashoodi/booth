@@ -912,9 +912,9 @@ pub fn firewall(state: Option<&FirewallState>) -> &'static str {
 
 fn mapping(word: MappingWord) -> &'static str {
     match word {
-        MappingWord::Easy => "Easy",
-        MappingWord::Hard => "Hard",
-        MappingWord::Unknown => "Unknown",
+        MappingWord::Easy => "easy",
+        MappingWord::Hard => "hard",
+        MappingWord::Unknown => "not known",
     }
 }
 
