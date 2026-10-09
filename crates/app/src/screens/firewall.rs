@@ -21,12 +21,11 @@ pub enum Answer {
     Continue,
 }
 
-// The mark alone in the title row, the reason, then the two verbs, and
-// nothing else. While the administrator prompt is open its line takes
+// An empty title row, the reason, then the two verbs, and nothing else. While the administrator prompt is open its line takes
 // Allow's place. Not now stays, for a prompt that went behind another window
 // or a firewall that never answers the helper.
 pub fn show(ui: &mut Ui, ask: &Ask, waiting: bool) -> Option<Answer> {
-    controls::title_row(ui, Lead::Mark, &[]);
+    controls::title_row(ui, Lead::Empty, &[]);
     controls::page(ui, |ui| {
         if ask.blocking_all {
             controls::prose(ui, messages::FIREWALL_BLOCKING_ALL, theme::body(), CHALK);

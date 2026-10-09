@@ -121,7 +121,7 @@ pub fn show(
         .then(|| Button::new("Settings").icon(theme::icons::regular::GEAR_SIX))
         .into_iter()
         .collect();
-    let settings_pressed = controls::title_row(ui, Lead::Mark, &settings).is_some();
+    let settings_pressed = controls::title_row(ui, Lead::Empty, &settings).is_some();
     // Laid out whatever was pressed, so the frame that shows the press is
     // not an empty page. With a few known hosts, one of them open, the page
     // is taller than the window, so it scrolls under the title row.

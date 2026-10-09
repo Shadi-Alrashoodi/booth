@@ -4,12 +4,11 @@ use eframe::egui::emath::GuiRounding;
 use eframe::egui::text::LayoutJob;
 use eframe::egui::{
     Align, Color32, Context, CursorIcon, Event, EventFilter, FontId, Frame, Id, Key,
-    KeyboardShortcut, Label, LayerId, Layout, Margin, Mesh, Modifiers, Order, Painter, Rect,
-    Response, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextBuffer, TextEdit, Ui,
-    UiBuilder, Vec2, WidgetInfo, WidgetType, accesskit, pos2, vec2,
+    KeyboardShortcut, Label, LayerId, Layout, Margin, Modifiers, Order, Painter, Rect, Response,
+    RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextBuffer, TextEdit, Ui, UiBuilder,
+    Vec2, WidgetInfo, WidgetType, accesskit, pos2, vec2,
 };
 
-use crate::mark;
 use crate::theme::{
     self, AMBER, ASH, CHALK, CHECK_RADIUS, CONTROL_HEIGHT, CONTROL_RADIUS, EDGE, FIELD_FILL,
     FIELD_FOCUS, FIELD_HINT, FIELD_OFF, FIELD_TEXT, FOCUS_RING, ICON_SIZE, INK, PANEL,
@@ -31,16 +30,17 @@ const SAMPLE: &str = "the quick brown fox jumps over the lazy dog";
 const KEYBOARD_FOCUS: &str = "focus came from the keyboard";
 const FOCUS_LAYER: &str = "focus rings";
 
-// What sits at the left of the title row: the mark, on the screens before a
-// room, or the screen's title.
+// What sits at the left of the title row: nothing on the screens before a
+// room, where the window's own title bar already shows the mark, or the
+// screen's title.
 #[derive(Clone, Copy)]
 pub enum Lead<'a> {
-    Mark,
+    Empty,
     Title(&'a str),
 }
 
-// 48 px in window tone, with its 32 px row in the middle: the mark or the
-// title on the left, the verbs at the right in reading order, and no line
+// 48 px in window tone, with its 32 px row in the middle: the title, if any,
+// on the left, the verbs at the right in reading order, and no line
 // under it; what follows starts with its own tone or its own first row.
 // Returns which verb was pressed; one that is not enabled never is.
 pub fn title_row(ui: &mut Ui, lead: Lead, verbs: &[Button]) -> Option<usize> {
@@ -57,9 +57,7 @@ pub fn title_row(ui: &mut Ui, lead: Lead, verbs: &[Button]) -> Option<usize> {
         rect,
         width,
         |ui| match lead {
-            Lead::Mark => {
-                paint_mark(ui);
-            }
+            Lead::Empty => {}
             Lead::Title(title) => {
                 one_line(ui, title, theme::title(), CHALK);
             }
@@ -67,23 +65,6 @@ pub fn title_row(ui: &mut Ui, lead: Lead, verbs: &[Button]) -> Option<usize> {
         |ui| pressed = buttons(ui, verbs, rect.height()),
     );
     pressed
-}
-
-// The mark in amber, 16 px, on whole device pixels.
-fn paint_mark(ui: &mut Ui) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(ICON_SIZE, ICON_SIZE), Sense::hover());
-    if ui.is_rect_visible(rect) {
-        let per_point = ui.pixels_per_point();
-        let origin = rect.min.round_to_pixels(per_point);
-        let size = (ICON_SIZE * per_point).round() as u32;
-        let at = |x: u32, y: u32| origin + vec2(x as f32, y as f32) / per_point;
-        let bars: Vec<Rect> = mark::rects(size)
-            .iter()
-            .map(|[l, t, r, b]| Rect::from_min_max(at(*l, *t), at(*r, *b)))
-            .collect();
-        fill_pixels(ui.painter(), &bars, AMBER);
-    }
-    response
 }
 
 // Buttons side by side with the usual gap, as wide as buttons() lays them.
@@ -264,16 +245,6 @@ pub fn region<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 // crisp row in its own colour instead of two rows in a colour between.
 pub fn thickness(width: f32, per_point: f32) -> f32 {
     (width * per_point).floor().max(1.0) / per_point
-}
-
-// As one mesh, because egui feathers the edges of a filled rect and on a
-// bar a few pixels thick the feathering is a visible part of it.
-pub fn fill_pixels(painter: &Painter, rects: &[Rect], color: Color32) {
-    let mut mesh = Mesh::default();
-    for rect in rects {
-        mesh.add_colored_rect(*rect, color);
-    }
-    painter.add(mesh);
 }
 
 // egui's focus look is its pressed look, so the ring is drawn here: 2 px of

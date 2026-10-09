@@ -1200,7 +1200,7 @@ impl eframe::App for App {
                         }
                         // Usually a frame or two at most, so no words.
                         (Screen::Checking, _) => {
-                            controls::title_row(ui, controls::Lead::Mark, &[]);
+                            controls::title_row(ui, controls::Lead::Empty, &[]);
                         }
                         (Screen::Room(_), None) => {}
                     }

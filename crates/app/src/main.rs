@@ -7,7 +7,6 @@ mod elevated;
 mod firewall;
 mod hotkeys;
 mod loopback;
-mod mark;
 mod messages;
 mod monitors;
 mod remote;
