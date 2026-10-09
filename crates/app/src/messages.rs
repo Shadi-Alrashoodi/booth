@@ -366,7 +366,7 @@ pub const RUNNING_ELEVATED: &str = "Booth was started as administrator. Start it
 pub const ADDRESS_NAME_ABOUT: &str = "If you run dynamic DNS, put the name here so friends can find you again after your address changes. Nothing here updates it; your own dynamic DNS client does.";
 // One sentence for every way a name can fail: the rules behind it (a number
 // at the end, localhost) are not worth a lesson each on this screen.
-pub const ADDRESS_NAME_REFUSED: &str = "That is not an address name Booth can use. Use letters, digits, hyphens and dots, like myroom.duckdns.org.";
+pub const ADDRESS_NAME_REFUSED: &str = "That is not an address name Booth can use. Use letters, digits, hyphens and dots, like myroom.example.net.";
 
 // The lines under the settings fields.
 pub const PORT_REFUSED: &str = "The port must be a number from 1024 to 65535.";
@@ -466,8 +466,8 @@ pub fn hotkeys_off(why: &str) -> String {
 // A known host's row, opened.
 pub const ADDRESS_OR_NAME: &str = "Address or name";
 // The help line under its field: an example, not a sentence, so no full stop.
-pub const MANUAL_HELP: &str = "For example 203.0.113.5:41000 or myroom.duckdns.org";
-pub const MANUAL_REFUSED: &str = "That is not an address or name Booth can use. Write an address and port like 203.0.113.5:41000, or a name like myroom.duckdns.org.";
+pub const MANUAL_HELP: &str = "For example 203.0.113.5:41000 or myroom.example.net";
+pub const MANUAL_REFUSED: &str = "That is not an address or name Booth can use. Write an address and port like 203.0.113.5:41000, or a name like myroom.example.net.";
 const FORGOT: &str = "Forgot {room}. A new invite is needed to join it again.";
 const DAMAGED: &str = "The list of known {list} could not be read, so Booth started with an empty one. The old file is kept as {file}.";
 

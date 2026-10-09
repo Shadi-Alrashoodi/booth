@@ -424,10 +424,10 @@ mod tests {
 
     #[test]
     fn host_check_prefers_this_pc() {
-        let outside = Ipv4Addr::new(188, 48, 202, 128);
+        let outside = Ipv4Addr::new(198, 51, 100, 20);
         let mut name = AddressName::new(String::from("myroom.duckdns.org"), Lookup::default());
         assert_eq!(name.matched(Some(outside)), None);
-        name.found(found(&["2001:db8::1", "203.0.113.5", "188.48.202.128"]));
+        name.found(found(&["2001:db8::1", "203.0.113.5", "198.51.100.20"]));
         let here = name.matched(Some(outside)).expect("both are known");
         assert_eq!(here.points_to, outside);
         assert!(here.is_this_pc());

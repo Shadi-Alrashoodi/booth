@@ -18,11 +18,7 @@ fn which_microphones_warn() {
     // My AirPods in the first real call, 2026-09-27: narrowband
     // hands-free, and the name Windows 11 gives them says nothing of it.
     let airpods = engine(8_000, 1);
-    let mic = microphone(
-        &airpods,
-        Some("BTHHFENUM"),
-        "Headset (Shadi\u{2019}s AirPods Pro #2 - Find My)",
-    );
+    let mic = microphone(&airpods, Some("BTHHFENUM"), "Headset (AirPods Pro)");
     assert_eq!(
         mic,
         Microphone {

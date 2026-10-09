@@ -1647,17 +1647,17 @@ mod tests {
         let name = String::from("myroom.duckdns.org");
         let here = NameView {
             name: name.clone(),
-            answer: found(&["188.48.202.128"]),
+            answer: found(&["198.51.100.20"]),
             outside: Some(NameMatch {
-                points_to: Ipv4Addr::new(188, 48, 202, 128),
-                outside: Ipv4Addr::new(188, 48, 202, 128),
+                points_to: Ipv4Addr::new(198, 51, 100, 20),
+                outside: Ipv4Addr::new(198, 51, 100, 20),
             }),
         };
         assert_eq!(
             name_lines(Role::Host, here),
             [
                 ("Address name", name.clone()),
-                ("Name points to", String::from("188.48.202.128, this PC")),
+                ("Name points to", String::from("198.51.100.20, this PC")),
             ]
         );
         let stale = NameView {
@@ -1665,12 +1665,12 @@ mod tests {
             answer: found(&["203.0.113.5"]),
             outside: Some(NameMatch {
                 points_to: Ipv4Addr::new(203, 0, 113, 5),
-                outside: Ipv4Addr::new(188, 48, 202, 128),
+                outside: Ipv4Addr::new(198, 51, 100, 20),
             }),
         };
         assert_eq!(
             name_lines(Role::Host, stale)[1].1,
-            "203.0.113.5, not this PC's outside address 188.48.202.128"
+            "203.0.113.5, not this PC's outside address 198.51.100.20"
         );
         // STUN and the router have not said yet.
         let unknown = NameView {

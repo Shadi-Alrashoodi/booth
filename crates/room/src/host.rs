@@ -4914,7 +4914,7 @@ mod tests {
             servers: None,
             result: Ok(net::dns::Resolved {
                 addrs: vec![net::dns::Found {
-                    ip: Ipv4Addr::new(188, 48, 202, 128).into(),
+                    ip: Ipv4Addr::new(198, 51, 100, 20).into(),
                     source: net::dns::Source::Authoritative,
                 }],
                 refused: Vec::new(),
@@ -4931,7 +4931,7 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "address name myroom.duckdns.org points to 188.48.202.128; stun and the router have not said what this pc's outside address is"
+                "address name myroom.duckdns.org points to 198.51.100.20; stun and the router have not said what this pc's outside address is"
             ]
         );
     }
