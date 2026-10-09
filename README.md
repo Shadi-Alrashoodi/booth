@@ -1,20 +1,20 @@
-# Booth
+<p align="center"><img src="docs/mark.svg" width="96" height="96" alt=""></p>
 
-Voice, text chat and screen sharing for a few friends on Windows, built for the lowest delay.
+<h1 align="center">Booth</h1>
 
-![Booth's room window with two people in it and a short chat](docs/room.png)
+<p align="center">Voice, text chat and screen sharing for a few friends on Windows, built for the lowest delay.</p>
 
-![Booth's loopback test sharing a screen that plays a film, with the delay numbers along the bottom](docs/share.gif)
+<p align="center"><a href="https://github.com/Shadi-Alrashoodi/booth/releases/download/v1.0.0/booth-1.0.0-setup.exe"><b>Download the installer</b></a> &nbsp; or &nbsp; <a href="https://github.com/Shadi-Alrashoodi/booth/releases/download/v1.0.0/booth-1.0.0-windows-x64.zip">the zip</a></p>
+
+<p align="center"><a href="https://github.com/Shadi-Alrashoodi/booth/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/Shadi-Alrashoodi/booth?label=release&color=E8912F"></a> <a href="#license"><img alt="License: MIT or Apache-2.0" src="https://img.shields.io/badge/license-MIT%20or%20Apache--2.0-555"></a></p>
+
+![Booth's start screen and a room with two friends and a short chat](docs/hero.png)
 
 ## Download
 
-[booth-0.2.3-setup.exe](https://github.com/Shadi-Alrashoodi/booth/releases/download/v0.2.3/booth-0.2.3-setup.exe), the installer
+Run the installer, or unzip the zip anywhere and run booth.exe. It needs Windows 10 version 2004 or later, or Windows 11, 64-bit, with a DirectX 12 graphics driver.
 
-[booth-0.2.3-windows-x64.zip](https://github.com/Shadi-Alrashoodi/booth/releases/download/v0.2.3/booth-0.2.3-windows-x64.zip), to unzip anywhere and run booth.exe
-
-Windows 10 version 2004 or later, or Windows 11, 64-bit, with a DirectX 12 graphics driver. Older versions are on the [releases page](https://github.com/Shadi-Alrashoodi/booth/releases).
-
-The exe is not code signed yet, so SmartScreen warns once (More info, then Run anyway), and Smart App Control on Windows 11 blocks it.
+The exe is not code signed yet, so SmartScreen warns once (More info, then Run anyway), and Smart App Control on Windows 11 blocks it. The release page has latest.txt, signed with minisign, with the SHA-256 of both files.
 
 ## Using it
 
@@ -56,4 +56,3 @@ MIT or Apache-2.0, at your option: [LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](
 - The IBM Plex fonts: SIL Open Font License 1.1, in `assets\fonts\OFL.txt`. The Phosphor icon font, from egui-phosphor: MIT.
 - `vendor\egui` and `vendor\epaint` are egui and epaint 0.36.2 with right-to-left fixes, MIT or Apache-2.0; `PATCHED.txt` in each says what changed.
 - THIRD-PARTY-LICENSES.txt in the zip lists every Rust crate in booth.exe with its license, and NVIDIA's notice for the encoder declarations in `crates\encode`.
-- The film in docs/share.gif is Big Buck Bunny, (c) copyright 2008, Blender Foundation, www.bigbuckbunny.org, under CC BY 3.0.

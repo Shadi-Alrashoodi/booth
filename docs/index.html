@@ -11,80 +11,79 @@
 <meta property="og:title" content="Booth">
 <meta property="og:description" content="Voice, text chat and screen sharing for a few friends on Windows, built for the lowest delay.">
 <meta property="og:url" content="https://shadi-alrashoodi.github.io/booth/">
-<meta property="og:image" content="https://shadi-alrashoodi.github.io/booth/social.png">
-<meta property="og:image:width" content="1280">
-<meta property="og:image:height" content="640">
-<meta property="og:image:alt" content="Booth's mark and name beside its room window, with two people in it and a short chat">
+<meta property="og:image" content="https://shadi-alrashoodi.github.io/booth/hero.png">
+<meta property="og:image:width" content="1600">
+<meta property="og:image:height" content="920">
+<meta property="og:image:alt" content="Booth's start screen and a room with two friends and a short chat">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="favicon.ico">
 <link rel="stylesheet" href="site.css">
 </head>
 <body>
-<header class="titlebar">
-  <div class="bar">
-    <h1 class="name"><svg class="mark" viewBox="0 0 16 16" width="32" height="32" aria-hidden="true" shape-rendering="crispEdges"><path d="M3 1h10v2H3zM1 4h2v11H1zM13 4h2v11h-2zM5 5h6v6H5z"/></svg>Booth</h1>
-    <a href="https://github.com/Shadi-Alrashoodi/booth">Source on GitHub</a>
-  </div>
+<header class="head">
+  <img class="mark" src="mark.svg" width="96" height="96" alt="">
+  <h1>Booth</h1>
+  <p class="line">Voice, text chat and screen sharing for a few friends on Windows, built for the lowest delay.</p>
+  <p class="buttons">
+    <a class="button primary" href="https://github.com/Shadi-Alrashoodi/booth/releases/download/v1.0.0/booth-1.0.0-setup.exe">Download the installer</a>
+    <a class="button secondary" href="https://github.com/Shadi-Alrashoodi/booth/releases/download/v1.0.0/booth-1.0.0-windows-x64.zip">Download the zip</a>
+  </p>
+  <p class="badges">
+    <a class="badge" href="https://github.com/Shadi-Alrashoodi/booth/releases/latest"><span>release</span><span>1.0.0</span></a>
+    <a class="badge" href="#license"><span>license</span><span>MIT or Apache-2.0</span></a>
+  </p>
 </header>
 
 <main>
-  <div class="layout">
-    <div class="intro">
-      <p class="lead">Voice, text chat and screen sharing for a few friends on Windows, built for the lowest delay.</p>
+  <img class="hero" src="hero.png" width="1600" height="920" alt="Booth's start screen and a room with two friends and a short chat">
 
-      <section class="download" aria-labelledby="download">
-        <h2 id="download" class="hidden">Download</h2>
-        <div class="buttons">
-          <a class="button primary" href="https://github.com/Shadi-Alrashoodi/booth/releases/download/v0.2.3/booth-0.2.3-setup.exe">Download the installer</a>
-          <a class="button secondary" href="https://github.com/Shadi-Alrashoodi/booth/releases/download/v0.2.3/booth-0.2.3-windows-x64.zip">Download the zip</a>
-        </div>
-        <p class="caption">Version 0.2.3. Windows 10 version 2004 or later, or Windows 11, <span class="nowrap">64-bit</span>, with a DirectX 12 graphics driver. Older versions are on the <a href="https://github.com/Shadi-Alrashoodi/booth/releases">releases page</a>.</p>
-        <p class="caption">The exe is not code signed yet, so SmartScreen warns once (More info, then Run anyway), and Smart App Control on Windows 11 blocks it.</p>
-      </section>
+  <div class="text">
+    <section aria-labelledby="download">
+      <h2 id="download">Download</h2>
+      <p>Run the installer, or unzip the zip anywhere and run booth.exe. It needs Windows 10 version 2004 or later, or Windows 11, <span class="nowrap">64-bit</span>, with a DirectX 12 graphics driver.</p>
+      <p>The exe is not code signed yet, so SmartScreen warns once (More info, then Run anyway), and Smart App Control on Windows 11 blocks it. The <a href="https://github.com/Shadi-Alrashoodi/booth/releases/latest">release page</a> has latest.txt, signed with minisign, with the SHA-256 of both files.</p>
+    </section>
 
-      <section aria-labelledby="using">
-        <h2 id="using">Using it</h2>
-        <p>Press Host, then Copy, and send the invite to your friends. They paste it under Join a room, and later rejoin from Known hosts. An invite lets in one friend within 10 minutes; for a group, switch it to anyone, 24 h, and copy it again. It carries your internet address, so never post it in public.</p>
-        <p>If a friend cannot get in, Booth gives them a code for the host to paste under the invite. Failing that, forward UDP 41000 to the host's PC, or use Tailscale or WireGuard.</p>
-        <p>The first time, Booth asks for administrator rights to add its firewall rule. Use a wired or USB headset: Booth has no echo cancellation. Push to talk is on by default: hold Right Ctrl to talk. Hotkeys work while a game has focus, unless the game runs as administrator. See and change them in Settings.</p>
-      </section>
-    </div>
+    <section aria-labelledby="using">
+      <h2 id="using">Using it</h2>
+      <p>Press Host, then Copy, and send the invite to your friends. They paste it under Join a room, and later rejoin from Known hosts. An invite lets in one friend within 10 minutes; for a group, switch it to anyone, 24 h, and copy it again. It carries your internet address, so never post it in public.</p>
+      <p>If a friend cannot get in, Booth gives them a code for the host to paste under the invite. Failing that, forward UDP 41000 to the host's PC, or use Tailscale or WireGuard.</p>
+      <p>The first time, Booth asks for administrator rights to add its firewall rule. Use a wired or USB headset: Booth has no echo cancellation.</p>
+      <p>Push to talk is on by default: hold Right Ctrl to talk. Hotkeys work while a game has focus, unless the game runs as administrator. See and change them in Settings.</p>
+    </section>
 
-    <figure class="shot">
-      <img src="room.png" width="544" height="1007" alt="Booth's room window with two people in it and a short chat">
-    </figure>
+    <section aria-labelledby="features">
+      <h2 id="features">Features</h2>
+      <ul>
+        <li>Voice in 5 ms Opus frames, with a jitter buffer that starts at the minimum.</li>
+        <li>Screen sharing with Desktop Duplication and GPU encoding, H.264 or HEVC, up to 1440p at 120 fps. On Intel graphics Booth encodes in software for now, H.264 up to 1080p at 60 fps.</li>
+        <li>Median capture to display on my PCs: about 5 ms at 1440p120 with host and viewer on one PC, 22 to 32 ms over the internet to a laptop on Wi-Fi.</li>
+        <li>Ping, jitter and loss always on screen in a room.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="building">
+      <h2 id="building">Building</h2>
+      <p>You need Windows 11, rustup, the Visual Studio 2022 Build Tools with C++ x64 tools and CMake, and PowerShell.</p>
+      <pre><code>powershell -ExecutionPolicy Bypass -File tools\fetch-third-party.ps1
+cargo build --release --locked -p app</code></pre>
+      <p><code>cargo test --workspace --locked</code> runs the tests. The code is <a href="https://github.com/Shadi-Alrashoodi/booth">on GitHub</a>.</p>
+    </section>
+
+    <section aria-labelledby="security">
+      <h2 id="security">Security</h2>
+      <p>Booth has no accounts and no cloud: voice, video and chat go straight between each friend's PC and the host's, over UDP, encrypted even on a LAN. Each connection starts with a Noise handshake (Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s) in which both sides prove who they are. The crypto is the snow, dalek and RustCrypto crates, not my own; the code around it has had no outside audit. The host decrypts and forwards everything in the room, so only join a host you trust. To learn your outside address, Booth asks two public STUN servers, Cloudflare's and Google's unless you change them in Settings; they see that address and nothing else.</p>
+    </section>
+
+    <section aria-labelledby="license">
+      <h2 id="license">License</h2>
+      <p>MIT or Apache-2.0, at your option. avcodec-62.dll and avutil-60.dll are FFmpeg 8.1.3 with only the H.264 and HEVC decoders and their Direct3D 11 paths, under the LGPL 2.1 or later; Booth loads them at runtime from next to booth.exe, so you can swap in your own build. The unmodified source and the build recipe are in the <a href="https://github.com/Shadi-Alrashoodi/booth/releases/tag/ffmpeg-8.1.3">ffmpeg-8.1.3 release</a>. The DLLs are based in part on the work of the Independent JPEG Group. The fonts are under the SIL Open Font License 1.1, and every other license is listed in THIRD-PARTY-LICENSES.txt in the zip.</p>
+    </section>
   </div>
-
-  <div class="more">
-    <figure class="share">
-      <picture>
-        <source srcset="share-still.png" media="(prefers-reduced-motion: reduce)">
-        <img src="share.gif" width="720" height="403" alt="Booth's loopback test sharing a screen that plays a film, with the delay numbers along the bottom">
-      </picture>
-    </figure>
-
-    <div class="notes">
-      <section aria-labelledby="what">
-        <h2 id="what">Features</h2>
-        <ul>
-          <li>Voice in 5 ms Opus frames, with a jitter buffer that starts at the minimum.</li>
-          <li>Screen sharing with GPU encoding, up to 1440p at 120 fps. On Intel graphics Booth encodes in software for now, up to 1080p at 60 fps.</li>
-          <li>Median capture to display on my PCs: about 5 ms on one PC, 22 to 32 ms over the internet.</li>
-        </ul>
-      </section>
-
-      <section aria-labelledby="security">
-        <h2 id="security">Security</h2>
-        <p>Booth has no accounts and no cloud: voice, video and chat go straight between each friend's PC and the host's, encrypted even on a LAN. Each connection starts with a Noise handshake in which both sides prove who they are. The code has had no outside audit yet. The host decrypts and forwards everything in the room, so only join a host you trust. Two public STUN servers, Cloudflare's and Google's unless you change them in Settings, see your address and nothing else.</p>
-      </section>
-    </div>
-  </div>
-
-  <p class="license">MIT or Apache-2.0. The code, how to build it and every third-party license are <a href="https://github.com/Shadi-Alrashoodi/booth">on GitHub</a>. The film in the screen share is Big Buck Bunny, (c) copyright 2008, Blender Foundation, www.bigbuckbunny.org, under CC BY 3.0.</p>
 </main>
 
 <footer class="strip">
-  <span>Booth 0.2.3</span>
+  <span>Booth 1.0.0</span>
   <span>MIT or Apache-2.0</span>
   <span class="trace" aria-hidden="true"></span>
 </footer>
