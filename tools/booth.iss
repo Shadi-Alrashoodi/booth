@@ -57,7 +57,8 @@ SolidCompression=yes
 SetupIconFile=..\crates\app\assets\booth.ico
 ; Dark like the panel, and without the lines across the pages, which the
 ; panel no longer draws either. No picture on the last page, since it would
-; say nothing about Booth. The corner picture is the mark on window tone,
+; say nothing about Booth and push that page's text away from the left edge
+; every other page uses ([Code] lays the page out like the rest). The corner picture is the mark on window tone,
 ; drawn on whole pixels at each size Setup asks for from 100 to 250 percent,
 ; so it picks one instead of scaling one soft. The pages and the space
 ; around the picture take the same window tone, #141412, so the picture's
@@ -110,12 +111,20 @@ WizardReady=Ready to install
 WizardPreparing=Preparing to install
 WizardUninstalling=Uninstall status
 ExitSetupTitle=Exit setup
+ExitSetupMessage=If you exit now, nothing is installed. You can run Setup again later.%n%nExit Setup?
 ButtonBack=&Back
 ButtonNext=&Next
-ReadyLabel1=Setup is now ready to begin installing [name] on this PC.
+SelectTasksDesc=What else should Setup do?
+SelectTasksLabel2=Clear any box you do not want, then click Next.
+ApplicationsFound=These programs use files Setup has to replace. Let Setup close them, or close them yourself first.
+ApplicationsFound2=These programs use files Setup has to replace. Let Setup close them, and it starts them again when it is done.
+CloseApplications=&Close them for me
+DontCloseApplications=&Leave them open
+ReadyLabel1=Setup is ready to install [name] on this PC.
+ReadyLabel2a=Click Install to start, or Back to change something.
 PreparingDesc=Setup is preparing to install [name] on this PC.
-InstallingLabel=Please wait while Setup installs [name] on this PC.
-UninstallStatusLabel=Please wait while %1 is removed from this PC.
+InstallingLabel=Setup is installing [name] on this PC.
+UninstallStatusLabel=Removing %1 from this PC.
 FinishedHeadingLabel=[name] is installed
 FinishedLabel=Open Booth from the Start menu or the desktop shortcut.
 UninstallAppFullTitle=Uninstall %1
@@ -127,6 +136,71 @@ UninstalledMost=%1 was removed, but some files in its folder could not be delete
 FinishedLabelNoDesktop=Open Booth from the Start menu.
 
 [Code]
+// One layout on every page: the heading, the line under it and the page's
+// own text all start at the heading's left edge, and the mark sits top
+// right. Inno Setup lays out its last page differently, a picture column
+// with the text beside it, which left the text floating in the middle of
+// the window. That page is laid out here like the others instead: no
+// picture, the heading where the other pages have theirs and in their font,
+// the text where theirs starts, and the mark moved onto it.
+procedure InitializeWizard;
+var
+  Edge, Shift: Integer;
+begin
+  Edge := WizardForm.PageNameLabel.Left;
+  Shift := WizardForm.PageDescriptionLabel.Left - Edge;
+  WizardForm.PageDescriptionLabel.Left := Edge;
+  WizardForm.PageDescriptionLabel.Width := WizardForm.PageDescriptionLabel.Width + Shift;
+  Shift := WizardForm.InnerNotebook.Left - Edge;
+  WizardForm.InnerNotebook.Left := Edge;
+  WizardForm.InnerNotebook.Width := WizardForm.InnerNotebook.Width + Shift;
+end;
+
+procedure LayOutFinishedPage;
+var
+  Edge, Gap: Integer;
+begin
+  Edge := WizardForm.PageNameLabel.Left;
+  WizardForm.WizardBitmapImage2.Visible := False;
+  WizardForm.WizardSmallBitmapImage.Parent := WizardForm.FinishedPage;
+
+  WizardForm.FinishedHeadingLabel.Font.Name := WizardForm.PageNameLabel.Font.Name;
+  WizardForm.FinishedHeadingLabel.Font.Size := WizardForm.PageNameLabel.Font.Size;
+  WizardForm.FinishedHeadingLabel.Font.Style := WizardForm.PageNameLabel.Font.Style;
+  WizardForm.FinishedHeadingLabel.Left := Edge;
+  WizardForm.FinishedHeadingLabel.Top := WizardForm.PageNameLabel.Top;
+  WizardForm.FinishedHeadingLabel.Width := WizardForm.WizardSmallBitmapImage.Left - Edge - ScaleX(8);
+  WizardForm.FinishedHeadingLabel.AdjustHeight;
+
+  Gap := WizardForm.RunList.Top - WizardForm.FinishedLabel.Top;
+  WizardForm.FinishedLabel.Left := Edge;
+  WizardForm.FinishedLabel.Top := WizardForm.InnerNotebook.Top;
+  WizardForm.FinishedLabel.Width := WizardForm.InnerNotebook.Width;
+  WizardForm.RunList.Left := Edge;
+  WizardForm.RunList.Top := WizardForm.FinishedLabel.Top + Gap;
+  WizardForm.RunList.Width := WizardForm.InnerNotebook.Width;
+  // Its item was drawn dark on the dark page, so the box showed with no
+  // words beside it; the task list on the first page draws its items right.
+  WizardForm.RunList.Color := WizardForm.TasksList.Color;
+  WizardForm.RunList.Font.Color := WizardForm.TasksList.Font.Color;
+end;
+
+// The uninstaller's page, the same way.
+procedure InitializeUninstallProgressForm;
+var
+  Edge, Shift: Integer;
+begin
+  Edge := UninstallProgressForm.PageNameLabel.Left;
+  Shift := UninstallProgressForm.PageDescriptionLabel.Left - Edge;
+  UninstallProgressForm.PageDescriptionLabel.Left := Edge;
+  UninstallProgressForm.PageDescriptionLabel.Width := UninstallProgressForm.PageDescriptionLabel.Width + Shift;
+  Shift := UninstallProgressForm.InnerNotebook.Left + UninstallProgressForm.StatusLabel.Left - Edge;
+  UninstallProgressForm.StatusLabel.Left := UninstallProgressForm.StatusLabel.Left - Shift;
+  UninstallProgressForm.StatusLabel.Width := UninstallProgressForm.StatusLabel.Width + Shift;
+  UninstallProgressForm.ProgressBar.Left := UninstallProgressForm.ProgressBar.Left - Shift;
+  UninstallProgressForm.ProgressBar.Width := UninstallProgressForm.ProgressBar.Width + Shift;
+end;
+
 // The finish text points at the desktop shortcut, which is not there when
 // its box was cleared. Literal text in FinishedLabel, not [name], so it is
 // found as written.
@@ -134,9 +208,12 @@ procedure CurPageChanged(CurPageID: Integer);
 var
   Text: String;
 begin
-  if (CurPageID = wpFinished) and not WizardIsTaskSelected('desktopicon') then begin
-    Text := WizardForm.FinishedLabel.Caption;
-    StringChangeEx(Text, SetupMessage(msgFinishedLabel), CustomMessage('FinishedLabelNoDesktop'), True);
-    WizardForm.FinishedLabel.Caption := Text;
+  if CurPageID = wpFinished then begin
+    if not WizardIsTaskSelected('desktopicon') then begin
+      Text := WizardForm.FinishedLabel.Caption;
+      StringChangeEx(Text, SetupMessage(msgFinishedLabel), CustomMessage('FinishedLabelNoDesktop'), True);
+      WizardForm.FinishedLabel.Caption := Text;
+    end;
+    LayOutFinishedPage;
   end;
 end;
