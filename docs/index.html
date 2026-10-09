@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Booth: voice, text chat and screen sharing for friends on Windows</title>
+<meta name="description" content="Voice, text chat and screen sharing for a few friends on Windows, built for the lowest delay. One friend hosts on their own PC, the others join with an invite code. No accounts, no cloud.">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#141412">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Booth">
+<meta property="og:description" content="Voice, text chat and screen sharing for a few friends on Windows, built for the lowest delay.">
+<meta property="og:url" content="https://shadi-alrashoodi.github.io/booth/">
+<meta property="og:image" content="https://shadi-alrashoodi.github.io/booth/social.png">
+<meta property="og:image:width" content="1280">
+<meta property="og:image:height" content="640">
+<meta property="og:image:alt" content="Booth's mark and name beside its room window, with two people in it and a short chat">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="favicon.ico">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<header class="titlebar">
+  <div class="bar">
+    <h1 class="name"><svg class="mark" viewBox="0 0 16 16" width="32" height="32" aria-hidden="true" shape-rendering="crispEdges"><path d="M3 1h10v2H3zM1 4h2v11H1zM13 4h2v11h-2zM5 5h6v6H5z"/></svg>Booth</h1>
+    <a href="https://github.com/Shadi-Alrashoodi/booth">Source on GitHub</a>
+  </div>
+</header>
+
+<main>
+  <div class="layout">
+    <div class="intro">
+      <p class="lead">Voice, text chat and screen sharing for a few friends on Windows, built for the lowest delay.</p>
+      <p>One friend hosts on their own PC, the others join with an invite code, and packets go straight between each friend's PC and the host's, encrypted. No accounts, no cloud, no server in the middle. It is free and open source.</p>
+
+      <section class="download" aria-labelledby="download">
+        <h2 id="download" class="hidden">Download</h2>
+        <div class="buttons">
+          <a class="button primary" href="https://github.com/Shadi-Alrashoodi/booth/releases/latest/download/booth-0.2.2-setup.exe">Download the installer</a>
+          <a class="button secondary" href="https://github.com/Shadi-Alrashoodi/booth/releases/latest/download/booth-0.2.2-windows-x64.zip">Download the zip</a>
+        </div>
+        <p class="caption">Version 0.2.2. The installer adds Booth to the Start menu; unzip the zip anywhere and run booth.exe. It needs Windows 10 version 2004 or later, or Windows 11, <span class="nowrap">64-bit</span>, with a DirectX 12 graphics driver. Older versions and how to check a download are on the <a href="https://github.com/Shadi-Alrashoodi/booth/releases">releases page</a>.</p>
+      </section>
+
+      <section aria-labelledby="first-run">
+        <h2 id="first-run">The first time</h2>
+        <ul>
+          <li>SmartScreen says "Windows protected your PC" because the exe is not code signed yet: More info, then Run anyway.</li>
+          <li>Booth asks once for administrator rights for its firewall rule: Allow, then Yes.</li>
+          <li>Use a wired or USB headset: Bluetooth adds tens of milliseconds before Booth does anything.</li>
+        </ul>
+      </section>
+    </div>
+
+    <figure class="shot">
+      <img src="room.png" width="544" height="1007" alt="Booth's room window: the host Shadi and you in the people list, three lines of chat, and the ping, jitter, loss and path along the bottom">
+    </figure>
+
+    <div class="rest">
+      <section aria-labelledby="start">
+        <h2 id="start">Starting a room</h2>
+        <ol>
+          <li>Press Host, then Copy.</li>
+          <li>Send the invite over whatever chat you use. It lets in one friend within 10 minutes; for a group chat, switch it to anyone, 24 h first.</li>
+          <li>Your friend runs Booth too and pastes the invite under Join a room. Next time they rejoin from Known hosts.</li>
+        </ol>
+        <p>If a friend cannot get in, Booth shows them a code to send back to the host, who pastes it under the invite; failing that, forward UDP 41000 to the host's PC, or use Tailscale or WireGuard.</p>
+        <p>Hotkeys work with a game in focus, unless the game runs as administrator, and you can change them in Settings:</p>
+        <dl class="keys">
+          <dt>Right Ctrl</dt><dd>push to talk</dd>
+          <dt>Ctrl+Shift+M</dt><dd>mute</dd>
+          <dt>Ctrl+Shift+D</dt><dd>deafen</dd>
+          <dt>Ctrl+Shift+S</dt><dd>twice within a second to share, once to stop</dd>
+          <dt>Ctrl+Shift+Space</dt><dd>show or hide Booth</dd>
+          <dt>Ctrl+Shift+I</dt><dd>the stats panel</dd>
+        </dl>
+      </section>
+
+      <section aria-labelledby="what">
+        <h2 id="what">What it does</h2>
+        <ul>
+          <li>Voice in 5 ms Opus frames, 10 ms with a repair copy while the link loses packets, and a jitter buffer that starts at the minimum.</li>
+          <li>Screen sharing with Desktop Duplication and GPU encoding, up to 1440p at 120 fps, H.264 or HEVC.</li>
+          <li>Voice, video and chat over UDP, never in plain text, not even on a LAN.</li>
+          <li>Ping, jitter and loss always on screen, along the bottom of every window.</li>
+        </ul>
+      </section>
+    </div>
+  </div>
+
+  <section class="measured" aria-labelledby="measured">
+    <h2 id="measured">Measured</h2>
+    <p>On my PCs, capture to display (median): about 5 ms for a 1440p120 test pattern through a room on one PC, and 22 to 32 ms over the internet to my laptop on Wi-Fi. For voice I have measured only the playback side so far: 20 ms.</p>
+    <figure>
+      <picture>
+        <source srcset="demo-still.png" media="(prefers-reduced-motion: reduce)">
+        <img src="demo.gif" width="1120" height="651" alt="Booth's loopback test on one PC: a test pattern, with the loss, encode, decode and end to end times along the bottom">
+      </picture>
+      <figcaption>The loopback test built into booth.exe, on a 1920x1080 test pattern: capture, encode, decode and display on one PC with no room around it, 2 to 3 ms end to end.</figcaption>
+    </figure>
+  </section>
+
+  <div class="column">
+    <section aria-labelledby="limits">
+      <h2 id="limits">Before you try it</h2>
+      <ul>
+        <li>Windows only, for the host and every friend: no Mac, Linux or phone.</li>
+        <li>Up to eight people in a room, the host included.</li>
+        <li>One person shares at a time, a whole monitor, view only for now.</li>
+        <li>No relay: when two routers block a direct path, Booth says why and what would fix it.</li>
+        <li>Sharing from Intel graphics encodes in software for now, H.264 up to 1080p at 60 fps. Sharing from AMD graphics goes through Windows' hardware encoder, and I have not had an AMD PC to test it on yet.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="security">
+      <h2 id="security">Security</h2>
+      <p>In a Noise handshake (Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s) both sides prove who they are; every later packet is encrypted. No crypto of my own: the snow, dalek and RustCrypto crates. The host decrypts and forwards everything in the room, so only join a host you trust. The handshake and session code has not had an outside audit yet.</p>
+      <p>To find its address from outside, Booth asks a public STUN server, Cloudflare's or Google's unless you change the list in Settings; it sees your address and nothing else.</p>
+    </section>
+
+    <section aria-labelledby="source">
+      <h2 id="source">Source and license</h2>
+      <p>Booth is written in Rust and licensed under MIT or Apache-2.0, at your option. The two FFmpeg DLLs that come with it are under the LGPL 2.1 or later, and their exact source is in <a href="https://github.com/Shadi-Alrashoodi/booth/releases/tag/ffmpeg-8.1.3">a release of its own</a>. The code, how to build it and every third-party license are <a href="https://github.com/Shadi-Alrashoodi/booth">on GitHub</a>.</p>
+    </section>
+  </div>
+</main>
+
+<footer class="strip">
+  <span>Booth 0.2.2</span>
+  <span>MIT or Apache-2.0</span>
+  <span class="trace" aria-hidden="true"></span>
+</footer>
+</body>
+</html>
