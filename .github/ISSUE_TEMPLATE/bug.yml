@@ -1,0 +1,46 @@
+name: Bug report
+description: Something in Booth does not work as it should.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what Booth did instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Booth version
+      description: The number in the name of the file you downloaded. The first line of the log has it too.
+      placeholder: 1.0.0
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      description: Press Win+R, type `winver` and press Enter.
+      placeholder: Windows 11 24H2
+    validations:
+      required: true
+  - type: dropdown
+    id: connection
+    attributes:
+      label: How the friend connected, or tried to
+      options:
+        - Same LAN
+        - Over the internet
+        - Tailscale or WireGuard
+  - type: textarea
+    id: log
+    attributes:
+      label: Log file
+      description: >-
+        Booth writes a log only when started with --log. Close Booth, press Win+R,
+        paste `"%LOCALAPPDATA%\Programs\Booth\booth.exe" --log` and press Enter.
+        If you run Booth from the zip, use the path of that booth.exe instead.
+        Make the problem happen again, then open `%LOCALAPPDATA%\Booth` the same way
+        and drag booth.log here. It shows IP addresses and your Windows user name,
+        so edit those out first if you do not want them public.
