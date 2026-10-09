@@ -3798,7 +3798,7 @@ mod tests {
             devices,
             vec![lan],
         );
-        let name = AddressName::new(String::from("myroom.duckdns.org"), Lookup::default());
+        let name = AddressName::new(String::from("myroom.example.net"), Lookup::default());
         host.address_name = Some(name);
         let server = Wire::new();
         host.stun_found(vec![server.addr()], &socket);
@@ -3825,7 +3825,7 @@ mod tests {
             addr: SocketAddr::V4(addr),
         };
         let bound = |addr: SocketAddrV4| SocketAddrV4::new(*addr.ip(), port);
-        let name = Some(String::from("myroom.duckdns.org"));
+        let name = Some(String::from("myroom.example.net"));
         assert_eq!(
             addresses_in(&heard),
             [(
@@ -4851,7 +4851,7 @@ mod tests {
         let start = Instant::now();
         let (log, captured) = Log::capture(64);
         let (mut host, _socket) = Rig::host(start, log, true);
-        let named = String::from("myroom.duckdns.org");
+        let named = String::from("myroom.example.net");
         host.address_name = Some(AddressName::new(named.clone(), Lookup::default()));
         host.stun_resolved(start);
         host.port_mapping(pcp_at(OUTSIDE), start);
@@ -4892,8 +4892,8 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "address name myroom.duckdns.org points to 203.0.113.7, this pc's outside address",
-                "address name myroom.duckdns.org points to 203.0.113.7, not this pc's outside address 198.51.100.4; friends who look it up cannot reach this pc until the dynamic dns client updates it",
+                "address name myroom.example.net points to 203.0.113.7, this pc's outside address",
+                "address name myroom.example.net points to 203.0.113.7, not this pc's outside address 198.51.100.4; friends who look it up cannot reach this pc until the dynamic dns client updates it",
             ]
         );
     }
@@ -4906,7 +4906,7 @@ mod tests {
         let (log, captured) = Log::capture(64);
         let (mut host, _socket) = Rig::host(start, log, true);
         host.address_name = Some(AddressName::new(
-            String::from("myroom.duckdns.org"),
+            String::from("myroom.example.net"),
             Lookup::default(),
         ));
         host.stun_resolved(start);
@@ -4933,7 +4933,7 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "address name myroom.duckdns.org points to 198.51.100.20; stun and the router have not said what this pc's outside address is"
+                "address name myroom.example.net points to 198.51.100.20; stun and the router have not said what this pc's outside address is"
             ]
         );
     }
@@ -5515,7 +5515,7 @@ mod tests {
     fn changed_under_ana(start: Instant, name_set: bool) -> (Rig, Guest, Instant) {
         let (mut host, socket) = Rig::host(start, Log::off(), false);
         if name_set {
-            let name = AddressName::new(String::from("myroom.duckdns.org"), Lookup::default());
+            let name = AddressName::new(String::from("myroom.example.net"), Lookup::default());
             host.address_name = Some(name);
         }
         let server = Wire::new();

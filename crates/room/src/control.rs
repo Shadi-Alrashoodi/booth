@@ -1392,7 +1392,7 @@ mod tests {
                 candidate(CandidateKind::Ipv6, "[2001:db8::20]:41000"),
                 candidate(CandidateKind::Public, "203.0.113.9:41000"),
             ],
-            address_name: Some(String::from("myroom.duckdns.org")),
+            address_name: Some(String::from("myroom.example.net")),
         }
     }
 

@@ -79,7 +79,7 @@ fn host(n: u8) -> KnownHost {
             candidate(CandidateKind::Ipv6, "[2001:db8::20]:41000"),
             candidate(CandidateKind::Public, "203.0.113.9:52000"),
         ],
-        address_name: Some(String::from("myroom.duckdns.org")),
+        address_name: Some(String::from("myroom.example.net")),
         last_reached: Some("127.0.0.1:41007".parse().unwrap()),
         manual: Manual::parse("203.0.113.5:41000").unwrap(),
         last_seen: 1_790_200_000 + u64::from(n),
@@ -303,9 +303,9 @@ fn what_can_be_typed_for_a_host() {
         Ok(addr("[2001:db8::5]:41000"))
     );
     assert_eq!(
-        Manual::parse("myroom.duckdns.org"),
+        Manual::parse("myroom.example.net"),
         Ok(Some(Manual(Entry::Name(String::from(
-            "myroom.duckdns.org"
+            "myroom.example.net"
         )))))
     );
     assert_eq!(Manual::parse("   "), Ok(None));
@@ -316,14 +316,14 @@ fn what_can_be_typed_for_a_host() {
         "[::1]:41000",
         "localhost",
         "my room.example.net",
-        "myroom.duckdns.org:41000",
+        "myroom.example.net:41000",
         "2001:db8::5",
-        "https://myroom.duckdns.org",
+        "https://myroom.example.net",
     ] {
         assert!(Manual::parse(bad).is_err(), "{bad}");
     }
-    let typed = Manual::parse("myroom.duckdns.org").unwrap().unwrap();
-    assert_eq!(typed.to_string(), "myroom.duckdns.org");
+    let typed = Manual::parse("myroom.example.net").unwrap().unwrap();
+    assert_eq!(typed.to_string(), "myroom.example.net");
 }
 
 // Each edit replaces, inserts or removes one byte.
@@ -364,7 +364,7 @@ fn any_kind() -> impl Strategy<Value = CandidateKind> {
 fn any_name() -> impl Strategy<Value = Option<String>> {
     prop_oneof![
         Just(None),
-        Just(Some(String::from("myroom.duckdns.org"))),
+        Just(Some(String::from("myroom.example.net"))),
         "[a-z0-9.:-]{0,20}".prop_map(Some),
     ]
 }
@@ -618,7 +618,7 @@ fn panel_forgets_and_sets_manual() {
         "newest first"
     );
 
-    let typed = Manual::parse("myroom.duckdns.org").unwrap();
+    let typed = Manual::parse("myroom.example.net").unwrap();
     set_manual(&folder.0, &[1; 32], typed.clone()).unwrap();
     forget_host(&folder.0, &[2; 32]).unwrap();
     // Forgetting a host that is not there changes nothing.

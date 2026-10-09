@@ -783,13 +783,13 @@ mod tests {
     #[test]
     fn round_trip() {
         let folder = Folder::new("round-trip");
-        named("myroom.duckdns.org").save(&folder.0).unwrap();
+        named("myroom.example.net").save(&folder.0).unwrap();
         assert_eq!(
             fs::read_to_string(folder.file()).unwrap(),
-            "address_name = myroom.duckdns.org\r\n"
+            "address_name = myroom.example.net\r\n"
         );
         let (settings, problems) = Settings::load(&folder.0);
-        assert_eq!(settings.address_name(), Some("myroom.duckdns.org"));
+        assert_eq!(settings.address_name(), Some("myroom.example.net"));
         assert!(problems.is_empty(), "{problems:?}");
 
         Settings::default().save(&folder.0).unwrap();
@@ -921,17 +921,17 @@ mod tests {
 
     #[test]
     fn only_names_the_invite_can_carry_are_taken() {
-        let mut settings = named("myroom.duckdns.org");
+        let mut settings = named("myroom.example.net");
         for bad in [
             "localhost",
             "192.168.1.20",
             "127.1",
             "my room.example.net",
-            "https://myroom.duckdns.org",
-            "myroom.duckdns.org.",
+            "https://myroom.example.net",
+            "myroom.example.net.",
         ] {
             assert!(settings.set_address_name(bad).is_err(), "{bad}");
-            assert_eq!(settings.address_name(), Some("myroom.duckdns.org"));
+            assert_eq!(settings.address_name(), Some("myroom.example.net"));
         }
         settings.set_address_name("  ").unwrap();
         assert_eq!(settings.address_name(), None);
@@ -940,7 +940,7 @@ mod tests {
     #[test]
     fn name_port_and_stun_servers_round_trip() {
         let folder = Folder::new("all-keys");
-        let mut settings = named("myroom.duckdns.org");
+        let mut settings = named("myroom.example.net");
         settings.set_name("  Mara ");
         settings.set_port("41010").unwrap();
         settings
@@ -949,7 +949,7 @@ mod tests {
         settings.save(&folder.0).unwrap();
         assert_eq!(
             fs::read_to_string(folder.file()).unwrap(),
-            "name = Mara\r\nport = 41010\r\nstun_servers = stun.example.org:3478, [2001:db8::3]:3478\r\naddress_name = myroom.duckdns.org\r\n"
+            "name = Mara\r\nport = 41010\r\nstun_servers = stun.example.org:3478, [2001:db8::3]:3478\r\naddress_name = myroom.example.net\r\n"
         );
         let (loaded, problems) = Settings::load(&folder.0);
         assert!(problems.is_empty(), "{problems:?}");

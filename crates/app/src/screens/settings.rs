@@ -737,9 +737,9 @@ mod tests {
             "127.1",
             "0x7f000001",
             "my room.example.net",
-            "https://myroom.duckdns.org",
-            "myroom.duckdns.org.",
-            "-myroom.duckdns.org",
+            "https://myroom.example.net",
+            "myroom.example.net.",
+            "-myroom.example.net",
             long_part.as_str(),
             too_long.as_str(),
         ] {
@@ -756,18 +756,18 @@ mod tests {
 
     #[test]
     fn name_trimmed() {
-        let next = typed("  myroom.duckdns.org ")
+        let next = typed("  myroom.example.net ")
             .settings(&Settings::default())
             .unwrap();
-        assert_eq!(next.address_name(), Some("myroom.duckdns.org"));
+        assert_eq!(next.address_name(), Some("myroom.example.net"));
     }
 
     #[test]
     fn an_empty_field_means_no_name() {
         let mut saved = Settings::default();
-        saved.set_address_name("myroom.duckdns.org").unwrap();
+        saved.set_address_name("myroom.example.net").unwrap();
         let draft = Draft::new(&saved, KnownDevices::default(), String::new());
-        assert_eq!(draft.address_name, "myroom.duckdns.org");
+        assert_eq!(draft.address_name, "myroom.example.net");
         for empty in ["", "   "] {
             assert_eq!(typed(empty).settings(&saved).unwrap().address_name(), None);
         }

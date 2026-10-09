@@ -1492,7 +1492,7 @@ mod tests {
                 to: "198.51.100.7:41000".parse().unwrap(),
             }),
             address_name: Some(NameView {
-                name: String::from("myroom.duckdns.org"),
+                name: String::from("myroom.example.net"),
                 answer: found(&["203.0.113.9"]),
                 outside: Some(NameMatch {
                     points_to: Ipv4Addr::new(203, 0, 113, 9),
@@ -1561,7 +1561,7 @@ mod tests {
     #[test]
     fn a_hidden_name_hides_what_the_lookup_refused() {
         let refused = NameView {
-            name: String::from("myroom.duckdns.org"),
+            name: String::from("myroom.example.net"),
             answer: NameAnswer::Found {
                 addrs: Vec::new(),
                 refused: vec![("127.0.0.1".parse().unwrap(), "it is a loopback address")],
@@ -1644,7 +1644,7 @@ mod tests {
 
     #[test]
     fn the_host_sees_whether_its_name_points_here() {
-        let name = String::from("myroom.duckdns.org");
+        let name = String::from("myroom.example.net");
         let here = NameView {
             name: name.clone(),
             answer: found(&["198.51.100.20"]),
@@ -1684,14 +1684,14 @@ mod tests {
     #[test]
     fn client_name_lookup() {
         let view = |answer| NameView {
-            name: String::from("myroom.duckdns.org"),
+            name: String::from("myroom.example.net"),
             answer,
             outside: None,
         };
         let not_yet = name_lines(Role::Client, view(NameAnswer::NotAsked));
         assert_eq!(
             not_yet,
-            [("Address name", String::from("myroom.duckdns.org"))]
+            [("Address name", String::from("myroom.example.net"))]
         );
         let value = |answer| name_lines(Role::Client, view(answer))[1].1.clone();
         assert_eq!(value(NameAnswer::Looking), "looking it up");

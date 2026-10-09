@@ -3377,14 +3377,14 @@ mod tests {
     #[test]
     fn name_looked_up_after_fast_round() {
         let mut joining = Joining::new(easy(), |invite| {
-            invite.hostname = Some(String::from("myroom.duckdns.org"));
+            invite.hostname = Some(String::from("myroom.example.net"));
         });
         joining.tick(DUE - Duration::from_millis(1));
         assert!(joining.client.name_wanted().is_none());
         let view = joining.tick(DUE);
         assert_eq!(view.notice, Some(Notice::StillTrying));
         let request = joining.client.name_wanted().expect("the lookup starts");
-        assert_eq!(request.name, "myroom.duckdns.org");
+        assert_eq!(request.name, "myroom.example.net");
         joining.tick(DUE + Duration::from_secs(1));
         assert!(joining.client.name_wanted().is_none(), "asked twice");
 
@@ -3467,7 +3467,7 @@ mod tests {
         assert_eq!(joining.client.drops.bad, 2);
     }
 
-    const NAME: &str = "myroom.duckdns.org";
+    const NAME: &str = "myroom.example.net";
 
     fn name_gave(ips: &[&str]) -> Outcome {
         Outcome {
@@ -3961,7 +3961,7 @@ mod tests {
             host_name: String::from("Mara"),
             secret: Zeroizing::new(host.peer_secret),
             candidates: vec![lan("192.0.2.10:41000")],
-            address_name: Some(String::from("myroom.duckdns.org")),
+            address_name: Some(String::from("myroom.example.net")),
             last_reached: reached,
             manual: None,
             last_seen: 1_790_000_000,

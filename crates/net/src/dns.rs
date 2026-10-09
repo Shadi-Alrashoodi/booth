@@ -827,7 +827,7 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    // Walks up from the name itself (myroom.duckdns.org, duckdns.org, org)
+    // Walks up from the name itself (myroom.example.net, example.net, org)
     // until the system resolver gives NS records, then finds their addresses.
     // Any failure on the way only moves the walk up a level: some dynamic DNS
     // providers run their own servers, which answer an NS question for a

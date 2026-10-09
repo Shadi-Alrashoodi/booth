@@ -285,7 +285,7 @@ mod tests {
             mapped: false,
             mapped_verified: false,
             second_router: false,
-            hostname: Some(String::from("myroom.duckdns.org")),
+            hostname: Some(String::from("myroom.example.net")),
         }
     }
 
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn host_check_prefers_this_pc() {
         let outside = Ipv4Addr::new(198, 51, 100, 20);
-        let mut name = AddressName::new(String::from("myroom.duckdns.org"), Lookup::default());
+        let mut name = AddressName::new(String::from("myroom.example.net"), Lookup::default());
         assert_eq!(name.matched(Some(outside)), None);
         name.found(found(&["2001:db8::1", "203.0.113.5", "198.51.100.20"]));
         let here = name.matched(Some(outside)).expect("both are known");
@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn lookup_once_per_ask() {
-        let mut name = AddressName::new(String::from("myroom.duckdns.org"), Lookup::default());
+        let mut name = AddressName::new(String::from("myroom.example.net"), Lookup::default());
         assert!(!name.is_asked());
         assert!(name.request().is_none());
         name.ask();
@@ -456,8 +456,8 @@ mod tests {
         assert!(name.request().is_none(), "asked again while looking");
 
         let servers = Nameservers {
-            zone: String::from("duckdns.org"),
-            names: vec![String::from("ns1.duckdns.org")],
+            zone: String::from("example.net"),
+            names: vec![String::from("ns1.example.net")],
             addrs: vec!["198.51.100.53:53".parse().unwrap()],
         };
         let mut outcome = found(&["203.0.113.5"]);
@@ -475,7 +475,7 @@ mod tests {
 
         let gone = Outcome {
             servers: None,
-            result: Err(DnsError::NoSuchName(String::from("myroom.duckdns.org"))),
+            result: Err(DnsError::NoSuchName(String::from("myroom.example.net"))),
         };
         assert!(name.found(gone).is_empty());
         assert_eq!(name.view(None).answer, NameAnswer::NoSuchName);

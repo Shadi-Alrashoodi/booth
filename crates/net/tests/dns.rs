@@ -14,7 +14,7 @@ use net::dns::{
 use proptest::prelude::*;
 use proptest::test_runner::FileFailurePersistence;
 
-const NAME: &str = "myroom.duckdns.org";
+const NAME: &str = "myroom.example.net";
 const ID: u16 = 0x1234;
 const HOME: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 5);
 const HOME_V6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5);
@@ -69,8 +69,8 @@ fn ns(owner: &str, target: &str) -> Rec {
 }
 
 fn soa(owner: &str) -> Rec {
-    let mut data = wire("ns1.duckdns.org");
-    data.extend(wire("hostmaster.duckdns.org"));
+    let mut data = wire("ns1.example.net");
+    data.extend(wire("hostmaster.example.net"));
     data.extend_from_slice(&[0; 20]);
     raw(owner, 6, 1, &data)
 }
@@ -158,14 +158,14 @@ fn captured() -> Vec<u8> {
         &[0x12, 0x34, 0x84, 0x00][..],
         // One question, one answer, one authority and one additional record.
         &[0, 1, 0, 1, 0, 1, 0, 1],
-        // The question, myroom.duckdns.org A IN, at offset 12.
+        // The question, myroom.example.net A IN, at offset 12.
         &wire(NAME), &[0, 1, 0, 1],
         // The answer at 36: a pointer to the question's name, A, IN, 60 s.
         &[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 203, 0, 113, 5],
-        // Authority at 52: duckdns.org, a pointer into the question's name at
-        // 19, NS ns1 plus a pointer back to duckdns.org. The data is at 64.
+        // Authority at 52: example.net, a pointer into the question's name at
+        // 19, NS ns1 plus a pointer back to example.net. The data is at 64.
         &[0xc0, 0x13, 0, 2, 0, 1, 0, 0, 0x0e, 0x10, 0, 6, 3, b'n', b's', b'1', 0xc0, 0x13],
-        // Additional at 70: glue for ns1.duckdns.org, a pointer to 64.
+        // Additional at 70: glue for ns1.example.net, a pointer to 64.
         &[0xc0, 0x40, 0, 1, 0, 1, 0, 0, 0x0e, 0x10, 0, 4, 99, 79, 143, 35],
     ]
     .concat()
@@ -181,8 +181,8 @@ fn query_matches_the_rfc_layout() {
         // One question, no answer, authority or additional records.
         0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         6, b'm', b'y', b'r', b'o', b'o', b'm',
-        7, b'd', b'u', b'c', b'k', b'd', b'n', b's',
-        3, b'o', b'r', b'g',
+        7, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
+        3, b'n', b'e', b't',
         0,
         // Type A, class IN.
         0x00, 0x01, 0x00, 0x01,
@@ -192,15 +192,15 @@ fn query_matches_the_rfc_layout() {
 
 #[test]
 fn queries_carry_their_type_and_recursion_bit() {
-    let aaaa = Query::new("MyRoom.DuckDNS.org.", Kind::Aaaa, true, 1)
+    let aaaa = Query::new("MyRoom.Example.net.", Kind::Aaaa, true, 1)
         .unwrap()
         .encode();
     assert_eq!(aaaa[2..4], [0x01, 0x00]);
     assert_eq!(aaaa[aaaa.len() - 4..], [0, 28, 0, 1]);
     // The trailing dot goes, the case stays as given.
-    assert_eq!(aaaa[12..aaaa.len() - 4], wire("MyRoom.DuckDNS.org")[..]);
+    assert_eq!(aaaa[12..aaaa.len() - 4], wire("MyRoom.Example.net")[..]);
 
-    let ns = Query::new("duckdns.org", Kind::Ns, false, 1)
+    let ns = Query::new("example.net", Kind::Ns, false, 1)
         .unwrap()
         .encode();
     assert_eq!(ns[2..4], [0, 0]);
@@ -213,7 +213,7 @@ fn names_that_cannot_be_asked_are_refused() {
     assert_eq!(refused(""), Some(NameError::Empty));
     assert_eq!(refused("."), Some(NameError::Empty));
     assert_eq!(refused("a..org"), Some(NameError::EmptyLabel));
-    assert_eq!(refused(".duckdns.org"), Some(NameError::EmptyLabel));
+    assert_eq!(refused(".example.net"), Some(NameError::EmptyLabel));
     assert_eq!(
         refused(&format!("{}.org", "a".repeat(64))),
         Some(NameError::LongLabel(64))
@@ -227,7 +227,7 @@ fn names_that_cannot_be_asked_are_refused() {
     assert_eq!(refused(&longest), None);
     let over = format!("{label}.{label}.{label}.{label}");
     assert_eq!(refused(&over), Some(NameError::Long(255)));
-    assert_eq!(refused("_dns.my-room.duckdns.org"), None);
+    assert_eq!(refused("_dns.my-room.example.net"), None);
 }
 
 #[test]
@@ -265,7 +265,7 @@ fn question_case_is_ignored() {
         answers: vec![a(NAME, HOME)],
         ..Reply::default()
     };
-    let msg = build(ID, &question("MyRoom.DUCKDNS.org", 1), NAME, &reply);
+    let msg = build(ID, &question("MyRoom.EXAMPLE.net", 1), NAME, &reply);
     assert_eq!(
         parse(NAME, Kind::A, &msg).unwrap().addrs,
         [IpAddr::V4(HOME)]
@@ -294,7 +294,7 @@ fn cname_chain_is_followed() {
 fn cname_leaving_the_answer() {
     let reply = Reply {
         aa: true,
-        answers: vec![cname("room.example.net", "MyRoom.DuckDNS.org")],
+        answers: vec![cname("room.example.net", "MyRoom.Example.net")],
         ..Reply::default()
     };
     let msg = answer("room.example.net", Kind::A, &reply);
@@ -370,7 +370,7 @@ fn nxdomain_and_servfail_come_back_as_rcodes() {
     let missing = Reply {
         aa: true,
         rcode: 3,
-        authority: vec![soa("duckdns.org")],
+        authority: vec![soa("example.net")],
         ..Reply::default()
     };
     let response = parse(NAME, Kind::A, &answer(NAME, Kind::A, &missing)).unwrap();
@@ -392,18 +392,18 @@ fn ns_answers_give_the_nameserver_names() {
     let reply = Reply {
         aa: true,
         answers: vec![
-            ns("duckdns.org", "ns1.duckdns.org"),
-            ns("duckdns.org", "NS2.DuckDNS.org"),
+            ns("example.net", "ns1.example.net"),
+            ns("example.net", "NS2.Example.net"),
         ],
         ..Reply::default()
     };
     let response = parse(
-        "duckdns.org",
+        "example.net",
         Kind::Ns,
-        &answer("duckdns.org", Kind::Ns, &reply),
+        &answer("example.net", Kind::Ns, &reply),
     )
     .unwrap();
-    assert_eq!(response.nameservers, ["ns1.duckdns.org", "ns2.duckdns.org"]);
+    assert_eq!(response.nameservers, ["ns1.example.net", "ns2.example.net"]);
     assert!(response.addrs.is_empty());
 }
 
@@ -423,7 +423,7 @@ fn other_records_are_left_out() {
     let reply = Reply {
         aa: true,
         answers: vec![
-            a("other.duckdns.org", Ipv4Addr::new(198, 51, 100, 1)),
+            a("other.example.net", Ipv4Addr::new(198, 51, 100, 1)),
             raw(NAME, 16, 1, b"\x05hello"),
             raw(NAME, 1, 3, &[198, 51, 100, 2]),
             a(NAME, HOME),
@@ -447,10 +447,10 @@ fn answer_to_another_query() {
 
     let reply = Reply {
         aa: true,
-        answers: vec![a("other.duckdns.org", HOME)],
+        answers: vec![a("other.example.net", HOME)],
         ..Reply::default()
     };
-    let other_name = build(ID, &question("other.duckdns.org", 1), "", &reply);
+    let other_name = build(ID, &question("other.example.net", 1), "", &reply);
     assert_eq!(parse(NAME, Kind::A, &other_name), Err(ParseError::Question));
     assert_eq!(parse(NAME, Kind::Aaaa, &good), Err(ParseError::Question));
     let mut chaos = good.clone();
@@ -588,18 +588,18 @@ fn records_of_the_wrong_size_are_refused() {
         Err(ParseError::Record { kind: 1, len: 5 })
     );
 
-    let mut data = wire("ns1.duckdns.org");
+    let mut data = wire("ns1.example.net");
     data.push(0);
     let reply = Reply {
         aa: true,
-        answers: vec![raw("duckdns.org", 2, 1, &data)],
+        answers: vec![raw("example.net", 2, 1, &data)],
         ..Reply::default()
     };
     assert_eq!(
         parse(
-            "duckdns.org",
+            "example.net",
             Kind::Ns,
-            &answer("duckdns.org", Kind::Ns, &reply)
+            &answer("example.net", Kind::Ns, &reply)
         ),
         Err(ParseError::Record { kind: 2, len: 18 })
     );
@@ -752,7 +752,7 @@ fn resolver<'a>(
 
 fn servers(addrs: &[SocketAddr]) -> Nameservers {
     Nameservers {
-        zone: "duckdns.org".to_string(),
+        zone: "example.net".to_string(),
         names: Vec::new(),
         addrs: addrs.to_vec(),
     }
@@ -928,16 +928,16 @@ fn home_server(turn: &Turn, v4: Vec<Ipv4Addr>, v6: Vec<Ipv6Addr>) -> Fake<'_> {
 #[test]
 fn walk_up_to_nameservers() {
     let system = FakeSystem::default()
-        .ns("duckdns.org", &["ns1.duckdns.org", "NS2.duckdns.org."])
-        .addrs("ns1.duckdns.org", Kind::A, &["127.0.0.11"])
-        .addrs("ns2.duckdns.org", Kind::A, &["127.0.0.12"]);
+        .ns("example.net", &["ns1.example.net", "NS2.example.net."])
+        .addrs("ns1.example.net", Kind::A, &["127.0.0.11"])
+        .addrs("ns2.example.net", Kind::A, &["127.0.0.12"]);
     let r = resolver(&system, &loopback_ok);
-    let (walked, lines) = noted(|note| r.nameservers("MyRoom.DuckDNS.org.", note));
+    let (walked, lines) = noted(|note| r.nameservers("MyRoom.Example.net.", note));
     assert_eq!(
         walked,
         Ok(Nameservers {
-            zone: "duckdns.org".to_string(),
-            names: vec!["ns1.duckdns.org".to_string(), "ns2.duckdns.org".to_string()],
+            zone: "example.net".to_string(),
+            names: vec!["ns1.example.net".to_string(), "ns2.example.net".to_string()],
             addrs: vec![
                 "127.0.0.11:53".parse().unwrap(),
                 "127.0.0.12:53".parse().unwrap(),
@@ -947,21 +947,21 @@ fn walk_up_to_nameservers() {
     assert_eq!(
         system.calls(),
         [
-            "NS myroom.duckdns.org",
-            "NS duckdns.org",
-            "A ns1.duckdns.org",
-            "AAAA ns1.duckdns.org",
-            "A ns2.duckdns.org",
-            "AAAA ns2.duckdns.org",
+            "NS myroom.example.net",
+            "NS example.net",
+            "A ns1.example.net",
+            "AAAA ns1.example.net",
+            "A ns2.example.net",
+            "AAAA ns2.example.net",
         ]
     );
     assert!(has(
         &lines,
-        "myroom.duckdns.org has no nameservers of its own"
+        "myroom.example.net has no nameservers of its own"
     ));
     assert!(has(
         &lines,
-        "nameserver ns1.duckdns.org is at 127.0.0.11:53"
+        "nameserver ns1.example.net is at 127.0.0.11:53"
     ));
 }
 
@@ -970,15 +970,15 @@ fn walk_past_errors() {
     let system = FakeSystem::default()
         .ns_fails(NAME, SystemError::NoSuchName)
         .ns_fails(
-            "duckdns.org",
+            "example.net",
             SystemError::Failed("the system resolver timed out".to_string()),
         )
-        .ns("org", &["a0.org.afilias-nst.info"])
-        .addrs("a0.org.afilias-nst.info", Kind::A, &["127.0.0.20"]);
+        .ns("net", &["a.gtld-servers.net"])
+        .addrs("a.gtld-servers.net", Kind::A, &["127.0.0.20"]);
     let r = resolver(&system, &loopback_ok);
     let (walked, lines) = noted(|note| r.nameservers(NAME, note));
-    assert_eq!(walked.unwrap().zone, "org");
-    assert!(has(&lines, "duckdns.org: the system resolver timed out"));
+    assert_eq!(walked.unwrap().zone, "net");
+    assert!(has(&lines, "example.net: the system resolver timed out"));
 
     let nothing = FakeSystem::default();
     let r = resolver(&nothing, &loopback_ok);
@@ -986,7 +986,7 @@ fn walk_past_errors() {
     assert_eq!(walked, Err(DnsError::NoNameservers(NAME.to_string())));
     assert_eq!(
         nothing.calls(),
-        ["NS myroom.duckdns.org", "NS duckdns.org", "NS org"]
+        ["NS myroom.example.net", "NS example.net", "NS net"]
     );
 }
 
@@ -994,7 +994,7 @@ fn walk_past_errors() {
 fn walk_takes_four_servers_at_most() {
     let system = FakeSystem::default()
         .ns(
-            "duckdns.org",
+            "example.net",
             &["ns1.x", "ns2.x", "ns3.x", "ns4.x", "ns5.x"],
         )
         .addrs("ns1.x", Kind::A, &["127.0.0.11"])
@@ -1013,7 +1013,7 @@ fn walk_takes_four_servers_at_most() {
 #[test]
 fn walk_takes_one_address_per_family() {
     let system = FakeSystem::default()
-        .ns("duckdns.org", &["ns1.x", "ns2.x"])
+        .ns("example.net", &["ns1.x", "ns2.x"])
         .addrs("ns1.x", Kind::A, &["127.0.0.11", "127.0.0.21"])
         .addrs("ns1.x", Kind::Aaaa, &["::1"])
         .addrs_fail(
@@ -1039,7 +1039,7 @@ fn walk_takes_one_address_per_family() {
 #[test]
 fn walk_refuses_checked_addresses() {
     let system = FakeSystem::default()
-        .ns("duckdns.org", &["ns1.x", "ns2.x"])
+        .ns("example.net", &["ns1.x", "ns2.x"])
         .addrs("ns1.x", Kind::A, &["127.0.0.11", "127.0.0.21"])
         .addrs("ns2.x", Kind::A, &["127.0.0.12"]);
     let check = |addr: SocketAddr| {
@@ -1069,7 +1069,7 @@ fn walk_refuses_checked_addresses() {
     let (walked, _) = noted(|note| r.nameservers(NAME, note));
     assert_eq!(
         walked,
-        Err(DnsError::NoServerAddress("duckdns.org".to_string()))
+        Err(DnsError::NoServerAddress("example.net".to_string()))
     );
 }
 
@@ -1122,7 +1122,7 @@ fn authoritative_answer() {
         ..resolver(&system, &loopback_ok)
     };
     let (resolved, lines) =
-        noted(|note| r.resolve("MyRoom.DuckDNS.org", Some(&servers(&[fake.addr])), note));
+        noted(|note| r.resolve("MyRoom.Example.net", Some(&servers(&[fake.addr])), note));
     assert_eq!(
         resolved,
         Ok(Resolved {
@@ -1160,7 +1160,7 @@ fn answer_without_authority() {
         // A resolver's flags: recursion available, no AA.
         let reply = Reply {
             answers: records,
-            authority: vec![soa("duckdns.org")],
+            authority: vec![soa("example.net")],
             ..Reply::default()
         };
         vec![reply_to(asked, &reply)]
@@ -1201,7 +1201,7 @@ fn truncated_answer_falls_back() {
         resolved.unwrap().addrs,
         [found(IpAddr::V4(HOME), Source::System)]
     );
-    assert_eq!(system.calls(), ["A myroom.duckdns.org fresh"]);
+    assert_eq!(system.calls(), ["A myroom.example.net fresh"]);
     assert!(has(&lines, "is truncated"));
 }
 
@@ -1221,8 +1221,8 @@ fn silent_nameserver_falls_back() {
     assert_eq!(
         system.calls(),
         [
-            "A myroom.duckdns.org fresh",
-            "AAAA myroom.duckdns.org fresh"
+            "A myroom.example.net fresh",
+            "AAAA myroom.example.net fresh"
         ]
     );
     assert!(has(&lines, "no A answer from"));
@@ -1258,7 +1258,7 @@ fn wrong_ids_and_wrong_questions_are_waited_past() {
             return vec![reply_to(asked, &authoritative(Vec::new()))];
         }
         let decoy = authoritative(vec![a(&asked.name, Ipv4Addr::new(198, 51, 100, 8))]);
-        let other = question("other.duckdns.org", 1);
+        let other = question("other.example.net", 1);
         vec![
             Out::Send(build(asked.id ^ 1, &asked.question, &asked.name, &decoy)),
             Out::Send(build(asked.id, &other, "", &decoy)),
@@ -1362,7 +1362,7 @@ fn authoritative_nxdomain() {
         let reply = Reply {
             aa: true,
             rcode: 3,
-            authority: vec![soa("duckdns.org")],
+            authority: vec![soa("example.net")],
             ..Reply::default()
         };
         vec![reply_to(asked, &reply)]
@@ -1399,8 +1399,8 @@ fn nxdomain_without_authority() {
     assert_eq!(
         system.calls(),
         [
-            "A myroom.duckdns.org fresh",
-            "AAAA myroom.duckdns.org fresh"
+            "A myroom.example.net fresh",
+            "AAAA myroom.example.net fresh"
         ]
     );
     assert!(has(&lines, "but not authoritatively"));
@@ -1463,7 +1463,7 @@ fn cname_into_another_zone() {
         system.calls(),
         ["A room.example.net fresh", "AAAA room.example.net fresh"]
     );
-    assert!(has(&lines, "points on to myroom.duckdns.org"));
+    assert!(has(&lines, "points on to myroom.example.net"));
 }
 
 #[test]
@@ -1471,7 +1471,7 @@ fn referral_is_not_an_answer() {
     let turn = turn();
     let fake = Fake::start(&turn, |asked| {
         let reply = Reply {
-            authority: vec![ns("duckdns.org", "ns1.duckdns.org")],
+            authority: vec![ns("example.net", "ns1.example.net")],
             ..Reply::default()
         };
         vec![reply_to(asked, &reply)]
@@ -1507,10 +1507,10 @@ fn without_nameservers() {
     assert_eq!(
         system.calls(),
         [
-            "A myroom.duckdns.org fresh",
-            "AAAA myroom.duckdns.org fresh",
-            "A myroom.duckdns.org fresh",
-            "AAAA myroom.duckdns.org fresh",
+            "A myroom.example.net fresh",
+            "AAAA myroom.example.net fresh",
+            "A myroom.example.net fresh",
+            "AAAA myroom.example.net fresh",
         ]
     );
 }
@@ -1592,8 +1592,8 @@ fn from_the_walk_to_the_answer() {
     let turn = turn();
     let fake = home_server(&turn, vec![HOME], Vec::new());
     let system = FakeSystem::default()
-        .ns("duckdns.org", &["ns1.duckdns.org"])
-        .addrs("ns1.duckdns.org", Kind::A, &["127.0.0.1"]);
+        .ns("example.net", &["ns1.example.net"])
+        .addrs("ns1.example.net", Kind::A, &["127.0.0.1"]);
     let r = Resolver {
         port: fake.addr.port(),
         ..resolver(&system, &loopback_ok)
