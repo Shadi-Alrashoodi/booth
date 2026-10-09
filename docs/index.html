@@ -36,18 +36,19 @@
       <section class="download" aria-labelledby="download">
         <h2 id="download" class="hidden">Download</h2>
         <div class="buttons">
-          <a class="button primary" href="https://github.com/Shadi-Alrashoodi/booth/releases/latest/download/booth-0.2.2-setup.exe">Download the installer</a>
-          <a class="button secondary" href="https://github.com/Shadi-Alrashoodi/booth/releases/latest/download/booth-0.2.2-windows-x64.zip">Download the zip</a>
+          <a class="button primary" href="https://github.com/Shadi-Alrashoodi/booth/releases/download/v0.2.2/booth-0.2.2-setup.exe">Download the installer</a>
+          <a class="button secondary" href="https://github.com/Shadi-Alrashoodi/booth/releases/download/v0.2.2/booth-0.2.2-windows-x64.zip">Download the zip</a>
         </div>
-        <p class="caption">Version 0.2.2. The installer adds Booth to the Start menu; unzip the zip anywhere and run booth.exe. It needs Windows 10 version 2004 or later, or Windows 11, <span class="nowrap">64-bit</span>, with a DirectX 12 graphics driver. Older versions and how to check a download are on the <a href="https://github.com/Shadi-Alrashoodi/booth/releases">releases page</a>.</p>
+        <p class="caption">Version 0.2.2. The installer adds Booth to the Start menu. The zip needs no install: unzip it anywhere and run booth.exe. It needs Windows 10 version 2004 or later, or Windows 11, <span class="nowrap">64-bit</span>, with a DirectX 12 graphics driver. Older versions and how to check a download are on the <a href="https://github.com/Shadi-Alrashoodi/booth/releases">releases page</a>.</p>
       </section>
 
       <section aria-labelledby="first-run">
         <h2 id="first-run">The first time</h2>
         <ul>
           <li>SmartScreen says "Windows protected your PC" because the exe is not code signed yet: More info, then Run anyway.</li>
+          <li>With Smart App Control on, Windows 11 blocks Booth outright, with no Run anyway, until the exe is signed.</li>
           <li>Booth asks once for administrator rights for its firewall rule: Allow, then Yes.</li>
-          <li>Use a wired or USB headset: Bluetooth adds tens of milliseconds before Booth does anything.</li>
+          <li>Use a wired or USB headset: Booth has no echo cancellation, so speakers send your friends' voices back to them, and Bluetooth adds tens of milliseconds before Booth does anything.</li>
         </ul>
       </section>
     </div>
@@ -61,11 +62,11 @@
         <h2 id="start">Starting a room</h2>
         <ol>
           <li>Press Host, then Copy.</li>
-          <li>Send the invite over whatever chat you use. It lets in one friend within 10 minutes; for a group chat, switch it to anyone, 24 h first.</li>
+          <li>Send the invite over whatever chat you use. It lets in one friend and runs out after 10 minutes. For a group chat, press "single use, 10 min" to switch it to "anyone, 24 h", then Copy again. The invite carries your internet address, so never post it in public.</li>
           <li>Your friend runs Booth too and pastes the invite under Join a room. Next time they rejoin from Known hosts.</li>
         </ol>
         <p>If a friend cannot get in, Booth shows them a code to send back to the host, who pastes it under the invite; failing that, forward UDP 41000 to the host's PC, or use Tailscale or WireGuard.</p>
-        <p>Hotkeys work with a game in focus, unless the game runs as administrator, and you can change them in Settings:</p>
+        <p>Booth starts in push to talk: hold Right Ctrl to talk, or pick Open mic in Settings. Hotkeys work with a game in focus, unless the game runs as administrator, and you can change them in Settings:</p>
         <dl class="keys">
           <dt>Right Ctrl</dt><dd>push to talk</dd>
           <dt>Ctrl+Shift+M</dt><dd>mute</dd>
@@ -79,10 +80,10 @@
       <section aria-labelledby="what">
         <h2 id="what">What it does</h2>
         <ul>
-          <li>Voice in 5 ms Opus frames, 10 ms with a repair copy while the link loses packets, and a jitter buffer that starts at the minimum.</li>
+          <li>Voice in 5 ms Opus frames, with a jitter buffer that starts at the minimum. While the link loses packets, each one also carries the frame before it, and from 5 percent loss voice moves to 10 ms frames with Opus's own repair data.</li>
           <li>Screen sharing with Desktop Duplication and GPU encoding, up to 1440p at 120 fps, H.264 or HEVC.</li>
           <li>Voice, video and chat over UDP, never in plain text, not even on a LAN.</li>
-          <li>Ping, jitter and loss always on screen, along the bottom of every window.</li>
+          <li>Ping, jitter and loss always on screen in a room, along the bottom of the room window and the viewer.</li>
         </ul>
       </section>
     </div>
@@ -90,7 +91,7 @@
 
   <section class="measured" aria-labelledby="measured">
     <h2 id="measured">Measured</h2>
-    <p>On my PCs, capture to display (median): about 5 ms for a 1440p120 test pattern through a room on one PC, and 22 to 32 ms over the internet to my laptop on Wi-Fi. For voice I have measured only the playback side so far: 20 ms.</p>
+    <p>On my PCs, capture to display (median): about 5 ms for a 1440p120 test pattern with host and viewer on the same PC, and 22 to 32 ms over the internet to my laptop on Wi-Fi. For voice I have measured only the playback side so far: 20 ms.</p>
     <figure>
       <picture>
         <source srcset="demo-still.png" media="(prefers-reduced-motion: reduce)">
@@ -107,6 +108,7 @@
         <li>Windows only, for the host and every friend: no Mac, Linux or phone.</li>
         <li>Up to eight people in a room, the host included.</li>
         <li>One person shares at a time, a whole monitor, view only for now.</li>
+        <li>Friends watching a share over the internet split the host's Video upload setting, 15 Mbit/s unless changed in Settings, so more watchers get a softer picture.</li>
         <li>No relay: when two routers block a direct path, Booth says why and what would fix it.</li>
         <li>Sharing from Intel graphics encodes in software for now, H.264 up to 1080p at 60 fps. Sharing from AMD graphics goes through Windows' hardware encoder, and I have not had an AMD PC to test it on yet.</li>
       </ul>
@@ -115,7 +117,7 @@
     <section aria-labelledby="security">
       <h2 id="security">Security</h2>
       <p>In a Noise handshake (Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s) both sides prove who they are; every later packet is encrypted. No crypto of my own: the snow, dalek and RustCrypto crates. The host decrypts and forwards everything in the room, so only join a host you trust. The handshake and session code has not had an outside audit yet.</p>
-      <p>To find its address from outside, Booth asks a public STUN server, Cloudflare's or Google's unless you change the list in Settings; it sees your address and nothing else.</p>
+      <p>To find its address from outside, Booth asks two public STUN servers, Cloudflare's and Google's, unless you change the list in Settings; they see your address and nothing else. The only other outside contact is GitHub, and only if you turn on the update check in Settings.</p>
     </section>
 
     <section aria-labelledby="source">
