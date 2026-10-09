@@ -4715,9 +4715,11 @@ mod tests {
         let mut bo = Guest::new();
         bo.join(&mut rig, "Bo", start);
         let mut ana = Guest::new();
+        // Newer than this build whatever its own version is, so the host
+        // is the one told to update.
         let later = Version {
-            major: 0,
-            minor: 9,
+            major: invite::VERSION.major + 1,
+            minor: 0,
             patch: 0,
         };
         for round in 0..3 {
@@ -4743,7 +4745,7 @@ mod tests {
         assert_eq!(
             problems(&rig.host.view(start, 0)),
             [format!(
-                "Ana has Booth 0.9.0 and this room runs {}, so they could not join. Get the same version as Ana from {}.",
+                "Ana has Booth {later} and this room runs {}, so they could not join. Get the same version as Ana from {}.",
                 invite::VERSION,
                 invite::RELEASES_PAGE
             )]
