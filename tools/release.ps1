@@ -407,7 +407,7 @@ if ($releaseKey -cnotmatch '^RW[A-Za-z0-9+/]{54}$') {
 # people to a file this release does not have.
 foreach ($page in 'README.md', 'docs\index.html') {
     $text = Get-Content -Raw -LiteralPath (Join-Path $root $page)
-    $old = [regex]::Matches($text, '(?:booth-|Booth |Version )([0-9]+\.[0-9]+\.[0-9]+)') |
+    $old = [regex]::Matches($text, '(?:booth-|Booth |Version |download/v)([0-9]+\.[0-9]+\.[0-9]+)') |
         Where-Object { $_.Groups[1].Value -ne $version } | ForEach-Object { $_.Value } | Sort-Object -Unique
     if ($old) {
         $notReady += "$page still says $($old -join ', '), and this is version $version. Change it to $version and commit first."
