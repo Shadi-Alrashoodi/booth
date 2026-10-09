@@ -28,7 +28,7 @@ use emath::GuiRounding as _;
 /// # });
 /// ```
 pub struct Ui {
-    /// Made from the id of the parent ui together with an optional id salt.
+    /// Generated based on id of parent ui together with an optional id salt.
     ///
     /// This should be stable from one frame to next
     /// so it can be used as a source for storing state
@@ -167,7 +167,7 @@ impl Ui {
                 .register_accesskit_parent(ui.unique_id, accessibility_parent);
         }
 
-        // Register in the widget stack early, to make sure we are behind all widgets we contain:
+        // Register in the widget stack early, to ensure we are behind all widgets we contain:
         let start_rect = Rect::NOTHING; // This will be overwritten when `remember_min_rect` is called
         ui.ctx().create_widget(
             WidgetRect {
@@ -202,7 +202,7 @@ impl Ui {
     /// This is a very low-level function.
     /// Usually you are better off using [`Self::scope_builder`].
     ///
-    /// Calling this does not allocate any space in the parent `Ui`,
+    /// Note that calling this does not allocate any space in the parent `Ui`,
     /// so after adding widgets to the child `Ui` you probably want to allocate
     /// the [`Ui::min_rect`] of the child in the parent `Ui` using e.g.
     /// [`Ui::advance_cursor_after_rect`].
@@ -295,7 +295,7 @@ impl Ui {
             accessibility_parent.unwrap_or(self.unique_id),
         );
 
-        // Register in the widget stack early, to make sure we are behind all widgets we contain:
+        // Register in the widget stack early, to ensure we are behind all widgets we contain:
         let start_rect = Rect::NOTHING; // This will be overwritten when `remember_min_rect` is called
         child_ui.ctx().create_widget(
             WidgetRect {
@@ -331,7 +331,7 @@ impl Ui {
 
     // -------------------------------------------------
 
-    /// Made from the id of the parent ui together with an optional id salt.
+    /// Generated based on id of parent ui together with an optional id salt.
     ///
     /// This should be stable from one frame to next
     /// so it can be used as a source for storing state
@@ -360,7 +360,7 @@ impl Ui {
 
     /// Style options for this [`Ui`] and its children.
     ///
-    /// This may be a different [`Style`] than that of [`Context::global_style`].
+    /// Note that this may be a different [`Style`] than that of [`Context::global_style`].
     #[inline]
     pub fn style(&self) -> &Arc<Style> {
         &self.style
@@ -477,7 +477,7 @@ impl Ui {
     ///
     /// Usually it is more convenient to use [`Self::add_enabled_ui`] or [`Self::add_enabled`].
     ///
-    /// Once disabled, there is no way to re-enable the [`Ui`].
+    /// Note that once disabled, there is no way to re-enable the [`Ui`].
     ///
     /// ### Example
     /// ```
@@ -824,13 +824,13 @@ impl Ui {
         self.set_max_height(height);
     }
 
-    /// Make sure we are big enough to contain the given x-coordinate.
+    /// Ensure we are big enough to contain the given x-coordinate.
     /// This is sometimes useful to expand a ui to stretch to a certain place.
     pub fn expand_to_include_x(&mut self, x: f32) {
         self.placer.expand_to_include_x(x);
     }
 
-    /// Make sure we are big enough to contain the given y-coordinate.
+    /// Ensure we are big enough to contain the given y-coordinate.
     /// This is sometimes useful to expand a ui to stretch to a certain place.
     pub fn expand_to_include_y(&mut self, y: f32) {
         self.placer.expand_to_include_y(y);
@@ -1010,7 +1010,7 @@ impl Ui {
     ///
     /// Equivalent to `ui.rect_contains_pointer(ui.min_rect())`
     ///
-    /// This tests against the _current_ [`Ui::min_rect`].
+    /// Note that this tests against the _current_ [`Ui::min_rect`].
     /// If you want to test against the final `min_rect`,
     /// use [`Self::response`] instead.
     pub fn ui_contains_pointer(&self) -> bool {
@@ -1349,7 +1349,7 @@ impl Ui {
 
     /// Convenience function to get a region to paint on.
     ///
-    /// Egui uses screen coordinates for everything.
+    /// Note that egui uses screen coordinates for everything.
     ///
     /// ```
     /// # use egui::*;
@@ -1665,7 +1665,7 @@ impl Ui {
     /// Add extra space before the next widget.
     ///
     /// The direction is dependent on the layout.
-    /// `add_space` isn't supported when in a grid layout.
+    /// Note that `add_space` isn't supported when in a grid layout.
     ///
     /// This will be in addition to the [`crate::style::Spacing::item_spacing`]
     /// that is always added, but `item_spacing` won't be added _again_ by `add_space`.
@@ -2006,7 +2006,7 @@ impl Ui {
 
     /// Show an image available at the given `uri`.
     ///
-    /// Warning: This will do nothing unless you install some image loaders first!
+    /// ⚠ This will do nothing unless you install some image loaders first!
     /// The easiest way to do this is via [`egui_extras::install_image_loaders`](https://docs.rs/egui_extras/latest/egui_extras/loaders/fn.install_image_loaders.html).
     ///
     /// The loaders handle caching image data, sampled textures, etc. across frames, so calling this is immediate-mode safe.
@@ -2536,7 +2536,7 @@ impl Ui {
         num_columns: usize,
         add_contents: Box<dyn FnOnce(&mut [Self]) -> R + 'c>,
     ) -> R {
-        // TODO(emilk): make sure there is space
+        // TODO(emilk): ensure there is space
         let spacing = self.spacing().item_spacing.x;
         let total_spacing = spacing * (num_columns as f32 - 1.0);
         let column_width = (self.available_width() - total_spacing) / (num_columns as f32);
@@ -2594,7 +2594,7 @@ impl Ui {
         &mut self,
         add_contents: impl FnOnce(&mut [Self; NUM_COL]) -> R,
     ) -> R {
-        // TODO(emilk): make sure there is space
+        // TODO(emilk): ensure there is space
         let spacing = self.spacing().item_spacing.x;
         let total_spacing = spacing * (NUM_COL as f32 - 1.0);
         let column_width = (self.available_width() - total_spacing) / (NUM_COL as f32);

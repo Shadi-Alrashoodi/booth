@@ -87,7 +87,7 @@ pub struct LogicOutput {
 
     /// The commands sent with [`crate::Context::send_viewport_cmd`] and friends.
     ///
-    /// This contains no information about which viewports exist:
+    /// Note that this contains no information about which viewports exist:
     /// the integration should leave its viewports as they are.
     pub viewport_commands: OrderedViewportIdMap<Vec<crate::ViewportCommand>>,
 }
@@ -159,7 +159,7 @@ pub struct PlatformOutput {
     pub events: Vec<OutputEvent>,
 
     /// Is there a mutable [`TextEdit`](crate::TextEdit) under the cursor?
-    /// Use by `eframe` web to show/hide mobile keyboard and IME.
+    /// Use by `eframe` web to show/hide mobile keyboard and IME agent.
     pub mutable_text_under_cursor: bool,
 
     /// This is set if, and only if, the user is currently editing text.
@@ -307,11 +307,11 @@ pub enum UserAttentionType {
 /// A bitmap cursor pushed to the integration via [`PlatformOutput::cursor_image`].
 ///
 /// The integration is expected to upload this to the OS as a real cursor
-/// (so the image is not clipped by the egui window, the problem `egui::Painter`
+/// (so the image is not clipped by the egui window — what `egui::Painter`
 /// drawn cursors suffer from). Backends that don't support it should fall
 /// back to [`PlatformOutput::cursor_icon`].
 ///
-/// `rgba` is straight (non-premultiplied) RGBA, the same encoding as
+/// `rgba` is straight (non-premultiplied) RGBA — same encoding as
 /// `winit::window::CustomCursor::from_rgba`. The buffer length must be
 /// exactly `size[0] * size[1] * 4` bytes. `size` and `hotspot` use
 /// `u16` to match winit's native types and avoid a lossy cast in the

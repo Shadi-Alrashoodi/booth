@@ -275,7 +275,7 @@ struct TextRun {
 ///
 /// When a cluster maps multiple characters to fewer glyphs (e.g. flag emojis,
 /// ligatures), zero-width "continuation" glyphs are emitted for the extra
-/// characters so that `glyphs.len() == char_count`, an invariant that all
+/// characters so that `glyphs.len() == char_count` — an invariant that all
 /// cursor and selection code relies on.
 ///
 /// The glyphs are emitted in _logical_ order with increasing x, whatever the
@@ -292,7 +292,7 @@ fn layout_shaped_run(
 ) {
     let px_scale = face_metrics.px_scale_factor;
 
-    // Reset cluster tracking: cluster values are byte offsets within run_text,
+    // Reset cluster tracking — cluster values are byte offsets within run_text,
     // so they are not comparable across runs.
     ctx.prev_cluster = None;
 
@@ -360,7 +360,7 @@ fn layout_shaped_run(
             .or_else(|| run_text.get(cluster as usize..)?.chars().next())
             .unwrap_or('\u{FFFD}'); // Unicode Replacement Character
 
-        // Tab is a layout concept, not a glyph: the shaper doesn't know about tab stops.
+        // Tab is a layout concept, not a glyph — the shaper doesn't know about tab stops.
         // Override the advance width using the font's configured tab size.
         if chr == '\t' {
             let tweak = font.fonts_by_id.get(&run.font_key).map(|ff| ff.tweak());
@@ -383,7 +383,7 @@ fn layout_shaped_run(
         let glyph = if glyph_id == skrifa::GlyphId::NOTDEF {
             // The shaper couldn't map this character. Drop combining marks
             // (Unicode category M) and duplicate NOTDEF glyphs within the same
-            // cluster; only the first base character gets a replacement glyph.
+            // cluster — only the first base character gets a replacement glyph.
             if is_combining_mark(chr) || !is_new_cluster {
                 continue;
             }
@@ -452,7 +452,7 @@ fn layout_shaped_run(
                     Default::default()
                 };
 
-            // Apply shaper y_offset; this varies per glyph instance so it
+            // Apply shaper y_offset — this varies per glyph instance so it
             // is not part of the cached ShapedGlyph / GlyphAllocation.
             glyph_alloc.uv_rect.offset.y += y_offset_px / ctx.pixels_per_point;
             if rtl {
@@ -566,7 +566,7 @@ fn layout_section(
     // Where the current segment starts in `job.text`, to look up its bidi levels.
     let mut segment_start = byte_range.start.0;
 
-    // Process each paragraph segment (split on newlines, which the shaper can't handle).
+    // Process each paragraph segment (split on newlines — the shaper can't handle them).
     for (seg_idx, segment) in SplitOrWhole::new(section_text, job.break_on_newline).enumerate() {
         let segment_levels = bidi.and_then(|bidi| {
             bidi.levels
@@ -677,7 +677,7 @@ fn calculate_intrinsic_size(
     for (idx, paragraph) in paragraphs.iter().enumerate() {
         // Use the precise cursor position instead of `last_glyph.max_x()`,
         // because glyph positions are pixel-snapped but the cursor tracks
-        // the exact subpixel advance. This makes sure that when two galleys are
+        // the exact subpixel advance. This ensures that when two galleys are
         // placed side-by-side, the gap matches what it would be within a
         // single galley.
         let width = paragraph.cursor_x_px / point_scale.pixels_per_point;
@@ -920,7 +920,7 @@ fn replace_last_glyph_with_overflow_character(
             };
             end + extra_letter_spacing
         } else {
-            0.0 // TODO(emilk): heed paragraph leading_space
+            0.0 // TODO(emilk): heed paragraph leading_space 😬
         };
         let bidi_level = row.glyphs.last().map_or(0, |glyph| glyph.bidi_level);
 
@@ -2124,7 +2124,7 @@ mod tests {
     fn test_combining_diacritics() {
         // ɔ̃ = U+0254 (LATIN SMALL LETTER OPEN O) + U+0303 (COMBINING TILDE)
         // With text shaping, the combining tilde should NOT produce a separate
-        // advance; it should be positioned above ɔ via GPOS anchors.
+        // advance — it should be positioned above ɔ via GPOS anchors.
         // Note: the default fonts don't contain U+0254, so the replacement glyph
         // is used. The key test is that the combining mark does NOT add extra width.
         let pixels_per_point = 1.0;
@@ -2234,7 +2234,7 @@ mod tests {
         let mut fonts = FontsImpl::new(TextOptions::default(), FontDefinitions::default());
 
         let job = LayoutJob::simple(
-            "Hi \u{1F389} bye".to_owned(),
+            "Hi 🎉 bye".to_owned(),
             FontId::proportional(14.0),
             Color32::WHITE,
             f32::INFINITY,
@@ -2242,7 +2242,7 @@ mod tests {
         let galley = layout(&mut fonts, pixels_per_point, job.into());
 
         assert_eq!(galley.rows.len(), 1);
-        // "Hi " (3) + U+1F389 (1) + " bye" (4) = at least 8 glyphs
+        // "Hi " (3) + "🎉" (1) + " bye" (4) = at least 8 glyphs
         assert!(
             galley.rows[0].row.glyphs.len() >= 8,
             "Expected >= 8 glyphs, got {}",
@@ -2309,9 +2309,9 @@ mod tests {
         // Each test case: (input text, expected char count)
         let cases: &[(&str, usize)] = &[
             // Flag emoji: two Regional Indicator codepoints → one visual glyph
-            ("\u{1F1EF}\u{1F1F5}", 2), // the flag of Japan
+            ("\u{1F1EF}\u{1F1F5}", 2), // 🇯🇵
             // Flag surrounded by ASCII
-            ("A\u{1F1EB}\u{1F1F7}B", 4), // A, the flag of France, B
+            ("A\u{1F1EB}\u{1F1F7}B", 4), // A🇫🇷B
             // Base char + combining acute accent
             ("e\u{0301}", 2), // é as decomposed
             // Multiple combining marks

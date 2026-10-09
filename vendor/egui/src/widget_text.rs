@@ -342,7 +342,7 @@ impl RichText {
 
     /// Append to an existing [`LayoutJob`]
     ///
-    /// The color of the [`RichText`] must be set, or may default to an undesirable color.
+    /// Note that the color of the [`RichText`] must be set, or may default to an undesirable color.
     ///
     /// ### Example
     /// ```
@@ -889,7 +889,7 @@ mod tests {
     use crate::WidgetText;
 
     #[test]
-    fn widget_text_is_as_small_as_a_string() {
+    fn ensure_small_widget_text() {
         assert_eq!(size_of::<WidgetText>(), size_of::<String>());
     }
 }

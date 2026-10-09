@@ -486,7 +486,7 @@ impl SubMenu {
         if should_open {
             set_open = Some(true);
             is_open = true;
-            // Make sure that all other sub menus are closed when we open the menu
+            // Ensure that all other sub menus are closed when we open the menu
             MenuState::from_id(ui.ctx(), menu_id, |state| {
                 state.open_item = None;
             });
@@ -514,7 +514,7 @@ impl SubMenu {
                     .with_tag_value(MenuConfig::MENU_CONFIG_TAG, menu_config.clone()),
             )
             .show(|ui| {
-                // Make sure our layer stays on top when the button is clicked
+                // Ensure our layer stays on top when the button is clicked
                 if button_response.clicked() || button_response.is_pointer_button_down_on() {
                     ui.ctx().move_to_top(ui.layer_id());
                 }

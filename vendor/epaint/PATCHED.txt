@@ -125,25 +125,12 @@ Other changes to the crate
   mimalloc, similar-asserts) and the benchmark removed: none of them is in
   Booth's Cargo.lock, and cargo will not test a crate outside the workspace
   that has dev-dependencies. src/text/fonts.rs uses assert_eq! where it used
-  similar_asserts::assert_eq!. The comment cargo puts at the top when it
-  publishes a crate is gone too; Cargo.toml.orig is still the original.
+  similar_asserts::assert_eq!.
 - src/text/fonts.rs: the FontDefinitions doc example is marked ignore; it
   includes a font by a path inside egui's own repository.
 - The 13 upstream tests that need egui's default fonts are ignored unless
   the default_fonts feature is on. Booth does not build that feature, and
   the epaint_default_fonts crate is not in its Cargo.lock.
-- The 13 long dashes in upstream comments replaced with plain punctuation.
-- The emoji in 5 upstream comments replaced the same way, by words, a code
-  point or nothing.
-- The emoji in string and char literals, and one en dash, are kept but
-  written as \u{...} escapes: in src/text/font.rs the en dash, U+203C
-  and U+2049 among the chars a CJK line may not start with, in
-  src/text/fonts.rs the white square drawn for a missing glyph, and in
-  src/text/text_layout.rs one test string. The values are the same;
-  checked on 2026-10-02 by compiling every changed literal against the one
-  it replaced.
-- In comments some stock phrases are put more plainly, and one debug
-  assertion's message is reworded.
 - Everything else is as upstream wrote it, its TODO lines included.
 
 LICENSE-MIT and LICENSE-APACHE are egui's, from github.com/emilk/egui at tag

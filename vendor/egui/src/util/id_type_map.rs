@@ -346,7 +346,7 @@ impl nohash_hasher::IsEnabled for RawKey {}
 impl RawKey {
     /// Create a new key for the given type.
     ///
-    /// Two keys with the same id but different types
+    /// Note that two keys with the same id but different types
     /// will be different keys.
     ///
     /// ```

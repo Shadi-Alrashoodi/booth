@@ -350,7 +350,7 @@ fn style_impl_send_sync() {
 impl Style {
     // TODO(emilk): rename style.interact() to maybe… `style.interactive` ?
     /// Use this style for interactive things.
-    /// You must already have a response,
+    /// Note that you must already have a response,
     /// i.e. you must allocate space and interact BEFORE painting the widget!
     pub fn interact(&self, response: &Response) -> &WidgetVisuals {
         self.visuals.widgets.style(response)
@@ -1172,7 +1172,7 @@ impl Visuals {
 
     /// Returns a "disabled" version of the given color.
     ///
-    /// It modifies the opcacity of the given color.
+    /// This function modifies the opcacity of the given color.
     /// If this is undesirable use [`gray_out`](Self::gray_out).
     #[inline(always)]
     pub fn disable(&self, color: Color32) -> Color32 {
@@ -1899,16 +1899,14 @@ impl Style {
             ui.end_row();
         });
 
-        ui.collapsing("\u{1F520} Text styles", |ui| {
-            text_styles_ui(ui, text_styles)
-        });
-        ui.collapsing("\u{1F4CF} Spacing", |ui| spacing.ui(ui));
-        ui.collapsing("\u{261D} Interaction", |ui| interaction.ui(ui));
-        ui.collapsing("\u{1F3A8} Visuals", |ui| visuals.ui(ui));
-        ui.collapsing("\u{1F504} Scroll animation", |ui| scroll_animation.ui(ui));
+        ui.collapsing("🔠 Text styles", |ui| text_styles_ui(ui, text_styles));
+        ui.collapsing("📏 Spacing", |ui| spacing.ui(ui));
+        ui.collapsing("☝ Interaction", |ui| interaction.ui(ui));
+        ui.collapsing("🎨 Visuals", |ui| visuals.ui(ui));
+        ui.collapsing("🔄 Scroll animation", |ui| scroll_animation.ui(ui));
 
         #[cfg(debug_assertions)]
-        ui.collapsing("\u{1F41B} Debug", |ui| debug.ui(ui));
+        ui.collapsing("🐛 Debug", |ui| debug.ui(ui));
 
         ui.checkbox(compact_menu_style, "Compact menu style");
 

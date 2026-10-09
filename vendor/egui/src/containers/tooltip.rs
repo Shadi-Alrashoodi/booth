@@ -256,7 +256,7 @@ impl Tooltip<'_> {
 
         if time_since_last_scroll < tooltip_delay {
             // See https://github.com/emilk/egui/issues/4781
-            // This means we cannot have `ScrollArea`s in a tooltip.
+            // Note that this means we cannot have `ScrollArea`s in a tooltip.
             response
                 .ctx
                 .request_repaint_after_secs(tooltip_delay - time_since_last_scroll);

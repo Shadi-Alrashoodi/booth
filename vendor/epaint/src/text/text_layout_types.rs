@@ -600,7 +600,7 @@ pub enum TextWrapMode {
 
     /// The text should be elided using "…" when reaching the `Ui` boundary.
     ///
-    /// Using [`TextWrapping`] and [`LayoutJob`] offers more control over the elision.
+    /// Note that using [`TextWrapping`] and [`LayoutJob`] offers more control over the elision.
     Truncate,
 }
 
@@ -614,7 +614,7 @@ pub struct TextWrapping {
     ///
     /// Set `max_width` to [`f32::INFINITY`] to turn off wrapping and elision.
     ///
-    /// `\n` always produces a new row
+    /// Note that `\n` always produces a new row
     /// if [`LayoutJob::break_on_newline`] is `true`.
     pub max_width: f32,
 
@@ -743,7 +743,7 @@ pub struct Galley {
     /// The number of characters in all rows sum up to `job.text.chars().count()`
     /// unless [`Self::elided`] is `true`.
     ///
-    /// A paragraph (a piece of text separated with `\n`)
+    /// Note that a paragraph (a piece of text separated with `\n`)
     /// can be split up into multiple rows.
     pub rows: Vec<PlacedRow>,
 
@@ -1216,7 +1216,7 @@ impl Galley {
 
             merged_galley.num_vertices += galley.num_vertices;
             merged_galley.num_indices += galley.num_indices;
-            // If `galley.elided` is true this will be the last `Galley` in
+            // Note that if `galley.elided` is true this will be the last `Galley` in
             // the vector and the loop will end.
             merged_galley.elided |= galley.elided;
             merged_galley.intrinsic_size.x =

@@ -699,7 +699,7 @@ impl Slider<'_> {
 
             let (dec_key, inc_key) = match self.orientation {
                 SliderOrientation::Horizontal => (Key::ArrowLeft, Key::ArrowRight),
-                // This is for moving the slider position,
+                // Note that this is for moving the slider position,
                 // so up = decrement y coordinate:
                 SliderOrientation::Vertical => (Key::ArrowUp, Key::ArrowDown),
             };
@@ -735,7 +735,7 @@ impl Slider<'_> {
                 _ => self.value_from_position(new_position, position_range),
             };
             if let Some(max_decimals) = self.max_decimals {
-                // self.set_value rounds, so make sure we reach at the least the next breakpoint
+                // self.set_value rounds, so ensure we reach at the least the next breakpoint
                 // note: we give it a little bit of leeway due to floating point errors. (0.1 isn't representable in binary)
                 // 'set_value' will round it to the nearest value.
                 let min_increment = 1.0 / (10.0_f64.powi(max_decimals as i32));

@@ -224,7 +224,7 @@ impl Modifiers {
     /// `self` here are the currently pressed modifiers,
     /// and the argument the pattern we are testing for.
     ///
-    /// This will require the `shift` and `alt` keys match, even though
+    /// Note that this will require the `shift` and `alt` keys match, even though
     /// these modifiers are sometimes required to produce some logical keys.
     /// For instance, to press `+` on an English keyboard, you need to press `shift` and `=`,
     /// but on a Swedish keyboard you can press the dedicated `+` key.

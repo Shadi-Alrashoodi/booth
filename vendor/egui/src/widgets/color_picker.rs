@@ -424,7 +424,7 @@ fn srgba_edit_ui(ui: &mut Ui, [r, g, b, a]: &mut [u8; 4], alpha: Alpha) -> bool 
         input_type_button_ui(ui);
 
         if ui
-            .button("\u{1F4CB}")
+            .button("📋")
             .on_hover_text("Click to copy color values")
             .clicked()
         {
@@ -465,7 +465,7 @@ fn rgba_edit_ui(ui: &mut Ui, [r, g, b, a]: &mut [f32; 4], alpha: Alpha) -> bool 
         input_type_button_ui(ui);
 
         if ui
-            .button("\u{1F4CB}")
+            .button("📋")
             .on_hover_text("Click to copy color values")
             .clicked()
         {
@@ -581,19 +581,19 @@ pub fn color_edit_button_rgb(ui: &mut Ui, rgb: &mut [f32; 3]) -> Response {
     response
 }
 
-// To make sure we keep hue slider when `srgba` is gray we store the full [`Hsva`] in a cache:
+// To ensure we keep hue slider when `srgba` is gray we store the full [`Hsva`] in a cache:
 fn color_cache_get(ctx: &Context, rgba: impl Into<Rgba>) -> Hsva {
     let rgba = rgba.into();
     use_color_cache(ctx, |cc| cc.get(&rgba).copied()).unwrap_or_else(|| Hsva::from(rgba))
 }
 
-// To make sure we keep hue slider when `srgba` is gray we store the full [`Hsva`] in a cache:
+// To ensure we keep hue slider when `srgba` is gray we store the full [`Hsva`] in a cache:
 fn color_cache_set(ctx: &Context, rgba: impl Into<Rgba>, hsva: Hsva) {
     let rgba = rgba.into();
     use_color_cache(ctx, |cc| cc.set(rgba, hsva));
 }
 
-// To make sure we keep hue slider when `srgba` is gray we store the full [`Hsva`] in a cache:
+// To ensure we keep hue slider when `srgba` is gray we store the full [`Hsva`] in a cache:
 fn use_color_cache<R>(ctx: &Context, f: impl FnOnce(&mut FixedCache<Rgba, Hsva>) -> R) -> R {
     ctx.data_mut(|d| f(d.get_temp_mut_or_default(Id::NULL)))
 }

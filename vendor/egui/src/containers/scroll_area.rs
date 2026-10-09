@@ -675,7 +675,7 @@ struct Prepared {
     ///
     /// This is always zero for floating scroll bars.
     ///
-    /// This is a `yx` swizzling of [`Self::show_bars_factor`]
+    /// Note that this is a `yx` swizzling of [`Self::show_bars_factor`]
     /// times the maximum bar with.
     /// That's because horizontal scroll uses up vertical space,
     /// and vice versa.

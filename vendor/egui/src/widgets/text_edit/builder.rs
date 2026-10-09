@@ -263,7 +263,7 @@ impl<'t> TextEdit<'t> {
     ///
     /// This can be used to implement things like syntax highlighting.
     ///
-    /// It will be called at least once per frame,
+    /// This function will be called at least once per frame,
     /// so it is strongly suggested that you cache the results of any syntax highlighter
     /// so as not to waste CPU highlighting the same string every frame.
     ///
@@ -678,7 +678,7 @@ impl TextEdit<'_> {
                         let mut galley = layouter(ui, text, args.available_size.x);
 
                         // Handling events here allows us to update the galley immediately on
-                        // keystrokes, avoiding frame delays, and making sure the scroll_to within
+                        // keystrokes, avoiding frame delays, and ensuring the scroll_to within
                         // ScrollAreas works correctly.
                         handle_events(ui, &mut galley, layouter, args.available_size.x, text);
 
@@ -1254,12 +1254,12 @@ fn events(
                 ///
                 /// ## Note
                 ///
-                /// The term "pre-edit string" is used by X11 and Wayland, and
-                /// we use "pre-edit text" and "pre-edit range" here in the
+                /// The term “pre-edit string” is used by X11 and Wayland, and
+                /// we use “pre-edit text” and “pre-edit range” here in the
                 /// same manner.
                 /// See: <https://wayland.app/protocols/input-method-unstable-v2>
                 ///
-                /// We previously referred to "pre-edit text" as "prediction",
+                /// We previously referred to “pre-edit text” as “prediction”,
                 /// which is not standard and can mean different things.
                 fn clear_preedit_text(
                     text: &mut dyn TextBuffer,

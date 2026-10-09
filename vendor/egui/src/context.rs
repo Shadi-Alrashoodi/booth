@@ -505,7 +505,7 @@ impl ContextImpl {
             );
         }
 
-        // Make sure we register the background area so panels and background ui can catch clicks:
+        // Ensure we register the background area so panels and background ui can catch clicks:
         self.memory.areas_mut().set_state(
             LayerId::background(),
             AreaState {
@@ -975,12 +975,12 @@ impl Context {
 impl Context {
     /// Read-only access to [`InputState`].
     ///
-    /// This locks the [`Context`].
+    /// Note that this locks the [`Context`].
     ///
     /// ```
     /// # let mut ctx = egui::Context::default();
     /// ctx.input(|i| {
-    ///     // Warning: Using `ctx` (even from other `Arc` reference) again here will lead to a deadlock!
+    ///     // ⚠️ Using `ctx` (even from other `Arc` reference) again here will lead to a deadlock!
     /// });
     ///
     /// if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
@@ -1154,7 +1154,7 @@ impl Context {
     /// If the given [`Id`] has been used previously the same pass at different position,
     /// then an error will be printed on screen.
     ///
-    /// It is already called for all widgets that do any interaction,
+    /// This function is already called for all widgets that do any interaction,
     /// but you can call this from widgets that store state but that does not interact.
     ///
     /// The given [`Rect`] should be approximately where the widget will be.
@@ -1180,7 +1180,7 @@ impl Context {
         let show_error = |widget_rect: Rect, text: String| {
             let content_rect = self.content_rect();
 
-            let text = format!("\u{1F525} {text}");
+            let text = format!("🔥 {text}");
             let color = self.global_style().visuals.error_fg_color;
             let painter = self.debug_painter();
             painter.rect_stroke(widget_rect, 0.0, (1.0, color), StrokeKind::Outside);
@@ -1622,7 +1622,7 @@ impl Context {
     /// When compiling natively, this is
     /// figured out from the `target_os`.
     ///
-    /// For web, this can be figured out from the browser's identification string,
+    /// For web, this can be figured out from the user-agent,
     /// and is done so by [`eframe`](https://github.com/emilk/egui/tree/main/crates/eframe).
     pub fn os(&self) -> OperatingSystem {
         self.read(|ctx| ctx.os)
@@ -1631,7 +1631,7 @@ impl Context {
     /// Set the operating system we are running on.
     ///
     /// If you are writing wasm-based integration for egui you
-    /// may want to set this based on e.g. the browser's identification string.
+    /// may want to set this based on e.g. the user-agent.
     pub fn set_os(&self, os: OperatingSystem) {
         self.write(|ctx| ctx.os = os);
     }
@@ -1680,7 +1680,7 @@ impl Context {
 
     /// Copy the given text to the system clipboard.
     ///
-    /// In web applications, the clipboard is only accessible in secure contexts (e.g.,
+    /// Note that in web applications, the clipboard is only accessible in secure contexts (e.g.,
     /// HTTPS or localhost). If this method is used outside of a secure context, it will log an
     /// error and do nothing. See <https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts>.
     pub fn copy_text(&self, text: String) {
@@ -1689,7 +1689,7 @@ impl Context {
 
     /// Copy the given image to the system clipboard.
     ///
-    /// In web applications, the clipboard is only accessible in secure contexts (e.g.,
+    /// Note that in web applications, the clipboard is only accessible in secure contexts (e.g.,
     /// HTTPS or localhost). If this method is used outside of a secure context, it will log an
     /// error and do nothing. See <https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts>.
     pub fn copy_image(&self, image: crate::ColorImage) {
@@ -1957,7 +1957,7 @@ impl Context {
     ///
     /// This lets you wake up a sleeping UI thread.
     ///
-    /// Only one callback can be set. Any new call overrides the previous callback.
+    /// Note that only one callback can be set. Any new call overrides the previous callback.
     pub fn set_request_repaint_callback(
         &self,
         callback: impl Fn(RequestRepaintInfo) + Send + Sync + 'static,
@@ -2323,7 +2323,7 @@ impl Context {
     /// Sets zoom factor of the UI.
     /// Will become active at the start of the next pass.
     ///
-    /// Calling this will not update [`Self::zoom_factor`] until the end of the pass.
+    /// Note that calling this will not update [`Self::zoom_factor`] until the end of the pass.
     ///
     /// This is used to calculate the `pixels_per_point`
     /// for the UI as `pixels_per_point = zoom_fator * native_pixels_per_point`.
@@ -2357,7 +2357,7 @@ impl Context {
     /// The function will hand over the image data to the egui backend, which will
     /// upload it to the GPU.
     ///
-    /// Warning: Make sure to only call this ONCE for each image, i.e. NOT in your main GUI code.
+    /// ⚠️ Make sure to only call this ONCE for each image, i.e. NOT in your main GUI code.
     /// The call is NOT immediate safe.
     ///
     /// The given name can be useful for later debugging, and will be visible if you call [`Self::texture_ui`].
@@ -3290,7 +3290,7 @@ impl Context {
         let prev_options = self.options(|o| o.clone());
         let mut options = prev_options.clone();
 
-        ui.collapsing("\u{1F520} Font tweak", |ui| {
+        ui.collapsing("🔠 Font tweak", |ui| {
             self.fonts_tweak_ui(ui);
         });
 
@@ -3383,7 +3383,7 @@ impl Context {
         .on_hover_text("This is approximately the number of text strings on screen");
         ui.add_space(16.0);
 
-        CollapsingHeader::new("\u{1F503} Repaint Causes")
+        CollapsingHeader::new("🔃 Repaint Causes")
             .default_open(false)
             .show(ui, |ui| {
                 ui.set_min_height(120.0);
@@ -3395,33 +3395,33 @@ impl Context {
                 }
             });
 
-        CollapsingHeader::new("\u{1F4E5} Input")
+        CollapsingHeader::new("📥 Input")
             .default_open(false)
             .show(ui, |ui| {
                 let input = ui.input(|i| i.clone());
                 input.ui(ui);
             });
 
-        CollapsingHeader::new("\u{1F4CA} Paint stats")
+        CollapsingHeader::new("📊 Paint stats")
             .default_open(false)
             .show(ui, |ui| {
                 let paint_stats = self.read(|ctx| ctx.paint_stats);
                 paint_stats.ui(ui);
             });
 
-        CollapsingHeader::new("\u{1F5BC} Textures")
+        CollapsingHeader::new("🖼 Textures")
             .default_open(false)
             .show(ui, |ui| {
                 self.texture_ui(ui);
             });
 
-        CollapsingHeader::new("\u{1F5BC} Image loaders")
+        CollapsingHeader::new("🖼 Image loaders")
             .default_open(false)
             .show(ui, |ui| {
                 self.loaders_ui(ui);
             });
 
-        CollapsingHeader::new("\u{1F520} Font texture")
+        CollapsingHeader::new("🔠 Font texture")
             .default_open(false)
             .show(ui, |ui| {
                 let font_image_size = self.fonts(|f| f.font_image_size());
@@ -3816,7 +3816,7 @@ impl Context {
     /// - [`LoadError::NotSupported`][not_supported] if none of the registered loaders support loading the given `uri`.
     /// - [`LoadError::Loading`][custom] if one of the loaders _does_ support loading the `uri`, but the loading process failed.
     ///
-    /// Warning: May deadlock if called from within a `BytesLoader`!
+    /// ⚠ May deadlock if called from within a `BytesLoader`!
     ///
     /// [not_supported]: crate::load::LoadError::NotSupported
     /// [custom]: crate::load::LoadError::Loading
@@ -3853,7 +3853,7 @@ impl Context {
     /// - [`LoadError::NotSupported`][not_supported] if none of the registered loaders support loading the given `uri`.
     /// - [`LoadError::Loading`][custom] if one of the loaders _does_ support loading the `uri`, but the loading process failed.
     ///
-    /// Warning: May deadlock if called from within an `ImageLoader`!
+    /// ⚠ May deadlock if called from within an `ImageLoader`!
     ///
     /// [no_image_loaders]: crate::load::LoadError::NoImageLoaders
     /// [not_supported]: crate::load::LoadError::NotSupported
@@ -3899,7 +3899,7 @@ impl Context {
     /// - [`LoadError::NotSupported`][not_supported] if none of the registered loaders support loading the given `uri`.
     /// - [`LoadError::Loading`][custom] if one of the loaders _does_ support loading the `uri`, but the loading process failed.
     ///
-    /// Warning: May deadlock if called from within a `TextureLoader`!
+    /// ⚠ May deadlock if called from within a `TextureLoader`!
     ///
     /// [not_supported]: crate::load::LoadError::NotSupported
     /// [custom]: crate::load::LoadError::Loading

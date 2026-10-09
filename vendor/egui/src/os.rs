@@ -52,24 +52,24 @@ impl OperatingSystem {
         }
     }
 
-    /// Helper: try to guess from the identification string of a browser.
-    pub fn from_browser_id(browser_id: &str) -> Self {
-        if browser_id.contains("Android") {
+    /// Helper: try to guess from the user-agent of a browser.
+    pub fn from_user_agent(user_agent: &str) -> Self {
+        if user_agent.contains("Android") {
             Self::Android
-        } else if browser_id.contains("like Mac") {
+        } else if user_agent.contains("like Mac") {
             Self::IOS
-        } else if browser_id.contains("Win") {
+        } else if user_agent.contains("Win") {
             Self::Windows
-        } else if browser_id.contains("Mac") {
+        } else if user_agent.contains("Mac") {
             Self::Mac
-        } else if browser_id.contains("Linux")
-            || browser_id.contains("X11")
-            || browser_id.contains("Unix")
+        } else if user_agent.contains("Linux")
+            || user_agent.contains("X11")
+            || user_agent.contains("Unix")
         {
             Self::Nix
         } else {
             log::warn!(
-                "egui: Failed to guess operating system from the browser id {browser_id:?}. Please file an issue at https://github.com/emilk/egui/issues"
+                "egui: Failed to guess operating system from User-Agent {user_agent:?}. Please file an issue at https://github.com/emilk/egui/issues"
             );
 
             Self::Unknown

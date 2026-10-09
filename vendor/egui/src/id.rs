@@ -110,7 +110,7 @@ impl Id {
     /// (e.g. accesskit::NodeId) and you want to convert it back to an [`Id`].
     ///
     /// # Safety
-    /// You need to make sure that the value is high-entropy since it might be used in
+    /// You need to ensure that the value is high-entropy since it might be used in
     /// a [`IdSet`] or [`IdMap`], which rely on the assumption that [`Id`]s have good entropy.
     ///
     /// The method is not unsafe in terms of memory safety.

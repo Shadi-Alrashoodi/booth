@@ -473,7 +473,7 @@ impl Widget for DragValue<'_> {
         let id = ui.next_auto_id();
         let is_slow_speed = shift && ui.ctx().is_being_dragged(id);
 
-        // The following makes sure that when a `DragValue` receives focus,
+        // The following ensures that when a `DragValue` receives focus,
         // it is immediately rendered in edit mode, rather than being rendered
         // in button mode for just one frame. This is important for
         // screen readers.

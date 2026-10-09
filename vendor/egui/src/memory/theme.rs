@@ -42,7 +42,7 @@ impl Theme {
         #![expect(clippy::collapsible_else_if)]
         if self == Self::Dark {
             if ui
-                .add(Button::new("\u{2600}").frame(false))
+                .add(Button::new("☀").frame(false))
                 .on_hover_text("Switch to light mode")
                 .clicked()
             {
@@ -50,7 +50,7 @@ impl Theme {
             }
         } else {
             if ui
-                .add(Button::new("\u{1F319}").frame(false))
+                .add(Button::new("🌙").frame(false))
                 .on_hover_text("Switch to dark mode")
                 .clicked()
             {
@@ -91,7 +91,7 @@ impl ThemePreference {
         ui.horizontal(|ui| {
             let system_theme = ui.input(|i| i.raw.system_theme);
 
-            ui.selectable_value(self, Self::System, "\u{1F4BB} System")
+            ui.selectable_value(self, Self::System, "💻 System")
                 .on_hover_ui(|ui| {
                     ui.label("Follow the system theme preference.");
 
@@ -110,10 +110,10 @@ impl ThemePreference {
                     }
                 });
 
-            ui.selectable_value(self, Self::Dark, "\u{1F319} Dark")
+            ui.selectable_value(self, Self::Dark, "🌙 Dark")
                 .on_hover_text("Use the dark mode theme");
 
-            ui.selectable_value(self, Self::Light, "\u{2600} Light")
+            ui.selectable_value(self, Self::Light, "☀ Light")
                 .on_hover_text("Use the light mode theme");
         });
     }

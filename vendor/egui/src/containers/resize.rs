@@ -158,7 +158,7 @@ impl Resize {
 
     /// Can you resize it with the mouse?
     ///
-    /// A window can still auto-resize.
+    /// Note that a window can still auto-resize.
     ///
     /// Default is `true`.
     #[inline]

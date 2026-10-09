@@ -300,7 +300,7 @@ pub struct InputState {
     /// and in all other situations this will be an accurate measurement of time passed
     /// since the previous frame.
     ///
-    /// A frame can still stall for various reasons, so `stable_dt` can
+    /// Note that a frame can still stall for various reasons, so `stable_dt` can
     /// still be unusually large in some situations.
     ///
     /// When animating something, it is recommended that you use something like
@@ -1508,7 +1508,7 @@ impl PointerState {
     /// But if the mouse is down long enough, or has moved far enough,
     /// then we consider it a drag.
     ///
-    /// It can return true on the same frame the drag is released,
+    /// This function can return true on the same frame the drag is released,
     /// but NOT on the first frame it was started.
     ///
     /// See also [`Self::could_any_button_be_click`].
@@ -1603,7 +1603,7 @@ impl InputState {
 
         ui.collapsing("Raw Input", |ui| raw.ui(ui));
 
-        crate::containers::CollapsingHeader::new("\u{1F5B1} Pointer")
+        crate::containers::CollapsingHeader::new("🖱 Pointer")
             .default_open(false)
             .show(ui, |ui| {
                 pointer.ui(ui);

@@ -634,7 +634,7 @@ pub mod path {
         }
     }
 
-    // Makes sure the radius of each corner is within a valid range
+    // Ensures the radius of each corner is within a valid range
     fn clamp_corner_radius(cr: CornerRadiusF32, rect: Rect) -> CornerRadiusF32 {
         let half_width = rect.width() * 0.5;
         let half_height = rect.height() * 0.5;
@@ -1564,7 +1564,7 @@ impl Tessellator {
         // Get the max pixel radius
         let max_radius = (radius.max_elem() * self.pixels_per_point) as u32;
 
-        // Make sure there is at least 8 points in each quarter of the ellipse
+        // Ensure there is at least 8 points in each quarter of the ellipse
         let num_points = u32::max(8, max_radius / 16);
 
         // Create an ease ratio based the ellipses a and b
@@ -2254,7 +2254,7 @@ impl Tessellator {
 
         for clipped_primitive in &clipped_primitives {
             if let Primitive::Mesh(mesh) = &clipped_primitive.primitive {
-                debug_assert!(mesh.is_valid(), "Tessellator made an invalid Mesh");
+                debug_assert!(mesh.is_valid(), "Tessellator generated invalid Mesh");
             }
         }
 

@@ -20,7 +20,7 @@ fn fit_to_rect_in_scene(
     // Compute the scale factor to fit the bounding rectangle into the available screen size:
     let scale = rect_in_global.size() / rect_in_scene.size();
 
-    // Use the smaller of the two scales to make sure the whole rectangle fits on the screen:
+    // Use the smaller of the two scales to ensure the whole rectangle fits on the screen:
     let scale = scale.min_elem();
 
     // Clamp scale to what is allowed
@@ -107,7 +107,7 @@ impl Scene {
     /// which mean you zan make things arbitrarily small, but you cannot zoom in past a `1:1` ratio.
     ///
     /// If you want to allow zooming in, you can set the zoom range to `0.0..=f32::INFINITY`.
-    /// Text rendering becomes blurry when you zoom in: <https://github.com/emilk/egui/issues/4813>.
+    /// Note that text rendering becomes blurry when you zoom in: <https://github.com/emilk/egui/issues/4813>.
     #[inline]
     pub fn zoom_range(mut self, zoom_range: impl Into<Rangef>) -> Self {
         self.zoom_range = zoom_range.into();
@@ -216,7 +216,7 @@ impl Scene {
         // Add the actual contents to the area:
         let ret = add_contents(&mut local_ui);
 
-        // This makes sure we catch clicks/drags/pans anywhere on the background.
+        // This ensures we catch clicks/drags/pans anywhere on the background.
         local_ui.force_set_min_rect((to_global.inverse() * outer_rect).round_ui());
 
         InnerResponse {

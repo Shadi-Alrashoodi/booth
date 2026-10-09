@@ -350,7 +350,7 @@ mod test {
         // the values below are correct despite not seeming that way on the first look,
         // handling of and around emojis is kind of weird and is not consistent across
         // text editors and browsers
-        let text = "\u{2764}\u{FE0F}\u{1F44D} skvělá knihovna \u{1F44D}\u{2764}\u{FE0F}";
+        let text = "❤️👍 skvělá knihovna 👍❤️";
         assert_eq!(next_word_boundary_char_index(text, CharIndex(0)).0, 2);
         assert_eq!(next_word_boundary_char_index(text, CharIndex(2)).0, 3); // this does not skip the space between thumbs-up and 'skvělá'
         assert_eq!(next_word_boundary_char_index(text, CharIndex(6)).0, 10);
@@ -381,8 +381,8 @@ mod test {
 
     #[test]
     fn test_index_conversion_roundtrip() {
-        // "é" is 2 bytes, U+1F44D is 4 bytes.
-        let text = "aé\u{1F44D}b";
+        // "é" is 2 bytes, "👍" is 4 bytes.
+        let text = "aé👍b";
         let char_count = text.chars().count(); // 4
         assert_eq!(char_count, 4);
 
@@ -479,30 +479,22 @@ mod tests {
             ("   ", "   ".chars().count(), 0),
             ("hello, world", "hello, world".chars().count(), 7),
             ("www.example.com", "www.example.com".chars().count(), 12),
-            ("안녕! \u{1F60A} 세상", 8, 6),
-            (
-                "\u{2764}\u{FE0F}\u{1F44D} skvělá knihovna \u{1F44D}\u{2764}\u{FE0F}",
-                18,
-                11,
-            ),
+            ("안녕! 😊 세상", 8, 6),
+            ("❤️👍 skvělá knihovna 👍❤️", 18, 11),
             (
                 "a e\u{301} b",
                 "a e\u{301} b".chars().count(),
                 "a e\u{301} ".chars().count(),
             ),
             (
-                "hi \u{1F642} world",
-                "hi \u{1F642} world".chars().count(),
-                "hi \u{1F642} ".chars().count(),
+                "hi 🙂 world",
+                "hi 🙂 world".chars().count(),
+                "hi 🙂 ".chars().count(),
             ),
             (
-                "hi \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466} world",
-                "hi \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466} world"
-                    .chars()
-                    .count(),
-                "hi \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466} "
-                    .chars()
-                    .count(),
+                "hi 👨‍👩‍👧‍👦 world",
+                "hi 👨‍👩‍👧‍👦 world".chars().count(),
+                "hi 👨‍👩‍👧‍👦 ".chars().count(),
             ),
         ];
 

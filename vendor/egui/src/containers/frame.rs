@@ -88,7 +88,7 @@ use epaint::{Color32, CornerRadius, Margin, MarginF32, Rect, Shadow, Shape, Stro
 /// # });
 /// ```
 ///
-/// You cannot change the margins after calling `begin`.
+/// Note that you cannot change the margins after calling `begin`.
 #[doc(alias = "border")]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]

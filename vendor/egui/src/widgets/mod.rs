@@ -52,7 +52,7 @@ pub use self::{
 ///
 /// You only need to implement `Widget` if you care about being able to do `ui.add(your_widget);`.
 ///
-/// The widgets ([`Button`], [`TextEdit`] etc) are
+/// Note that the widgets ([`Button`], [`TextEdit`] etc) are
 /// [builders](https://doc.rust-lang.org/1.0.0/style/ownership/builders.html),
 /// and not objects that hold state.
 ///
@@ -63,7 +63,7 @@ pub use self::{
 pub trait Widget {
     /// Allocate space, interact, paint, and return a [`Response`].
     ///
-    /// This consumes `self`.
+    /// Note that this consumes `self`.
     /// This is because most widgets ([`Button`], [`TextEdit`] etc) are
     /// [builders](https://doc.rust-lang.org/1.0.0/style/ownership/builders.html)
     ///

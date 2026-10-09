@@ -17,7 +17,7 @@ use crate::{
 /// Whenever something gets added to a [`Ui`], a [`Response`] object is returned.
 /// [`Ui::add`] returns a [`Response`], as does [`Ui::button`], and all similar shortcuts.
 ///
-/// Warning: The `Response` contains a clone of [`Context`], and many methods lock the `Context`.
+/// ⚠️ The `Response` contains a clone of [`Context`], and many methods lock the `Context`.
 /// It can therefore be a deadlock to use `Context` from within a context-locking closures,
 /// such as [`Context::input`].
 #[derive(Clone, Debug)]
@@ -142,7 +142,7 @@ bitflags::bitflags! {
         /// e.g. the slider was dragged, text was entered in a [`TextEdit`](crate::TextEdit) etc.
         /// Always `false` for something like a [`Button`](crate::Button).
         ///
-        /// This can be `true` even if the user did not interact with the widget,
+        /// Note that this can be `true` even if the user did not interact with the widget,
         /// for instance if an existing slider value was clamped to the given range.
         const CHANGED = 1<<11;
 
@@ -176,7 +176,7 @@ impl Response {
     /// This will also return true if the widget was clicked via accessibility integration,
     /// or if the widget had keyboard focus and the use pressed Space/Enter.
     ///
-    /// The widget must be sensing clicks with [`Sense::click`].
+    /// Note that the widget must be sensing clicks with [`Sense::click`].
     /// [`crate::Button`] senses clicks; [`crate::Label`] does not (unless you call [`crate::Label::sense`]).
     ///
     /// You can use [`Self::interact`] to sense more things *after* adding a widget.
@@ -203,7 +203,7 @@ impl Response {
     /// A click is registered when the mouse or touch is released within
     /// a certain amount of time and distance from when and where it was pressed.
     ///
-    /// The widget must be sensing clicks with [`Sense::click`].
+    /// Note that the widget must be sensing clicks with [`Sense::click`].
     /// [`crate::Button`] senses clicks; [`crate::Label`] does not (unless you call [`crate::Label::sense`]).
     ///
     /// This also returns true if the widget was pressed-and-held on a touch screen.
@@ -225,7 +225,7 @@ impl Response {
     /// A click is registered when the mouse or touch is released within
     /// a certain amount of time and distance from when and where it was pressed.
     ///
-    /// The widget must be sensing clicks with [`Sense::click`].
+    /// Note that the widget must be sensing clicks with [`Sense::click`].
     /// [`crate::Button`] senses clicks; [`crate::Label`] does not (unless you call [`crate::Label::sense`]).
     #[inline]
     pub fn middle_clicked(&self) -> bool {
@@ -343,7 +343,7 @@ impl Response {
 
     /// This widget has the keyboard focus (i.e. is receiving key presses).
     ///
-    /// It only returns true if the UI as a whole (e.g. window)
+    /// This function only returns true if the UI as a whole (e.g. window)
     /// also has the keyboard focus. That makes this function suitable
     /// for style choices, e.g. a thicker border around focused widgets.
     pub fn has_focus(&self) -> bool {
@@ -415,7 +415,7 @@ impl Response {
     /// decision is postponed until whichever of these comes first:
     /// * the pointer moves further than [`crate::InputOptions::max_click_dist`],
     /// * it is held longer than [`crate::InputOptions::max_click_duration`],
-    /// * or it leaves the widget: a click has to be released on the widget, so
+    /// * or it leaves the widget — a click has to be released on the widget, so
     ///   once the pointer is outside, the gesture can only be a drag. This is what
     ///   keeps a handle thinner than `max_click_dist` from spending the decision
     ///   window as neither hovered nor dragged.
@@ -607,7 +607,7 @@ impl Response {
     /// This is not set if the *view* of the data was changed.
     /// For instance, moving the cursor in a [`TextEdit`](crate::TextEdit) does not set this to `true`.
     ///
-    /// This can be `true` even if the user did not interact with the widget,
+    /// Note that this can be `true` even if the user did not interact with the widget,
     /// for instance if an existing slider value was clamped to the given range.
     #[inline(always)]
     pub fn changed(&self) -> bool {
@@ -781,7 +781,7 @@ impl Response {
     /// i.e. if the response was from a widget behind button, the interaction will also be behind that button.
     /// egui gives priority to the _last_ added widget (the one on top gets clicked first).
     ///
-    /// This call will not add any hover-effects to the widget, so when possible
+    /// Note that this call will not add any hover-effects to the widget, so when possible
     /// it is better to give the widget a [`Sense`] instead, e.g. using [`crate::Label::sense`].
     ///
     /// Using this method on a `Response` that is the result of calling `union` on multiple `Response`s
@@ -1039,7 +1039,7 @@ impl Response {
     /// Draw a debug rectangle over the response displaying the response's id and whether it is
     /// enabled and/or hovered.
     ///
-    /// It is intended for debugging purpose and can be useful, for example, in case of
+    /// This function is intended for debugging purpose and can be useful, for example, in case of
     /// widget id instability.
     ///
     /// Color code:

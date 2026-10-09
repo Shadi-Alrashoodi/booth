@@ -11,7 +11,7 @@
 //!
 //! You must never open one top-level panel from within another panel. Add one panel, then the next.
 //!
-//! Warning: Always add any [`CentralPanel`] last.
+//! ⚠ Always add any [`CentralPanel`] last.
 //!
 //! Add your [`crate::Window`]:s after any top-level panels.
 
@@ -29,7 +29,7 @@ fn animate_expansion(ctx: &Context, id: Id, is_expanded: bool) -> f32 {
 /// [`Id`] of a panel's resize-handle widget.
 ///
 /// A panel registers its handle under this same id whether it is open,
-/// mid-slide, or fully collapsed; that is what lets one uninterrupted drag
+/// mid-slide, or fully collapsed — that is what lets one uninterrupted drag
 /// collapse the panel and pull it back open. [`Panel::show_switched`] points
 /// both of its panels at one shared handle the same way.
 fn resize_widget_id(id_source: Id) -> Id {
@@ -182,7 +182,7 @@ impl PanelSide {
 /// The order in which you add panels matter!
 /// The first panel you add will always be the outermost, and the last you add will always be the innermost.
 ///
-/// Warning: Always add any [`CentralPanel`] last.
+/// ⚠ Always add any [`CentralPanel`] last.
 ///
 /// See the [module level docs](crate::containers::panel) for more details.
 ///
@@ -229,7 +229,7 @@ pub struct Panel {
     /// Override for the [`Id`] under which the resize-handle widget is registered.
     ///
     /// Used by [`Self::show_switched`] so the collapsed and
-    /// expanded panels share a single resize widget; that way a drag on either
+    /// expanded panels share a single resize widget — that way a drag on either
     /// one can flip `is_expanded` and the gesture survives the swap.
     resize_id_source: Option<Id>,
 
@@ -331,8 +331,8 @@ impl Panel {
     /// When enabled, a panel that [`Self::show_collapsible`] has collapsed all
     /// the way still leaves a thin grab handle at its fixed edge. The handle is
     /// invisible until hovered, at which point it lights up like a normal resize
-    /// handle. Dragging it outward past [`Self::min_size`] (or double-clicking
-    /// it) reopens the panel.
+    /// handle. Dragging it outward past [`Self::min_size`] — or double-clicking
+    /// it — reopens the panel.
     ///
     /// This is the counterpart to drag-to-collapse, and like it requires
     /// [`Self::resizable`] to be `true`.
@@ -475,7 +475,7 @@ impl Panel {
 
         let panel = if how_expanded < 1.0 {
             if drag_in_progress {
-                // Mid-animation but the user is dragging: keep resize live so the
+                // Mid-animation but the user is dragging — keep resize live so the
                 // drag-to-reopen gesture flows straight into a normal resize.
                 self.with_slide_fraction(how_expanded)
             } else {
@@ -611,8 +611,8 @@ impl Panel {
                 // Animate the visible size from collapsed_size to expanded_size,
                 // so the slide picks up where the collapsed panel left off.
                 let expanded_size = if drag_in_progress {
-                    // During a drag the pointer sets the size, clamped to `min_size`,
-                    // and that, not the (stale) persisted size, is where the slide
+                    // During a drag the pointer sets the size, clamped to `min_size`
+                    // — so that, not the (stale) persisted size, is where the slide
                     // meets the collapsed panel, whether opening or closing. Get it
                     // wrong and the panel jumps the gap between the two sizes in one
                     // frame.
@@ -631,7 +631,7 @@ impl Panel {
                 };
                 let panel = expanded_panel.with_slide_fraction(slide_fraction);
                 // Keep the resize handle live during the slide if the drag is
-                // ongoing; otherwise disabling it would kill the gesture.
+                // ongoing — otherwise disabling it would kill the gesture.
                 if drag_in_progress {
                     panel
                 } else {
@@ -736,7 +736,7 @@ impl Panel {
         if resizable {
             // Resolve the resize interaction first to avoid frame latency in the resize.
             // We also recompute the size on the release frame (`drag_stopped`) so the
-            // released size gets persisted into [`PanelState`]; without this the
+            // released size gets persisted into [`PanelState`] — without this the
             // store-skipped-during-drag rule would leave the stored size at the
             // pre-drag value.
             let resize_id = self.resize_id();
@@ -760,7 +760,7 @@ impl Panel {
                 let prev_outer_size = outer_size;
                 // Signed distance from the fixed edge to the pointer along the
                 // panel's axis. Going past the fixed edge yields a negative size,
-                // which `clamp_to_range` then snaps up to `min`. DON'T use
+                // which `clamp_to_range` then snaps up to `min` — DON'T use
                 // `.abs()` here, that would mirror the drag and spuriously
                 // trigger drag-to-expand once the pointer crosses the edge.
                 let raw_outer_size = -side.sign() * (pointer[axis] - side.fixed_pos(outer_rect));
@@ -898,7 +898,7 @@ impl Panel {
         }
 
         // The highlight follows the pointer all the way down to zero size, where
-        // `collapsed_resize_handle` picks it straight up again, so the user never
+        // `collapsed_resize_handle` picks it straight up again — so the user never
         // loses sight of the edge they are dragging. The dim idle separator does
         // get hidden once the panel is mostly slid off, since there it would just
         // be a stray dash hovering near the parent edge.
@@ -971,7 +971,7 @@ impl Panel {
     /// The grab handle of a fully collapsed panel: a thin strip along the panel's
     /// fixed edge, invisible until hovered.
     ///
-    /// Dragging it outward past the minimum size (or double-clicking it)
+    /// Dragging it outward past the minimum size — or double-clicking it —
     /// reopens the panel. Registering it under the same id as the expanded
     /// panel's resize handle also keeps an in-progress drag-to-collapse gesture
     /// alive, so the user can drag the panel straight back out without releasing.
@@ -1013,7 +1013,7 @@ impl Panel {
             && let Some(pointer) = response.interact_pointer_pos()
         {
             // Signed distance from the fixed edge to the pointer along the panel's
-            // axis. Only counts as "pulled outward" while positive: going past the
+            // axis. Only counts as "pulled outward" while positive — going past the
             // fixed edge gives a negative value, NOT a mirrored positive one (no
             // `.abs()`), so dragging past the screen edge can't spuriously reopen.
             //
@@ -1037,7 +1037,7 @@ impl Panel {
         };
         if 0.0 < stroke.width {
             // The collapsed panel occupies no space of its own, so the line has to
-            // go _inside_ the area the following panels use, which means painting
+            // go _inside_ the area the following panels use — which means painting
             // in a layer above them, or they would cover it.
             // TODO(emilk): use the panel's own layer once https://github.com/emilk/egui/issues/1516 is done
             let painter = ui
@@ -1059,7 +1059,7 @@ impl Panel {
     /// including the [`Frame`] margin & border, or fall back to some default.
     ///
     /// Always clamped to [`Self::outer_size_range`] so callers get the size the
-    /// panel would actually render at, never a stale persisted size from a
+    /// panel would actually render at — never a stale persisted size from a
     /// previous build with a different range.
     fn outer_size(&self, ui: &Ui) -> f32 {
         let axis = self.side.axis();
@@ -1095,7 +1095,7 @@ impl Panel {
     fn cursor_icon(&self, outer_size: f32) -> CursorIcon {
         // When this panel is the collapsed view of `show_switched`
         // (`resize_id_source` is set), dragging past `max_size` triggers
-        // drag-to-expand, so the user can always grow further. Treat the cap
+        // drag-to-expand — so the user can always grow further. Treat the cap
         // as `INFINITY` for cursor purposes, otherwise we'd advertise
         // "can only shrink" while sitting on a drag-to-expand affordance.
         let can_drag_to_expand = self.resize_id_source.is_some();
@@ -1166,7 +1166,7 @@ impl Panel {
 /// The order in which you add panels matter!
 /// The first panel you add will always be the outermost, and the last you add will always be the innermost.
 ///
-/// Warning: [`CentralPanel`] must be added after all other panels!
+/// ⚠ [`CentralPanel`] must be added after all other panels!
 ///
 /// NOTE: Any [`crate::Window`]s and [`crate::Area`]s will cover the top-level [`CentralPanel`].
 ///

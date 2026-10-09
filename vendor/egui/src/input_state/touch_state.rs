@@ -48,7 +48,7 @@ pub struct MultiTouchInfo {
     /// Relative movement (comparing previous frame and current frame) of the average position of
     /// all touch points. Without movement this value is `Vec2::ZERO`.
     ///
-    /// This may not necessarily be measured in screen points (although it _will_ be for
+    /// Note that this may not necessarily be measured in screen points (although it _will_ be for
     /// most mobile devices). In general (depending on the touch device), touch coordinates cannot
     /// be directly mapped to the screen. A touch always is considered to start at the position of
     /// the pointer, but touch movement is always measured in the units delivered by the device,
@@ -124,7 +124,7 @@ struct ActiveTouch {
 
     /// Current force of the touch. A value in the interval [0.0 .. 1.0]
     ///
-    /// A value of 0.0 either indicates a very light touch, or it means that the device
+    /// Note that a value of 0.0 either indicates a very light touch, or it means that the device
     /// is not capable of measuring the touch force.
     force: Option<f32>,
 }

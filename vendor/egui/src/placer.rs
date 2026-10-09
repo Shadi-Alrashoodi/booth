@@ -148,7 +148,7 @@ impl Placer {
     /// Advance the cursor by this many points.
     /// [`Self::min_rect`] will expand to contain the cursor.
     ///
-    /// `advance_cursor` isn't supported when in a grid layout.
+    /// Note that `advance_cursor` isn't supported when in a grid layout.
     pub(crate) fn advance_cursor(&mut self, amount: f32) {
         debug_assert!(
             self.grid.is_none(),

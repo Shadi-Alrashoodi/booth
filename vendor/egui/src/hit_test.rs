@@ -8,7 +8,7 @@ use crate::{LayerId, Pos2, Sense, WidgetRect, WidgetRects, emath, id::IdSet};
 ///
 /// Answers the question "what is under the mouse pointer?".
 ///
-/// This doesn't care if the mouse button is pressed or not,
+/// Note that this doesn't care if the mouse button is pressed or not,
 /// or if we're currently already dragging something.
 #[derive(Clone, Debug, Default)]
 pub struct WidgetHits {
@@ -343,7 +343,7 @@ fn hit_test_on_close(close: &[WidgetRect], pos: Pos2) -> WidgetHits {
         (Some(hit_click), None) => {
             // We have a perfect hit on a click-widget, but not on a drag-widget.
             //
-            // We don't look for a close drag widget in this case,
+            // Note that we don't look for a close drag widget in this case,
             // because I can't think of a case where that would be helpful.
             // This is in contrast with the opposite case,
             // where when hovering directly over a drag-widget (like a big ScrollArea),

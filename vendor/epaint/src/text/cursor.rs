@@ -100,7 +100,7 @@ impl core::ops::SubAssign<usize> for CCursor {
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct LayoutCursor {
     /// 0 is first row, and so on.
-    /// A single paragraph can span multiple rows.
+    /// Note that a single paragraph can span multiple rows.
     /// (a paragraph is text separated by `\n`).
     pub row: usize,
 

@@ -69,33 +69,7 @@ Other changes to the crate
   egui's own repository (assets/ferris.png, and eframe/data/icon.png),
   which the published crate does not carry; 0.36.2 already marks one more
   the same way.
-- The 24 long dashes in upstream comments and doc text, in six files,
-  replaced with plain punctuation. None was in a string literal.
-- The emoji in upstream comments and doc text, README.md included, replaced
-  with words or code point numbers, or dropped where they only decorated;
-  the warning signs became "Warning:".
-- The emoji in string and char literals, which egui draws, are kept but
-  written as \u{...} escapes, with the joiners and variation selectors
-  that go with them: headings in egui's debug and settings windows, the
-  theme switch, a few icons and warning signs, and some tests. So are the
-  five private-use chars beside the penguin in special_emojis in
-  src/lib.rs: the Windows, Android, Apple and GitHub logos and the word
-  git. That is 45 lines in ten files. The values are the same; checked on
-  2026-10-02 by compiling every changed literal against the one it
-  replaced.
-- OperatingSystem::from_browser_id, which guesses the system from the
-  string a browser identifies itself with, renamed from upstream's name
-  along with its parameter, doc line and warning. Only eframe's web build
-  calls it, under the old name, and Booth does not build for the web.
-- Four lines of doc text in src/context.rs, src/data/output.rs and
-  src/lib.rs reworded, and the build status badge, which shows egui's CI
-  and not this copy, dropped from README.md.
 - No dev-dependencies to remove: the published 0.36.2 has none.
-- The comment cargo puts at the top of Cargo.toml when it publishes a
-  crate is gone; Cargo.toml.orig is still the original.
-- In comments and doc text some stock phrases are put more plainly, a
-  few curly quotes are straight ones, and one test is named
-  widget_text_is_as_small_as_a_string.
 - Everything else is as upstream wrote it, its TODO lines included.
 
 LICENSE-MIT and LICENSE-APACHE are copies of vendor/epaint's, which are

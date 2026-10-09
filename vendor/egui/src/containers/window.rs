@@ -30,7 +30,7 @@ pub enum WindowDrag {
     /// Only the title bar accepts the move-drag gesture.
     ///
     /// Windows without a title bar (see [`Window::title_bar`]) silently fall
-    /// back to [`Self::Anywhere`]; otherwise they'd be unmovable.
+    /// back to [`Self::Anywhere`] — otherwise they'd be unmovable.
     TitleBar,
 
     /// [`Self::Anywhere`] when a touch screen is detected (see
@@ -76,7 +76,7 @@ impl WindowDrag {
 ///
 /// The previous rectangle used by this window can be obtained through [`crate::Memory::area_rect()`].
 ///
-/// This is NOT a native OS window.
+/// Note that this is NOT a native OS window.
 /// To create a new native OS window, use [`crate::Context::show_viewport_deferred`].
 #[must_use = "You should call .show()"]
 pub struct Window<'a> {
@@ -451,7 +451,7 @@ impl<'a> Window<'a> {
 
     /// Can the user resize the window by dragging its edges?
     ///
-    /// Even if you set this to `false` the window may still auto-resize.
+    /// Note that even if you set this to `false` the window may still auto-resize.
     ///
     /// You can set the window to only be resizable in one direction by using
     /// e.g. `[true, false]` as the argument,
@@ -516,7 +516,7 @@ impl<'a> Window<'a> {
 
     /// Controls scrolling the window by dragging the contents with the pointer.
     ///
-    /// Defaults to [`DragScroll::OnTouch`]: only active when a touch screen is detected.
+    /// Defaults to [`DragScroll::OnTouch`] — only active when a touch screen is detected.
     ///
     /// See [`ScrollArea::scroll_source`] and [`DragScroll`] for more.
     #[inline]
@@ -584,7 +584,7 @@ impl Window<'_> {
         // Make the area itself agree: keep its movable flag in sync with
         // the resolved drag mode so resize behavior and `Area::begin`'s
         // drag-from-anywhere handling don't disagree with the title-bar
-        // path. (Builder order shouldn't matter: `.drag_area(Off)` after
+        // path. (Builder order shouldn't matter — `.drag_area(Off)` after
         // `.movable(true)` and vice versa both end up here.)
         let area = if effective_drag == WindowDrag::Off {
             area.movable(false)

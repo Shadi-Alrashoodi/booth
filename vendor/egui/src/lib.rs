@@ -159,7 +159,7 @@
 //! In immediate mode GUIs, the entire interface is laid out and painted at the same high rate.
 //! This makes immediate mode GUIs especially well suited for highly interactive applications.
 //!
-//! It is useful to fully understand what "immediate mode" implies.
+//! It is useful to fully grok what "immediate mode" implies.
 //!
 //! Here is an example to illustrate it:
 //!
@@ -195,7 +195,7 @@
 //! ```
 //!
 //! Here egui will read `value` (an `f32`) to display the slider, then look if the mouse is dragging the slider and if so change the `value`.
-//! `egui` does not store the slider value for you - it only displays the current value, and changes it
+//! Note that `egui` does not store the slider value for you - it only displays the current value, and changes it
 //! by how much the slider has been dragged in the previous few milliseconds.
 //! This means it is responsibility of the egui user to store the state (`value`) so that it persists between frames.
 //!
@@ -502,7 +502,7 @@ pub use self::{
 pub fn warn_if_debug_build(ui: &mut crate::Ui) {
     if cfg!(debug_assertions) {
         ui.label(
-            RichText::new("\u{26A0} Debug build \u{26A0}")
+            RichText::new("⚠ Debug build ⚠")
                 .small()
                 .color(ui.visuals().warn_fg_color),
         )
@@ -577,9 +577,17 @@ macro_rules! github_link_file {
 pub(crate) const MINUS_CHAR_STR: &str = "−";
 
 /// The default egui fonts supports around 1216 emojis in total.
-/// Some of the most useful are media controls, arrows, check boxes, stars,
-/// calendars, charts, clipboards, pins, speakers, magnifiers, links, clocks
-/// and file and folder icons.
+/// Here are some of the most useful:
+/// ∞⊗⎗⎘⎙⏏⏴⏵⏶⏷
+/// ⏩⏪⏭⏮⏸⏹⏺■▶📾🔀🔁🔃
+/// ☀☁★☆☐☑☜☝☞☟⛃⛶✔
+/// ↺↻⟲⟳⬅➡⬆⬇⬈⬉⬊⬋⬌⬍⮨⮩⮪⮫
+/// ♡
+/// 📅📆
+/// 📈📉📊
+/// 📋📌📎📤📥🔆
+/// 🔈🔉🔊🔍🔎🔗🔘
+/// 🕓🖧🖩🖮🖱🖴🖵🖼🗀🗁🗋🗐🗑🗙🚫❓
 ///
 /// NOTE: In egui all emojis are monochrome!
 ///
@@ -589,22 +597,22 @@ pub(crate) const MINUS_CHAR_STR: &str = "−";
 /// This module contains some of them:
 pub mod special_emojis {
     /// Tux, the Linux penguin.
-    pub const OS_LINUX: char = '\u{1F427}';
+    pub const OS_LINUX: char = '🐧';
 
     /// The Windows logo.
-    pub const OS_WINDOWS: char = '\u{E61F}';
+    pub const OS_WINDOWS: char = '';
 
     /// The Android logo.
-    pub const OS_ANDROID: char = '\u{E618}';
+    pub const OS_ANDROID: char = '';
 
     /// The Apple logo.
-    pub const OS_APPLE: char = '\u{F8FF}';
+    pub const OS_APPLE: char = '';
 
     /// The Github logo.
-    pub const GITHUB: char = '\u{E624}';
+    pub const GITHUB: char = '';
 
     /// The word `git`.
-    pub const GIT: char = '\u{E625}';
+    pub const GIT: char = '';
 
     // I really would like to have ferris here.
 }

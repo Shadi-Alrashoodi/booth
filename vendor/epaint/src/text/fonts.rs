@@ -288,7 +288,7 @@ impl Default for FontTweak {
 /// makes text crisp at small sizes / low dpi, at the cost of slightly distorting
 /// the designer's outlines. At high dpi it matters little.
 ///
-/// This only has an effect if the font is actually hinted: either it ships
+/// This only has an effect if the font is actually hinted — either it ships
 /// TrueType instructions, or it was auto-hinted (see [`FontTweak::hinting`]).
 ///
 /// Used by [`FontTweak::hinting_target`].
@@ -362,7 +362,7 @@ pub struct SmoothHinting {
     /// in a way that changes spacing).
     ///
     /// `true` keeps inter-glyph spacing identical to the unhinted font, so
-    /// layout never depends on hinting, but it also prevents horizontal
+    /// layout never depends on hinting — but it also prevents horizontal
     /// grid-fitting, leaving vertical stems softer on low-dpi screens.
     ///
     /// `false` lets the (auto)hinter snap horizontally for crisper stems.
@@ -634,7 +634,7 @@ impl CachedFamily {
         fonts: Vec<FontFaceKey>,
         fonts_by_id: &mut nohash_hasher::IntMap<FontFaceKey, FontFace>,
     ) -> Self {
-        const PRIMARY_REPLACEMENT_CHAR: char = '\u{25FB}'; // white medium square
+        const PRIMARY_REPLACEMENT_CHAR: char = '◻'; // white medium square
         const FALLBACK_REPLACEMENT_CHAR: char = '?'; // fallback for the fallback
 
         if fonts.is_empty() {
@@ -676,7 +676,7 @@ impl CachedFamily {
 
     /// Walk the fallback chain and return the first face whose charmap supports `c`.
     ///
-    /// Pure: does not touch any cache. Callers that want memoisation should
+    /// Pure — does not touch any cache. Callers that want memoisation should
     /// insert into [`Self::face_cache`] themselves.
     pub(crate) fn find_face_for_char(
         &self,
@@ -723,7 +723,7 @@ impl Fonts {
     ///
     /// Call after painting the previous frame, but before using [`Fonts`] for the new frame.
     ///
-    /// It will react to changes in [`TextOptions`],
+    /// This function will react to changes in [`TextOptions`],
     /// as well as notice when the font atlas is getting full, and handle that.
     pub fn begin_pass(&mut self, options: TextOptions) {
         let text_options_changed = self.fonts.options() != &options;

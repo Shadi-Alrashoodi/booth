@@ -154,7 +154,7 @@ impl UiStackInfo {
 /// i.e. to set some tag on a [`crate::Ui`] and then in your own widget check
 /// for the existence of this tag up the [`UiStack`].
 ///
-/// Egui never sets any tags itself, so this is purely for user code.
+/// Note that egui never sets any tags itself, so this is purely for user code.
 ///
 /// All tagging is transient, and will only live as long as the parent [`crate::Ui`], i.e. within a single render frame.
 #[derive(Clone, Default, Debug)]
@@ -177,7 +177,7 @@ impl UiTags {
 
     /// Get the value of a tag.
     ///
-    /// `None` is returned both if the key is set to the value `None`,
+    /// Note that `None` is returned both if the key is set to the value `None`,
     /// and if the key is not set at all.
     #[inline]
     pub fn get_any(&self, key: &str) -> Option<&Arc<dyn Any + Send + Sync + 'static>> {
@@ -186,7 +186,7 @@ impl UiTags {
 
     /// Get the value of a tag.
     ///
-    /// `None` is returned both if the key is set to the value `None`,
+    /// Note that `None` is returned both if the key is set to the value `None`,
     /// and if the key is not set at all.
     pub fn get_downcast<T: Any + Send + Sync + 'static>(&self, key: &str) -> Option<&T> {
         self.0.get(key)?.as_ref().and_then(|any| any.downcast_ref())

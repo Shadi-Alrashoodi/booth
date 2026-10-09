@@ -161,7 +161,7 @@ impl ComboBox {
     ///
     /// By default, [`Ui::wrap_mode`] will be used, which can be overridden with [`crate::Style::wrap_mode`].
     ///
-    /// Any `\n` in the text will always produce a new line.
+    /// Note that any `\n` in the text will always produce a new line.
     #[inline]
     pub fn wrap_mode(mut self, wrap_mode: TextWrapMode) -> Self {
         self.wrap_mode = Some(wrap_mode);

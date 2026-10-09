@@ -71,7 +71,7 @@ impl Sense {
 
     /// Sense both clicks, drags and hover (e.g. a slider or window), and make the widget focusable.
     ///
-    /// This will introduce a latency when dragging,
+    /// Note that this will introduce a latency when dragging,
     /// because when the user starts a press egui can't know if this is the start
     /// of a click or a drag, and it won't know until the cursor has
     /// either moved a certain distance, or the user has released the mouse button.

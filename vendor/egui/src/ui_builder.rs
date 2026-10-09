@@ -60,7 +60,7 @@ impl UiBuilder {
 
     /// Set an id of the new `Ui` that is independent of the parent `Ui`.
     /// This way child widgets can be moved in the ui tree without losing state.
-    /// You have to make sure that in a frame the child widgets do not get rendered in multiple places.
+    /// You have to ensure that in a frame the child widgets do not get rendered in multiple places.
     ///
     /// You should set the same unique `id` at every place in the ui tree where you want the
     /// child widgets to share state.
@@ -116,7 +116,7 @@ impl UiBuilder {
 
     /// Make the new `Ui` disabled, i.e. grayed-out and non-interactive.
     ///
-    /// If the parent `Ui` is disabled, the child will always be disabled.
+    /// Note that if the parent `Ui` is disabled, the child will always be disabled.
     ///
     /// See also [`crate::Ui::add_enabled`], [`crate::Ui::add_enabled_ui`] and [`crate::Ui::is_enabled`].
     #[inline]

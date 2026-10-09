@@ -410,7 +410,7 @@ impl Options {
         use crate::Widget as _;
         use crate::containers::CollapsingHeader;
 
-        CollapsingHeader::new("\u{2699} Options")
+        CollapsingHeader::new("⚙ Options")
             .default_open(false)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -438,7 +438,7 @@ impl Options {
                 ui.checkbox(reduce_texture_memory, "Reduce texture memory");
             });
 
-        CollapsingHeader::new("\u{1F391} Style")
+        CollapsingHeader::new("🎑 Style")
             .default_open(true)
             .show(ui, |ui| {
                 theme_preference.radio_buttons(ui);
@@ -452,7 +452,7 @@ impl Options {
                 style.ui(ui);
             });
 
-        CollapsingHeader::new("\u{2712} Painting")
+        CollapsingHeader::new("✒ Painting")
             .default_open(false)
             .show(ui, |ui| {
                 tessellation_options.ui(ui);
@@ -461,7 +461,7 @@ impl Options {
                 });
             });
 
-        CollapsingHeader::new("\u{1F5B1} Input")
+        CollapsingHeader::new("🖱 Input")
             .default_open(false)
             .show(ui, |ui| {
                 input_options.ui(ui);
@@ -490,7 +490,7 @@ pub(crate) struct InteractionState {
 
     /// A widget interested in drags that has a mouse press on it.
     ///
-    /// This is set as soon as the mouse is pressed,
+    /// Note that this is set as soon as the mouse is pressed,
     /// so the widget may not yet be marked as "dragged"
     /// as that can only happen after the mouse has moved a bit
     /// (at least if the widget is interesated in both clicks and drags).
@@ -858,7 +858,7 @@ impl Memory {
     /// Check if the widget lost keyboard focus.
     ///
     /// Returns `true` when `id` was the focused widget at the start
-    /// of this frame *or* the start of the previous frame, but is
+    /// of this frame *or* the start of the previous frame — but is
     /// not focused now. The two-frame window matters when focus
     /// transfers mid-frame: the previously-focused widget has
     /// usually already been rendered by the time another widget
@@ -880,7 +880,7 @@ impl Memory {
 
     /// Does this widget have keyboard focus?
     ///
-    /// It does not consider whether the UI as a whole (e.g. window)
+    /// This function does not consider whether the UI as a whole (e.g. window)
     /// has the keyboard focus. That makes this function suitable for deciding
     /// widget state that should not be disrupted if the user moves away from
     /// the window and back.

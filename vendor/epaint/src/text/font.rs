@@ -24,7 +24,7 @@ pub struct UvRect {
     pub offset: Vec2,
 
     /// Screen size (in points) of this glyph.
-    /// The height is different from the font height.
+    /// Note that the height is different from the font height.
     pub size: Vec2,
 
     /// Top left corner UV in texture.
@@ -357,7 +357,7 @@ pub struct FontFace {
     subpixel_binning: bool,
 
     /// Cached `harfrust` shaper data (parsed GSUB/GPOS tables).
-    /// `ShaperData` is `Copy`, so it lives outside the `self_cell`.
+    /// `ShaperData` is `Copy` — lives outside the `self_cell`.
     shaper_data: harfrust::ShaperData,
 
     /// Location-independent: `char → GlyphId | Invisible`.
@@ -717,7 +717,7 @@ impl Font<'_> {
 
     /// Can we display this glyph?
     pub fn has_glyph(&mut self, c: char) -> bool {
-        // TODO(emilk): this is a false negative if the user asks about the replacement character itself
+        // TODO(emilk): this is a false negative if the user asks about the replacement character itself 🤦‍♂️
         self.resolve_face(c) != self.cached_family.replacement_face_key
     }
 
@@ -728,7 +728,7 @@ impl Font<'_> {
 
     /// Find which face in the fallback chain owns `c`.
     ///
-    /// Location-independent: fallback choice depends only on charmap support.
+    /// Location-independent — fallback choice depends only on charmap support.
     /// Falls back to the replacement-glyph face when no fallback face has `c`.
     #[inline]
     pub(crate) fn resolve_face(&mut self, c: char) -> FontFaceKey {
@@ -754,7 +754,7 @@ impl Font<'_> {
     ///
     /// `metrics` must be the resolved [`StyledMetrics`] for the face that ends
     /// up owning `c`. Most callers pass the metrics of their text run's primary
-    /// face, which is correct as long as `c` is in that face. For correct
+    /// face — that is correct as long as `c` is in that face. For correct
     /// fallback-face advances, resolve the face first with [`Self::resolve_face`]
     /// and build metrics for that face.
     pub(crate) fn glyph_info(
@@ -767,7 +767,7 @@ impl Font<'_> {
             return (face_key, GlyphInfo::INVISIBLE);
         };
         let glyph_info = face.glyph_info(c, metrics).unwrap_or_else(|| {
-            // `c` is in no face, so render the replacement character instead.
+            // `c` is in no face — render the replacement character instead.
             face.glyph_info(self.cached_family.replacement_char, metrics)
                 .unwrap_or(GlyphInfo::INVISIBLE)
         });
@@ -881,5 +881,5 @@ pub(super) fn is_cjk(c: char) -> bool {
 #[inline]
 pub(super) fn is_cjk_break_allowed(c: char) -> bool {
     // See: https://en.wikipedia.org/wiki/Line_breaking_rules_in_East_Asian_languages#Characters_not_permitted_on_the_start_of_a_line.
-    !")]｝〕〉》」』】〙〗〟'\"｠»ヽヾーァィゥェォッャュョヮヵヶぁぃぅぇぉっゃゅょゎゕゖㇰㇱㇲㇳㇴㇵㇶㇷㇸㇹㇺㇻㇼㇽㇾㇿ々〻‐゠\u{2013}〜?!\u{203C}⁇⁈\u{2049}・、:;,。.".contains(c)
+    !")]｝〕〉》」』】〙〗〟'\"｠»ヽヾーァィゥェォッャュョヮヵヶぁぃぅぇぉっゃゅょゎゕゖㇰㇱㇲㇳㇴㇵㇶㇷㇸㇹㇺㇻㇼㇽㇾㇿ々〻‐゠–〜?!‼⁇⁈⁉・、:;,。.".contains(c)
 }

@@ -14,7 +14,7 @@ pub struct WidgetRect {
     /// and also big red warning test on the screen in debug builds
     /// (see [`crate::Options::warn_on_id_clash`]).
     ///
-    /// You can keep ids globally unique using [`crate::Ui::push_id`].
+    /// You can ensure globally unique ids using [`crate::Ui::push_id`].
     pub id: Id,
 
     /// The [`Id`] of the parent [`crate::Ui`] that hosts this widget.
@@ -86,7 +86,7 @@ impl Default for InteractOptions {
     }
 }
 
-/// Stores the [`WidgetRect`]s of all widgets made during a single egui update/frame.
+/// Stores the [`WidgetRect`]s of all widgets generated during a single egui update/frame.
 ///
 /// All [`crate::Ui`]s have a [`WidgetRect`]. It is created in [`crate::Ui::new`] with [`Rect::NOTHING`]
 /// and updated with the correct [`Rect`] when the [`crate::Ui`] is dropped.

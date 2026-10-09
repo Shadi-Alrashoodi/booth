@@ -72,7 +72,7 @@ impl ProgressBar {
     }
 
     /// Whether to display a loading animation when progress `< 1`.
-    /// This will cause the UI to be redrawn.
+    /// Note that this will cause the UI to be redrawn.
     /// Defaults to `false`.
     ///
     /// If [`Self::corner_radius`] and [`Self::animate`] are used simultaneously, the animation is not

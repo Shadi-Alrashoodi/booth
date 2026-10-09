@@ -220,7 +220,7 @@ pub enum Key {
     SuperRight,
 
     // ----------------------------------------------
-    // International keys: physical positions that only exist on
+    // International keys — physical positions that only exist on
     // non-US keyboards.
     /// ISO 102nd key: physically located between the left Shift and Z
     /// on ISO layouts. On French AZERTY it produces `<>|`; on UK
@@ -372,7 +372,7 @@ impl Key {
     /// This will parse the output of both [`Self::name`] and [`Self::symbol_or_name`],
     /// but will also parse single characters, so that both `"-"` and `"Minus"` will return `Key::Minus`.
     ///
-    /// This should support both the names a web browser uses,
+    /// This should support both the names generated in a web browser,
     /// and by winit. Please test on both with `eframe`.
     pub fn from_name(key: &str) -> Option<Self> {
         Some(match key {

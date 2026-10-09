@@ -70,7 +70,7 @@ struct CurrentSelection {
 
     /// When selecting with a mouse, this is where the mouse was released.
     /// When moving with e.g. shift+arrows, this is what moves.
-    /// The two ends can come in any order, and also be equal (no selection).
+    /// Note that the two ends can come in any order, and also be equal (no selection).
     pub primary: WidgetTextCursor,
 
     /// When selecting with a mouse, this is where the mouse was first pressed.

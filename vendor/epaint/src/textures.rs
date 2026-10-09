@@ -169,7 +169,7 @@ pub struct TextureOptions {
 
     /// How to filter between texture mipmaps.
     ///
-    /// Mipmaps makes sure textures look smooth even when the texture is very small and pixels are much
+    /// Mipmaps ensures textures look smooth even when the texture is very small and pixels are much
     /// larger than individual texels.
     ///
     /// # Notes

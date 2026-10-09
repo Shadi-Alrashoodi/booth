@@ -12,7 +12,7 @@ use super::text_cursor_state::{ccursor_next_word, ccursor_previous_word, slice_c
 pub struct CCursorRange {
     /// When selecting with a mouse, this is where the mouse was released.
     /// When moving with e.g. shift+arrows, this is what moves.
-    /// The two ends can come in any order, and also be equal (no selection).
+    /// Note that the two ends can come in any order, and also be equal (no selection).
     pub primary: CCursor,
 
     /// When selecting with a mouse, this is where the mouse was first pressed.
