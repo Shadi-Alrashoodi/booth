@@ -16,8 +16,9 @@
 # latest.txt.minisig. It uploads and publishes nothing; that stays a step
 # done by hand.
 #
-# The zip's and the installer's names carry the version, so the two download
-# links in README.md change with each version.
+# The zip's and the installer's names carry the version, so the download
+# links in README.md and docs\index.html change with each version, and a
+# release is refused while either still names another one.
 #
 # The key's password is needed twice, for the check and for signing. When it
 # is stored in Windows Credential Manager as the generic credential
@@ -400,6 +401,17 @@ if ($releasesPage -match '/OWNER/') {
 }
 if ($releaseKey -cnotmatch '^RW[A-Za-z0-9+/]{54}$') {
     $notReady += "RELEASE_KEY in $updateCode is `"$releaseKey`", not a public key yet, so no copy of Booth could check this release. Make the release key once with: cargo run --release --locked -p release -- keygen <path outside this repository>, and put the public key it prints in RELEASE_KEY."
+}
+# README.md and the project page link the installer and the zip by name,
+# and the names carry the version, so an old link in either would send
+# people to a file this release does not have.
+foreach ($page in 'README.md', 'docs\index.html') {
+    $text = Get-Content -Raw -LiteralPath (Join-Path $root $page)
+    $old = [regex]::Matches($text, '(?:booth-|Booth |Version )([0-9]+\.[0-9]+\.[0-9]+)') |
+        Where-Object { $_.Groups[1].Value -ne $version } | ForEach-Object { $_.Value } | Sort-Object -Unique
+    if ($old) {
+        $notReady += "$page still says $($old -join ', '), and this is version $version. Change it to $version and commit first."
+    }
 }
 if ($notReady) {
     if (-not $Rehearsal) {
