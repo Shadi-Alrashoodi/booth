@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Booth: privacy</title>
+<meta name="description" content="What Booth collects, which is nothing, and the few servers it contacts.">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#141412">
+<link rel="icon" href="favicon.ico">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<header class="head">
+  <a href="./"><img class="mark" src="mark.svg" width="96" height="96" alt="Booth"></a>
+  <h1>Privacy</h1>
+</header>
+
+<main>
+  <div class="text">
+    <section>
+      <p>Booth has no accounts, no analytics and no server of its own. Voice, video and chat go straight between your PC and the host's, encrypted, and nothing about you or your calls is collected or sent to me or anyone else. Your keys, your settings and the friends you have met stay on your PC.</p>
+      <p>To learn your outside address, Booth asks two public STUN servers, Cloudflare's and Google's unless you change them in Settings; they see that address and nothing else. The zip and the installer also ask GitHub once a day whether a newer version is out, and only if you turn on Check for new versions in Settings. The copy from the Microsoft Store never does, since the Store updates it. Booth contacts nothing else.</p>
+    </section>
+  </div>
+</main>
+
+<footer class="strip">
+  <span><a href="./">Booth</a></span>
+  <span>MIT or Apache-2.0</span>
+  <span><a href="privacy.html" aria-current="page">Privacy</a></span>
+  <span class="trace" aria-hidden="true"></span>
+</footer>
+</body>
+</html>
