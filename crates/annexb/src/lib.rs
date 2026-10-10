@@ -102,6 +102,16 @@ impl<'a> Iterator for NalUnits<'a> {
     }
 }
 
+// True when `unit`, read from just after a start code, holds nothing but
+// zero bytes up to where nal_units would end it, so nal_units skips it.
+fn only_zeros(unit: &[u8]) -> bool {
+    let end = unit
+        .windows(3)
+        .position(|w| w[0] == 0 && w[1] == 0 && w[2] <= 1)
+        .unwrap_or(unit.len());
+    unit[..end].iter().all(|&byte| byte == 0)
+}
+
 // Where nal_units ends a NAL unit: at 00 00 00 or 00 00 01.
 fn ends(w: &[u8], i: usize) -> u8 {
     u8::from((w[i] | w[i + 1] | (w[i + 2] & 0xfe)) == 0)

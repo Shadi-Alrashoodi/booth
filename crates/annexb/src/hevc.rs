@@ -317,10 +317,20 @@ fn sps_starts(w: &[u8], i: usize) -> u8 {
 /// at a time, since walking 3 MiB of the smallest NAL units one start code
 /// at a time takes up to about 1 ms.
 pub fn first_picture(access_unit: &[u8]) -> Option<u8> {
-    let at = super::find::<4>(access_unit, |w, i| {
-        u8::from((w[i] | w[i + 1] | (w[i + 2] ^ 1) | (w[i + 3] & 0x40)) == 0)
-    })?;
-    Some((access_unit[at + 3] >> 1) & 0x3f)
+    let mut from = 0;
+    loop {
+        let at = from
+            + super::find::<4>(&access_unit[from..], |w, i| {
+                u8::from((w[i] | w[i + 1] | (w[i + 2] ^ 1) | (w[i + 3] & 0x40)) == 0)
+            })?;
+        let unit = &access_unit[at + 3..];
+        // Zero bytes up to the next start code are no unit to nal_units,
+        // only padding, so they are no picture either.
+        if unit[0] != 0 || !super::only_zeros(unit) {
+            return Some((unit[0] >> 1) & 0x3f);
+        }
+        from = at + 3;
+    }
 }
 
 /// How many SPSs an access unit carries, the number [`coded_sizes`] gives,
@@ -782,6 +792,19 @@ mod tests {
     // forbidden_zero_bit, the type, layer 0, TemporalId 0.
     fn header(kind: u8) -> [u8; 2] {
         [kind << 1, 1]
+    }
+
+    // Zero bytes after a start code are padding, which nal_units skips, so
+    // they are no picture, and an IDR after them is still the frame's first.
+    #[test]
+    fn padding_after_a_start_code_is_no_picture() {
+        assert_eq!(first_picture(&[0, 3, 0, 0, 0, 1, 0, 0]), None);
+        let mut unit = vec![0, 0, 1, 0, 0, 0, 1];
+        unit.extend_from_slice(&header(IDR_W_RADL));
+        unit.push(0xaf);
+        assert_eq!(first_picture(&unit), Some(IDR_W_RADL));
+        // A unit that starts with a zero byte and holds more is a picture.
+        assert_eq!(first_picture(&[0, 0, 1, 0, 5]), Some(0));
     }
 
     /// An SPS as NVENC writes one for 2560x1440, Main, level 6, 12
@@ -1255,19 +1278,11 @@ mod tests {
             ),
         ) {
             let unit = pieces.concat();
-            // Every 00 00 01 in turn, as the decoder used to find it.
-            let mut walked = None;
-            let mut rest = &unit[..];
-            while let Some(start) = rest.windows(3).position(|w| w == [0, 0, 1]) {
-                rest = &rest[start + 3..];
-                let Some(&header) = rest.first() else {
-                    break;
-                };
-                if (header >> 1) & 0x3f < 32 {
-                    walked = Some((header >> 1) & 0x3f);
-                    break;
-                }
-            }
+            // The first picture unit nal_units finds, as the decoder reads
+            // the rest of the frame.
+            let walked = super::super::nal_units(&unit)
+                .find(is_slice)
+                .map(|nal| kind(&nal));
             proptest::prop_assert_eq!(first_picture(&unit), walked);
         }
     }
