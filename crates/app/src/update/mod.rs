@@ -53,6 +53,13 @@ const MOST_RECORD_BYTES: usize = 64;
 // Under the setting in Settings while it is on.
 pub const CHECK_ABOUT: &str = "Once a day, when Booth starts, it asks GitHub whether a newer version is out. GitHub sees your address, as it would for any download. The new version is not downloaded until you press Download.";
 
+// In Settings, in place of the setting, in the Store's copy.
+pub const FROM_STORE: &str = concat!(
+    "Booth ",
+    env!("CARGO_PKG_VERSION"),
+    ", from the Microsoft Store. The Store keeps it up to date."
+);
+
 pub type Notify = Arc<dyn Fn() + Send + Sync>;
 
 // A day since the last check, either way: a clock set back by more than a

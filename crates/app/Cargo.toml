@@ -10,6 +10,11 @@ publish.workspace = true
 name = "booth"
 path = "src/main.rs"
 
+[features]
+# The Microsoft Store build: the Store updates it, and its package brings the
+# firewall rule, so there is no update check and no administrator step.
+store = []
+
 [dependencies]
 keys.workspace = true
 invite.workspace = true

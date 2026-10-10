@@ -83,6 +83,13 @@ fn main() -> ExitCode {
     // administrator prompt started.
     if elevated::asked_for(&args) {
         win::system_dlls_only();
+        if cfg!(feature = "store") {
+            eprintln!(
+                "booth: the Store package brings its own firewall rule, so {} does nothing in this copy",
+                elevated::FLAG
+            );
+            return ExitCode::from(2);
+        }
         return elevated::run(&args);
     }
     // The panel parses invites and packets from the internet, and nothing

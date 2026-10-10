@@ -223,7 +223,8 @@ impl App {
             if let Some(line) = update::tidy(&dir) {
                 app.backlog.add(line);
             }
-            if setup.settings.check_for_new_versions() {
+            // The Store updates its own copy.
+            if setup.settings.check_for_new_versions() && !cfg!(feature = "store") {
                 app.update = Update::start(dir, Arc::clone(&app.notify));
             }
         }
@@ -287,12 +288,14 @@ impl App {
             Screen::Checking if self.setup.is_err() => {
                 self.screen = self.start(Start::default());
             }
+            // The Store package brings its own rule, so its copy only reads
+            // the firewall, for the log and the stats.
             Screen::Checking => match self.firewall.checked(&mut self.backlog) {
                 Some(
                     state @ (FirewallState::Blocked(_)
                     | FirewallState::Missing(_)
                     | FirewallState::BlockingAll(_)),
-                ) => {
+                ) if !cfg!(feature = "store") => {
                     self.screen = Screen::Firewall(ask(state));
                 }
                 Some(_) => self.screen = self.start(Start::default()),

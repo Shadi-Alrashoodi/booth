@@ -229,6 +229,11 @@ pub fn show(ui: &mut Ui, draft: &mut Draft, audio: &SettingsAudio) -> Option<Pre
                 sharing(ui, draft);
                 devices(ui, draft);
                 blocked(ui, draft);
+                if cfg!(feature = "store") {
+                    ui.add_space(SECTION_GAP);
+                    head(ui, "About");
+                    line(ui, update::FROM_STORE, ASH);
+                }
                 if let Some(error) = &draft.list_error {
                     ui.add_space(FIELD_GAP);
                     controls::prose(ui, error.as_str(), theme::body(), BAD);
@@ -345,16 +350,19 @@ fn network(ui: &mut Ui, draft: &mut Draft) -> [Response; 2] {
 
     // The update check talks to GitHub, so it sits with the other settings
     // that decide who this PC talks to. Its sentence shows while it is on,
-    // the choice that costs something.
-    ui.add_space(FIELD_GAP);
-    let id = ui.id().with("new versions");
-    let on = draft.check_for_new_versions;
-    let kind = WidgetType::Checkbox;
-    if controls::choice_row(ui, id, on, "Check for new versions", None, kind).clicked() {
-        draft.check_for_new_versions = !on;
-    }
-    if draft.check_for_new_versions {
-        line(ui, update::CHECK_ABOUT, ASH);
+    // the choice that costs something. The Store's copy has no check, and
+    // keeps whatever settings.txt says for a copy from the zip.
+    if !cfg!(feature = "store") {
+        ui.add_space(FIELD_GAP);
+        let id = ui.id().with("new versions");
+        let on = draft.check_for_new_versions;
+        let kind = WidgetType::Checkbox;
+        if controls::choice_row(ui, id, on, "Check for new versions", None, kind).clicked() {
+            draft.check_for_new_versions = !on;
+        }
+        if draft.check_for_new_versions {
+            line(ui, update::CHECK_ABOUT, ASH);
+        }
     }
     if let Some(error) = &draft.error {
         line(ui, error.as_str(), BAD);
