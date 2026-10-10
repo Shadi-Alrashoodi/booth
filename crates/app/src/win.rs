@@ -1,14 +1,11 @@
-use std::ffi::OsStr;
 use std::io;
-use std::os::windows::ffi::OsStrExt;
+#[cfg(feature = "store")]
 use std::path::Path;
 use std::ptr;
 use std::sync::{Mutex, PoisonError};
 
 use eframe::egui::Color32;
-use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_CANCELLED, FILETIME, HANDLE, HWND, SYSTEMTIME, WAIT_OBJECT_0,
-};
+use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, HWND, SYSTEMTIME};
 use windows_sys::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DwmSetWindowAttribute,
 };
@@ -17,26 +14,17 @@ use windows_sys::Win32::Security::{
     TOKEN_ELEVATION_TYPE, TOKEN_QUERY, TokenElevationType, TokenElevationTypeDefault,
     TokenElevationTypeFull, WinBuiltinAdministratorsSid,
 };
-use windows_sys::Win32::System::Com::{
-    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
-};
 use windows_sys::Win32::System::LibraryLoader::{
     GetModuleHandleW, LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemTime;
-use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcessToken, WaitForSingleObject,
-};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows_sys::Win32::System::WindowsProgramming::GetUserNameW;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
-use windows_sys::Win32::UI::Shell::{
-    SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
-    ShellExecuteExW,
-};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, HWND_TOP, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW,
-    MB_ICONERROR, MB_OK, MessageBoxW, SM_CXICON, SM_CXSMICON, SPI_GETCLIENTAREAANIMATION, SW_HIDE,
+    MB_ICONERROR, MB_OK, MessageBoxW, SM_CXICON, SM_CXSMICON, SPI_GETCLIENTAREAANIMATION,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetForegroundWindow, SetWindowPos,
     SystemParametersInfoW, WM_SETICON,
 };
@@ -216,6 +204,8 @@ pub fn error_box(text: &str) {
     }
 }
 
+// Only the prompt gives the first two, and the Store's copy has no prompt.
+#[cfg_attr(feature = "store", allow(dead_code))]
 pub enum Elevated {
     Exited(u32),
     // The prompt was closed or answered No.
@@ -223,82 +213,19 @@ pub enum Elevated {
     Failed(io::Error),
 }
 
-// Starts this exe again through the administrator prompt, with one argument
-// and no window, and waits for it to end. That takes as long as the user
-// looks at the prompt, so it runs on a thread of its own. `owner` is the
-// panel's window, so the prompt belongs to it.
-pub fn run_elevated(exe: &Path, argument: &str, owner: Option<isize>) -> Elevated {
-    // ShellExecuteEx can hand the work to shell extensions, which need COM,
-    // but only for the call itself. The wait after it pumps no messages,
-    // which a thread in a COM apartment would owe anyone calling in.
-    // SAFETY: no reserved pointer; a success is paired with the
-    // CoUninitialize below, on this same thread.
-    let com = unsafe {
-        CoInitializeEx(
-            ptr::null(),
-            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
-        )
-    } >= 0;
-    let started = start_elevated(exe, argument, owner);
-    if com {
-        // SAFETY: pairs the CoInitializeEx above. With NOASYNC the shell is
-        // done with COM once the call has returned.
-        unsafe { CoUninitialize() };
-    }
-    match started {
-        Ok(process) => wait_for_exit(process),
-        Err(err) if err.raw_os_error() == Some(ERROR_CANCELLED as i32) => Elevated::Cancelled,
-        Err(err) => Elevated::Failed(err),
-    }
-}
+// The Store's copy never asks for administrator rights; its package brings
+// the firewall rule. Leaving the prompt out also keeps ShellExecuteEx, which
+// the Store's checks flag as a way to launch programs, out of booth.exe.
+#[cfg(not(feature = "store"))]
+mod prompt;
+#[cfg(not(feature = "store"))]
+pub use prompt::run_elevated;
 
-fn start_elevated(exe: &Path, argument: &str, owner: Option<isize>) -> io::Result<HANDLE> {
-    let verb = wide("runas");
-    let file = wide(exe);
-    let parameters = wide(argument);
-    let mut info = SHELLEXECUTEINFOW {
-        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
-        // NO_UI keeps the shell's own error box away, so the one message
-        // the user sees is Booth's; the consent prompt is not an error box
-        // and still shows. NOASYNC because this thread has no message loop.
-        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC,
-        hwnd: owner.map_or(ptr::null_mut(), |hwnd| hwnd as HWND),
-        lpVerb: verb.as_ptr(),
-        lpFile: file.as_ptr(),
-        lpParameters: parameters.as_ptr(),
-        nShow: SW_HIDE,
-        ..SHELLEXECUTEINFOW::default()
-    };
-    // SAFETY: `info` carries its own size, every pointer in it is null or a
-    // zero-terminated string that outlives the call, and the call writes
-    // only into `info`.
-    if unsafe { ShellExecuteExW(&mut info) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if info.hProcess.is_null() {
-        return Err(io::Error::other(
-            "Windows accepted the prompt but gave back no process to wait for",
-        ));
-    }
-    Ok(info.hProcess)
-}
-
-// Takes the process handle and closes it.
-fn wait_for_exit(process: HANDLE) -> Elevated {
-    let mut code = 0u32;
-    // SAFETY: `process` is the live handle ShellExecuteExW returned, owned
-    // here, and `code` is a live u32 for the exit code.
-    let exited = unsafe {
-        WaitForSingleObject(process, INFINITE) == WAIT_OBJECT_0
-            && GetExitCodeProcess(process, &mut code) != 0
-    };
-    let failed = (!exited).then(io::Error::last_os_error);
-    // SAFETY: closed once, and not used after this.
-    unsafe { CloseHandle(process) };
-    match failed {
-        None => Elevated::Exited(code),
-        Some(err) => Elevated::Failed(err),
-    }
+#[cfg(feature = "store")]
+pub fn run_elevated(_exe: &Path, _argument: &str, _owner: Option<isize>) -> Elevated {
+    Elevated::Failed(io::Error::other(
+        "this copy is from the Microsoft Store, whose package brings the firewall rule",
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -401,10 +328,6 @@ pub fn utc_stamp() -> String {
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
         now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond, now.wMilliseconds
     )
-}
-
-fn wide(text: impl AsRef<OsStr>) -> Vec<u16> {
-    text.as_ref().encode_wide().chain([0]).collect()
 }
 
 // Seconds since 1970 to 100 ns ticks since 1601, which is what FILETIME is.
