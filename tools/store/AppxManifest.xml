@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- tools\store.ps1 fills in the {{...}} values. The firewall rules come
      with the package and go with it, so Booth never asks for administrator
-     rights to let friends in. -->
+     rights to let friends in. The display name is the one reserved in
+     Partner Center; the window title stays Booth. -->
 <Package
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
@@ -12,7 +13,7 @@
   <Identity Name="{{Name}}" Publisher="{{Publisher}}" Version="{{Version}}" ProcessorArchitecture="x64" />
 
   <Properties>
-    <DisplayName>Booth</DisplayName>
+    <DisplayName>Booth Voice</DisplayName>
     <PublisherDisplayName>{{PublisherDisplayName}}</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
   </Properties>
@@ -23,13 +24,13 @@
   </Dependencies>
 
   <Resources>
-    <Resource Language="en-us" />
+    <Resource Language="en-US" />
   </Resources>
 
   <Applications>
     <Application Id="Booth" Executable="booth.exe" EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
-        DisplayName="Booth"
+        DisplayName="Booth Voice"
         Description="Voice, text chat and screen sharing for a few friends, hosted on one friend's PC."
         BackgroundColor="transparent"
         Square150x150Logo="Assets\Square150x150Logo.png"

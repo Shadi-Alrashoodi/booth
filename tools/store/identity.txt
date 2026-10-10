@@ -1,10 +1,10 @@
-# The Store package's identity, from Partner Center: Booth, Product
+# The Store package's identity, from Partner Center: Booth Voice, Product
 # management, Product identity, under "View app identity details". Copy each
 # value exactly as shown there:
 #   Name                  Package/Identity/Name
 #   Publisher             Package/Identity/Publisher, the whole CN=...
 #   PublisherDisplayName  Package/Properties/PublisherDisplayName
 # tools\store.ps1 builds no package for the Store while any of them is empty.
-Name =
-Publisher =
-PublisherDisplayName =
+Name = ShadiAlrashoodi.BoothVoice
+Publisher = CN=FF2BB441-837F-49F6-81F8-437B85D087DD
+PublisherDisplayName = Shadi Alrashoodi
