@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use common::voiced::{RATE, Voiced, settled, sine, voiced};
+use common::voiced::{RATE, Voiced, settled, tone_440, tone_660, voiced};
 use common::{invite_to, loopback};
 use net::Socket;
 use room::view::{LinkState, OwnShare, View};
@@ -34,7 +34,7 @@ const NVIDIA: u32 = 0x10de;
 const FFMPEG: [&str; 2] = ["avcodec-62.dll", "avutil-60.dll"];
 const WAIT: Duration = Duration::from_secs(10);
 
-// A home router's buffer, as the loopback's network has it.
+// How much a home router queues before it drops.
 const QUEUE: Duration = Duration::from_millis(200);
 // Wi-Fi's delay comes in stretches, so one draw of the jitter holds this
 // long for every packet in it.
@@ -62,14 +62,6 @@ fn ready() -> bool {
     }
     share::make_process_dpi_aware().unwrap_or_else(|err| panic!("{err}"));
     true
-}
-
-fn tone_440(frame: u64, _: u16) -> f32 {
-    sine(frame, 440.0, 0.2)
-}
-
-fn tone_660(frame: u64, _: u16) -> f32 {
-    sine(frame, 660.0, 0.2)
 }
 
 fn pattern() -> VideoConfig {
@@ -419,8 +411,7 @@ fn second(friend: &View, host: &View) -> Second {
 }
 
 // Silences of GAP or longer in mono samples: their total and the longest,
-// in milliseconds, how many, and where the sound first came back after
-// `from` samples (None if it never did).
+// in milliseconds, and how many.
 #[derive(Debug, Default)]
 struct Gaps {
     total_ms: f64,
@@ -550,23 +541,24 @@ fn print_report(report: &Report, friend_audio: &[f32], host_audio: &[f32]) {
 }
 
 // When, after `from`, sound first comes back in `audio` and stays for a
-// second, in ms after `from`.
+// second, in ms after `from`. Silences shorter than GAP do not break the
+// second: the tone crosses zero, and the decoder covers a lost frame.
 fn sound_back(audio: &[f32], from: usize) -> Option<f64> {
     let hold = RATE as usize;
+    let gap = (GAP.as_secs_f64() * RATE as f64) as usize;
     let mut start = None;
+    let mut quiet = 0usize;
     for (at, sample) in audio.iter().enumerate().skip(from) {
         if sample.abs() < QUIET {
-            if let Some(began) = start
-                && at - began < hold
-            {
+            quiet += 1;
+            if quiet >= gap {
                 start = None;
             }
-        } else if start.is_none() {
-            start = Some(at);
+            continue;
         }
-        if let Some(began) = start
-            && at - began >= hold
-        {
+        quiet = 0;
+        let began = *start.get_or_insert(at);
+        if at - began >= hold {
             return Some((began - from) as f64 * 1000.0 / RATE as f64);
         }
     }
