@@ -1037,10 +1037,10 @@ impl Host {
             self.say_capped(count);
         }
         self.punches.send_due(now, socket, &self.log);
-        // The friend's tries reach this PC within a second or two of the
-        // punches when anything can, so lost_after past the last round says
-        // the routers keep the two apart. A code that ran out first, pasted
-        // close to its end, says the same.
+        // When there is a path at all, the friend's tries reach this PC within
+        // a second or two of the punches, so lost_after past the last round
+        // means the routers keep the two apart. A code that ran out first,
+        // pasted close to its end, means the same.
         let unanswered = self.punches.unanswered(now, self.timers.lost_after);
         let ran_out = self.punches.expire(now, &self.log);
         for key in unanswered.into_iter().chain(ran_out) {

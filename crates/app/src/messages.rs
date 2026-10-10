@@ -149,7 +149,7 @@ fn host_version_step(host: Option<(Version, u16)>) -> String {
     match (host_newer, cfg!(feature = "store")) {
         (true, false) => format!("Get the same version as the host from {RELEASES_PAGE}."),
         (true, true) => String::from(
-            "The Microsoft Store keeps Booth up to date. Check for updates there to get it now.",
+            "The Microsoft Store keeps Booth up to date. Check for updates there.",
         ),
         (false, false) => format!(
             "Ask the host to get Booth {} from {RELEASES_PAGE}.",
@@ -222,10 +222,10 @@ pub fn friends_lost(changed: Option<AddressChanged>) -> Option<&'static str> {
 
 // The reply code screen on a friend's PC, and the paste field on the host's.
 pub const SEND_CODE_BACK: &str = "Send this code back to the host:";
-// Under the code while it is on show: until the host pastes it, nothing
-// else can get this friend in.
-pub const CODE_NOT_PASTED: &str =
-    "The host pastes it under their invite, and you get in a few seconds later.";
+// Under the code, which does nothing until the host pastes it. Also above
+// the people list after this PC's own address changed, so it promises
+// nothing about getting in.
+pub const CODE_NOT_PASTED: &str = "The host pastes it in the field under their invite.";
 pub const CODE_SECOND_ROUTER: &str =
     "The host is behind a second router; this code is the one thing that can still work over IPv4.";
 pub const CODE_EXPIRED: &str = "The code did not get through.";
@@ -254,10 +254,10 @@ pub fn reply(state: ReplyState, port: Option<u16>) -> Option<String> {
             "Your router changes ports for every connection, so a code sent back will not help. Ask the host to forward {port}, or use IPv6, Tailscale or WireGuard."
         ),
         ReplyState::NoAddress => format!(
-            "Could not learn your outside address, so a code sent back will not help. Check the STUN servers in Settings, ask the host to forward {port}, or connect over IPv6, Tailscale or WireGuard."
+            "Could not learn your outside address, so a code sent back will not help. Check the STUN servers in Settings. Otherwise ask the host to forward {port}, or connect over IPv6, Tailscale or WireGuard."
         ),
         ReplyState::HostNoAddress => String::from(
-            "This invite carries no internet address, so a code sent back will not help. Ask the host to check the STUN servers in Settings and make a new invite.",
+            "This invite carries no internet address, so a code sent back will not help. If you share Tailscale or WireGuard with the host, check that both of you are connected; otherwise ask the host to check the STUN servers in Settings and make a new invite.",
         ),
         // No punch came, so either the code was never pasted or the host's
         // packets were dropped on the way: the line names both.
@@ -282,9 +282,9 @@ pub fn reply(state: ReplyState, port: Option<u16>) -> Option<String> {
     })
 }
 
-// Case two on either side: the address name no longer leads to the host.
-// The host knows once its name points somewhere other than its outside
-// address; a friend only when the name gives no address at all.
+// The address name no longer leads to the host. The host can tell once the
+// name points somewhere other than its outside address; a friend only when
+// the name gives no address at all.
 pub fn name_line(role: Role, name: Option<&NameView>) -> Option<String> {
     let name = name?;
     match (role, &name.answer, name.outside) {
@@ -293,7 +293,7 @@ pub fn name_line(role: Role, name: Option<&NameView>) -> Option<String> {
             name.name
         )),
         (Role::Client, NameAnswer::NoSuchName | NameAnswer::NoAddress, _) => Some(format!(
-            "The invite's address name, {}, leads to no address now. Ask the host for a new invite.",
+            "The invite's address name, {}, gives no address now. Ask the host for a new invite.",
             name.name
         )),
         _ => None,
@@ -330,7 +330,7 @@ pub fn paste(state: &PasteState, port: u16) -> Option<String> {
             "This friend's router changes ports for every connection, so the code cannot help. Forward UDP {port} to this PC, or use IPv6, Tailscale or WireGuard."
         ),
         ReplyRefused::RoomFull => {
-            String::from("The room is full: eight people is the most it holds.")
+            String::from("The room is full. It holds eight people, you included.")
         }
         ReplyRefused::TooSoon => String::from("Wait a few seconds before pasting this code again."),
         ReplyRefused::AlreadyHere { name } => {
@@ -825,7 +825,7 @@ mod tests {
             ..this
         };
         let store =
-            "The Microsoft Store keeps Booth up to date. Check for updates there to get it now.";
+            "The Microsoft Store keeps Booth up to date. Check for updates there.";
         assert_eq!(
             code_error(&CodeError::OtherVersion {
                 protocol: invite::PROTOCOL + 1,
@@ -1092,12 +1092,13 @@ mod tests {
     // case and its fix on the side that can know it.
 
     // The friend's code is not pasted under the invite yet. Only the host
-    // knows for sure; the friend sees the code with where it goes, and once
-    // it runs out with no punch, both this case and the strict one.
+    // knows for sure; the friend's screen says where the code goes, and once
+    // it runs out with no punch it names this case and the strict one.
     #[test]
     fn case_code_not_pasted() {
         assert_sentences(CODE_NOT_PASTED);
         assert!(CODE_NOT_PASTED.contains("under their invite"));
+        assert!(!CODE_NOT_PASTED.contains("get in"), "it shows in the room too");
         let quiet = reply(
             ReplyState::Expired {
                 second_router: false,
@@ -1157,7 +1158,7 @@ mod tests {
             assert_sentences(&line);
             assert_eq!(
                 line,
-                "The invite's address name, myroom.example.net, leads to no address now. Ask the host for a new invite."
+                "The invite's address name, myroom.example.net, gives no address now. Ask the host for a new invite."
             );
         }
         for answer in [

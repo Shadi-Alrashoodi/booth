@@ -3464,7 +3464,8 @@ mod tests {
     fn name_looked_up_after_fast_round() {
         let mut joining = Joining::new(easy(), |invite| {
             invite.hostname = Some(String::from("myroom.example.net"));
-            // The name is the way out here; no outside address beside it.
+            // The name is the only way to the host here: no outside address
+            // beside it.
             invite.candidates.truncate(1);
         });
         joining.tick(DUE - Duration::from_millis(1));

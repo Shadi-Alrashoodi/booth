@@ -324,8 +324,8 @@ pub fn first_picture(access_unit: &[u8]) -> Option<u8> {
                 u8::from((w[i] | w[i + 1] | (w[i + 2] ^ 1) | (w[i + 3] & 0x40)) == 0)
             })?;
         let unit = &access_unit[at + 3..];
-        // Zero bytes up to the next start code are no unit to nal_units,
-        // only padding, so they are no picture either.
+        // nal_units skips a unit that is all zero bytes as padding, so it is
+        // no picture here either.
         if unit[0] != 0 || !super::only_zeros(unit) {
             return Some((unit[0] >> 1) & 0x3f);
         }
