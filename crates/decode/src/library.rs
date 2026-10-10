@@ -360,7 +360,11 @@ mod tests {
     #[test]
     #[ignore = "run by planted_windows_dlls in a process of its own"]
     fn load_beside_planted_windows_dlls() {
-        let folder = PathBuf::from(std::env::var_os(PLANT_FOLDER).expect(PLANT_FOLDER));
+        // Run alone, as --include-ignored does, there is no folder to plant
+        // in and nothing to check.
+        let Some(folder) = std::env::var_os(PLANT_FOLDER).map(PathBuf::from) else {
+            return;
+        };
         let beside_test = exe_folder().unwrap();
         for file in [AVUTIL, AVCODEC] {
             assert_eq!(module_path(file), None, "{file} is loaded already");
