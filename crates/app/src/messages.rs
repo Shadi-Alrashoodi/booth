@@ -140,15 +140,20 @@ pub fn code_error(err: &CodeError) -> String {
 }
 
 // The host has another version, or with None a test build from before
-// version numbers: whoever has the older one gets the newer.
+// version numbers: whoever has the older one gets the newer. A copy from
+// the Store gets its updates there, so it sends nobody to GitHub.
 fn host_version_step(host: Option<(Version, u16)>) -> String {
-    if host.is_some_and(|host| host > (invite::VERSION, invite::PROTOCOL)) {
-        format!("Get the same version as the host from {RELEASES_PAGE}.")
-    } else {
-        format!(
+    let host_newer = host.is_some_and(|host| host > (invite::VERSION, invite::PROTOCOL));
+    match (host_newer, cfg!(feature = "store")) {
+        (true, false) => format!("Get the same version as the host from {RELEASES_PAGE}."),
+        (true, true) => String::from(
+            "The Microsoft Store keeps Booth up to date. Check for updates there to get it now.",
+        ),
+        (false, false) => format!(
             "Ask the host to get Booth {} from {RELEASES_PAGE}.",
             invite::VERSION
-        )
+        ),
+        (false, true) => format!("Ask the host to update to Booth {}.", invite::VERSION),
     }
 }
 
@@ -709,6 +714,7 @@ mod tests {
     // Both versions, and what to do: whoever has the older one gets the
     // newer.
     #[test]
+    #[cfg(not(feature = "store"))]
     fn other_versions() {
         let this = invite::VERSION;
         let later = Version {
@@ -756,6 +762,57 @@ mod tests {
                 "The host has a test build of Booth made before the first release. Ask the host to get Booth {this} from {RELEASES_PAGE}."
             )
         );
+    }
+
+    // The Store build says the same without the releases page.
+    #[test]
+    #[cfg(feature = "store")]
+    fn other_versions_from_the_store() {
+        let this = invite::VERSION;
+        let later = Version {
+            major: this.major + 1,
+            ..this
+        };
+        let store =
+            "The Microsoft Store keeps Booth up to date. Check for updates there to get it now.";
+        assert_eq!(
+            code_error(&CodeError::OtherVersion {
+                protocol: invite::PROTOCOL + 1,
+                version: later,
+            }),
+            format!("This invite is for Booth {later} and you have {this}. {store}")
+        );
+        assert_eq!(
+            notice(&Notice::OtherVersion {
+                protocol: invite::PROTOCOL + 1,
+                version: later
+            }),
+            format!("The host has Booth {later} and you have {this}. {store}")
+        );
+        assert_eq!(
+            code_error(&CodeError::OtherVersion {
+                protocol: invite::PROTOCOL + 1,
+                version: version(0, 0, 1),
+            }),
+            format!(
+                "This invite is for Booth 0.0.1 and you have {this}. Ask the host to update to Booth {this}."
+            )
+        );
+        assert_eq!(
+            notice(&Notice::UnversionedHost),
+            format!(
+                "The host has a test build of Booth made before the first release. Ask the host to update to Booth {this}."
+            )
+        );
+        for text in [
+            code_error(&CodeError::Unversioned),
+            notice(&Notice::OtherVersion {
+                protocol: invite::PROTOCOL + 1,
+                version: version(0, 0, 1),
+            }),
+        ] {
+            assert!(!text.contains("github"), "{text}");
+        }
     }
 
     #[test]
