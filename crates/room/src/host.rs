@@ -913,6 +913,11 @@ impl Host {
                 name: peer.name.clone(),
             });
         }
+        // Its handshake would be dropped as the room is full, and the punches
+        // would end in a line blaming the routers.
+        if !self.is_peer(key) && self.seats_taken(key) >= MAX_CLIENTS {
+            return Err(ReplyRefused::RoomFull);
+        }
         if self.punches.too_soon(key, now) {
             return Err(ReplyRefused::TooSoon);
         }
@@ -1032,13 +1037,23 @@ impl Host {
             self.say_capped(count);
         }
         self.punches.send_due(now, socket, &self.log);
-        for key in self.punches.expire(now, &self.log) {
-            if self
-                .last_paste
-                .as_ref()
-                .is_some_and(|(pasted, state)| *pasted == key && *state == PasteState::Sent)
+        // The friend's tries reach this PC within a second or two of the
+        // punches when anything can, so lost_after past the last round says
+        // the routers keep the two apart. A code that ran out first, pasted
+        // close to its end, says the same.
+        let unanswered = self.punches.unanswered(now, self.timers.lost_after);
+        let ran_out = self.punches.expire(now, &self.log);
+        for key in unanswered.into_iter().chain(ran_out) {
+            if let Some((pasted, state)) = self.last_paste.as_mut()
+                && *pasted == key
+                && *state == PasteState::Sent
             {
-                self.last_paste = None;
+                log!(
+                    self.log,
+                    "{} did not come in after the punches",
+                    keys::fingerprint(&key)
+                );
+                *state = PasteState::Missed;
                 changed = true;
             }
         }
@@ -1204,7 +1219,7 @@ impl Host {
             soonest.add(Some(self.next_roster));
         }
         soonest.add(self.roster_due);
-        soonest.add(self.punches.next_deadline());
+        soonest.add(self.punches.next_deadline(self.timers.lost_after));
         soonest.add(self.cookies.next_deadline());
         soonest.add(self.booth_lines.next_deadline());
         soonest.add(self.other_lines.next_deadline());
@@ -3884,6 +3899,65 @@ mod tests {
         assert_eq!(rig.host.roster().entries[1].name, "Anna");
     }
 
+    // Nothing came in after the punches: once the friend has had lost_after
+    // to answer them, the line under the paste field says so instead of
+    // going away.
+    #[test]
+    fn unanswered_punches_turn_the_paste_to_missed() {
+        let start = Instant::now();
+        let mut rig = Rig::new(start);
+        let ana = Guest::new();
+        let code = code_for(
+            &ana,
+            Answers::Invite(rig.invite.invite_id),
+            Some(ana.wire.addr()),
+        );
+        rig.host.accept_reply(&code, start).expect("accepted");
+        let mut now = start;
+        for _ in 0..crate::reply::PUNCH_ROUNDS {
+            rig.tick(now);
+            now += crate::reply::PUNCH_GAP;
+        }
+        let missed_at = now - crate::reply::PUNCH_GAP + rig.host.timers.lost_after;
+        assert!(rig.host.next_deadline().is_some_and(|at| at <= missed_at));
+        rig.tick(missed_at - Duration::from_millis(1));
+        assert_eq!(rig.host.view(missed_at, 0).paste, Some(PasteState::Sent));
+        rig.tick(missed_at);
+        assert_eq!(rig.host.view(missed_at, 0).paste, Some(PasteState::Missed));
+        // A forward made meanwhile still lets her in, and the line follows.
+        let mut ana = ana;
+        ana.join(&mut rig, "Ana", missed_at);
+        assert_eq!(rig.host.view(missed_at, 0).paste, Some(PasteState::Joined));
+    }
+
+    // A ninth person's code is refused as it is, not punched for and then
+    // blamed on the routers.
+    #[test]
+    fn a_code_for_a_full_room_is_refused() {
+        let start = Instant::now();
+        let mut rig = Rig::new(start);
+        for i in 0..MAX_CLIENTS {
+            Guest::new().join(&mut rig, &format!("Friend {i}"), start);
+        }
+        assert_eq!(rig.host.peers.len(), MAX_CLIENTS);
+        let ninth = Guest::new();
+        let code = code_for(
+            &ninth,
+            Answers::Invite(rig.invite.invite_id),
+            Some(ninth.wire.addr()),
+        );
+        assert_eq!(
+            rig.host.accept_reply(&code, start),
+            Err(ReplyRefused::RoomFull)
+        );
+        assert_eq!(
+            rig.host.view(start, 0).paste,
+            Some(PasteState::Refused(ReplyRefused::RoomFull))
+        );
+        rig.tick(start);
+        assert_eq!(punches(&ninth.wire), 0);
+    }
+
     #[test]
     fn the_last_seat_goes_to_the_first_to_confirm() {
         let start = Instant::now();
@@ -5123,7 +5197,8 @@ mod tests {
         assert!(!none.invite.second_router);
         assert!(!none.invite.mapped);
         let view = none.host.view(start, 0);
-        assert_eq!(view.invite.unwrap().router, RouterState::Unknown);
+        // No STUN answer and no mapping: nothing in the invite reaches this PC.
+        assert_eq!(view.invite.unwrap().router, RouterState::NoAddress);
         assert_eq!(view.numbers.mapping_protocol, None);
     }
 

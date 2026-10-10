@@ -157,7 +157,9 @@ fn silent_stun_server_still_gives_an_invite() {
         v.invite.as_ref().is_some_and(|i| !i.code.is_empty())
     });
     assert!(started.elapsed() >= Duration::from_millis(300));
-    assert_eq!(view.invite.unwrap().router, RouterState::Unknown);
+    // No answer and no mapping: the invite carries no outside address, and
+    // the panel says so with its fix.
+    assert_eq!(view.invite.unwrap().router, RouterState::NoAddress);
     assert_eq!(view.numbers.public_addr, None);
     assert!(fake.requests() >= 1);
 }

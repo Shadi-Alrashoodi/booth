@@ -9,7 +9,7 @@ use eframe::egui::{
 use invite::ReplyCode;
 use room::Room;
 use room::view::{
-    InviteView, LinkState, MappingWord, Notice, OwnShare, PasteState, Person, ReplyState,
+    InviteView, LinkState, MappingWord, NameView, Notice, OwnShare, PasteState, Person, ReplyState,
     ReplyView, Role, ShareView, TalkMode, View, Voice,
 };
 use voice::audio::{AudioError, Choice};
@@ -330,7 +330,14 @@ impl InRoom {
         if let Some(invite) = &view.invite {
             block = true;
             controls::region(ui, |ui| {
-                self.invite(ui, invite, view.numbers.local_port, &view.share, step);
+                self.invite(
+                    ui,
+                    invite,
+                    view.numbers.local_port,
+                    view.numbers.address_name.as_ref(),
+                    &view.share,
+                    step,
+                );
                 // A punch from a router that changes ports opens a port
                 // nobody will come to, so the field is not offered then.
                 let codes_help = view.numbers.mapping != Some(MappingWord::Hard);
@@ -338,7 +345,7 @@ impl InRoom {
                     let moved = view
                         .address_changed
                         .is_some_and(|changed| changed.codes_cannot_help);
-                    self.paste_field(ui, view.paste.as_ref(), moved);
+                    self.paste_field(ui, view.paste.as_ref(), moved, view.numbers.local_port);
                 }
             });
         }
@@ -359,6 +366,7 @@ impl InRoom {
         ui: &mut Ui,
         invite: &InviteView,
         port: u16,
+        name: Option<&NameView>,
         share: &ShareView,
         step: &mut Option<Step>,
     ) {
@@ -436,6 +444,12 @@ impl InRoom {
         if let Some(why) = outdated {
             controls::text(ui, why, theme::caption(), ASH);
         }
+        // The name is as private as the address it leads to.
+        if !addresses_hidden(share)
+            && let Some(line) = messages::name_line(Role::Host, name)
+        {
+            controls::text(ui, line, theme::caption(), ASH);
+        }
         if let Some(error) = &self.copy_error {
             ui.add_space(HALF_STEP);
             controls::text(ui, error.as_str(), theme::caption(), BAD);
@@ -445,7 +459,7 @@ impl InRoom {
     // Enter hands the code to the room, which checks it and punches. The
     // one line under the field says what came of it. `moved` is this PC's
     // own address having just changed with friends still out.
-    fn paste_field(&mut self, ui: &mut Ui, last: Option<&PasteState>, moved: bool) {
+    fn paste_field(&mut self, ui: &mut Ui, last: Option<&PasteState>, moved: bool, port: u16) {
         ui.add_space(FIELD_GAP);
         let field = controls::field(
             ui,
@@ -470,7 +484,7 @@ impl InRoom {
                 Err(err) => self.paste_error = messages::reply_code_error(&err),
             }
         }
-        if let Some((text, color)) = paste_line(self.paste_error.as_deref(), moved, last) {
+        if let Some((text, color)) = paste_line(self.paste_error.as_deref(), moved, last, port) {
             ui.add_space(HALF_STEP);
             controls::text(ui, text, theme::caption(), color);
         }
@@ -481,7 +495,7 @@ impl InRoom {
     fn client(&mut self, ui: &mut Ui, view: &View, block: bool, step: &mut Option<Step>) {
         if view.people.is_empty() {
             match &view.notice {
-                Some(Notice::StillTrying) => self.still_trying(ui, view.reply.as_ref(), step),
+                Some(Notice::StillTrying) => self.still_trying(ui, view, step),
                 Some(notice) => controls::page(ui, |ui| explain(ui, notice)),
                 None => {}
             }
@@ -505,12 +519,18 @@ impl InRoom {
     // Joining when the host cannot be reached: the code to send back in its
     // own block, or the sentence that says why none would help, under the
     // line that says the tries go on.
-    fn still_trying(&mut self, ui: &mut Ui, reply: Option<&ReplyView>, step: &mut Option<Step>) {
+    fn still_trying(&mut self, ui: &mut Ui, view: &View, step: &mut Option<Step>) {
         controls::page(ui, |ui| {
             let still = messages::notice(&Notice::StillTrying);
             controls::prose(ui, still, theme::body(), CHALK);
+            if let Some(line) =
+                messages::name_line(Role::Client, view.numbers.address_name.as_ref())
+            {
+                ui.add_space(HALF_STEP);
+                controls::prose(ui, line, theme::body(), CHALK);
+            }
         });
-        if let Some(reply) = reply
+        if let Some(reply) = view.reply.as_ref()
             && self.code_region(ui, reply)
         {
             *step = Some(Step::NewCode);
@@ -540,6 +560,8 @@ impl InRoom {
                         .err()
                         .map(|err| messages::copy_error(&err));
                 }
+                ui.add_space(HALF_STEP);
+                controls::prose(ui, messages::CODE_NOT_PASTED, theme::caption(), ASH);
                 if second_router {
                     ui.add_space(HALF_STEP);
                     controls::prose(ui, messages::CODE_SECOND_ROUTER, theme::caption(), ASH);
@@ -706,6 +728,7 @@ fn paste_line(
     typed: Option<&str>,
     moved: bool,
     last: Option<&PasteState>,
+    port: u16,
 ) -> Option<(String, Color32)> {
     if let Some(error) = typed {
         return Some((error.to_owned(), BAD));
@@ -715,7 +738,7 @@ fn paste_line(
     }
     let last = last?;
     let color = if *last == PasteState::Sent { ASH } else { BAD };
-    messages::paste(last).map(|text| (text, color))
+    messages::paste(last, port).map(|text| (text, color))
 }
 
 fn leave_word(role: Role) -> &'static str {
@@ -1343,6 +1366,7 @@ mod tests {
         let expired = ReplyView {
             state: ReplyState::Expired {
                 second_router: false,
+                punched: false,
             },
             code: String::new(),
             ..code()
@@ -1567,28 +1591,34 @@ mod tests {
     #[test]
     fn paste_line_after_address_change() {
         let cannot_help = Some((String::from(messages::CODES_CANNOT_HELP), ASH));
-        assert_eq!(paste_line(None, true, None), cannot_help);
-        assert_eq!(paste_line(None, true, Some(&PasteState::Sent)), cannot_help);
+        assert_eq!(paste_line(None, true, None, 41000), cannot_help);
+        assert_eq!(
+            paste_line(None, true, Some(&PasteState::Sent), 41000),
+            cannot_help
+        );
         let too_soon = PasteState::Refused(ReplyRefused::TooSoon);
-        assert_eq!(paste_line(None, true, Some(&too_soon)), cannot_help);
+        assert_eq!(paste_line(None, true, Some(&too_soon), 41000), cannot_help);
         // Something that is not a code at all is still answered.
         let typed = "This is an invite, not a reply code. Paste it in Join.";
         assert_eq!(
-            paste_line(Some(typed), true, None),
+            paste_line(Some(typed), true, None, 41000),
             Some((typed.to_owned(), BAD))
         );
     }
 
     #[test]
     fn paste_line_last_paste() {
-        assert_eq!(paste_line(None, false, None), None);
+        assert_eq!(paste_line(None, false, None, 41000), None);
         assert_eq!(
-            paste_line(None, false, Some(&PasteState::Sent)),
+            paste_line(None, false, Some(&PasteState::Sent), 41000),
             Some((String::from(messages::PASTE_SENT), ASH))
         );
-        assert_eq!(paste_line(None, false, Some(&PasteState::Joined)), None);
+        assert_eq!(
+            paste_line(None, false, Some(&PasteState::Joined), 41000),
+            None
+        );
         let too_soon = PasteState::Refused(ReplyRefused::TooSoon);
-        let (_, color) = paste_line(None, false, Some(&too_soon)).unwrap();
+        let (_, color) = paste_line(None, false, Some(&too_soon), 41000).unwrap();
         assert_eq!(color, BAD);
     }
 

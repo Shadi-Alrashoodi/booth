@@ -332,6 +332,9 @@ impl fmt::Debug for InviteView {
 pub enum RouterState {
     Testing,
     Unknown,
+    // STUN gave no outside address and the router mapped no port, so the
+    // invite carries no address a friend on the internet can use.
+    NoAddress,
     Easy,
     Hard,
     // The router said it mapped the port, and no friend has come in through it yet.
@@ -369,9 +372,14 @@ pub enum ReplyState {
     OwnHard,
     // STUN gave this PC no outside address at all.
     NoAddress,
+    // The invite has no outside address and no address name, so the host
+    // could punch toward this PC but this PC would not know where to answer.
+    HostNoAddress,
     // The code ran out with no handshake. The rung that failed is the second
     // router when the invite named one, easy or unknown mapping otherwise.
-    Expired { second_router: bool },
+    // `punched` when the host's punch packets reached this PC, which says
+    // the code was pasted.
+    Expired { second_router: bool, punched: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -380,6 +388,8 @@ pub enum PasteState {
     Sent,
     // The friend it named is in the room.
     Joined,
+    // The punches went out and the friend did not come in after them.
+    Missed,
     Refused(crate::ReplyRefused),
 }
 

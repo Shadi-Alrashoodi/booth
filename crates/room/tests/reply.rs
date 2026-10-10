@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{FakeStun, Member, OUTSIDE, StrictRouter, invite_to, loopback, timers};
-use invite::{Answers, ReplyCode};
+use invite::{Answers, CandidateKind, ReplyCode};
 use keys::Identity;
 use room::Timers;
 use room::view::{LinkState, PasteState, ReplyState, View};
@@ -45,7 +45,13 @@ fn reply_code_gets_past_a_strict_router() {
     let mut config = common::config("Ana", quick);
     config.stun_servers = vec![stun.addr.to_string()];
     config.log = Some(client_log.clone());
-    let invite = invite_to(&host, router.outside);
+    let mut invite = invite_to(&host, router.outside);
+    // The router's outside side stands for the host's outside address.
+    invite
+        .candidates
+        .last_mut()
+        .expect("the router's address")
+        .kind = CandidateKind::Public;
     let invite_id = invite.invite_id;
     let mut client = Member::join_with(config, Arc::new(Identity::generate()), invite);
 

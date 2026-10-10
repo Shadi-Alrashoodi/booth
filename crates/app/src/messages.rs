@@ -3,7 +3,9 @@ use std::io;
 use input::Action;
 use invite::{CodeError, Version};
 use keys::KeyError;
-use room::view::{AddressChanged, Notice, PasteState, ReplyState, RouterState};
+use room::view::{
+    AddressChanged, NameAnswer, NameView, Notice, PasteState, ReplyState, Role, RouterState,
+};
 use room::{ChatRefused, DamagedList, KnownError, List, ReplyRefused, RoomError};
 use voice::audio::Microphone;
 
@@ -182,6 +184,9 @@ pub fn router(state: RouterState, port: u16) -> String {
             );
         }
         RouterState::Unknown => "Could not test your router. Friends can still try.",
+        RouterState::NoAddress => {
+            "Could not learn your outside address: the STUN servers did not answer and the router opened no port. Check the STUN servers in Settings, or turn on UPnP on your router."
+        }
         RouterState::Mapped => "Your router says it opened the port.",
         RouterState::MappedVerified => {
             "Your router opened the port. Friends can reach you directly."
@@ -198,7 +203,8 @@ pub fn router(state: RouterState, port: u16) -> String {
 
 pub const MAPPED_SINCE: &str =
     "Your router opened the port after this invite was made. A new invite includes it.";
-pub const ADDRESS_CHANGED_SINCE: &str = "Your address changed since this invite was made.";
+pub const ADDRESS_CHANGED_SINCE: &str =
+    "Your address changed since this invite was made. Make a new invite and send it.";
 
 // The host's side of an address change mid-session. The friends' side is in
 // the notices.
@@ -216,6 +222,10 @@ pub fn friends_lost(changed: Option<AddressChanged>) -> Option<&'static str> {
 
 // The reply code screen on a friend's PC, and the paste field on the host's.
 pub const SEND_CODE_BACK: &str = "Send this code back to the host:";
+// Under the code while it is on show: until the host pastes it, nothing
+// else can get this friend in.
+pub const CODE_NOT_PASTED: &str =
+    "The host pastes it under their invite, and you get in a few seconds later.";
 pub const CODE_SECOND_ROUTER: &str =
     "The host is behind a second router; this code is the one thing that can still work over IPv4.";
 pub const CODE_EXPIRED: &str = "The code did not get through.";
@@ -239,31 +249,68 @@ pub fn reply(state: ReplyState, port: Option<u16>) -> Option<String> {
         ReplyState::HostHard => format!(
             "The host's router changes ports for every connection. Ask them to forward {port}, or connect over IPv6, Tailscale or WireGuard."
         ),
-        ReplyState::OwnHard => String::from(
-            "Your router changes ports for every connection, so a code sent back will not help. Use IPv6, Tailscale or WireGuard.",
+        // A forward on the host lets in a friend behind any router.
+        ReplyState::OwnHard => format!(
+            "Your router changes ports for every connection, so a code sent back will not help. Ask the host to forward {port}, or use IPv6, Tailscale or WireGuard."
         ),
         ReplyState::NoAddress => format!(
-            "Could not learn your outside address, so a code sent back will not help. Ask the host to forward {port}, or connect over IPv6, Tailscale or WireGuard."
+            "Could not learn your outside address, so a code sent back will not help. Check the STUN servers in Settings, ask the host to forward {port}, or connect over IPv6, Tailscale or WireGuard."
+        ),
+        ReplyState::HostNoAddress => String::from(
+            "This invite carries no internet address, so a code sent back will not help. Ask the host to check the STUN servers in Settings and make a new invite.",
+        ),
+        // No punch came, so either the code was never pasted or the host's
+        // packets were dropped on the way: the line names both.
+        ReplyState::Expired {
+            second_router: false,
+            punched: false,
+        } => format!(
+            "If the host has not pasted it yet, press New code and send the new one. If they did, ask them to forward {port}, or connect over IPv6, Tailscale or WireGuard."
         ),
         ReplyState::Expired {
             second_router: false,
+            punched: true,
         } => format!(
-            "Ask the host to turn on UPnP or forward {port}, or connect over IPv6, Tailscale or WireGuard."
+            "The host pasted it, but the two routers still keep these PCs apart. Ask the host to forward {port}, or connect over IPv6, Tailscale or WireGuard."
         ),
         ReplyState::Expired {
             second_router: true,
+            ..
         } => String::from(
             "There is another router in front of the host's, so the code could not get through. Connect over IPv6, Tailscale or WireGuard.",
         ),
     })
 }
 
+// Case two on either side: the address name no longer leads to the host.
+// The host knows once its name points somewhere other than its outside
+// address; a friend only when the name gives no address at all.
+pub fn name_line(role: Role, name: Option<&NameView>) -> Option<String> {
+    let name = name?;
+    match (role, &name.answer, name.outside) {
+        (Role::Host, _, Some(outside)) if !outside.is_this_pc() => Some(format!(
+            "Your address name {} does not point to this PC. Check your dynamic DNS client.",
+            name.name
+        )),
+        (Role::Client, NameAnswer::NoSuchName | NameAnswer::NoAddress, _) => Some(format!(
+            "The invite's address name, {}, leads to no address now. Ask the host for a new invite.",
+            name.name
+        )),
+        _ => None,
+    }
+}
+
 // The line under the paste field. None once the friend is in, since the
-// person list says it.
-pub fn paste(state: &PasteState) -> Option<String> {
+// person list says it. `port` as for router.
+pub fn paste(state: &PasteState, port: u16) -> Option<String> {
     let refused = match state {
         PasteState::Sent => return Some(String::from(PASTE_SENT)),
         PasteState::Joined => return None,
+        PasteState::Missed => {
+            return Some(format!(
+                "Your friend did not get in with that code: the two routers keep these PCs apart. Forward UDP {port} to this PC, or use IPv6, Tailscale or WireGuard."
+            ));
+        }
         PasteState::Refused(refused) => refused,
     };
     Some(match refused {
@@ -279,9 +326,12 @@ pub fn paste(state: &PasteState) -> Option<String> {
         ReplyRefused::Blocked => {
             String::from("This code is from a device you blocked. Nothing was sent to it.")
         }
-        ReplyRefused::FriendHard => String::from(
-            "This friend's router changes ports too. The code cannot help; they need IPv6, Tailscale or WireGuard.",
+        ReplyRefused::FriendHard => format!(
+            "This friend's router changes ports for every connection, so the code cannot help. Forward UDP {port} to this PC, or use IPv6, Tailscale or WireGuard."
         ),
+        ReplyRefused::RoomFull => {
+            String::from("The room is full: eight people is the most it holds.")
+        }
         ReplyRefused::TooSoon => String::from("Wait a few seconds before pasting this code again."),
         ReplyRefused::AlreadyHere { name } => {
             format!("{} is already in the room.", isolated(name))
@@ -633,6 +683,7 @@ pub fn notice(notice: &Notice) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use room::view::NameMatch;
 
     #[test]
     fn key_in_use() {
@@ -897,11 +948,18 @@ mod tests {
             ReplyState::HostHard,
             ReplyState::OwnHard,
             ReplyState::NoAddress,
+            ReplyState::HostNoAddress,
             ReplyState::Expired {
                 second_router: false,
+                punched: false,
+            },
+            ReplyState::Expired {
+                second_router: false,
+                punched: true,
             },
             ReplyState::Expired {
                 second_router: true,
+                punched: false,
             },
         ];
         let mut seen = Vec::new();
@@ -946,10 +1004,14 @@ mod tests {
             ReplyRefused::AddressTaken {
                 addr: "203.0.113.9:52000".parse().unwrap(),
             },
+            ReplyRefused::RoomFull,
         ];
-        let mut seen = vec![paste(&PasteState::Sent).expect("a line for Sent")];
+        let mut seen = vec![
+            paste(&PasteState::Sent, 41000).expect("a line for Sent"),
+            paste(&PasteState::Missed, 41000).expect("a line for Missed"),
+        ];
         for refused in refusals {
-            let text = paste(&PasteState::Refused(refused.clone())).expect("a line");
+            let text = paste(&PasteState::Refused(refused.clone()), 41000).expect("a line");
             let first = text.trim_start_matches('\u{2068}');
             assert!(first.starts_with(char::is_uppercase), "{text}");
             assert!(text.ends_with('.') && !text.contains('!'), "{text}");
@@ -959,12 +1021,12 @@ mod tests {
             );
             seen.push(text);
         }
-        assert_eq!(paste(&PasteState::Joined), None);
+        assert_eq!(paste(&PasteState::Joined, 41000), None);
         let here = PasteState::Refused(ReplyRefused::AlreadyHere {
             name: String::from("Tom"),
         });
         assert_eq!(
-            paste(&here).unwrap(),
+            paste(&here, 41000).unwrap(),
             "\u{2068}Tom\u{2069} is already in the room."
         );
     }
@@ -983,6 +1045,7 @@ mod tests {
         let states = [
             RouterState::Testing,
             RouterState::Unknown,
+            RouterState::NoAddress,
             RouterState::Easy,
             RouterState::Hard,
             RouterState::Mapped,
@@ -1023,6 +1086,167 @@ mod tests {
                 "no capital: {text}"
             );
         }
+    }
+
+    // A failed join, one test for each of its four cases: each line names the
+    // case and its fix on the side that can know it.
+
+    // The friend's code is not pasted under the invite yet. Only the host
+    // knows for sure; the friend sees the code with where it goes, and once
+    // it runs out with no punch, both this case and the strict one.
+    #[test]
+    fn case_code_not_pasted() {
+        assert_sentences(CODE_NOT_PASTED);
+        assert!(CODE_NOT_PASTED.contains("under their invite"));
+        let quiet = reply(
+            ReplyState::Expired {
+                second_router: false,
+                punched: false,
+            },
+            Some(41000),
+        )
+        .unwrap();
+        assert_sentences(&quiet);
+        assert!(
+            quiet.starts_with(
+                "If the host has not pasted it yet, press New code and send the new one."
+            ),
+            "{quiet}"
+        );
+        assert!(quiet.contains("forward UDP 41000,"), "{quiet}");
+        assert!(router(RouterState::Easy, 41000).contains("short code to send back"));
+        assert_eq!(PASTE_HINT, "Paste a code a friend sent back");
+    }
+
+    // The invite's address leads somewhere other than the host's PC: the
+    // host's address changed, or its address name points elsewhere, which
+    // the host can see; a friend only sees a name that gives no address.
+    #[test]
+    fn case_invite_points_elsewhere() {
+        assert_sentences(ADDRESS_CHANGED_SINCE);
+        assert!(ADDRESS_CHANGED_SINCE.ends_with("Make a new invite and send it."));
+        let view = |answer: NameAnswer, points_to: [u8; 4]| NameView {
+            name: String::from("myroom.example.net"),
+            answer,
+            outside: Some(NameMatch {
+                points_to: points_to.into(),
+                outside: [203, 0, 113, 5].into(),
+            }),
+        };
+        let found = || NameAnswer::Found {
+            addrs: Vec::new(),
+            refused: Vec::new(),
+        };
+        let elsewhere = name_line(Role::Host, Some(&view(found(), [198, 51, 100, 20])));
+        assert_eq!(
+            elsewhere.as_deref(),
+            Some(
+                "Your address name myroom.example.net does not point to this PC. Check your dynamic DNS client."
+            )
+        );
+        assert_eq!(
+            name_line(Role::Host, Some(&view(found(), [203, 0, 113, 5]))),
+            None
+        );
+        for answer in [NameAnswer::NoSuchName, NameAnswer::NoAddress] {
+            let gone = NameView {
+                outside: None,
+                ..view(answer, [0, 0, 0, 0])
+            };
+            let line = name_line(Role::Client, Some(&gone)).unwrap();
+            assert_sentences(&line);
+            assert_eq!(
+                line,
+                "The invite's address name, myroom.example.net, leads to no address now. Ask the host for a new invite."
+            );
+        }
+        for answer in [
+            NameAnswer::NotAsked,
+            NameAnswer::Looking,
+            NameAnswer::Unanswered,
+            found(),
+        ] {
+            let fine = NameView {
+                outside: None,
+                ..view(answer, [0, 0, 0, 0])
+            };
+            assert_eq!(name_line(Role::Client, Some(&fine)), None);
+        }
+        assert_eq!(name_line(Role::Client, None), None);
+    }
+
+    // STUN or the router did not answer, on the host (no outside address
+    // and no mapped port, so the invite carries no address), seen from the
+    // friend in that invite, or on the friend's own PC.
+    #[test]
+    fn case_stun_or_router_silent() {
+        let host = router(RouterState::NoAddress, 41000);
+        assert_sentences(&host);
+        assert!(
+            host.contains("STUN servers did not answer") && host.contains("turn on UPnP"),
+            "{host}"
+        );
+        assert!(
+            host.contains("Check the STUN servers in Settings"),
+            "{host}"
+        );
+        let invite = reply(ReplyState::HostNoAddress, Some(41000)).unwrap();
+        assert_sentences(&invite);
+        assert!(invite.contains("no internet address"), "{invite}");
+        assert!(invite.contains("check the STUN servers"), "{invite}");
+        let own = reply(ReplyState::NoAddress, Some(41000)).unwrap();
+        assert!(own.contains("Check the STUN servers in Settings"), "{own}");
+        assert!(own.contains("forward UDP 41000,"), "{own}");
+        let unknown_port = reply(ReplyState::NoAddress, None).unwrap();
+        assert!(
+            unknown_port.contains("forward Booth's UDP port,"),
+            "{unknown_port}"
+        );
+    }
+
+    // Both sides behind strict NAT, so there is no direct path: a forward on
+    // the host lets anyone in, else a tunnel. Booth has no relay.
+    #[test]
+    fn case_strict_nat_both_sides() {
+        let missed = paste(&PasteState::Missed, 41500).unwrap();
+        assert_sentences(&missed);
+        assert!(
+            missed.ends_with("Forward UDP 41500 to this PC, or use IPv6, Tailscale or WireGuard."),
+            "{missed}"
+        );
+        let friend_hard = paste(&PasteState::Refused(ReplyRefused::FriendHard), 41500).unwrap();
+        assert!(
+            friend_hard.contains("Forward UDP 41500 to this PC,"),
+            "{friend_hard}"
+        );
+        let pasted = reply(
+            ReplyState::Expired {
+                second_router: false,
+                punched: true,
+            },
+            Some(41000),
+        )
+        .unwrap();
+        assert_sentences(&pasted);
+        assert!(pasted.starts_with("The host pasted it"), "{pasted}");
+        assert!(pasted.contains("forward UDP 41000,") && !pasted.contains("New code"));
+        for state in [ReplyState::HostHard, ReplyState::OwnHard] {
+            let line = reply(state, Some(41000)).unwrap();
+            assert!(line.contains("forward UDP 41000,"), "{line}");
+        }
+        assert!(router(RouterState::Hard, 41000).contains("Forward UDP 41000,"));
+        // Behind a second router a forward does not reach the host, and a
+        // punch changes nothing in the line.
+        let second = |punched| {
+            reply(
+                ReplyState::Expired {
+                    second_router: true,
+                    punched,
+                },
+                Some(41000),
+            )
+        };
+        assert_eq!(second(true), second(false));
     }
 
     #[test]

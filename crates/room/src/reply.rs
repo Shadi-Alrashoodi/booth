@@ -52,6 +52,8 @@ pub enum ReplyRefused {
     // Someone else in the room is at that address, or it was punched open
     // for someone else. Taking it would lock them out of it.
     AddressTaken { addr: SocketAddr },
+    // Eight people are in the room already, the most it holds.
+    RoomFull,
 }
 
 // Words for the log. The panel has its own sentences.
@@ -87,6 +89,7 @@ impl fmt::Display for ReplyRefused {
                 f,
                 "{addr} belongs to another key, which is in the room there or had it punched open"
             ),
+            ReplyRefused::RoomFull => f.write_str("the room is full"),
         }
     }
 }
@@ -106,8 +109,11 @@ pub(crate) fn choose(
     second_router: bool,
     own: Mapping,
     has_address: bool,
+    host_outside: bool,
 ) -> ReplyState {
-    if host == Mapping::Hard {
+    if !host_outside {
+        ReplyState::HostNoAddress
+    } else if host == Mapping::Hard {
         ReplyState::HostHard
     } else if own == Mapping::Hard {
         ReplyState::OwnHard
@@ -177,6 +183,9 @@ struct Punch {
     // one of `to` is taken only with this key.
     until: Instant,
     joined: bool,
+    // When the last round went out, until the host has said the friend did
+    // not come in after it.
+    done_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -216,6 +225,7 @@ impl Punches {
             next_round: Some(now),
             until: now + left.min(REPLY_LIFETIME),
             joined: false,
+            done_at: None,
         });
     }
 
@@ -275,6 +285,7 @@ impl Punches {
                     "all punch rounds for {} are done; it has not joined yet",
                     keys::fingerprint(&punch.key)
                 );
+                punch.done_at = Some(now);
                 None
             };
         }
@@ -315,10 +326,27 @@ impl Punches {
         Some(punch.rounds)
     }
 
-    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+    // The keys whose last round went out at least `after` ago with no
+    // handshake since, each given once.
+    pub(crate) fn unanswered(&mut self, now: Instant, after: Duration) -> Vec<[u8; 32]> {
+        let mut keys = Vec::new();
+        for punch in &mut self.records {
+            if !punch.joined && punch.done_at.is_some_and(|at| now >= at + after) {
+                punch.done_at = None;
+                keys.push(punch.key);
+            }
+        }
+        keys
+    }
+
+    // `after` as unanswered takes it.
+    pub(crate) fn next_deadline(&self, after: Duration) -> Option<Instant> {
         self.records
             .iter()
-            .flat_map(|p| [p.next_round, Some(p.until)])
+            .flat_map(|p| {
+                let unanswered = p.done_at.filter(|_| !p.joined).map(|at| at + after);
+                [p.next_round, Some(p.until), unanswered]
+            })
             .flatten()
             .min()
     }
@@ -369,19 +397,28 @@ mod tests {
             (Unknown, Unknown, false, ReplyState::NoAddress),
         ] {
             assert_eq!(
-                choose(host, false, own, has_address),
+                choose(host, false, own, has_address, true),
                 want,
                 "host {host:?}, own {own:?}, address {has_address}"
             );
         }
         // Behind a second router the code is still the way, with a line more.
         assert_eq!(
-            choose(Easy, true, Unknown, true),
+            choose(Easy, true, Unknown, true, true),
             ReplyState::Code {
                 second_router: true
             }
         );
-        assert_eq!(choose(Hard, true, Easy, true), ReplyState::HostHard);
+        assert_eq!(choose(Hard, true, Easy, true, true), ReplyState::HostHard);
+        // An invite with no outside address and no name: the host could punch
+        // this way, but this PC would not know where to answer, so no code
+        // helps whatever the routers do.
+        for (host, own) in [(Easy, Easy), (Hard, Easy), (Easy, Hard), (Unknown, Unknown)] {
+            assert_eq!(
+                choose(host, false, own, true, false),
+                ReplyState::HostNoAddress
+            );
+        }
     }
 
     fn candidate(kind: CandidateKind, addr: &str) -> invite::Candidate {

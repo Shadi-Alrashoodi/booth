@@ -79,6 +79,9 @@ struct Reply {
     // A no-code screen made while STUN was still out is made again when it
     // finishes: a late answer can still give the address a code needs.
     stun_finished: bool,
+    // The host's punch packets arrived while the code was on show, so the
+    // host did paste it.
+    punched: bool,
 }
 
 // What a client starts from: an invite, or the record of a host it joined
@@ -144,6 +147,9 @@ struct Start {
     mapped_verified: bool,
     host_mapping: Mapping,
     second_router: bool,
+    // The invite has an address a friend on the internet can use: an
+    // outside or IPv6 one, or an address name.
+    host_outside: bool,
     stored: Stored,
 }
 
@@ -200,6 +206,11 @@ fn from_invite(identity: &Identity, invite: &Invite, has_ipv6: bool, log: &Log) 
         mapped_verified: invite.mapped && invite.mapped_verified,
         host_mapping: invite.mapping,
         second_router: invite.second_router,
+        host_outside: invite.hostname.is_some()
+            || invite
+                .candidates
+                .iter()
+                .any(|c| matches!(c.kind, CandidateKind::Public | CandidateKind::Ipv6)),
         stored: Stored {
             candidates: known::clean_candidates(&invite.candidates),
             address_name: invite.hostname.clone(),
@@ -253,6 +264,9 @@ fn from_known(known: &KnownHost, has_ipv6: bool, log: &Log) -> Start {
         mapped_verified: false,
         host_mapping: Mapping::Unknown,
         second_router: false,
+        // A known host was reached before; its record is no reason to give
+        // up on a code.
+        host_outside: true,
         stored: Stored {
             candidates: known.candidates.clone(),
             address_name: known.address_name.clone(),
@@ -348,6 +362,7 @@ pub(crate) struct Client {
     // From the invite, for the reply code screen.
     host_mapping: Mapping,
     second_router: bool,
+    host_outside: bool,
     host_port: Option<u16>,
     reply: Option<Reply>,
     // The code is due but STUN has not finished: it goes out at this time
@@ -519,6 +534,7 @@ impl Client {
                 setup.log.clone(),
             ),
             host_mapping: start.host_mapping,
+            host_outside: start.host_outside,
             second_router: start.second_router,
             host_port: reply::host_port(&start.ports_from).or(start.also_port),
             reply: None,
@@ -1464,6 +1480,11 @@ impl Client {
                 "the host's punch packets are arriving from {from}"
             );
         }
+        if let Some(reply) = self.reply.as_mut()
+            && matches!(reply.state, ReplyState::Code { .. })
+        {
+            reply.punched = true;
+        }
         false
     }
 
@@ -1525,6 +1546,7 @@ impl Client {
         );
         reply.state = ReplyState::Expired {
             second_router: self.second_router,
+            punched: reply.punched,
         };
         reply.code.clear();
         reply.expires = None;
@@ -1536,7 +1558,15 @@ impl Client {
         let own = self.stun.invite_mapping();
         let (v4, v6) = (self.stun.public_v4(), self.stun.public_v6());
         let has_address = v4.is_some() || v6.is_some();
-        let mut state = reply::choose(self.host_mapping, self.second_router, own, has_address);
+        let mut state = reply::choose(
+            self.host_mapping,
+            self.second_router,
+            own,
+            has_address,
+            // Once the host was heard, this PC knows where to answer, whatever
+            // the invite carried.
+            self.host_outside || self.host_addr.is_some(),
+        );
         let mut made = None;
         if let ReplyState::Code { .. } = state {
             let answers = match (&self.secret, &self.invite) {
@@ -1582,6 +1612,7 @@ impl Client {
             expires_at_unix: made.as_ref().map_or(0, |code| code.expires_at),
             expires: made.is_some().then(|| now + REPLY_LIFETIME),
             stun_finished: self.stun.is_settled(),
+            punched: false,
         });
     }
 
@@ -3177,6 +3208,9 @@ mod tests {
         client: Client,
         socket: Socket,
         host: Wire,
+        // Stands in for the host's outside address, which a real invite
+        // carries once STUN has answered; it never answers either.
+        _outside: Wire,
         start: Instant,
     }
 
@@ -3185,6 +3219,7 @@ mod tests {
         // STUN round has finished with `stun`, or not at all.
         fn new(stun: StunSaw, edit: impl FnOnce(&mut Invite)) -> Joining {
             let host = Wire::new();
+            let outside = Wire::at(Ipv4Addr::new(127, 0, 0, 3));
             let socket = Socket::bind(0, Log::off()).expect("bind the client socket");
             let mut invite = Invite {
                 host_key: *Identity::generate().public(),
@@ -3192,10 +3227,16 @@ mod tests {
                 secret: [3; 16],
                 multi_use: false,
                 expires_at: crate::unix_now() + 600,
-                candidates: vec![Candidate {
-                    kind: CandidateKind::Lan,
-                    addr: host.addr(),
-                }],
+                candidates: vec![
+                    Candidate {
+                        kind: CandidateKind::Lan,
+                        addr: host.addr(),
+                    },
+                    Candidate {
+                        kind: CandidateKind::Public,
+                        addr: outside.addr(),
+                    },
+                ],
                 mapping: Mapping::Unknown,
                 mapped: false,
                 mapped_verified: false,
@@ -3227,6 +3268,7 @@ mod tests {
                 client,
                 socket,
                 host,
+                _outside: outside,
                 start,
             }
         }
@@ -3271,6 +3313,44 @@ mod tests {
         assert!(!joining.host.packets().is_empty());
     }
 
+    // Punches from the host while the code was on show mean it was pasted, so
+    // the screen after it runs out can say which way it failed. A new code
+    // starts over.
+    #[test]
+    fn a_punch_says_the_code_was_pasted() {
+        let mut joining = Joining::new(easy(), |_| {});
+        let first = joining.tick(DUE).reply.expect("a reply code");
+        assert!(matches!(first.state, ReplyState::Code { .. }));
+        let now = joining.start + DUE + Duration::from_secs(1);
+        let from = joining.host.addr();
+        let punch = session::punch_packet(&[7; session::PUNCH_RANDOM_LEN]);
+        joining.client.on_packet(&punch, from, now, &joining.socket);
+        let expired = joining
+            .tick(DUE + REPLY_LIFETIME)
+            .reply
+            .expect("the expired screen");
+        assert_eq!(
+            expired.state,
+            ReplyState::Expired {
+                second_router: false,
+                punched: true
+            }
+        );
+        let pressed = DUE + REPLY_LIFETIME + Duration::from_secs(1);
+        assert!(joining.client.new_code(joining.start + pressed));
+        let again = joining
+            .tick(pressed + REPLY_LIFETIME)
+            .reply
+            .expect("expired again");
+        assert_eq!(
+            again.state,
+            ReplyState::Expired {
+                second_router: false,
+                punched: false
+            }
+        );
+    }
+
     #[test]
     fn expired_code_and_new_code() {
         for second_router in [false, true] {
@@ -3287,7 +3367,13 @@ mod tests {
                 .tick(DUE + REPLY_LIFETIME)
                 .reply
                 .expect("the expired screen");
-            assert_eq!(expired.state, ReplyState::Expired { second_router });
+            assert_eq!(
+                expired.state,
+                ReplyState::Expired {
+                    second_router,
+                    punched: false
+                }
+            );
             assert!(expired.code.is_empty());
 
             let pressed = joining.start + DUE + REPLY_LIFETIME + Duration::from_secs(1);
@@ -3378,6 +3464,8 @@ mod tests {
     fn name_looked_up_after_fast_round() {
         let mut joining = Joining::new(easy(), |invite| {
             invite.hostname = Some(String::from("myroom.example.net"));
+            // The name is the way out here; no outside address beside it.
+            invite.candidates.truncate(1);
         });
         joining.tick(DUE - Duration::from_millis(1));
         assert!(joining.client.name_wanted().is_none());
@@ -3781,7 +3869,8 @@ mod tests {
         assert_eq!(
             view.reply.map(|reply| reply.state),
             Some(ReplyState::Expired {
-                second_router: false
+                second_router: false,
+                punched: false
             })
         );
         assert!(rig.client.new_code(expiry));
