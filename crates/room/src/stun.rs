@@ -319,8 +319,10 @@ impl Stun {
         match (self.phase, self.mapping) {
             (Phase::Settled, Mapping::Easy) => RouterState::Easy,
             (Phase::Settled, Mapping::Hard) => RouterState::Hard,
-            // No server answered: there is nothing for an invite to carry.
-            (Phase::Settled, Mapping::Unknown) if self.public_v4.is_none() => {
+            // No server answered: the invite gets no outside address.
+            (Phase::Settled, Mapping::Unknown)
+                if self.public_v4.is_none() && self.public_v6.is_none() =>
+            {
                 RouterState::NoAddress
             }
             (Phase::Settled, Mapping::Unknown) => RouterState::Unknown,
