@@ -80,6 +80,9 @@ WizardSmallImageBackColor=#141412
 ; older one left would make the folder differ from the zip.
 Type: files; Name: "{app}\*.dll"
 Type: filesandordirs; Name: "{app}\ffmpeg"
+; The README was the GitHub page's README.md before it became the plain
+; README.txt.
+Type: files; Name: "{app}\README.md"
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs

@@ -154,6 +154,59 @@ function New-Zip([string]$Path, [string]$Base, [System.IO.FileInfo[]]$Items) {
     }
 }
 
+# The zip's README is opened in Notepad, where the GitHub page's HTML header,
+# badges and picture are noise. This keeps README.md's words as plain text:
+# the name and its line on top, headings underlined, a link's address in
+# brackets after its words, code indented, lines wrapped at 78 columns.
+function ConvertTo-PlainReadme([string]$Markdown, [string]$Repository) {
+    $lines = $Markdown -split "`r?`n"
+    $tagline = ($lines | Where-Object { $_ -match '^<p align="center">[^<]' } | Select-Object -First 1) -replace '<[^>]+>', ''
+    if (-not $tagline) {
+        throw 'README.md has no line under its name in the centered header, so the plain README for the zip would start without one.'
+    }
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($line in 'Booth', '', $tagline.Trim(), '', $Repository) { $out.Add($line) }
+    $inCode = $false
+    foreach ($line in $lines) {
+        if ($line -match '^\s*<' -or $line -match '^!\[') { continue }
+        if ($line -match '^```') { $inCode = -not $inCode; continue }
+        if ($inCode) { $out.Add("    $line"); continue }
+        if ($line -match '^#{1,6} (.+)$') {
+            foreach ($row in '', $Matches[1], ('-' * $Matches[1].Length)) { $out.Add($row) }
+            continue
+        }
+        # A link inside the repository or to a heading keeps only its words.
+        $text = [regex]::Replace($line, '\[([^\]]+)\]\(([^)]+)\)', {
+            param($m)
+            if ($m.Groups[2].Value -match '^https?://') { "$($m.Groups[1].Value) ($($m.Groups[2].Value))" } else { $m.Groups[1].Value }
+        })
+        $out.Add(($text -replace '`([^`]+)`', '$1'))
+    }
+    $wrapped = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $out) {
+        if ($line.Length -le 78 -or $line.StartsWith('    ')) { $wrapped.Add($line); continue }
+        # A list item's later lines start under its text, not under the dash.
+        $indent = if ($line.StartsWith('- ')) { '  ' } else { '' }
+        $current = ''
+        foreach ($word in $line -split ' ') {
+            if ($current.Length -eq 0) { $current = $word }
+            elseif ($current.Length + 1 + $word.Length -le 78) { $current += " $word" }
+            else { $wrapped.Add($current); $current = "$indent$word" }
+        }
+        if ($current) { $wrapped.Add($current) }
+    }
+    $final = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $wrapped) {
+        if ($line -eq '' -and $final.Count -gt 0 -and $final[$final.Count - 1] -eq '') { continue }
+        $final.Add($line)
+    }
+    $text = ($final -join "`r`n").Trim() + "`r`n"
+    if ($text -match '<[a-zA-Z/!]|!\[|&nbsp;|\.(png|svg|gif|jpg)\b') {
+        throw 'The plain README for the zip still has HTML or a picture in it: README.md has something ConvertTo-PlainReadme in tools\release.ps1 does not turn into text. Change one of the two.'
+    }
+    $text
+}
+
 $rebuildFfmpeg = 'Build FFmpeg again with: powershell -ExecutionPolicy Bypass -File tools\build-ffmpeg.ps1'
 
 # The LGPL asks for the exact source of the FFmpeg DLLs for as long as they
@@ -654,9 +707,11 @@ foreach ($dll in Get-ChildItem -LiteralPath $files -Filter '*.dll' -File) {
     }
 }
 
-foreach ($file in 'README.md', 'LICENSE-MIT', 'LICENSE-APACHE') {
+foreach ($file in 'LICENSE-MIT', 'LICENSE-APACHE') {
     Copy-Item -LiteralPath (Join-Path $root $file) -Destination $files
 }
+$readme = ConvertTo-PlainReadme (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $root 'README.md')) ($releasesPage -replace '/releases$', '')
+[System.IO.File]::WriteAllText((Join-Path $files 'README.txt'), $readme, (New-Object System.Text.UTF8Encoding $false))
 
 # The installer is built from this same folder, so this covers both.
 $releaseFiles = @(Get-ChildItem -LiteralPath $files -Recurse -File | Sort-Object FullName)
