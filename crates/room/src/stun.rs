@@ -1,9 +1,9 @@
-// The STUN questions from the room socket. Both roles ask one round at start:
+// STUN requests from the room socket. Both roles send one round at start:
 // the host's first invite waits for it, and the client's reply code carries
-// what it saw. The host then asks one every stun_every to keep the router's
-// mapping warm; the client's own tries to the host do that for it. Either
-// side asks an extra round when its address may have changed, and every
-// answer after the first round is held against what came before it, which
+// what it saw. The host then sends one every stun_every to keep the router's
+// mapping open; the client's own packets to the host do that for it. Either
+// side sends an extra round when its address may have changed, and every
+// response after the first round is compared with the one before it, which
 // is how a new outside address shows.
 
 use std::fmt;
@@ -17,11 +17,11 @@ use crate::log::{Log, list, log, secs};
 use crate::socket::Socket;
 use crate::view::{MappingWord, RouterState};
 
-// A STUN answer takes one round trip. This is what the first invite still
-// waits after slow name lookups have used up stun_wait, for the questions
+// A STUN response takes one round trip. This is how long the first invite
+// still waits after slow name lookups used up stun_wait, for the requests
 // sent to the names that resolved last.
 const LATE_ANSWER: Duration = Duration::from_millis(300);
-// How long an address check goes on asking while no server answers.
+// How long an address check keeps sending requests while no server answers.
 const CHECK_FOR: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
@@ -47,7 +47,7 @@ pub(crate) struct Stun {
     public_v6: Option<SocketAddrV6>,
     public: Option<SocketAddr>,
     // What each server saw last. A router with hard mapping shows every
-    // server another port, so a new answer is held against the same
+    // server another port, so a new response is compared with the same
     // server's last one.
     seen: Vec<(SocketAddr, SocketAddr)>,
     // When an answer last showed the outside address in each family as it
@@ -70,7 +70,7 @@ enum Phase {
 pub(crate) enum Answer {
     NotOurs(NotOurs),
     Recorded,
-    // The last question of the first round was answered.
+    // The last request of the first round got its response.
     Settled,
     // After the first round: the outside address or port is not what it
     // was.
@@ -89,7 +89,7 @@ pub(crate) struct Moved {
 
 pub(crate) enum NotOurs {
     Unreadable(StunError),
-    // From a server we asked, to no question still open: an answer to a
+    // From a server we asked, to no request still open: a response to a
     // round that is over, or a second copy.
     Late,
     Stranger,
@@ -105,7 +105,7 @@ impl fmt::Display for NotOurs {
                 write!(f, "stun, but not an answer this pc can use: {err}")
             }
             NotOurs::Late => {
-                f.write_str("a stun answer from a server we asked, to no open question")
+                f.write_str("a stun response from a server we asked, to no open request")
             }
             NotOurs::Stranger => f.write_str("stun from someone this pc never asked"),
             NotOurs::Inside(addr) => {
@@ -150,7 +150,7 @@ impl Stun {
         }
     }
 
-    // One server name resolved. Its questions go out now, so the answers
+    // One server name resolved. Its requests go out now, so the responses
     // come in while the next name is still being looked up.
     pub(crate) fn found(&mut self, servers: Vec<SocketAddr>, socket: &Socket) {
         for server in servers {
@@ -208,7 +208,7 @@ impl Stun {
             .seen
             .iter()
             .any(|(asked, seen)| *asked == from && same_place(*seen, mapped));
-        let moved = self.held_against_before(from, mapped, now);
+        let moved = self.compare_with_previous(from, mapped, now);
         match mapped {
             _ if repeat => {}
             SocketAddr::V4(v4) => {
@@ -267,12 +267,11 @@ impl Stun {
         settled
     }
 
-    // The address may have changed: every server is asked now, and again
-    // every stun_retry while a family stays silent, for up to CHECK_FOR. A
-    // round already out, or the first one, goes on, so nothing more goes out
-    // then, but a round out left before the change and can come back the old
-    // way, so its answers do not end the check and it is tried again after
-    // stun_retry all the same. Without servers there is no one to ask.
+    // The address may have changed: query every server now, and again every
+    // stun_retry while a family stays silent, for up to CHECK_FOR. While a
+    // round is in flight nothing more is sent, but its queries left before
+    // the change and may come back with the old address, so their responses
+    // do not end the check and the round is retried after stun_retry anyway.
     // Returns true when a round went out.
     pub(crate) fn check(&mut self, now: Instant, socket: &Socket) -> bool {
         if self.phase != Phase::Settled || self.servers.is_empty() {
@@ -286,9 +285,9 @@ impl Stun {
         true
     }
 
-    // What the check was asking has its answer some other way, such as the
-    // host being heard again. A round already out can still land and show a
-    // move, but nothing more is asked. Returns true when a check was on.
+    // The check got its answer some other way, such as hearing from the host
+    // again. A round in flight can still arrive and show a move, but no more
+    // requests go out. Returns true when a check was on.
     pub(crate) fn end_check(&mut self) -> bool {
         if self.check_until.take().is_none() {
             return false;
@@ -404,9 +403,9 @@ impl Stun {
         }
     }
 
-    // A later round is written down when its last answer comes in, or
-    // stun_wait after its questions went out if some never do, the same way
-    // settle() does it for the first round.
+    // A later round is recorded when its last response comes in, or
+    // stun_wait after its requests went out if some never arrive, the same
+    // way settle() does it for the first round.
     fn round(&mut self, now: Instant, socket: &Socket) {
         // Only when stun_wait is longer than stun_every.
         if self.round_ends.is_some() {
@@ -420,7 +419,7 @@ impl Stun {
         self.next_round = self.after_round(now);
         self.round_started = Some(now);
         if self.requests.is_empty() {
-            // Not one question left this PC: it has no network right now.
+            // Not one request left this PC: it has no network right now.
             self.retry_check(now);
         } else {
             self.round_ends = Some(now + self.wait);
@@ -449,11 +448,11 @@ impl Stun {
 
     // A router coming back can bring IPv6 back before IPv4, or the other way
     // round, so an address check waits for every family a server asked in
-    // this round gave an outside address in before. A family no question
-    // could leave this PC for has nothing to wait for.
+    // this round gave an outside address in before. A family no request
+    // could leave this PC in has nothing to wait for.
     fn every_family_back(&self) -> bool {
-        // A round that left before the check began can come back the old way
-        // and show the old address, so it answers nothing.
+        // A round sent before the check began can come back with the old
+        // address, so it does not count.
         let after_change = match (self.round_started, self.check_until) {
             (Some(started), Some(until)) => started + CHECK_FOR >= until,
             _ => false,
@@ -520,14 +519,14 @@ impl Stun {
         }
     }
 
-    // Some when the answer shows another outside address or port than the
-    // last answer did, and the server that gave it saw something else last
+    // Some when the response shows another outside address or port than the
+    // last one did, and the server that gave it saw something else last
     // time too, so one change is one move however many servers show it. A
     // server with nothing to go by counts only for another address. With
     // hard mapping every server sees its own port, so only the address
-    // counts there. The first round is only written down: there is nothing
-    // before it to hold it against.
-    fn held_against_before(
+    // counts there. The first round is only recorded: there is nothing
+    // before it to compare with.
+    fn compare_with_previous(
         &mut self,
         server: SocketAddr,
         now: SocketAddr,
@@ -695,7 +694,7 @@ mod tests {
             .requests
             .iter()
             .find(|(_, asked)| *asked == server)
-            .expect("a question to answer");
+            .expect("a request to answer");
         stun.on_answer(&stun_answer_seeing(&txid, seen), server, now)
     }
 
@@ -740,7 +739,7 @@ mod tests {
         stun.tick(noticed + wait, &socket);
         assert_eq!(stun.next_deadline(), Some(noticed + RETRY));
         stun.tick(noticed + RETRY, &socket);
-        assert_eq!(server.packets().len(), 1, "no second question");
+        assert_eq!(server.packets().len(), 1, "no second request");
 
         // Then it does, from its new outside port.
         let answered = noticed + RETRY + Duration::from_millis(20);
@@ -859,7 +858,10 @@ mod tests {
         assert_eq!(server.packets().len(), 1);
         let noticed = keepalive + Duration::from_millis(500);
         assert!(!stun.check(noticed, &socket));
-        assert!(server.packets().is_empty(), "the round out answers it");
+        assert!(
+            server.packets().is_empty(),
+            "the round in flight answers it"
+        );
 
         stun.tick(keepalive + wait, &socket);
         assert_eq!(stun.next_deadline(), Some(keepalive + RETRY));
@@ -905,7 +907,7 @@ mod tests {
                 to: SocketAddr::V4(outside(52001)),
                 from_confirmed: Some(start),
             }),
-            "held against the last IPv4 answer, not the IPv6 one"
+            "compared with the last IPv4 response, not the IPv6 one"
         );
         answer_seeing(&mut stun, v6.addr(), outside_v6, retried);
         assert_eq!(stun.next_deadline(), None, "the check is over");
@@ -983,7 +985,7 @@ mod tests {
             .collect()
     }
 
-    // Each round is written down when it ends, not when the next one starts.
+    // Each round is recorded when it ends, not when the next one starts.
     #[test]
     fn keepalive_round_logged_at_end() {
         let (log, captured) = Log::capture(256);
@@ -1019,7 +1021,7 @@ mod tests {
         );
         assert_eq!(stun.next_deadline(), Some(second + every));
 
-        // One server stays silent: the round is written down at stun_wait.
+        // One server stays silent: the round is recorded at stun_wait.
         let third = second + every;
         stun.tick(third, &socket);
         answer_from(&mut stun, one.addr());
