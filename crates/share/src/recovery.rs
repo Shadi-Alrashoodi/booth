@@ -29,7 +29,7 @@ pub enum Back {
 }
 
 // Asking for an IDR again while the first one is on its way would only make
-// another. The sharer also drops an ask an IDR already answered.
+// another. The sharer also drops a request an IDR already answered.
 const IDR_ASK_GAP: Duration = channels::video::RECOVER_GAP;
 
 // Failed decodes are reported as the reassembler reports drops: the first
@@ -48,13 +48,12 @@ const IDR_AFTER_FAILURES: u32 = 3;
 
 // The GPU's decoder refusing the stream comes back with every IDR, and the
 // loopback's stream never changes, so the run stops with the decoder's
-// sentence. Not at the first one: FFmpeg's refusal also covers video memory
+// error message. Not at the first one: FFmpeg's refusal also covers video memory
 // running out, which a game can cause for a moment.
 const REFUSALS_TO_STOP: u32 = 3;
 
-// Frames asked for in one recover request are looked at one by one. A
-// request this long only comes after an outage, and the first frames of it
-// say all there is to say.
+// Frames in one recover request are checked one by one. A request this
+// long only comes after an outage, and its first frames are enough.
 const MOST_RECOVERED: u32 = 64;
 
 // Recent invalidations remembered on the sharer's side. A request about the
@@ -72,7 +71,7 @@ const LOST_HERE_KEPT: usize = 16;
 // the screen stands still for 100 ms, and at most once for each picture.
 pub(crate) const REPEAT_AFTER: Duration = Duration::from_millis(100);
 
-// An IDR that answers a loss or a watcher's IDR ask waits until the last IDR
+// An IDR that answers a loss or a viewer's IDR request waits until the last IDR
 // has used at most this share of the upload setting: its bits spread over
 // the time since it went out.
 // A friend's PC that reports every frame lost then costs the sharer at most
@@ -103,7 +102,7 @@ pub struct Asks {
     held: u64,
     // The loss number sent last, and whether a frame was repaired or dropped
     // since.
-    told_loss: Option<f32>,
+    last_sent_loss: Option<f32>,
     lost_since: bool,
 }
 
@@ -193,7 +192,7 @@ impl Asks {
     // The loss number, once a second.
     pub fn loss(&mut self, loss: Option<f32>, back: &mut Vec<Back>) {
         back.push(Back::Loss(loss));
-        self.told_loss = loss;
+        self.last_sent_loss = loss;
         self.lost_since = false;
     }
 
@@ -203,12 +202,14 @@ impl Asks {
     // that is still on its way counts as lost for a moment. `loss` is the
     // reassembler's number now.
     pub fn first_loss(&mut self, loss: impl FnOnce() -> Option<f32>, back: &mut Vec<Back>) {
-        if !std::mem::take(&mut self.lost_since) || self.told_loss.is_some_and(|told| told > 0.0) {
+        if !std::mem::take(&mut self.lost_since)
+            || self.last_sent_loss.is_some_and(|sent| sent > 0.0)
+        {
             return;
         }
         if let Some(pct) = loss().filter(|&pct| pct > 0.0) {
             back.push(Back::Loss(Some(pct)));
-            self.told_loss = Some(pct);
+            self.last_sent_loss = Some(pct);
         }
     }
 
@@ -254,10 +255,10 @@ impl Asks {
 pub struct Answers {
     newest: Option<u64>,
     last_idr: Option<u64>,
-    // The encoder said its next frame is an IDR.
+    // The encoder reported that its next frame is an IDR.
     idr_coming: bool,
     force_idr: bool,
-    // An IDR that answers a loss or an IDR ask, waiting for the floor. The
+    // An IDR that answers a loss or an IDR request, waiting for the floor. The
     // encoder has not been asked: asking commits it to the IDR.
     held: bool,
     // The last IDR that went to the pacer, and the one before it, which
@@ -490,7 +491,7 @@ impl Answers {
 
     // The viewer has no picture to build on after frame `seen`. An IDR sent
     // after that frame is on its way already; if it was lost too, the viewer
-    // asks again. An ask about a frame not sent yet would otherwise force an
+    // asks again. A request about a frame not sent yet would otherwise force an
     // IDR every time. The IDR waits for the floor, as one answering a loss.
     pub fn idr_asked(&mut self, seen: u32, now: Instant, numbers: &mut SharerNumbers) {
         if !self.sent(seen) {
