@@ -30,7 +30,7 @@ use crate::{Clock, Line};
 const STRIP_EVERY: Duration = Duration::from_millis(250);
 const SECOND: Duration = Duration::from_secs(1);
 
-// The first decode failure is said, since without a log it would be lost;
+// The first decode failure is shown, since without a log it would be lost;
 // the next few go to the log word for word, and after that only the count.
 const FAILURES_LOGGED: u64 = 5;
 
@@ -53,7 +53,7 @@ const MOST_FRAMED: usize = 256;
 const NEW_DECODERS_PER_GAP: usize = 3;
 
 // Held back this often within HOLDS_WITHIN, the stream ends the watch with
-// a sentence rather than a picture that keeps stopping. A sharer that
+// an error message rather than a picture that keeps stopping. A sharer that
 // changes codec only as Booth's rules do is not held back at all.
 const HOLDS_TO_STOP: usize = 3;
 const HOLDS_WITHIN: Duration = Duration::from_secs(30);
@@ -874,7 +874,7 @@ impl Screen {
         }
     }
 
-    // Err ends the run, with the decoder's sentence, when the GPU's decoder
+    // Err ends the run, with the decoder's error message, when the GPU's decoder
     // keeps refusing the stream.
     fn lost(
         &mut self,

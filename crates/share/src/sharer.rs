@@ -49,7 +49,7 @@ pub const SOFTWARE_FAILED_TOO: &str = "the GPU encoder failed and the software e
 // Why a share runs on Windows' software encoder until it ends, which the
 // panel says once. A share on a GPU with no encoder Booth can use lands on
 // it as well, through encode::open_codec's order, and the panel has a
-// sentence of its own for that one.
+// message of its own for that one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Software {
     // Intel graphics, whose hardware encoders Booth does not use yet
