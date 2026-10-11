@@ -19,8 +19,8 @@
 <main>
   <div class="text">
     <section>
-      <p>Booth has no accounts, no analytics and no server of its own. Voice, video and chat go straight between your PC and the host's, encrypted, and nothing about you or your calls is collected or sent to me or anyone else. Your keys, your settings and the friends you have met stay on your PC.</p>
-      <p>To learn your outside address, Booth asks two public STUN servers, Cloudflare's and Google's unless you change them in Settings; they see that address and nothing else. The zip and the installer also ask GitHub once a day whether a newer version is out, and only if you turn on Check for new versions in Settings. The copy from the Microsoft Store never does, since the Store updates it. Booth contacts nothing else.</p>
+      <p>Booth has no accounts, no analytics and no server of mine. It has no telemetry and sends me nothing. Voice, video and chat go encrypted from your PC to the host's PC. The host's PC decrypts them and passes them on to the others, so the host sees everything said and shown in the room. Your private key, your settings and your known hosts and devices stay on your PC.</p>
+      <p>To learn your outside address, Booth sends STUN requests to two public servers, Cloudflare's and Google's unless you change them in Settings. A STUN server learns your public address and port, which is all a STUN request carries. The zip and installer builds ask GitHub whether a newer version is out, at most once a day when Booth starts, and only when Check for new versions is on in Settings. GitHub then sees your address, like any site you visit. The copy from the Microsoft Store never asks. When you host, Booth also asks your router to open a port for the room. Apart from that, the PCs in your room and DNS lookups, Booth contacts nothing else.</p>
     </section>
   </div>
 </main>
