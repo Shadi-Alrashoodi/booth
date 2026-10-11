@@ -2,7 +2,7 @@
 
 <h1 align="center">Booth</h1>
 
-<p align="center">Voice, text chat and screen sharing for a few friends on Windows, built for the lowest delay.</p>
+<p align="center">Voice, text chat and screen sharing for a few friends on Windows, built for low delay.</p>
 
 <p align="center"><a href="https://github.com/Shadi-Alrashoodi/booth/releases/download/v1.0.1/booth-1.0.1-setup.exe"><b>Download the installer</b></a> &nbsp; or &nbsp; <a href="https://github.com/Shadi-Alrashoodi/booth/releases/download/v1.0.1/booth-1.0.1-windows-x64.zip">the zip</a></p>
 
@@ -28,7 +28,7 @@ Push to talk is on by default: hold Right Ctrl to talk. Hotkeys work while a gam
 
 ## Features
 
-- Voice in 5 ms Opus frames, with a jitter buffer that starts as small as it can and grows only when the network needs it.
+- Voice in 5 ms Opus frames, with a jitter buffer that starts as small as it can, grows when over 1% of packets arrive late and shrinks after 5 s with none.
 - Screen sharing with Desktop Duplication and GPU encoding, H.264 or HEVC, up to 1440p at 120 fps. On Intel graphics Booth encodes in software for now, H.264 up to 1080p at 60 fps.
 - Median capture to display on my PCs: about 5 ms at 1440p120 with host and viewer on one PC, 22 to 32 ms over the internet to a laptop on Wi-Fi.
 - Ping, jitter and loss always on screen in a room.
@@ -46,7 +46,7 @@ cargo build --release --locked -p app
 
 ## Security
 
-Booth has no accounts and no cloud: voice, video and chat go straight between each friend's PC and the host's, over UDP, encrypted even on a LAN. Each connection starts with a Noise handshake (Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s) in which both sides prove who they are. The crypto is the snow, dalek and RustCrypto crates, not my own; the code around it has had no outside audit. The host decrypts and forwards everything in the room, so only join a host you trust. To learn your outside address, Booth asks two public STUN servers, Cloudflare's and Google's unless you change them in Settings; they see that address and nothing else. Besides those, Booth contacts only GitHub (github.com and its download host), and only if you turn on Check for new versions in Settings. Report a security problem privately from the Security tab on GitHub.
+Booth has no accounts and no cloud: voice, video and chat go straight between each friend's PC and the host's, over UDP, encrypted even on a LAN. Each connection starts with a Noise handshake (Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s) in which both sides prove who they are. The crypto is the snow, dalek and RustCrypto crates, not my own; the code around it has had no outside audit. The host decrypts and forwards everything in the room, so only join a host you trust. To learn your outside address, Booth asks two public STUN servers, Cloudflare's and Google's unless you change them in Settings; a STUN server learns your public address and port, which is all a STUN request carries. Besides those, Booth contacts only GitHub (github.com and its download host), and only if you turn on Check for new versions in Settings. Report a security problem privately from the Security tab on GitHub.
 
 ## License
 
