@@ -723,7 +723,7 @@ fn outdated_by(invite: &InviteView) -> Option<&'static str> {
 // The one line under the paste field. Something pasted that is not a code
 // at all comes first, since it answers what was just typed. While this PC's
 // own address has just changed no code can help, whatever the room made of
-// the last one, so that is said instead.
+// the last one, so that is shown instead.
 fn paste_line(
     typed: Option<&str>,
     moved: bool,
@@ -1683,7 +1683,7 @@ mod tests {
 
     // The hotkeys do push to talk while they can hear keys. While an
     // administrator window has focus, or when they did not start, the
-    // button is back, and the pause is said under your row.
+    // button is back, and the pause is shown under your row.
     #[test]
     fn hold_to_talk_shown() {
         let live = hotkeys::State {
@@ -1825,7 +1825,7 @@ mod tests {
         assert_eq!(Slot::of(&you, Some(&deafened)), Slot::Deafened);
     }
 
-    // A microphone that cannot open is said under your row, as a sentence,
+    // A microphone that cannot open is shown under your row as a message,
     // and the room goes on for listening.
     #[test]
     fn device_problem_under_your_row() {

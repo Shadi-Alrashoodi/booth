@@ -529,7 +529,7 @@ mod tests {
     }
 
     // A device that is not connected fails a moment after it was passed
-    // over. That is about the old choice, and nothing is said under the new
+    // over. That is about the old choice, and nothing is shown under the new
     // one while it opens.
     #[test]
     fn a_replaced_stream_says_nothing_about_the_new_choice() {

@@ -18,7 +18,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-// One address for the update check and for the sentences that tell a
+// One address for the update check and for the messages that tell a
 // friend where to get the host's version.
 pub use invite::RELEASES_PAGE;
 
