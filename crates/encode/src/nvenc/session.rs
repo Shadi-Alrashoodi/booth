@@ -280,7 +280,7 @@ impl Session {
     }
 
     /// Whether the GPU's encoder lists `codec` at all. Asked before any caps,
-    /// so a GPU without HEVC gets a sentence saying so rather than whatever
+    /// so a GPU without HEVC gets an error message saying so rather than whatever
     /// status its first caps call fails with.
     pub(crate) fn offers_codec(&self, codec: Codec) -> Result<bool, EncodeError> {
         let mut count = 0;

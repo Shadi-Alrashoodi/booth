@@ -130,7 +130,7 @@ fn caps(session: &Session, request: &Request) -> Result<Caps, EncodeError> {
 }
 
 /// Whether NVENC takes the request, asked through a session that encodes
-/// nothing; the reason as a sentence when it does not. The caller has
+/// nothing; an error message when it does not. The caller has
 /// checked that some level of the codec holds the size and rate.
 pub(crate) fn offers(device: &ID3D11Device, request: &Request) -> Result<(), String> {
     let _opening = gpu::opening();

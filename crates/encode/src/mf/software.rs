@@ -29,8 +29,8 @@ use crate::{
     AccessUnit, Codec, EncodeError, Encoder, Frame, Kind, Recovery, Request, Settings, gpu,
 };
 
-/// Whether this encoder takes the request as it is; the reason as a
-/// sentence when not.
+/// Whether this encoder takes the request as it is; an error
+/// message when not.
 pub(crate) fn offers(request: &Request) -> Result<(), String> {
     let Request {
         codec,

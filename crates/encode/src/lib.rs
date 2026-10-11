@@ -409,7 +409,7 @@ pub fn open_kind_codec(
 pub struct Offer {
     /// Fastest first, in the order [`open_codec`] tries them.
     pub kinds: Vec<Kind>,
-    /// Why each of the others does not, one sentence each, for the log.
+    /// Why each of the others does not, one line each, for the log.
     pub refused: Vec<String>,
     /// The name the GPU's driver gives the Media Foundation hardware encoder
     /// [`open_codec`] would start for this codec, for example "NVIDIA HEVC

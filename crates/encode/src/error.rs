@@ -11,7 +11,7 @@ pub enum EncodeError {
     NoEncoderForGpu {
         gpu: String,
         codec: Codec,
-        /// Why each encoder tried could not, fastest first, one sentence
+        /// Why each encoder tried could not, fastest first, one line
         /// each.
         tried: Vec<String>,
         /// Set when the software encoder would take the share at this
@@ -48,12 +48,12 @@ pub enum EncodeError {
         waited: Duration,
     },
     /// A Media Foundation encoder did something its own rules do not allow.
-    /// `problem` is the whole sentence.
+    /// `problem` is the whole message.
     EncoderMisbehaved {
         problem: &'static str,
     },
     /// A Media Foundation encoder lacks something Booth needs. `problem` is
-    /// the whole sentence.
+    /// the whole message.
     EncoderLacks {
         problem: &'static str,
     },

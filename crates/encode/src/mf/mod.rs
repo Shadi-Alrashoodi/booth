@@ -276,7 +276,7 @@ fn note_own_buffer(api: &mut CodecApi, bitrate: u32) {
 /// Every loss is answered with an IDR on these encoders, so one that cannot
 /// make an IDR on request could never recover a share and is refused at
 /// open, which lets open_codec() move on to the next encoder. `problem` is
-/// the sentence the error gives.
+/// the error message it carries.
 fn check_idr_on_request(api: &mut CodecApi, problem: &'static str) -> Result<(), EncodeError> {
     if !api.supports(&CODECAPI_AVEncVideoForceKeyFrame) {
         return Err(EncodeError::EncoderLacks { problem });
