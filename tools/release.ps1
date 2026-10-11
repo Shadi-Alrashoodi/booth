@@ -1,67 +1,18 @@
-# Builds a release with one command:
-#
+# Builds a release: checks every crate with cargo deny and the key's public half
+# against RELEASE_KEY, builds booth.exe, the zip and, with Inno Setup 6, the
+# installer, and signs latest.txt, which holds the SHA-256 of both. A file that
+# names a folder of this PC stops the release.
 #   powershell -ExecutionPolicy Bypass -File tools\release.ps1 -SecretKey E:\booth-release.key
-#
-# Windows runs no scripts until told otherwise, and -ExecutionPolicy Bypass
-# tells it for that one command only.
-#
-# Checks every crate with cargo deny, builds the release tool and checks
-# with it that the key's public half is RELEASE_KEY, the key every copy of
-# Booth checks a release against. Only then fetches the third-party files,
-# collects their licenses, builds booth.exe, puts the zip together, builds
-# the installer when Inno Setup 6 is installed, writes the update manifest
-# latest.txt with the SHA-256 of both, and signs latest.txt and nothing
-# else, since it vouches for the other two. The release is those four files
-# in dist\<version>: the zip, the installer, latest.txt and
-# latest.txt.minisig. It uploads and publishes nothing; that stays a step
-# done by hand.
-#
-# The zip's and the installer's names carry the version, so the download
-# links in README.md and docs\index.html change with each version, and a
-# release is refused while either still names another one.
-#
-# The key's password is needed twice, for the check and for signing. When it
-# is stored in Windows Credential Manager as the generic credential
-# booth-release, it is read from there each time and piped to the release
-# tool, never shown, written to a file, put on a command line or in an
-# environment variable. Store it once in Control Panel, Credential Manager,
-# Windows Credentials, Add a generic credential, with booth-release as the
-# address and any user name. Anything running under your Windows login can
-# read it, so it is only as safe as that login, which is also all that
-# guards the key file while it is plugged in. Without the credential the
-# password is asked for both times, three tries each. -CredentialTarget
-# reads another credential instead, for a test with a throwaway key, and
-# given a name that has no credential, the password is asked for.
-#
-# dist\<version> is emptied before anything is built, so it never holds an
-# earlier run's files beside this one's, such as an installer latest.txt
-# does not describe. Emptied rather than refused: only this script writes
-# there and it makes every file again, so a refusal would only mean a
-# delete by hand before each rebuild.
-#
-# No folder of this PC goes out with a release. The cargo home, the
-# repository and the target folder are cut from the file names rustc and
-# cl.exe write into booth.exe, and every file for the zip and the installer
-# is searched for them, and for any :\Users, before it is zipped. A hit
-# stops the release.
-#
-# FFmpeg's source archive and the recipe that built its DLLs go up once, to
-# a release of their own that the license texts in every zip point to, not
-# with each release. -FfmpegSource puts those two files in
-# dist\ffmpeg-<FFmpeg's version> and does nothing else: no key, no build,
-# no signature.
-#
-#   powershell -ExecutionPolicy Bypass -File tools\release.ps1 -FfmpegSource
-#
-# The key is made once with the release tool, and the public key it prints
-# goes in RELEASE_KEY in crates\app\src\update\mod.rs:
+# Output: dist\<version>, emptied first, with the zip, the installer, latest.txt
+# and latest.txt.minisig. Nothing is uploaded or published.
+# The key's password comes from the generic credential booth-release (Control
+# Panel, Credential Manager, Windows Credentials); without it, it is asked for.
+# -Rehearsal warns and goes on where a real run stops, for a build never to be published.
+# -FfmpegSource only puts FFmpeg's source and build recipe in dist\ffmpeg-<its version>.
+# -CredentialTarget reads another credential, for a test with a throwaway key.
+# The key is made once, and the public key it prints goes in RELEASE_KEY in
+# crates\app\src\update\mod.rs:
 #   cargo run --release --locked -p release -- keygen E:\booth-release.key
-#
-# -Rehearsal builds a release that is never to be published. Where a real
-# run stops, it warns and goes on: while the releases address in the code
-# still has its OWNER placeholder or FFmpeg's source release is not under
-# it, while RELEASE_KEY is not made yet, and with a key that is not
-# RELEASE_KEY's, so a throwaway key works.
 param(
     [string]$SecretKey,
     [switch]$Rehearsal,
