@@ -1,8 +1,8 @@
 // Fallback 1: the hardware H.264 or HEVC encoder a GPU's driver registers
-// with Media Foundation. These encoders are asynchronous: they say through
-// their event generator, from their own threads, when they want a frame and
-// when one is done. Booth still keeps one frame in flight: encode() feeds a
-// frame and returns once that frame's bitstream is out.
+// with Media Foundation. These encoders are asynchronous: they signal through
+// their event generator, from their own threads, when they want input and
+// when output is ready. Booth still keeps one frame in flight: encode()
+// feeds a frame and returns once that frame's bitstream is out.
 
 use std::ffi::c_void;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -46,17 +46,17 @@ const HELD_IN_A_ROW: u32 = 3;
 // Why a frame is drained out of the encoder instead of waited for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Held {
-    // The encoder asked for the next frame before giving this one back.
+    // The encoder asked for the next input before returning this frame.
     Ahead,
-    // It said its output format changed and gave no frame after it.
+    // It reported a new output format and returned no frame after it.
     NewFormat,
 }
 
 // Until when wait_for_output waits for the next event of a frame that went
 // in at `submitted`, and what running out of that time means: Some, the
-// frame is drained out, None, it is given up on. After a new output format
-// the wait counts from the change, so a slow first frame that also changes
-// the format is not drained for having been slow before it.
+// frame is drained; None, encode() returns NoOutput. After a new output
+// format the wait counts from the change, so a slow first frame that also
+// changes the format is not drained for having been slow before it.
 fn wait_limit(
     submitted: Instant,
     changed: Option<Instant>,
@@ -170,7 +170,7 @@ impl Mft {
     }
 }
 
-// Joined only once the thread has said it is leaving: an encoder that
+// Joined only after the thread reports that it is exiting: an encoder that
 // ignored the shutdown would otherwise hang the caller here.
 fn joined(events: &Receiver<Event>, pump: JoinHandle<()>) -> bool {
     let deadline = Instant::now() + GIVE_UP;
@@ -207,15 +207,15 @@ pub(crate) struct Hardware {
     held_in_a_row: u32,
     // Set once the encoder has held HELD_IN_A_ROW frames back.
     drain_every_frame: bool,
-    threw_away_late_output: bool,
-    said_format_change: bool,
-    said_drain: bool,
+    discarded_late_output: bool,
+    format_change_logged: bool,
+    drain_logged: bool,
     idr_next: bool,
     last_index: Option<u64>,
-    // Frames given back.
+    // Frames returned by encode().
     encoded: u64,
-    // From this many frames given back on, the encoder's requests for
-    // frames go unheard: crate::fault's stall, None outside a test.
+    // After this many returned frames, the encoder's input requests are
+    // ignored: crate::fault's stall, None outside a test.
     stall_after: Option<u64>,
     // Last, so Media Foundation stops only after everything above is gone.
     _mf: Mf,
@@ -382,9 +382,9 @@ impl Hardware {
             output_wait: GIVE_UP,
             held_in_a_row: 0,
             drain_every_frame: false,
-            threw_away_late_output: false,
-            said_format_change: false,
-            said_drain: false,
+            discarded_late_output: false,
+            format_change_logged: false,
+            drain_logged: false,
             idr_next: true,
             last_index: None,
             encoded: 0,
@@ -481,9 +481,9 @@ impl Hardware {
                     });
                 };
                 if held == Held::Ahead {
-                    // It wants the next frame before giving this one back:
-                    // a frame of delay if Booth fed it one. This frame is
-                    // drained out instead. A slow first frame or a GPU stall
+                    // It wants the next input before returning this frame,
+                    // a frame of delay if Booth fed it one, so this frame
+                    // is drained instead. A slow first frame or a GPU stall
                     // lands here once; an encoder that holds frames does it
                     // every time, and then every frame is drained.
                     self.held_in_a_row += 1;
@@ -495,7 +495,7 @@ impl Hardware {
                     }
                 }
                 // An encoder that sends no METransformHaveOutput after a new
-                // output format gives the frame up to a drain as well.
+                // output format is drained as well.
                 self.note_drain(index, held, submitted.elapsed());
                 drained = true;
                 self.drain()?;
@@ -508,7 +508,7 @@ impl Hardware {
                 });
             }
             if kind == METransformNeedInput.0 as u32 {
-                self.hear_request();
+                self.count_request();
             } else if kind == METransformHaveOutput.0 as u32 {
                 let taken = self.output.take(&self.mft.transform, &self.fns)?;
                 if self.output.format_changed() {
@@ -543,11 +543,11 @@ impl Hardware {
         Ok((data, Instant::now()))
     }
 
-    /// Waits until the encoder asks for a frame. The output of a frame
-    /// encode() gave up on can still come out here: it is taken and thrown
-    /// away, since that frame's caller already had the error and the next
-    /// frame is an IDR. Left in the encoder, it would stop it from ever
-    /// asking for another frame. `index` is the frame about to go in.
+    /// Waits until the encoder asks for input. The output of a frame that
+    /// encode() timed out on can still arrive here: it is discarded, since
+    /// that frame's caller already got the error and the next frame is an
+    /// IDR. Left in the encoder, it would stop it from asking for input
+    /// again. `index` is the frame about to go in.
     fn wait_for_request(&mut self, index: u64) -> Result<(), EncodeError> {
         while self.wanted == 0 {
             let Some((kind, status)) = self.next_event(Instant::now() + GIVE_UP)? else {
@@ -562,7 +562,7 @@ impl Hardware {
                 });
             }
             if kind == METransformNeedInput.0 as u32 {
-                self.hear_request();
+                self.count_request();
                 continue;
             }
             if kind != METransformHaveOutput.0 as u32 {
@@ -574,10 +574,10 @@ impl Hardware {
             }
             if late.is_some() {
                 self.idr_next = true;
-                if !self.threw_away_late_output {
-                    self.threw_away_late_output = true;
+                if !self.discarded_late_output {
+                    self.discarded_late_output = true;
                     self.notes.push_str(
-                        ". A frame came out after Booth had given up on it and was thrown away",
+                        ". Discarded the output of a frame that encode() had already timed out on",
                     );
                 }
             }
@@ -589,34 +589,32 @@ impl Hardware {
         self.stall_after.is_some_and(|after| self.encoded >= after)
     }
 
-    fn hear_request(&mut self) {
+    fn count_request(&mut self) {
         if !self.stalled() {
             self.wanted += 1;
         }
     }
 
-    // Once per encoder, for the log: which encoders change their output
-    // format mid-stream only a share on one can tell, and Booth has run on
-    // NVIDIA's only.
+    // Logged once per encoder: only a real share shows which encoders change
+    // their output format mid-stream, and Booth has run on NVIDIA's only.
     fn note_format_change(&mut self, index: u64) {
-        if !self.said_format_change {
-            self.said_format_change = true;
+        if !self.format_change_logged {
+            self.format_change_logged = true;
             self.notes.push_str(&format!(
                 ". The encoder changed its output format at frame {index}"
             ));
         }
     }
 
-    // Once per encoder, for the log, as the frames held back in a row are:
-    // a drain costs the frame its wait, and whether an encoder asks for
-    // frames again after one only a share on it can tell.
+    // Logged once per encoder: a drain costs the frame its wait, and only a
+    // real share shows whether the encoder asks for input again after one.
     fn note_drain(&mut self, index: u64, held: Held, waited: Duration) {
-        if self.said_drain {
+        if self.drain_logged {
             return;
         }
-        self.said_drain = true;
+        self.drain_logged = true;
         let why = match held {
-            Held::Ahead => "the encoder asked for the next frame before giving it back",
+            Held::Ahead => "the encoder asked for the next input before returning it",
             Held::NewFormat => "no frame followed the encoder's new output format",
         };
         self.notes.push_str(&format!(
@@ -733,8 +731,8 @@ impl Encoder for Hardware {
     }
 }
 
-/// The name of the hardware encoder for `codec` Windows lists first for this
-/// GPU, the one open() would start; the reason as a sentence when it lists
+/// The name of the hardware encoder for `codec` that Windows lists first for
+/// this GPU, the one open() would start, or an error message when it lists
 /// none. Media Foundation says nothing of an encoder's limits until it is
 /// started, so a size past them shows only at open.
 pub(crate) fn offers(adapter: &Adapter, codec: Codec) -> Result<String, String> {
@@ -975,7 +973,7 @@ mod tests {
             assert_eq!(unit.idr, i == 2, "frame {i}");
         }
         assert!(
-            encoder.notes().contains("thrown away"),
+            encoder.notes().contains("Discarded the output"),
             "{}",
             encoder.notes()
         );
@@ -1034,11 +1032,10 @@ mod tests {
         result.map_or_else(|e| e.code(), |()| S_OK)
     }
 
-    // The code in the log of the Iris Xe laptop whose H.264 encoder failed
-    // on its first frame, 0x8000ffff, is what an asynchronous encoder says
-    // to a ProcessOutput no event announced: NVIDIA's do, before the first
-    // frame and between frames, and go on encoding. So after a new output
-    // format Output::take waits for the next event instead of asking again.
+    // 0x8000ffff, from an Iris Xe laptop that failed its first H.264 frame, is
+    // what an asynchronous encoder returns from a ProcessOutput no event
+    // announced. NVIDIA's return it too but keep encoding. So after a new
+    // output format Output::take waits for the next event.
     #[test]
     fn unannounced_output_refused() {
         let _turn = gpu::test_turn();
