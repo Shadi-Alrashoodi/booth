@@ -63,10 +63,10 @@ pub struct App {
     scrolling: bool,
     notify: Notify,
     // After Not now on the firewall screen, the line the start screen shows
-    // for the rest of the run. Which one depends on what the screen said.
+    // for the rest of the run. Which one depends on what the screen showed.
     not_now: Option<&'static str>,
-    // Known lists found damaged and put aside during this run, each said
-    // once on the start screen for the rest of it.
+    // Known lists found damaged and put aside during this run, each shown on
+    // the start screen for the rest of the run.
     damaged: Vec<DamagedList>,
     // Known lists left where they were because they could not be used, one
     // start screen line each, until a later read of that list works.
@@ -76,12 +76,8 @@ pub struct App {
     // The panic key's cut and whether this PC is controlled, shared with the
     // hotkey thread and the injector's guard.
     flags: Arc<Flags>,
-    // Remote control ships once the injector does, and it is not written yet.
-    // Until a room here gets one, the panel shows none of it: no Control, no
-    // request block, no Stop control or End control, no control words or
-    // stats lines, no settings lock and no control states in the tray, and it
-    // declines any request that reaches it anyway. Read once, since the
-    // injector a room gets cannot come or go while Booth runs.
+    // Remote control stays hidden and refused until the injector exists. Read
+    // once, since a room's injector cannot come or go while Booth runs.
     control_offered: bool,
     share_key: ShareKey,
     // Shown by a hotkey on the last pass, and brought to the front on this
@@ -209,7 +205,7 @@ impl App {
         };
         // The start screen reads the known hosts each time it opens. The
         // devices are read only in settings and when a room opens, so a list
-        // of them that cannot be used is looked for once here, to be said
+        // of them that cannot be used is looked for once here, to be shown
         // with the hosts before anyone hosts with it.
         if let Ok(setup) = &app.setup
             && let Err(err) = Room::known_devices(&setup.config.data_dir)
@@ -588,7 +584,7 @@ impl App {
         match problem {
             None => self.list_read(List::Devices),
             Some(err) => {
-                // A damaged list is said on the start screen; anything else
+                // A damaged list is shown on the start screen; anything else
                 // here too, where Remove and Unblock would have been.
                 if err.damaged().is_none() {
                     draft.list_error = Some(messages::list_error(&err));
@@ -791,7 +787,7 @@ impl App {
         }
     }
 
-    // What the update check or its download said since the last pass. The
+    // What the update check or its download reported since the last pass. The
     // lines wait in the backlog like any other, but outside a room nothing
     // else would write them, and someone who ran --log to see why a check
     // failed may never open one.
@@ -1335,7 +1331,7 @@ fn window(frame: &eframe::Frame) -> Option<isize> {
 }
 
 pub enum NotStarted {
-    // A panel that can open no room, with the sentence that says why.
+    // A panel that can open no room, with the message that says why.
     Blocked(String),
     // No panel: the copy already open on this profile showed its own.
     BroughtForward,
