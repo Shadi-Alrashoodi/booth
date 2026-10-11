@@ -439,8 +439,8 @@ pub struct Decision {
     // a climb.
     pub rate_kbps: Option<u32>,
     pub backoff: Option<Sign>,
-    // A sign let pass because the share sends too little to fill a queue.
-    pub let_pass: Option<Sign>,
+    // A sign ignored because the share sends too little to fill a queue.
+    pub ignored: Option<Sign>,
     pub step: Option<Step>,
 }
 
@@ -529,7 +529,7 @@ pub struct Rate {
     allowed_kbps: u32,
     rate_kbps: u32,
     last_backoff: Option<Instant>,
-    // Clean seconds in a row: no sign of a queue, or one let pass.
+    // Clean seconds in a row: no sign of a queue, or one ignored.
     clean: u32,
     // Seconds in a row the round trip has risen, and of those the ones past
     // AT_ONCE_MARGINS times the margin, and how far it was over the floor in
@@ -545,10 +545,10 @@ pub struct Rate {
     // Frames sent and lost per second, newest last, LOSS_SECONDS at most.
     loss: VecDeque<(u32, u32)>,
     near: bool,
-    // Seconds with a sign let pass: in a row up to this one, and since the
+    // Seconds with an ignored sign: in a row up to this one, and since the
     // count was last taken.
-    letting_pass: u32,
-    let_pass_seconds: u32,
+    ignored_run: u32,
+    ignored_seconds: u32,
     judged: Judged,
     small: Option<SteppedDown>,
     last_step: Option<Instant>,
@@ -574,8 +574,8 @@ impl Rate {
             bytes: VecDeque::with_capacity(NEAR_SECONDS),
             loss: VecDeque::with_capacity(LOSS_SECONDS),
             near: false,
-            letting_pass: 0,
-            let_pass_seconds: 0,
+            ignored_run: 0,
+            ignored_seconds: 0,
             judged: Judged::default(),
             small: None,
             last_step: None,
@@ -609,7 +609,7 @@ impl Rate {
     // A second's decision and what it was judged on, in the same words in
     // the room and the loopback.
     pub fn describe(&self, decision: &Decision) -> String {
-        let what = match (decision.rate_kbps, decision.backoff, decision.let_pass) {
+        let what = match (decision.rate_kbps, decision.backoff, decision.ignored) {
             (Some(_), Some(Sign::ShardLoss), _) => {
                 format!(", backed off for {}, to what arrived", Sign::ShardLoss)
             }
@@ -618,10 +618,10 @@ impl Rate {
             }
             (Some(_), Some(sign), _) => format!(", backed off for {sign}"),
             (Some(_), None, Some(sign)) => {
-                format!(", climbing, not near the rate, {sign} let pass")
+                format!(", climbing, not near the rate, {sign} ignored")
             }
             (Some(_), None, None) => String::from(", climbing"),
-            (None, _, Some(sign)) => format!(", not near the rate, {sign} let pass"),
+            (None, _, Some(sign)) => format!(", not near the rate, {sign} ignored"),
             (None, _, None) => String::new(),
         };
         format!(
@@ -631,16 +631,16 @@ impl Rate {
     }
 
     // The room's log line for a second: when the rate changed, or the first
-    // second of signs let pass. The rest of a let pass that stands is a
-    // count on the 10 s line (take_let_pass), not a line every second.
+    // second a sign is ignored. Later ignored seconds are only a count on the
+    // 10 s line (take_ignored_seconds), not a line every second.
     pub fn line(&self, decision: &Decision) -> Option<String> {
-        let starts_letting_pass = decision.let_pass.is_some() && self.letting_pass == 1;
-        (decision.rate_kbps.is_some() || starts_letting_pass).then(|| self.describe(decision))
+        let starts_ignoring = decision.ignored.is_some() && self.ignored_run == 1;
+        (decision.rate_kbps.is_some() || starts_ignoring).then(|| self.describe(decision))
     }
 
-    // Seconds with a sign let pass since this was last asked.
-    pub fn take_let_pass(&mut self) -> u32 {
-        std::mem::take(&mut self.let_pass_seconds)
+    // Seconds with an ignored sign since the last call.
+    pub fn take_ignored_seconds(&mut self) -> u32 {
+        std::mem::take(&mut self.ignored_seconds)
     }
 
     // The host's rule changed, as someone started or stopped watching. A
@@ -819,18 +819,18 @@ impl Rate {
             }
             Some(sign) => {
                 self.clean += 1;
-                decision.let_pass = Some(sign);
+                decision.ignored = Some(sign);
             }
             // Risen but not for long enough yet, or draining: no climb on
             // it.
             None if near && past => self.clean = 0,
             None => self.clean += 1,
         }
-        if decision.let_pass.is_some() {
-            self.letting_pass += 1;
-            self.let_pass_seconds += 1;
+        if decision.ignored.is_some() {
+            self.ignored_run += 1;
+            self.ignored_seconds += 1;
         } else {
-            self.letting_pass = 0;
+            self.ignored_run = 0;
         }
         let most = if near {
             self.allowed_kbps

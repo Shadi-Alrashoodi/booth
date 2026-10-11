@@ -323,15 +323,15 @@ fn share(
             );
             seconds += 1;
             if seconds.is_multiple_of(LOG_EVERY_SECONDS) {
-                let let_pass = match rate.take_let_pass() {
+                let ignored = match rate.take_ignored_seconds() {
                     0 => String::new(),
-                    passed => format!(
-                        ", not near the rate with a sign of a queue let pass in {passed} of the last {LOG_EVERY_SECONDS} s"
+                    count => format!(
+                        ", not near the rate, a sign of a queue ignored in {count} of the last {LOG_EVERY_SECONDS} s"
                     ),
                 };
                 log!(
                     log,
-                    "share {number}: {seconds} s: {}{let_pass}",
+                    "share {number}: {seconds} s: {}{ignored}",
                     numbers_line(&numbers)
                 );
             }

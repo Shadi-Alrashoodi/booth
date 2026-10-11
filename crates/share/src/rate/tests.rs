@@ -280,11 +280,11 @@ fn the_round_trip_margin_grows_with_the_links_own_spread() {
 
 // Below half the rate a share cannot fill a queue unless the link carries
 // less than half the rate: loss and delay short of the gate are the link's
-// own and never cut for. The room's log says so once when it starts, and
-// counts the seconds on its 10 s line. Here 10 frames in 100 lost and a
+// own and never cut for. The room logs it once when it starts and counts
+// the seconds on its 10 s line. Here 10 frames in 100 lost and a
 // round trip 22 ms over the floor, past the margin but not twice it.
 #[test]
-fn signs_far_under_the_rate_are_let_pass() {
+fn signs_far_under_the_rate_are_ignored() {
     let start = Instant::now();
     let mut rate = Rate::new(15_000);
     let light = Second {
@@ -296,7 +296,7 @@ fn signs_far_under_the_rate_are_let_pass() {
     for n in 0..6 {
         let decision = rate.second(at(start, n), &light);
         assert_eq!(
-            (decision.rate_kbps, decision.let_pass),
+            (decision.rate_kbps, decision.ignored),
             (None, Some(Sign::Loss))
         );
         lines.push(rate.line(&decision));
@@ -304,12 +304,12 @@ fn signs_far_under_the_rate_are_let_pass() {
     assert!(
         lines[0]
             .as_deref()
-            .is_some_and(|line| line.contains(", not near the rate, loss let pass; sent 7400")),
+            .is_some_and(|line| line.contains(", not near the rate, loss ignored; sent 7400")),
         "{lines:?}"
     );
     assert!(lines[1..].iter().all(Option::is_none), "{lines:?}");
-    assert_eq!(rate.take_let_pass(), 6);
-    assert_eq!(rate.take_let_pass(), 0);
+    assert_eq!(rate.take_ignored_seconds(), 6);
+    assert_eq!(rate.take_ignored_seconds(), 0);
     assert!(!rate.judged().near);
     assert_eq!(rate.backoffs(), 0);
     // Coming near the rate, what was lost below it no longer counts: one
@@ -323,8 +323,13 @@ fn signs_far_under_the_rate_are_let_pass() {
     assert_eq!((rate.judged().lost, rate.judged().frames), (1, 120));
     assert_eq!(rate.judged().sent_kbps, 7_500, "averaged over 2 s");
     assert!(rate.judged().near);
+}
 
-    // A let pass that stops and comes back is said again.
+// An ignored sign is logged once while it lasts, and again after it clears
+// and comes back.
+#[test]
+fn logs_an_ignored_sign_again_after_it_clears_and_comes_back() {
+    let start = Instant::now();
     let mut rate = Rate::new(15_000);
     let queued = Second {
         round_trip: rtt(80.0),
@@ -334,7 +339,7 @@ fn signs_far_under_the_rate_are_let_pass() {
         round_trip: rtt(20.0),
         ..sending(1_000)
     };
-    let said: Vec<bool> = [queued, queued, clear, queued]
+    let logged: Vec<bool> = [queued, queued, clear, queued]
         .iter()
         .zip(0..)
         .map(|(second, n)| {
@@ -342,13 +347,13 @@ fn signs_far_under_the_rate_are_let_pass() {
             rate.line(&decision).is_some()
         })
         .collect();
-    assert_eq!(said, [true, false, false, true]);
+    assert_eq!(logged, [true, false, false, true]);
 }
 
 // While the share sends under half its rate, 20 frames in 100 lost over a
 // full loss window and in 2 of its seconds, or a round trip past twice the
 // margin for 5 s in a row, backs off all the same, to 0.8 times what was
-// sent. Just short of either is let pass, as the link's own.
+// sent. Just short of either is ignored as the link's own.
 #[test]
 fn the_gate_cuts_from_what_was_sent() {
     let start = Instant::now();
@@ -357,22 +362,18 @@ fn the_gate_cuts_from_what_was_sent() {
         round_trip: queue_beside(),
         ..sending(7_200)
     };
-    // 19 in 100 is let pass however long it lasts.
+    // 19 in 100 is ignored however long it lasts.
     let mut rate = Rate::new(15_000);
     let decisions = run(&mut rate, start, 0, 20, Second { lost: 19, ..light });
     assert!(
-        decisions.iter().all(|d| d.let_pass == Some(Sign::Loss)),
+        decisions.iter().all(|d| d.ignored == Some(Sign::Loss)),
         "{decisions:?}"
     );
     assert_eq!((rate.judged().lost, rate.judged().frames), (95, 500));
     // 20 in 100 waits for the window to be full: 100 of 500 on the fifth.
     let mut rate = Rate::new(15_000);
     let decisions = run(&mut rate, start, 0, 5, Second { lost: 20, ..light });
-    assert!(
-        decisions[..4]
-            .iter()
-            .all(|d| d.let_pass == Some(Sign::Loss))
-    );
+    assert!(decisions[..4].iter().all(|d| d.ignored == Some(Sign::Loss)));
     assert_eq!(
         (decisions[4].rate_kbps, decisions[4].backoff),
         (Some(5_760), Some(Sign::HeavyLoss))
@@ -395,9 +396,7 @@ fn the_gate_cuts_from_what_was_sent() {
         })
         .collect();
     assert!(
-        decisions[1..]
-            .iter()
-            .all(|d| d.let_pass == Some(Sign::Loss)),
+        decisions[1..].iter().all(|d| d.ignored == Some(Sign::Loss)),
         "{decisions:?}"
     );
     let judged = rate.judged();
@@ -454,7 +453,7 @@ fn the_gate_cuts_from_what_was_sent() {
         decisions
             .iter()
             .skip(1)
-            .all(|d| d.let_pass == Some(Sign::RoundTrip)),
+            .all(|d| d.ignored == Some(Sign::RoundTrip)),
         "{decisions:?}"
     );
     assert_eq!(rate.judged().far_seconds, 0);
@@ -524,7 +523,7 @@ fn heavy_window(judged: &Judged) -> bool {
 // the report comes the second after it, one frame, which is a third of that
 // second's.
 #[test]
-fn an_outage_is_let_pass() {
+fn an_outage_is_ignored() {
     let start = Instant::now();
     for (sent, kbps, outage, asked) in [(60, 1_200, 1, 0), (60, 1_200, 2, 0), (3, 100, 2, 1)] {
         let still = Second {
@@ -554,7 +553,7 @@ fn an_outage_is_let_pass() {
             let judged = *rate.judged();
             let case = format!("{outage} s at {sent} frames a second, second {n}: {judged}");
             assert_eq!(decision.backoff, None, "{case}");
-            assert_eq!(decision.let_pass, None, "{case}");
+            assert_eq!(decision.ignored, None, "{case}");
             if heavy_window(&judged) {
                 heavy_before += 1;
                 assert_eq!(judged.heavy_seconds, 1, "{case}");
@@ -894,7 +893,7 @@ fn first_internet_shares_replayed() {
     // Test 2 was busy enough to count as near the rate from its 23rd
     // second, where 16 Mbit/s of 30 went out, and the rules ran then.
     let (_, decisions) = replay(30_000, &TEST_2[..20], 4, test_2_floor, false);
-    assert!(decisions.iter().all(|d| d.let_pass.is_none()));
+    assert!(decisions.iter().all(|d| d.ignored.is_none()));
     let (rate, _) = replay(30_000, &TEST_2[..21], 4, test_2_floor, false);
     assert!(rate.judged().near, "{}", rate.judged());
 }
@@ -997,7 +996,7 @@ fn careful_climb_after_one_backoff() {
 // rate the last backoff came at: past that, a rate the share does not use
 // is one the link has not shown it carries. Busy again, it climbs on.
 #[test]
-fn climbs_while_signs_are_let_pass() {
+fn climbs_while_signs_are_ignored() {
     let start = Instant::now();
     let mut rate = Rate::new(15_000);
     let lossy = Second {
@@ -1008,8 +1007,8 @@ fn climbs_while_signs_are_let_pass() {
     run(&mut rate, start, 0, 1, lossy);
     run(&mut rate, start, 2, 1, lossy);
     assert_eq!(rate.rate_kbps(), 9_600);
-    // Second 3 still averages the busy second before it, so the let pass
-    // starts at 4, and its seconds count as clean.
+    // Second 3 still averages the busy second before it, so the sign is
+    // ignored from 4 on, and those seconds count as clean.
     let still = Second {
         lost: 12,
         round_trip: rtt(40.0),
