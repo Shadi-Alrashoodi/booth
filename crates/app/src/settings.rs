@@ -37,7 +37,7 @@ const VSYNC_IN_VIEWER: &str = "vsync_in_viewer";
 const HIDE_STRIP_IN_FULLSCREEN: &str = "hide_strip_in_fullscreen";
 const SHARE_MONITOR: &str = "share_monitor";
 // Off unless the user turns it on, since a check shows GitHub this PC's
-// address. Only on is written down.
+// address. Only on is saved.
 const CHECK_FOR_NEW_VERSIONS: &str = "check_for_new_versions";
 // Every key this version knows, in the order a save adds the missing ones.
 const KEYS: [&str; 20] = [
@@ -67,7 +67,8 @@ const OPEN_MIC: &str = "open_mic";
 const BOM: &[u8] = b"\xEF\xBB\xBF";
 
 pub const DEFAULT_PORT: u16 = 41000;
-// Windows hands the ports below this to its own services.
+// Ports below 1024 are the IANA well-known range. Windows lets any process
+// bind them, but system services and some firewalls treat them as reserved.
 pub const LOWEST_PORT: u16 = 1024;
 // What the room keeps of a name, so the field shows no more than that.
 pub const NAME_CHARS: usize = 32;
@@ -80,23 +81,22 @@ pub const LEAST_UPLOAD_MBITS: u32 = 1;
 pub struct Settings {
     // None means the Windows user name.
     name: Option<String>,
-    // None means DEFAULT_PORT, which is never written down.
+    // None means DEFAULT_PORT, which is never saved.
     port: Option<u16>,
     // None means net's defaults. Some of an empty list is no STUN at all.
     stun_servers: Option<Vec<String>>,
     // Always None or a name invite::check_hostname accepts.
     address_name: Option<String>,
-    // Endpoint ids. None means Windows default, which is never written down.
+    // Endpoint ids. None means Windows default, which is never saved.
     input_device: Option<String>,
     output_device: Option<String>,
-    // Push to talk and constant-rate voice, the defaults, are never
-    // written down.
+    // Push to talk and constant-rate voice, the defaults, are never saved.
     open_mic: bool,
     variable_rate: bool,
-    // Only the ones off their defaults are written down.
+    // Only the ones off their defaults are saved.
     hotkeys: Bindings,
     // None means DEFAULT_UPLOAD_MBITS. Vsync and the strip's hide are off
-    // by default, and only on is written down.
+    // by default, and only on is saved.
     upload_mbits: Option<u32>,
     vsync: bool,
     hide_strip: bool,
@@ -275,7 +275,7 @@ impl Settings {
     // What may not change while this PC is controlled, since the controller
     // can drive the settings screen too: the panic key with the other
     // hotkeys, and the sharing settings. Compared by what they mean, so an
-    // upload written down at its default is the same as one left out.
+    // upload saved at its default is the same as one left out.
     pub fn locked_part_differs(&self, other: &Settings) -> bool {
         self.hotkeys != other.hotkeys
             || self.upload_mbits() != other.upload_mbits()
@@ -372,8 +372,8 @@ impl Settings {
         }
     }
 
-    // A value as the file has it. Ok holds what was left out of it, for the
-    // log; Err is why the whole line was.
+    // Sets one key from the file. Ok carries the parts of the value that were
+    // dropped, for the log; Err carries the reason the whole line was dropped.
     fn set_from_file(&mut self, key: &str, value: &str) -> Result<Vec<String>, String> {
         match key {
             NAME => self.set_name(value),
@@ -828,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn broken_lines_are_skipped_and_said() {
+    fn broken_lines_are_skipped_and_reported() {
         let text = "\u{FEFF}garbage\n = nothing\nAddress_Name = a.example.net\naddress_name = localhost\naddress_name = 192.168.1.20\nfuture_key = 3\naddress_name = good.example.net\n";
         let (settings, problems) = parse(text.as_bytes());
         assert_eq!(settings.address_name(), Some("good.example.net"));
@@ -1034,7 +1034,7 @@ mod tests {
     }
 
     #[test]
-    fn the_file_s_own_mistakes_are_said_and_skipped() {
+    fn the_file_s_own_mistakes_are_reported_and_skipped() {
         let text = "name = \u{e9}mile\nport = 99\nport = 41010\nstun_servers = a.example.org:3478, nothing, b.example.org:3478\n";
         let (settings, problems) = parse(text.as_bytes());
         assert_eq!(settings.name(), Some("\u{e9}mile"));
@@ -1165,7 +1165,7 @@ mod tests {
         assert_eq!(fs::read_to_string(folder.file()).unwrap(), "");
     }
 
-    // The panic key is written down and read back like any other, and only
+    // The panic key is saved and read back like any other, and only
     // when it is off its default.
     #[test]
     fn the_panic_key_is_kept_like_the_other_hotkeys() {
@@ -1212,7 +1212,7 @@ mod tests {
         assert!(changed(
             &|next| next.set_share_monitor(Some(r"\\.\DISPLAY2"))
         ));
-        // The upload at its default, written down or not, is no change.
+        // The upload at its default, saved or not, is no change.
         assert!(!changed(&|next| next.set_upload_mbits(DEFAULT_UPLOAD_MBITS)));
         assert!(!changed(&|next| next.set_name("Tom")));
         assert!(!changed(&|next| next.set_port("41010").unwrap()));
