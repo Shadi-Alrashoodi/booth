@@ -56,7 +56,7 @@ pub enum ReplyRefused {
     RoomFull,
 }
 
-// Words for the log. The panel has its own sentences.
+// Words for the log. The panel has its own messages.
 impl fmt::Display for ReplyRefused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

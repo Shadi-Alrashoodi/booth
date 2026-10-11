@@ -161,7 +161,7 @@ pub(crate) enum Entry {
 impl Manual {
     // The panel's field: an address with its port, or a name. Nothing typed
     // is no entry. The error is why not, for the log; the panel has one
-    // sentence for all of them.
+    // message for all of them.
     pub fn parse(text: &str) -> Result<Option<Manual>, &'static str> {
         let text = text.trim();
         if text.is_empty() {
@@ -263,8 +263,8 @@ pub enum KnownError {
     Write(KeyError),
 }
 
-// Words for the log, each with what to do. The panel has its own sentence
-// for Damaged and turns the rest into sentences as they are.
+// Words for the log, each with what to do. The panel has its own message
+// for Damaged and shows the rest as they are, in sentence case.
 impl fmt::Display for KnownError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -903,7 +903,7 @@ pub(crate) struct Save {
 }
 
 // A list that could not be read and was put aside, for the panel's
-// sentence.
+// message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DamagedList {
     pub list: List,
@@ -912,7 +912,7 @@ pub struct DamagedList {
 }
 
 impl KnownError {
-    // None for a write that failed: that is said where it was asked for.
+    // None for a write that failed: that is reported where it was asked for.
     pub fn problem(&self) -> Option<ListProblem> {
         match self {
             KnownError::Damaged { .. } => self.damaged().map(ListProblem::Damaged),

@@ -755,7 +755,7 @@ impl Host {
     }
 
     // What the mapper thread found. A later answer changes the router
-    // sentence at once and the invite only when the user asks for a new one.
+    // message at once and the invite only when the user asks for a new one.
     pub(crate) fn port_mapping(&mut self, report: Report, now: Instant) -> bool {
         if self.closed {
             return false;
@@ -1583,7 +1583,7 @@ impl Host {
         });
     }
 
-    // The two sentences the panel shows after a change, while they apply.
+    // The two messages the panel shows after a change, while they apply.
     fn change_step(&mut self, now: Instant) -> bool {
         let Some(change) = &mut self.change else {
             return false;
@@ -3063,7 +3063,7 @@ impl Host {
     // test build reads nothing of this host's Hello and shows the Bye as the
     // host closing the room, so one line in its own chat, under this host's
     // name, goes ahead of the Bye and says why. A numbered build has already
-    // left over this host's Hello, with its own sentence.
+    // left over this host's Hello, with its own message.
     fn other_version(
         &mut self,
         i: usize,
@@ -5070,7 +5070,7 @@ mod tests {
             "{lines:#?}"
         );
 
-        // The sentence follows the router at once, the code only when the
+        // The message follows the router at once, the code only when the
         // user asks for a new one.
         let later = now + Duration::from_secs(2);
         host.port_mapping(pcp_at(OUTSIDE), later);
@@ -5635,7 +5635,7 @@ mod tests {
     }
 
     // The paste field's line for 2 minutes while friends are reconnecting
-    // or lost, and the host sentence for up to 5 minutes while a friend who
+    // or lost, and the host message for up to 5 minutes while a friend who
     // was in the room is lost and not back.
     #[test]
     fn change_sentences_and_their_times() {

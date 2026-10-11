@@ -1,4 +1,4 @@
-// Wrong addresses and races in the STUN questions.
+// Wrong addresses and races in STUN responses.
 
 use super::*;
 
@@ -54,7 +54,7 @@ fn a_round_out_before_the_change_does_not_end_the_check() {
     stun.tick(keepalive, &socket);
     assert_eq!(server.packets().len(), 1);
     let noticed = keepalive + Duration::from_millis(20);
-    assert!(!stun.check(noticed, &socket), "the round out goes on");
+    assert!(!stun.check(noticed, &socket), "the round in flight goes on");
     let old = answer_with(
         &mut stun,
         server.addr(),

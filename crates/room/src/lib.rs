@@ -362,7 +362,7 @@ impl Room {
     /// Asks to share this PC's screen at `fps` frames a second: `monitor`,
     /// from room::monitors, or the primary one with None. A host decides at
     /// once; a client asks its host, and the view's `share.own` says when
-    /// the answer came: Sharing, or Refused with the sentence to show.
+    /// the answer came: Sharing, or Refused with the message to show.
     /// Nothing is captured before it. Then the room's own thread opens the
     /// capture and the encoder, and captures, encodes and sends while
     /// someone watches; `share.running` and `numbers.sharing` follow it.

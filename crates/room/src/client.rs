@@ -3792,7 +3792,7 @@ mod tests {
         let quiet = start + timers.reconnecting_after;
         rig.tick(quiet);
         assert_eq!(server.packets().len(), 1, "the silence asks");
-        // Windows saw the router go. The round out answers that too.
+        // Windows saw the router go. The round in flight answers that too.
         let noticed = quiet + Duration::from_millis(10);
         rig.client.address_changed(noticed, &rig.socket);
         assert!(

@@ -168,9 +168,9 @@ pub struct AddressChanged {
     // not help.
     pub codes_cannot_help: bool,
     // A friend who was in the room before the change was lost and is not
-    // back, within 5 minutes of the change: the host sentence shows.
+    // back, within 5 minutes of the change: the host message shows.
     pub friends_lost: bool,
-    // An address name is set, so the host sentence asks to check that it
+    // An address name is set, so the host message asks to check that it
     // points to this PC instead of asking to set one.
     pub name_set: bool,
 }
@@ -269,7 +269,7 @@ pub enum LineKind {
     // sentence, and `author` and `name` whom it is about.
     System,
     // A system line in warn: a share or a viewer ran into something, and
-    // the sentence says what to do.
+    // the message says what to do.
     Problem,
 }
 
@@ -327,7 +327,7 @@ impl fmt::Debug for InviteView {
     }
 }
 
-// What the host learned about its own router. The panel turns it into one sentence.
+// What the host learned about its own router. The panel turns it into one message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouterState {
     Testing,
@@ -712,7 +712,7 @@ pub enum NameAnswer {
     // over yet.
     NotAsked,
     Looking,
-    // IPv4 first. Refused holds what invite::check_addr turned down, and why;
+    // IPv4 first. Refused holds what invite::check_addr rejected, and why;
     // nothing is ever sent there.
     Found {
         addrs: Vec<IpAddr>,

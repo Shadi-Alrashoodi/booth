@@ -1,5 +1,5 @@
 // What the host knows about the routers between it and the internet, from
-// STUN (stun.rs) and the port mapping (mapper.rs): the sentence the panel
+// STUN (stun.rs) and the port mapping (mapper.rs): the message the panel
 // shows, the mapped address and flags for the invite, and the check for a
 // second router in front of this one, which port mapping cannot cross.
 

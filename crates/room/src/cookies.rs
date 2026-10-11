@@ -30,9 +30,9 @@ const CAPPED_LINE_EVERY: Duration = Duration::from_secs(1);
 pub(crate) struct Gate {
     checker: CookieChecker,
     load: Load,
-    // What the log last said, so going under load and coming out are each
-    // written once.
-    said_under: bool,
+    // What was last logged, so going under load and coming out are each
+    // logged once.
+    logged_under: bool,
     pub(crate) replies_sent: u64,
     lines: Lines,
     capped: Capped,
@@ -48,7 +48,7 @@ impl Gate {
         Gate {
             checker: CookieChecker::new(host_public, now),
             load: Load::new(initiations, calm),
-            said_under: false,
+            logged_under: false,
             replies_sent: 0,
             lines: Lines::default(),
             capped: Capped::default(),
@@ -84,8 +84,8 @@ impl Gate {
     // Some(false) when it has just come out.
     pub(crate) fn changed(&mut self, now: Instant) -> Option<bool> {
         let under = self.load.is_on(now);
-        (under != self.said_under).then(|| {
-            self.said_under = under;
+        (under != self.logged_under).then(|| {
+            self.logged_under = under;
             under
         })
     }
@@ -94,7 +94,7 @@ impl Gate {
     // host is under it, or when the line about a second of initiations the
     // cap held back is due.
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
-        let load = self.load.until.filter(|_| self.said_under);
+        let load = self.load.until.filter(|_| self.logged_under);
         let capped = self.capped.since.map(|since| since + CAPPED_LINE_EVERY);
         load.into_iter().chain(capped).min()
     }
