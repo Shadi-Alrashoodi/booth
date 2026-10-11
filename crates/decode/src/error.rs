@@ -117,8 +117,8 @@ pub enum DecodeError {
         gpu: String,
     },
     /// From [`crate::probe`]: the GPU's own decoder does not take the codec
-    /// at that size. `why` reads after "because"; `next` is a sentence of
-    /// what may help.
+    /// at that size. `why` reads after "because"; `next` says what may
+    /// help.
     NotDecodable {
         gpu: String,
         codec: Codec,
@@ -133,7 +133,7 @@ impl std::error::Error for DecodeError {}
 
 const UNZIP: &str = "Unzip Booth again with all its files";
 
-// Windows' own sentence for a failed load ends in a full stop and may carry
+// Windows' own message for a failed load ends in a full stop and may carry
 // a %1 for the file name.
 fn system_text(source: &windows::core::Error, file: &str) -> String {
     source
