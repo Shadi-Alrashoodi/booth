@@ -14,19 +14,19 @@ use windows::Win32::Devices::FunctionDiscovery::{
     PKEY_Device_EnumeratorName, PKEY_Device_FriendlyName,
 };
 use windows::Win32::Foundation::{
-    CloseHandle, E_ACCESSDENIED, E_NOINTERFACE, E_POINTER, HANDLE, PROPERTYKEY, RPC_E_CHANGED_MODE,
-    S_OK, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, E_ACCESSDENIED, E_INVALIDARG, E_NOINTERFACE, E_POINTER, HANDLE, PROPERTYKEY,
+    RPC_E_CHANGED_MODE, S_OK, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
     AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_E_DEVICE_IN_USE, AUDCLNT_E_DEVICE_INVALIDATED,
     AUDCLNT_E_ENGINE_PERIODICITY_LOCKED, AUDCLNT_E_RESOURCES_INVALIDATED,
-    AUDCLNT_E_SERVICE_NOT_RUNNING, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
-    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, DEVICE_STATE,
-    DEVICE_STATE_ACTIVE, EDataFlow, ERole, IAudioCaptureClient, IAudioClient, IAudioClient3,
-    IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, IMMEndpoint, IMMNotificationClient,
-    IMMNotificationClient_Vtbl, MMDeviceEnumerator, WAVE_FORMAT_PCM, WAVEFORMATEX, eCapture,
-    eConsole, eRender,
+    AUDCLNT_E_SERVICE_NOT_RUNNING, AUDCLNT_E_UNSUPPORTED_FORMAT, AUDCLNT_SHAREMODE_SHARED,
+    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, DEVICE_STATE, DEVICE_STATE_ACTIVE, EDataFlow, ERole,
+    IAudioCaptureClient, IAudioClient, IAudioClient3, IAudioRenderClient, IMMDevice,
+    IMMDeviceEnumerator, IMMEndpoint, IMMNotificationClient, IMMNotificationClient_Vtbl,
+    MMDeviceEnumerator, WAVE_FORMAT_PCM, WAVEFORMATEX, eCapture, eConsole, eRender,
 };
 use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToStringAlloc};
 use windows::Win32::System::Com::{
@@ -44,7 +44,7 @@ use super::devices::{Choice, DeviceList, Direction, Endpoint, Lists};
 use super::error::AudioError;
 use super::format::{Format, RATE, plan};
 use super::microphone::hands_free;
-use super::stream::{Device, DeviceStream, Packet, StreamInfo, Wake};
+use super::stream::{Device, DeviceStream, Packet, Refused, StreamInfo, Wake};
 
 // HRESULT_FROM_WIN32(ERROR_NOT_FOUND): no default device, or no device with
 // that id.
@@ -265,48 +265,35 @@ impl Session {
         let client: IAudioClient = activate(&device).map_err(fail("open"))?;
         let (engine, engine_bytes) = mix_format(&client, direction, &name)?;
         drop(client);
-        let plan = plan(&engine);
-        // At 48 kHz the engine's own bytes, exactly as Windows gave them.
-        let wave_bytes = if plan.resampled {
-            plan.format.to_bytes().to_vec()
-        } else {
-            engine_bytes
-        };
-        let wave = wave_bytes.as_ptr().cast::<WAVEFORMATEX>();
+        let first = Ask::first(engine, engine_bytes);
 
         // The small period first. It needs the engine's own format, so only
         // when that is already 48 kHz.
-        let small = if plan.resampled {
+        let small = if first.convert {
             None
         } else {
             activate::<IAudioClient3>(&device)
                 .ok()
-                .and_then(|client3| init_small(&device, client3, &wave_bytes))
+                .and_then(|client3| init_small(&device, client3, &first.bytes))
         };
-        let (client, period_frames, small_period) = match small {
+        let (client, period_frames, small_period, ask, refused) = match small {
             Some((client3, frames)) => {
                 let client: IAudioClient = client3.cast().map_err(fail("open"))?;
-                (client, frames, true)
+                (client, frames, true, first, None)
             }
             None => {
-                // A fresh client: one that refused the small period is left
-                // in a state Initialize may not accept.
-                let client: IAudioClient = activate(&device).map_err(fail("open"))?;
-                let mut flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
-                if plan.resampled {
-                    flags |= AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
-                        | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-                }
-                // SAFETY: `wave` points into `wave_bytes`, a whole format
-                // that lives until the end of this function. Zero buffer and
-                // period ask for the default in shared mode.
-                unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, wave, None) }
-                    .map_err(fail("open"))?;
+                let engine_now = || {
+                    let client: IAudioClient = activate(&device)?;
+                    Ok(Format::parse(&mix_bytes(&client)?).ok())
+                };
+                let (client, ask, refused) =
+                    init_with(first, |ask| init_shared(&device, ask), engine_now)
+                        .map_err(fail("open"))?;
                 let mut default = 0i64;
                 // SAFETY: one local for the call to fill.
                 unsafe { client.GetDevicePeriod(Some(&mut default), None) }
                     .map_err(fail("ask for the period of"))?;
-                (client, hns_frames(default), false)
+                (client, hns_frames(default), false, ask, refused)
             }
         };
 
@@ -326,21 +313,22 @@ impl Session {
             Direction::Output => Io::Render(unsafe { client.GetService() }.map_err(fail("open"))?),
         };
         Ok(WasapiStream {
-            frame_bytes: plan.format.frame_bytes(),
+            frame_bytes: ask.format.frame_bytes(),
             info: StreamInfo {
                 direction,
                 device: name,
                 id,
-                format: plan.format,
-                engine,
+                format: ask.format,
+                engine: ask.engine,
                 hands_free: is_hands_free(&device),
                 period: frames_time(period_frames, RATE),
                 period_frames,
-                resampled: plan.resampled,
+                resampled: ask.engine.rate != RATE,
                 small_period,
                 stream_latency: hns_time(latency),
                 buffer_frames,
                 pro_audio: false,
+                refused,
             },
             io,
             client,
@@ -420,6 +408,108 @@ fn engine_periods(client: &IAudioClient3, wave: &[u8]) -> windows::core::Result<
     Ok(periods)
 }
 
+// One Initialize: the format asked for, as Windows lays it out, and the
+// engine it was worked out from.
+#[derive(Clone, Debug, PartialEq)]
+struct Ask {
+    engine: Format,
+    format: Format,
+    bytes: Vec<u8>,
+    // Windows converts the engine's format to this one.
+    convert: bool,
+}
+
+impl Ask {
+    // At 48 kHz the engine's own bytes, exactly as Windows gave them.
+    fn first(engine: Format, engine_bytes: Vec<u8>) -> Ask {
+        let plan = plan(&engine);
+        let bytes = if plan.resampled {
+            plan.format.to_bytes().to_vec()
+        } else {
+            engine_bytes
+        };
+        Ask {
+            engine,
+            format: plan.format,
+            bytes,
+            convert: plan.resampled,
+        }
+    }
+
+    // Float at 48 kHz from the engine as Windows has it now, converted
+    // whatever the engine runs at.
+    fn again(engine: Format) -> Ask {
+        let format = Format::float_48k(engine.channels, engine.channel_mask);
+        Ask {
+            engine,
+            format,
+            bytes: format.to_bytes().to_vec(),
+            convert: true,
+        }
+    }
+}
+
+// Windows refused the format itself.
+fn format_refused(code: HRESULT) -> bool {
+    code == E_INVALIDARG || code == AUDCLNT_E_UNSUPPORTED_FORMAT
+}
+
+// The first ask, and once more on a fresh client from the engine read
+// again when Windows refused the format. A Bluetooth headset's microphone
+// refuses an open that comes while the headset is still switching to
+// hands-free, often with the very ask that works a moment later, so the
+// second ask may be the first one again. When it is refused too, the first
+// error stands, so the message is the one a single try would give; any
+// other error on the way, such as a device that went away, is passed on as
+// it is. A stream that opened on the second ask comes back with the engine
+// the first was made from and the code it was refused with.
+fn init_with<C>(
+    first: Ask,
+    mut init: impl FnMut(&Ask) -> windows::core::Result<C>,
+    engine_now: impl FnOnce() -> windows::core::Result<Option<Format>>,
+) -> windows::core::Result<(C, Ask, Option<Refused>)> {
+    let first_err = match init(&first) {
+        Ok(client) => return Ok((client, first, None)),
+        Err(err) if format_refused(err.code()) => err,
+        Err(err) => return Err(err),
+    };
+    let engine = match engine_now() {
+        Ok(Some(engine)) => engine,
+        Ok(None) => return Err(first_err),
+        Err(err) if format_refused(err.code()) => return Err(first_err),
+        Err(err) => return Err(err),
+    };
+    let again = Ask::again(engine);
+    match init(&again) {
+        Ok(client) => Ok((
+            client,
+            again,
+            Some(Refused {
+                engine: first.engine,
+                code: first_err.code().0,
+            }),
+        )),
+        Err(err) if format_refused(err.code()) => Err(first_err),
+        Err(err) => Err(err),
+    }
+}
+
+// A fresh client each time: one that refused a format, or the small period,
+// is left in a state Initialize may not accept.
+fn init_shared(device: &IMMDevice, ask: &Ask) -> windows::core::Result<IAudioClient> {
+    let client: IAudioClient = activate(device)?;
+    let mut flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+    if ask.convert {
+        flags |= AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+    }
+    let wave = ask.bytes.as_ptr().cast::<WAVEFORMATEX>();
+    // SAFETY: `wave` points into the ask's bytes, a whole format that
+    // outlives the call. Zero buffer and period ask for the default in
+    // shared mode.
+    unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, wave, None) }?;
+    Ok(client)
+}
+
 // The smallest period the driver allows. When another program already runs
 // the engine at another period, Windows will not change it under that
 // program, so the stream takes the period that is running.
@@ -491,10 +581,20 @@ fn mix_format(
     direction: Direction,
     name: &str,
 ) -> Result<(Format, Vec<u8>), AudioError> {
+    let bytes = mix_bytes(client)
+        .map_err(|err| classify(&err, direction, name, "ask for the format of"))?;
+    let format = Format::parse(&bytes).map_err(|error| AudioError::Format {
+        direction,
+        name: name.to_owned(),
+        error,
+    })?;
+    Ok((format, bytes))
+}
+
+fn mix_bytes(client: &IAudioClient) -> windows::core::Result<Vec<u8>> {
     // SAFETY: a getter on a live, not yet initialized client. The format is
     // allocated by COM for us and freed below, once copied.
-    let wave = unsafe { client.GetMixFormat() }
-        .map_err(|err| classify(&err, direction, name, "ask for the format of"))?;
+    let wave = unsafe { client.GetMixFormat() }?;
     // SAFETY: GetMixFormat returns a whole WAVEFORMATEX, and cbSize says how
     // many bytes follow its 18, except for plain PCM, where Windows ignores
     // cbSize and so may leave anything in it.
@@ -512,12 +612,7 @@ fn mix_format(
     }
     // SAFETY: as above; nothing reads it after this.
     unsafe { CoTaskMemFree(Some(wave as *const c_void)) };
-    let format = Format::parse(&bytes).map_err(|error| AudioError::Format {
-        direction,
-        name: name.to_owned(),
-        error,
-    })?;
-    Ok((format, bytes))
+    Ok(bytes)
 }
 
 fn activate<T: Interface>(device: &IMMDevice) -> windows::core::Result<T> {
@@ -1064,7 +1159,199 @@ fn qpc_frequency() -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::format::Sample;
     use super::*;
+
+    fn stereo_48k() -> Format {
+        Format {
+            rate: RATE,
+            channels: 2,
+            sample: Sample::F32,
+            channel_mask: 0x3,
+        }
+    }
+
+    fn hands_free_16k() -> Format {
+        Format {
+            rate: 16_000,
+            channels: 1,
+            sample: Sample::F32,
+            channel_mask: 0x4,
+        }
+    }
+
+    fn refusal(code: HRESULT) -> windows::core::Error {
+        windows::core::Error::from_hresult(code)
+    }
+
+    fn engine_unread() -> windows::core::Result<Option<Format>> {
+        panic!("the engine is read again only after a refused format")
+    }
+
+    #[test]
+    fn the_first_ask_that_opens_is_the_only_one() {
+        let first = Ask::first(stereo_48k(), stereo_48k().to_bytes().to_vec());
+        let mut tries = 0;
+        let (_, ask, refused) = init_with(
+            first.clone(),
+            |_| {
+                tries += 1;
+                Ok(())
+            },
+            engine_unread,
+        )
+        .expect("opens");
+        assert_eq!((tries, ask, refused), (1, first, None));
+    }
+
+    // The AirPods case: the microphone is refused while the headset is
+    // still switching to hands-free, and the same ask on a fresh client
+    // opens once it has.
+    #[test]
+    fn the_same_ask_again_once_the_headset_has_switched() {
+        let first = Ask::first(hands_free_16k(), hands_free_16k().to_bytes().to_vec());
+        let mut asked = Vec::new();
+        let (opened_on, ask, refused) = init_with(
+            first.clone(),
+            |ask| {
+                asked.push(ask.clone());
+                if asked.len() == 1 {
+                    Err(refusal(E_INVALIDARG))
+                } else {
+                    Ok(asked.len())
+                }
+            },
+            || Ok(Some(hands_free_16k())),
+        )
+        .expect("opens on the second ask");
+        assert_eq!(asked, [first.clone(), first]);
+        assert_eq!(opened_on, 2);
+        assert!(ask.convert, "Windows converts from 16 kHz");
+        assert_eq!(
+            refused,
+            Some(Refused {
+                engine: hands_free_16k(),
+                code: E_INVALIDARG.0
+            })
+        );
+    }
+
+    // An engine read before a profile change: the second ask is made from
+    // the engine as it is now.
+    #[test]
+    fn a_refused_format_is_asked_again_from_the_engine_now() {
+        let first = Ask::first(stereo_48k(), stereo_48k().to_bytes().to_vec());
+        let mut asked = Vec::new();
+        let (_, ask, refused) = init_with(
+            first.clone(),
+            |ask| {
+                asked.push(ask.clone());
+                if asked.len() == 1 {
+                    Err(refusal(AUDCLNT_E_UNSUPPORTED_FORMAT))
+                } else {
+                    Ok(())
+                }
+            },
+            || Ok(Some(hands_free_16k())),
+        )
+        .expect("opens on the second ask");
+        assert_eq!(asked, [first, Ask::again(hands_free_16k())]);
+        assert_eq!(ask.format, Format::float_48k(1, 0x4));
+        assert_eq!(ask.engine, hands_free_16k());
+        assert_eq!(
+            refused,
+            Some(Refused {
+                engine: stereo_48k(),
+                code: AUDCLNT_E_UNSUPPORTED_FORMAT.0
+            })
+        );
+    }
+
+    #[test]
+    fn the_first_error_stands_when_every_ask_is_refused() {
+        let first = Ask::first(hands_free_16k(), hands_free_16k().to_bytes().to_vec());
+        let mut tries = 0;
+        let err = init_with(
+            first,
+            |_| {
+                tries += 1;
+                Err::<(), _>(refusal(if tries == 1 {
+                    E_INVALIDARG
+                } else {
+                    AUDCLNT_E_UNSUPPORTED_FORMAT
+                }))
+            },
+            || Ok(Some(hands_free_16k())),
+        )
+        .unwrap_err();
+        assert_eq!((tries, err.code()), (2, E_INVALIDARG));
+    }
+
+    // A device that went away is not a format Windows refused: it goes on
+    // to the reopen that handles it, whenever it shows.
+    #[test]
+    fn a_device_lost_is_passed_on() {
+        let first = Ask::first(hands_free_16k(), hands_free_16k().to_bytes().to_vec());
+        let lost = || refusal(AUDCLNT_E_DEVICE_INVALIDATED);
+
+        let mut tries = 0;
+        let err = init_with(
+            first.clone(),
+            |_| {
+                tries += 1;
+                Err::<(), _>(lost())
+            },
+            engine_unread,
+        )
+        .unwrap_err();
+        assert_eq!((tries, err.code()), (1, AUDCLNT_E_DEVICE_INVALIDATED));
+
+        let mut tries = 0;
+        let err = init_with(
+            first.clone(),
+            |_| {
+                tries += 1;
+                Err::<(), _>(refusal(E_INVALIDARG))
+            },
+            || Err(lost()),
+        )
+        .unwrap_err();
+        assert_eq!((tries, err.code()), (1, AUDCLNT_E_DEVICE_INVALIDATED));
+
+        let mut tries = 0;
+        let err = init_with(
+            first,
+            |_| {
+                tries += 1;
+                Err::<(), _>(if tries == 1 {
+                    refusal(E_INVALIDARG)
+                } else {
+                    lost()
+                })
+            },
+            || Ok(Some(hands_free_16k())),
+        )
+        .unwrap_err();
+        assert_eq!((tries, err.code()), (2, AUDCLNT_E_DEVICE_INVALIDATED));
+    }
+
+    // The engine read again in a format Booth cannot take: nothing better
+    // to ask for.
+    #[test]
+    fn no_second_ask_without_an_engine() {
+        let first = Ask::first(hands_free_16k(), hands_free_16k().to_bytes().to_vec());
+        let mut tries = 0;
+        let err = init_with(
+            first,
+            |_| {
+                tries += 1;
+                Err::<(), _>(refusal(E_INVALIDARG))
+            },
+            || Ok(None),
+        )
+        .unwrap_err();
+        assert_eq!((tries, err.code()), (1, E_INVALIDARG));
+    }
 
     // The performance counter now, in the 100 ns units GetBuffer uses.
     fn qpc_now() -> u64 {

@@ -576,8 +576,17 @@ fn on_event(shared: Arc<Shared>, log: Log, side: Side) -> impl FnMut(Event) + Se
 }
 
 fn opened(info: &StreamInfo) -> String {
+    let refused = info
+        .refused
+        .map(|refused| {
+            format!(
+                ", opened on a second try: the first, from an engine at {} Hz, was refused with 0x{:08X}",
+                refused.engine.rate, refused.code
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "opened: {}, period {:.2} ms ({} frames), engine {} Hz, resampled by windows {}, bluetooth hands-free {}, small period {}, pro audio {}",
+        "opened: {}, period {:.2} ms ({} frames), engine {} Hz, resampled by windows {}, bluetooth hands-free {}, small period {}, pro audio {}, stream ({}){refused}",
         crate::log::quoted(&info.device),
         info.period_ms(),
         info.period_frames,
@@ -585,6 +594,7 @@ fn opened(info: &StreamInfo) -> String {
         yes_no(info.resampled),
         yes_no(info.hands_free),
         yes_no(info.small_period),
-        yes_no(info.pro_audio)
+        yes_no(info.pro_audio),
+        info.format
     )
 }

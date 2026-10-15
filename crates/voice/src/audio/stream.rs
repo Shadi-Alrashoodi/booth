@@ -88,6 +88,15 @@ pub struct StreamInfo {
     pub buffer_frames: u32,
     // The thread got the "Pro Audio" scheduling class.
     pub pro_audio: bool,
+    // When Windows refused the first ask and the stream opened on a second.
+    pub refused: Option<Refused>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Refused {
+    // The engine format the first ask was made from.
+    pub engine: Format,
+    pub code: i32,
 }
 
 impl StreamInfo {

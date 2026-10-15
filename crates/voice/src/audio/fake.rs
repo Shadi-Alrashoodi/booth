@@ -248,6 +248,7 @@ impl FakeDevice {
                 stream_latency: setup.stream_latency,
                 buffer_frames: setup.buffer_frames,
                 pro_audio: false,
+                refused: None,
             },
             started: None,
             ticks_seen: 0,
