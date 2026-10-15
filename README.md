@@ -12,9 +12,10 @@
 
 ## Download
 
-Run the installer, or unzip the zip anywhere and run booth.exe. It needs Windows 10 version 2004 or later, or Windows 11, 64-bit, with a DirectX 12 graphics driver. The same app is in the [Microsoft Store](https://apps.microsoft.com/detail/9PDT1RSX3J4V) as Booth Voice, and that copy is signed by Microsoft and updates through the Store.
+- [Microsoft Store](https://apps.microsoft.com/detail/9PDT1RSX3J4V), listed as Booth Voice: signed by Microsoft and updates on its own.
+- [GitHub release](https://github.com/Shadi-Alrashoodi/booth/releases/latest): installer or zip. Not code signed yet, so SmartScreen warns once and Smart App Control blocks it. latest.txt there has the SHA-256 of both files and a minisign signature.
 
-The exe is not code signed yet, so SmartScreen warns once (More info, then Run anyway), and Smart App Control on Windows 11 blocks it. The [release page](https://github.com/Shadi-Alrashoodi/booth/releases/latest) has latest.txt, signed with minisign, with the SHA-256 of both files and the steps to check them.
+Windows 10 version 2004 or later, or Windows 11, 64-bit, with a DirectX 12 graphics driver.
 
 ## Using it
 
