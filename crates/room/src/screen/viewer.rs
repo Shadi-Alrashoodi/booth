@@ -341,6 +341,13 @@ impl Tally {
         }
         self.latency
             .push_back(std::mem::take(&mut window.end_to_end_ms));
+        stats::gauge!("room.watch_tally.latency", self.latency);
+        stats::gauge!(
+            "room.watch_tally.latency.samples",
+            self,
+            self.latency.iter().map(Vec::len).sum(),
+            self.latency.iter().map(Vec::capacity).sum()
+        );
         let mut all: Vec<f32> = self.latency.iter().flatten().copied().collect();
         let capture_to_display = spread(&mut all).map(|(median_ms, p95_ms)| Latency {
             median_ms,

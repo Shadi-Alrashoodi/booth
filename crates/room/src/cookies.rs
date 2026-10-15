@@ -121,6 +121,11 @@ impl Gate {
     pub(crate) fn capped_over(&mut self, now: Instant) -> Option<u64> {
         self.capped.take_over(now)
     }
+
+    pub(crate) fn gauge(&self) {
+        stats::gauge!("room.cookies.recent", self.load.recent);
+        stats::gauge!("room.cookies.lines", self.lines.at);
+    }
 }
 
 #[derive(Default)]

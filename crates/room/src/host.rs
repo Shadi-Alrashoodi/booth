@@ -1180,7 +1180,51 @@ impl Host {
             }
             self.next_roster = now + ROSTER_EVERY;
         }
+        self.gauge();
         changed
+    }
+
+    fn gauge(&self) {
+        stats::gauge!("room.host.keys", self.keys);
+        stats::gauge!("room.host.peers", self.peers);
+        stats::gauge!(
+            "room.host.peer.name",
+            self,
+            self.peers.iter().map(|peer| peer.name.len()).sum(),
+            self.peers.iter().map(|peer| peer.name.capacity()).sum()
+        );
+        stats::gauge!(
+            "room.link.minute.samples",
+            self,
+            self.peers
+                .iter()
+                .map(|peer| peer.link.minute_samples().0)
+                .sum(),
+            self.peers
+                .iter()
+                .map(|peer| peer.link.minute_samples().1)
+                .sum()
+        );
+        stats::gauge!("room.host.pending", self.pending);
+        stats::gauge!("room.host.lost", self.lost);
+        stats::gauge!("room.host.scratch", self.scratch);
+        stats::gauge!("room.host.just_left", self.just_left);
+        stats::gauge!("room.host.other_versions", self.other_versions);
+        stats::gauge!("room.host.reports", self.reports);
+        stats::gauge!("room.host.voice_payload", self.voice_payload);
+        stats::gauge!("room.host.voice_plain", self.voice_plain);
+        stats::gauge!("room.host.voice_sealed", self.voice_sealed);
+        stats::gauge!("room.host.left_limits", self.left_limits);
+        stats::gauge!("room.host.video_sealed", self.video_sealed);
+        stats::gauge!("room.host.input_events", self.input_events);
+        stats::gauge!("room.host.input_sealed", self.input_sealed);
+        self.invites.gauge();
+        self.limit.gauge();
+        self.cookies.gauge();
+        self.history.gauge();
+        self.delivery.gauge();
+        self.booth_lines.gauge();
+        self.other_lines.gauge();
     }
 
     pub(crate) fn next_deadline(&self) -> Option<Instant> {

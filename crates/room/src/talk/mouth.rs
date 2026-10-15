@@ -90,6 +90,9 @@ impl Mouth {
             }
         }
         self.shared.capture_times.record(began.elapsed());
+        stats::gauge!("room.mouth.payload", self.payload);
+        stats::gauge!("room.mouth.plain", self.plain);
+        stats::gauge!("room.mouth.sealed", self.sealed);
     }
 
     fn frame(&mut self) {

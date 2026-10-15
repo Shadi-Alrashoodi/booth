@@ -311,6 +311,8 @@ impl Punches {
         });
         self.accepted
             .retain(|(_, at)| now.saturating_duration_since(*at) < PASTE_GAP);
+        stats::gauge!("room.punches.records", self.records);
+        stats::gauge!("room.punches.accepted", self.accepted);
         missed
     }
 

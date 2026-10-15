@@ -131,6 +131,9 @@ impl Setup {
             output: self.settings.device(Direction::Output),
             talk: self.settings.talk_mode(),
             constant_rate: self.settings.constant_rate(),
+            #[cfg(feature = "memstats")]
+            devices: crate::memstats::devices().unwrap_or(Devices::Windows),
+            #[cfg(not(feature = "memstats"))]
             devices: Devices::Windows,
         };
         self.config.video_upload_kbps = self.settings.upload_mbits() * 1000;
@@ -1046,6 +1049,13 @@ fn saved_line(settings: &Settings) -> String {
 impl eframe::App for App {
     // Runs while the window is minimized too, where ui does not.
     fn logic(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
+        #[cfg(feature = "memstats")]
+        {
+            crate::memstats::egui(ctx);
+            self.backlog.gauge();
+            ::stats::gauge!("app.damaged", self.damaged);
+            ::stats::gauge!("app.unusable", self.unusable);
+        }
         // Shown on the last pass, the window is on screen now and can come
         // forward.
         if std::mem::take(&mut self.raise)
@@ -1362,6 +1372,8 @@ pub fn load(args: &Args, backlog: &mut Backlog) -> Result<Setup, NotStarted> {
         }
     };
     let identity = Identity::load_or_create(&data_dir).map_err(shown)?;
+    #[cfg(feature = "memstats")]
+    crate::memstats::start(&data_dir);
     let (settings, problems) = Settings::load(&data_dir);
     for problem in problems {
         backlog.add(problem);

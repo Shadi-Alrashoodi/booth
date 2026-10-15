@@ -233,6 +233,15 @@ impl Controls {
         self.wake.set();
     }
 
+    pub(crate) fn gauge(&self) {
+        if stats::mem::ON {
+            let out = lock(&self.out);
+            stats::gauge!("room.controls.waiting", out.waiting);
+            stats::gauge!("room.controls.plain", out.plain);
+            stats::gauge!("room.controls.sealed", out.sealed);
+        }
+    }
+
     // The thread's turn: motion that waited MOVE_EVERY, or the held state
     // when nothing went for STATE_EVERY. When to look again, if ever.
     fn tick(&self, now: Instant) -> Option<Instant> {

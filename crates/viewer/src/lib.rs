@@ -320,6 +320,10 @@ impl Viewer {
         self.window.fullscreen(Fullscreen::Toggle);
     }
 
+    pub fn gauge(&self) {
+        self.scene.gauge();
+    }
+
     pub fn present(&mut self, frame: &Frame) -> Result<Presented, ViewerError> {
         let started = Instant::now();
         if self.window.shared().closed() {

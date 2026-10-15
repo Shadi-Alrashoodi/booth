@@ -90,6 +90,10 @@ impl Chat {
         room: &Room,
         composer: Composer,
     ) {
+        stats::gauge!("app.chat.lines", self, lines.len(), lines.len());
+        stats::gauge!("app.chat.times", self.times.0);
+        stats::gauge!("app.chat.heights", self.heights.lines);
+        stats::gauge!("app.chat.names", self.names.keys);
         self.names.note(people, lines);
         let height = (ui.available_height() - self.bottom).max(0.0);
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());

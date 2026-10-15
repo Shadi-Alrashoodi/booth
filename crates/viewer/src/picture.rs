@@ -296,6 +296,10 @@ impl Picture {
         Ok(())
     }
 
+    pub(crate) fn gauge(&self) {
+        stats::gauge!("viewer.picture.views", self.views);
+    }
+
     #[cfg(test)]
     pub(crate) fn cached_views(&self) -> usize {
         self.views.len()

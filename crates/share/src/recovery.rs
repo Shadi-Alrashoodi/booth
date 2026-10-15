@@ -318,6 +318,11 @@ impl Answers {
         self.bitrate = bitrate;
     }
 
+    pub fn gauge(&self) {
+        stats::gauge!("share.answers.cuts", self.cuts);
+        stats::gauge!("share.answers.lost_here", self.lost_here);
+    }
+
     // For the frame about to be encoded, at `now`.
     pub fn take_force_idr(&mut self, now: Instant) -> bool {
         let released = self.held && !self.within_floor(now);

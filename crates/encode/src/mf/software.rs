@@ -298,6 +298,10 @@ impl Encoder for Software {
         &self.notes
     }
 
+    fn gauge(&self) {
+        stats::gauge!("encode.software.notes", self.notes);
+    }
+
     fn encode(&mut self, frame: &Frame<'_>) -> Result<AccessUnit, EncodeError> {
         platform::com()?;
         if let Some(previous) = self.last_index

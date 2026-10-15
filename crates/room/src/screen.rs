@@ -667,6 +667,14 @@ impl Sharing {
         std::mem::take(&mut *lock(&self.round_trip))
     }
 
+    fn gauge(&self) {
+        let told = lock(&self.told);
+        stats::gauge!("room.sharing.answers", told.answers);
+        drop(told);
+        let news = lock(&self.news);
+        stats::gauge!("room.sharing.news", *news);
+    }
+
     // Everything this PC's socket sent so far, headers included.
     fn upload_bytes(&self) -> Option<u64> {
         self.socket.as_ref().map(|socket| socket.sent_bytes())
@@ -1371,6 +1379,31 @@ impl Watching {
             work();
         }
     }
+
+    fn gauge(&self) {
+        let inbox = lock(&self.inbox);
+        stats::gauge!("room.watching.video", inbox.video);
+        stats::gauge!("room.watching.spare", inbox.spare);
+        stats::gauge!("room.watching.shapes", inbox.shapes);
+        stats::gauge!("room.watching.events", inbox.events);
+        drop(inbox);
+        let backs = lock(&self.backs);
+        stats::gauge!("room.watching.backs", *backs);
+        drop(backs);
+        let news = lock(&self.news);
+        stats::gauge!("room.watching.news", *news);
+        drop(news);
+        if let Some(attached) = lock(&self.attached).as_ref() {
+            let shapes = attached.shapes.iter().map(|(_, shape)| &shape.bytes);
+            stats::gauge!("room.attached.shapes", attached.shapes);
+            stats::gauge!(
+                "room.attached.shape.bytes",
+                attached,
+                shapes.clone().map(Vec::len).sum(),
+                shapes.map(Vec::capacity).sum()
+            );
+        }
+    }
 }
 
 // This PC's ping clock moved by the offset to the sharer's: the sharer's
@@ -1619,6 +1652,7 @@ impl Screen {
     }
 
     pub(crate) fn fill(&self, numbers: &mut Numbers) {
+        self.gauge();
         numbers.video_sent = self.sharing.video_sent();
         numbers.video_relayed = self.relayed;
         numbers.video_dropped = self.dropped;
@@ -1643,6 +1677,22 @@ impl Screen {
             self.watching.event(WatchEvent::Ended { share });
             self.shapes = Assembler::default();
         }
+    }
+
+    // With every view, under the state lock. Watching's and Sharing's locks
+    // are taken one at a time, and only in a build that keeps the gauges.
+    fn gauge(&self) {
+        if !stats::mem::ON {
+            return;
+        }
+        stats::gauge!("room.screen.published", self.published);
+        self.shapes.gauge();
+        if let Some(far) = &self.far {
+            stats::gauge!("room.far.open", far.loss.open);
+            stats::gauge!("room.far.counted", far.loss.counted);
+        }
+        self.sharing.gauge();
+        self.watching.gauge();
     }
 }
 

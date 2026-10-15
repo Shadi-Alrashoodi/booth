@@ -696,6 +696,44 @@ impl Gate {
         lock(&self.stats).fill(numbers);
         numbers.dropped.stale += self.stale.load(Ordering::Relaxed);
     }
+
+    fn gauge(&self) {
+        if !stats::mem::ON {
+            return;
+        }
+        {
+            let queue = lock(&self.queue);
+            stats::gauge!("room.gate.calls", queue.calls);
+            stats::gauge!("room.gate.spare", queue.spare);
+            stats::gauge!(
+                "room.gate.spare.events",
+                self,
+                queue.spare.iter().map(|batch| batch.events.len()).sum(),
+                queue
+                    .spare
+                    .iter()
+                    .map(|batch| batch.events.capacity())
+                    .sum()
+            );
+        }
+        {
+            let sums = lock(&self.sums);
+            stats::gauge!(
+                "room.gate.sums",
+                self,
+                sums.iter().map(Vec::len).sum(),
+                sums.iter().map(Vec::capacity).sum()
+            );
+        }
+        let mut numbers = lock(&self.stats);
+        let windows = numbers.windows();
+        stats::gauge!(
+            "room.gate.window.samples",
+            self,
+            windows.iter().map(|window| window.samples.len()).sum(),
+            windows.iter().map(|window| window.samples.capacity()).sum()
+        );
+    }
 }
 
 // Latencies over the last WINDOW, worked out at most every REFRESH_EVERY.
@@ -1106,6 +1144,8 @@ impl Remote {
     // Every timer pass: CUTOFF without a packet lets go of what is held.
     // True when it ran.
     pub(crate) fn step(&mut self, now: Instant) -> bool {
+        self.gate.gauge();
+        self.controls.gauge();
         let Some(here) = self.here.as_mut().filter(|here| here.allowed && !here.cut) else {
             return false;
         };

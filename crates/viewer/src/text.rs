@@ -117,6 +117,10 @@ impl Text {
         self.metrics
     }
 
+    pub(crate) fn gauge(&self) {
+        stats::gauge!("viewer.text.lines", self.lines);
+    }
+
     // Text is laid out at this size, in pixels, until it changes.
     pub(crate) fn set_size(&mut self, size: f32) -> Result<(), ViewerError> {
         if self.format.is_some() && self.size == size {

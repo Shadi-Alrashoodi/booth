@@ -1106,6 +1106,14 @@ fn timers(shared: &Arc<Shared>, inbox: &Receiver<Command>, timer: Timer) {
         shared.gate.run();
         // Off the state lock, and off the receive thread, which injects.
         shared.gate.refresh(now);
+        stats::gauge!(
+            "room.threads.commands",
+            inbox,
+            inbox.len(),
+            inbox.capacity().unwrap_or(0)
+        );
+        shared.socket.gauge();
+        shared.log.gauge();
         if changed {
             (shared.notify)();
         }

@@ -189,6 +189,7 @@ impl<K: PartialEq, S: FrameSource> Mixer<K, S> {
     }
 
     pub fn render(&mut self, out: &mut [f32]) {
+        stats::gauge!("voice.mixer.voices", self.voices);
         out.fill(0.0);
         if self.silent() {
             self.pause_all();

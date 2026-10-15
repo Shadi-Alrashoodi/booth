@@ -1297,6 +1297,9 @@ impl Host {
         self.own_shape(now, socket);
         self.tell_clocks(false, now, socket);
         self.join_idrs(now, socket);
+        if let Some(live) = &self.live {
+            stats::gauge!("room.host.live.recovered", live.recovered);
+        }
     }
 
     // New watchers' IDR asks the gap held back, once it is over.

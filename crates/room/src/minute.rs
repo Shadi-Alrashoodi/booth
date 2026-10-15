@@ -55,6 +55,15 @@ impl Minute {
         self.next_line
     }
 
+    // Samples kept in both lists, and the room they have, for the memory
+    // gauges.
+    pub(crate) fn samples(&self) -> (usize, usize) {
+        (
+            self.acks.len() + self.pings.len(),
+            self.acks.capacity() + self.pings.capacity(),
+        )
+    }
+
     // Once a minute: what the log line says after "reliable to <who>: ".
     // `retransmits` is the link's count so far, `timer` its retransmit
     // timeout now.

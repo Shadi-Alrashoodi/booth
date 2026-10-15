@@ -692,6 +692,7 @@ impl Talk {
     // report_due says so.
     pub(crate) fn tick(&mut self, now: Instant) -> bool {
         self.retired.retain(|(_, until)| now < *until);
+        self.gauge();
         let talking_for = self.timers.talking_for;
         let mut changed = false;
         for talker in &mut self.talkers {
@@ -701,6 +702,26 @@ impl Talk {
             }
         }
         changed
+    }
+
+    fn gauge(&self) {
+        stats::gauge!("room.talk.talkers", self.talkers);
+        stats::gauge!("room.talk.retired", self.retired);
+        stats::gauge!("room.talk.published", self.published);
+        stats::gauge!(
+            "room.talk.speaker",
+            self,
+            self.speaker.len(),
+            self.speaker.capacity().unwrap_or(0)
+        );
+        if stats::mem::ON {
+            devices::gauge();
+            // Each ear sits in an Arc of its own, so its gauges keep one
+            // address while the list of talkers changes.
+            for talker in &self.talkers {
+                lock(&talker.ear).gauge();
+            }
+        }
     }
 
     pub(crate) fn report_due(&mut self, now: Instant) -> bool {

@@ -235,6 +235,10 @@ impl LossWindow {
         }
     }
 
+    pub(crate) fn gauge(&self) {
+        stats::gauge!("channels.loss_window.entries", self.entries);
+    }
+
     fn add(&mut self, entry: Entry) {
         self.forget(entry.at);
         if self.entries.len() == MAX_ENTRIES {

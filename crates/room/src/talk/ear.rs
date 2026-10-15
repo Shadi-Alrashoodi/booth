@@ -94,6 +94,11 @@ impl Ear {
         }
     }
 
+    pub(crate) fn gauge(&self) {
+        stats::gauge!("room.ear.samples", self.samples);
+        self.buffer.gauge();
+    }
+
     // A frame left for the speaker at `ear_us`, on this PC's ping clock.
     fn played(&mut self, seq: u16, ear_us: u64) {
         let Some(stamp) = self.stamps[usize::from(seq) % STAMPS].filter(|stamp| stamp.seq == seq)

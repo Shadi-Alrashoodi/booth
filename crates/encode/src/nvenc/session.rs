@@ -411,6 +411,10 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) fn gauge(&self) {
+        stats::gauge!("encode.nvenc.registrations", self.registrations);
+    }
+
     /// Encodes one frame and waits for it: map the texture, encode, lock the
     /// bitstream (which blocks until the frame is done), copy it out, unlock,
     /// unmap. One frame in flight, nothing queued.

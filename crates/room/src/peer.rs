@@ -523,6 +523,12 @@ impl Link {
         self.minute.next_line()
     }
 
+    // A sum rather than a gauge of its own: a host's links sit in its list
+    // of peers and move when someone joins or leaves.
+    pub(crate) fn minute_samples(&self) -> (usize, usize) {
+        self.minute.samples()
+    }
+
     pub(crate) fn round_trip(&self, now: Instant) -> Option<share::rate::RoundTrip> {
         self.minute.round_trip(now)
     }

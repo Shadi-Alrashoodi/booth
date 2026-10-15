@@ -700,6 +700,8 @@ impl Rate {
             self.loss.pop_front();
         }
         self.loss.push_back((second.sent, second.lost));
+        stats::gauge!("share.rate.bytes", self.bytes);
+        stats::gauge!("share.rate.loss", self.loss);
         let (frames, lost) = self
             .loss
             .iter()

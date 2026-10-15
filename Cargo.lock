@@ -680,6 +680,7 @@ version = "1.0.1"
 dependencies = [
  "proptest",
  "reed-solomon-simd",
+ "stats",
  "zeroize",
 ]
 
@@ -887,6 +888,7 @@ dependencies = [
  "cc",
  "encode",
  "proptest",
+ "stats",
  "windows",
 ]
 
@@ -1078,6 +1080,7 @@ version = "1.0.1"
 dependencies = [
  "annexb",
  "cc",
+ "stats",
  "windows",
 ]
 
@@ -1921,6 +1924,7 @@ dependencies = [
  "getrandom 0.3.4",
  "proptest",
  "socket2",
+ "stats",
  "windows",
  "windows-sys 0.61.2",
 ]
@@ -3527,6 +3531,7 @@ dependencies = [
  "getrandom 0.3.4",
  "opus",
  "proptest",
+ "stats",
  "windows",
 ]
 

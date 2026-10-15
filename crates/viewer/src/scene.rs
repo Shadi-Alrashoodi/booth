@@ -186,6 +186,11 @@ impl Scene {
         self.pointer.has_shape()
     }
 
+    pub(crate) fn gauge(&self) {
+        self.picture.gauge();
+        self.painter.gauge();
+    }
+
     pub(crate) fn keep(&mut self, video: &Video) -> Result<(), ViewerError> {
         let _locked = Locked::enter(&self.lock);
         self.picture.keep(video)

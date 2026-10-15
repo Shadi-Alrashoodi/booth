@@ -355,6 +355,13 @@ impl Decoder {
         }
     }
 
+    pub fn gauge(&self) {
+        stats::gauge!("decode.decoder.buffer", self.buffer);
+        if let Some(timing) = &self.timing {
+            timing.gauge();
+        }
+    }
+
     // The access unit is in `buffer`, `size` bytes and the padding.
     fn send_and_receive(&mut self, size: usize, unit: u64) -> Result<Option<Decoded>, DecodeError> {
         let library = self.library;

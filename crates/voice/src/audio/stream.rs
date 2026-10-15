@@ -402,7 +402,15 @@ impl Work {
         stream.start()
     }
 
+    fn gauge(&self) {
+        match self {
+            Work::Capture { mono, .. } => stats::gauge!("voice.capture.mono", *mono),
+            Work::Render { mono, .. } => stats::gauge!("voice.render.mono", *mono),
+        }
+    }
+
     fn serve(&mut self, stream: &mut dyn DeviceStream, shared: &Shared) -> Result<(), AudioError> {
+        self.gauge();
         let format = stream.info().format;
         match self {
             Work::Capture {

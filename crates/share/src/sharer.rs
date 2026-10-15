@@ -424,6 +424,16 @@ impl Sharer {
         self.pacer.numbers()
     }
 
+    pub fn gauge(&self) {
+        stats::gauge!("share.sharer.back", self.back);
+        stats::gauge!("share.sharer.encode_ms", self.numbers.encode_ms);
+        self.answers.gauge();
+        self.packetizer.gauge();
+        if let Some(opened) = &self.opened {
+            opened.encoder.gauge();
+        }
+    }
+
     // For the frames from the next one on. A ceiling, like
     // encode::Settings::bitrate.
     pub fn set_bitrate(&mut self, bits_per_second: u32) -> Result<(), String> {

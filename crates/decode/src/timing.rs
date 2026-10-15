@@ -217,6 +217,10 @@ impl Timing {
         into.extend(self.done.drain(..));
     }
 
+    pub(crate) fn gauge(&self) {
+        stats::gauge!("decode.timing.done", self.done);
+    }
+
     fn corner(&mut self, format: DXGI_FORMAT) -> Option<ID3D11Texture2D> {
         if let Some((made_for, corner)) = &self.corner
             && *made_for == format

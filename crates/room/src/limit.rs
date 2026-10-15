@@ -178,6 +178,10 @@ impl RateLimit {
             .retain(|_, bucket| bucket.refill(now, PER_SECOND, BURST) < BURST);
         self.buckets.len() < MAX_SOURCES
     }
+
+    pub(crate) fn gauge(&self) {
+        stats::gauge!("room.limit.buckets", self.buckets);
+    }
 }
 
 // One home connection gets a whole /64, so counting single IPv6 addresses

@@ -251,6 +251,10 @@ impl Stun {
 
     // Returns true when the first wait ran out just now.
     pub(crate) fn tick(&mut self, now: Instant, socket: &Socket) -> bool {
+        stats::gauge!("room.stun.servers", self.servers);
+        stats::gauge!("room.stun.requests", self.requests);
+        stats::gauge!("room.stun.answers", self.answers);
+        stats::gauge!("room.stun.seen", self.seen);
         let mut settled = false;
         if let Phase::Waiting(until) = self.phase
             && now >= until

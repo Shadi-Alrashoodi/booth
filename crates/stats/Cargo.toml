@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Counts kept for finding memory growth in a long session; see mem.rs.
+memstats = []
+
 [dependencies]
 
 [dev-dependencies]

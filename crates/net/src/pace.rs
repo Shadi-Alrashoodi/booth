@@ -277,8 +277,22 @@ impl Pacer {
 
     // Why the thread stopped on its own, if it did: a broken event or timer
     // handle, or a send function that panicked. Frames are no longer sent.
+    // The sharer asks after every frame and every idle wait, which is often
+    // enough for the gauges.
     pub fn failure(&self) -> Option<String> {
-        self.shared.lock().failed.clone()
+        let mailbox = self.shared.lock();
+        stats::gauge!("net.pacer.spare", mailbox.spare);
+        stats::gauge!(
+            "net.pacer.spare.bytes",
+            &*self.shared,
+            mailbox.spare.iter().map(|burst| burst.bytes.len()).sum(),
+            mailbox
+                .spare
+                .iter()
+                .map(|burst| burst.bytes.capacity())
+                .sum()
+        );
+        mailbox.failed.clone()
     }
 }
 

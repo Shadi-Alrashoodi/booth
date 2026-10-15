@@ -73,6 +73,13 @@ impl Socket {
         self.inner.wake()
     }
 
+    pub(crate) fn gauge(&self) {
+        if stats::mem::ON {
+            let failing = self.failing.lock().unwrap_or_else(PoisonError::into_inner);
+            stats::gauge!("room.socket.failing", *failing);
+        }
+    }
+
     pub(crate) fn send_to(&self, buf: &[u8], to: SocketAddr) -> io::Result<usize> {
         let sent = self.inner.send_to(buf, to);
         if sent.is_ok() {

@@ -299,6 +299,9 @@ pub trait Encoder: Send {
     fn invalidates(&self) -> bool {
         false
     }
+
+    /// Sets stats::gauge! for what it keeps from frame to frame.
+    fn gauge(&self) {}
 }
 
 /// Opens the fastest encoder for `codec` that works on the GPU `device` is

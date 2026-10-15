@@ -522,6 +522,16 @@ impl Assembler {
         };
         Some((first.share, first.id, shape))
     }
+
+    pub(crate) fn gauge(&self) {
+        let bytes = self.under_way.as_ref().map(|(chunk, _)| &chunk.bytes);
+        stats::gauge!(
+            "room.assembler.bytes",
+            self,
+            bytes.map_or(0, Vec::len),
+            bytes.map_or(0, Vec::capacity)
+        );
+    }
 }
 
 #[cfg(test)]

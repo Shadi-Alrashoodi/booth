@@ -455,6 +455,11 @@ impl JitterBuffer {
         }
     }
 
+    pub fn gauge(&self) {
+        stats::gauge!("voice.jitter.arrivals", self.arrivals);
+        stats::gauge!("voice.jitter.outcomes", self.outcomes);
+    }
+
     // Lost frames in the window that belong to runs of at most
     // SCATTERED_RUN, counting the part of a run from before the window.
     fn scattered(&self) -> u32 {

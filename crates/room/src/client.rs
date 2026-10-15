@@ -616,6 +616,7 @@ impl Client {
     }
 
     pub(crate) fn on_timer(&mut self, now: Instant, socket: &Socket) -> bool {
+        self.gauge();
         if self.state == LinkState::Closed {
             return false;
         }
@@ -771,6 +772,22 @@ impl Client {
         }
         changed |= self.talk.tick(now);
         changed
+    }
+
+    fn gauge(&self) {
+        stats::gauge!("room.client.attempts", self.attempts);
+        stats::gauge!("room.client.from_name", self.from_name);
+        stats::gauge!("room.client.punch_sources", self.punch_sources);
+        stats::gauge!("room.client.scratch", self.scratch);
+        stats::gauge!("room.client.input_events", self.input_events);
+        stats::gauge!("room.client.roster.entries", self.roster.entries);
+        if stats::mem::ON {
+            let (len, cap) = self.link.minute_samples();
+            stats::gauge!("room.link.minute.samples", &self.link, len, cap);
+        }
+        self.strays.gauge();
+        self.history.gauge();
+        self.delivery.gauge();
     }
 
     pub(crate) fn next_deadline(&self) -> Option<Instant> {

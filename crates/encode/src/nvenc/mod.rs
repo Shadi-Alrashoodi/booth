@@ -405,6 +405,11 @@ impl Encoder for Nvenc {
         self.codec
     }
 
+    fn gauge(&self) {
+        self.session.gauge();
+        self.references.gauge();
+    }
+
     fn encode(&mut self, frame: &Frame<'_>) -> Result<AccessUnit, EncodeError> {
         if let Some(previous) = self.last_index
             && frame.index <= previous

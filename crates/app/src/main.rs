@@ -7,6 +7,8 @@ mod elevated;
 mod firewall;
 mod hotkeys;
 mod loopback;
+#[cfg(feature = "memstats")]
+mod memstats;
 mod messages;
 mod monitors;
 mod remote;
@@ -79,6 +81,8 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    #[cfg(feature = "memstats")]
+    let args = memstats::take_flags(args);
     // First, before any window, profile or key: this may be the process the
     // administrator prompt started.
     if elevated::asked_for(&args) {

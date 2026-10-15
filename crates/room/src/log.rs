@@ -78,6 +78,13 @@ impl Log {
             out.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    // Keyed by what every copy of this log shares.
+    pub(crate) fn gauge(&self) {
+        if let Some(out) = &self.out {
+            stats::gauge!("room.log.lines", &**out, out.lines.len(), WAITING_LINES);
+        }
+    }
 }
 
 impl fmt::Debug for Log {
@@ -570,6 +577,10 @@ impl PerSource {
 
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         self.due
+    }
+
+    pub(crate) fn gauge(&self) {
+        stats::gauge!("room.per_source.windows", self.windows);
     }
 
     // The room is closing: counts whose minute has not ended yet would

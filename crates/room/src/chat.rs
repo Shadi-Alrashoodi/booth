@@ -262,6 +262,21 @@ impl History {
     pub(crate) fn shared(&self) -> Arc<Vec<Arc<ChatLine>>> {
         Arc::clone(&self.0)
     }
+
+    // Keyed by the history itself: the list moves each time a line is added
+    // while a view holds it.
+    pub(crate) fn gauge(&self) {
+        stats::gauge!("room.history.lines", self, self.0.len(), self.0.capacity());
+        if stats::mem::ON {
+            let (len, cap) = self.0.iter().fold((0, 0), |(len, cap), line| {
+                (
+                    len + line.name.len() + line.text.len(),
+                    cap + line.name.capacity() + line.text.capacity(),
+                )
+            });
+            stats::gauge!("room.history.text", self, len, cap);
+        }
+    }
 }
 
 // The delivery times of the last minute, for the stats panel.
@@ -308,6 +323,10 @@ impl Delivery {
         numbers.chat_delivery_avg_ms = (!recent.is_empty())
             .then(|| recent.iter().map(|sample| sample.ms).sum::<f32>() / recent.len() as f32);
         numbers.chat_delivery_about = last.about || recent.iter().any(|sample| sample.about);
+    }
+
+    pub(crate) fn gauge(&self) {
+        stats::gauge!("room.delivery.samples", self.samples);
     }
 }
 

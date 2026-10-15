@@ -362,6 +362,19 @@ impl Invites {
             _ => false,
         }
     }
+
+    pub(crate) fn gauge(&self) {
+        stats::gauge!("room.invites.entries", self.entries);
+        stats::gauge!(
+            "room.invites.entry.admitted",
+            self,
+            self.entries.iter().map(|entry| entry.admitted.len()).sum(),
+            self.entries
+                .iter()
+                .map(|entry| entry.admitted.capacity())
+                .sum()
+        );
+    }
 }
 
 #[cfg(test)]

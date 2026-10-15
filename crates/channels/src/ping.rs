@@ -116,6 +116,7 @@ impl OffsetEstimator {
             self.samples.pop_front();
         }
         self.samples.push_back(sample);
+        stats::gauge!("channels.offset.samples", self.samples);
     }
 
     // On a tie the newest sample wins, since the clocks drift apart slowly.

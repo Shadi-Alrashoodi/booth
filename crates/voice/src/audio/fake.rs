@@ -61,6 +61,9 @@ struct State {
     // The next packet captured comes after lost sound.
     glitch: AtomicBool,
     record: Mutex<Record>,
+    // Off for a fake left running for hours, where a record of every
+    // sample would be the biggest thing in the process.
+    recording: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -81,6 +84,21 @@ pub struct Record {
 
 impl Fake {
     pub fn new(setup: Setup, devices: &[(&str, &str)], default: Option<&str>) -> Fake {
+        Fake::with_record(setup, devices, default, true)
+    }
+
+    // As new, but what the streams carry is not kept: record() has the
+    // opens, starts and stops only.
+    pub fn unrecorded(setup: Setup, devices: &[(&str, &str)], default: Option<&str>) -> Fake {
+        Fake::with_record(setup, devices, default, false)
+    }
+
+    fn with_record(
+        setup: Setup,
+        devices: &[(&str, &str)],
+        default: Option<&str>,
+        recording: bool,
+    ) -> Fake {
         Fake {
             state: Arc::new(State {
                 setup,
@@ -95,6 +113,7 @@ impl Fake {
                 stalled: AtomicBool::new(false),
                 glitch: AtomicBool::new(false),
                 record: Mutex::new(Record::default()),
+                recording,
             }),
         }
     }
@@ -347,7 +366,9 @@ impl DeviceStream for FakeStream {
                 silent: false,
                 glitch,
             });
-            lock(&self.state.record).packets.push(setup.period_frames);
+            if self.state.recording {
+                lock(&self.state.record).packets.push(setup.period_frames);
+            }
             self.frames_out += period;
         }
         Ok(())
@@ -375,7 +396,7 @@ impl DeviceStream for FakeStream {
         let mut bytes = vec![0u8; frames as usize * self.info.format.frame_bytes()];
         fill(&mut bytes);
         // The silence a stream starts with is not what the test asked for.
-        if self.primed {
+        if self.primed && self.state.recording {
             let mut record = lock(&self.state.record);
             record.packets.push(frames);
             let (samples, _) = bytes.as_chunks::<4>();

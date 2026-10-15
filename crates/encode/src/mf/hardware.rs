@@ -641,6 +641,10 @@ impl Encoder for Hardware {
         &self.notes
     }
 
+    fn gauge(&self) {
+        stats::gauge!("encode.hardware.notes", self.notes);
+    }
+
     fn shut_down(&mut self) -> Option<String> {
         (!self.mft.shut_down()).then(|| {
             format!(

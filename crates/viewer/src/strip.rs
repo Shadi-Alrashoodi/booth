@@ -553,6 +553,10 @@ impl Painter {
         })
     }
 
+    pub(crate) fn gauge(&self) {
+        self.text.gauge();
+    }
+
     // Between the context's BeginDraw and EndDraw, with the target set.
     pub(crate) fn draw(
         &mut self,

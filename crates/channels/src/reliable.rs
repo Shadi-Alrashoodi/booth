@@ -220,6 +220,8 @@ impl Reliable {
             self.ack_owed = false;
             return Some(wire::ack_only(ack));
         }
+        // Every flush ends here, once per call rather than once per frame.
+        self.gauge();
         None
     }
 
@@ -257,6 +259,13 @@ impl Reliable {
             .filter(|sent| !sent.acked)
             .map(|sent| sent.message.as_slice())
             .chain(self.queue.iter().map(|message| message.as_slice()))
+    }
+
+    fn gauge(&self) {
+        stats::gauge!("channels.reliable.queue", self.queue);
+        stats::gauge!("channels.reliable.in_flight", self.in_flight);
+        stats::gauge!("channels.reliable.delivered", self.delivered);
+        stats::gauge!("channels.reliable.ack_delays", self.ack_delays);
     }
 
     fn current_ack(&self) -> Ack {

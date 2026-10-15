@@ -815,6 +815,7 @@ impl DeviceBook {
     }
 
     pub(crate) fn take_save(&mut self, now: Instant) -> Option<Save> {
+        stats::gauge!("room.known.devices", self.list.devices);
         self.unsaved.take(self.writable, now).then(|| self.encode())
     }
 
@@ -879,6 +880,7 @@ impl HostBook {
     }
 
     pub(crate) fn take_save(&mut self, now: Instant) -> Option<Save> {
+        stats::gauge!("room.known.hosts", self.hosts);
         self.unsaved.take(self.writable, now).then(|| self.encode())
     }
 

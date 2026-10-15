@@ -261,6 +261,10 @@ fn share(
         let now = Instant::now();
         if now >= next_second {
             next_second = (next_second + Duration::from_secs(1)).max(now);
+            stats::gauge!("room.outbox.plain", watchers.outbox.plain);
+            stats::gauge!("room.outbox.sealed", watchers.outbox.sealed);
+            stats::gauge!("room.share_tally.minute", tally.minute);
+            sharer.gauge();
             let frames = std::mem::take(&mut watchers.sent);
             let mut encode_ms: Vec<f32> = frames.iter().map(|frame| frame.encode_ms).collect();
             // Frames the sharer lost itself are no sign of the network.

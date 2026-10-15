@@ -88,6 +88,10 @@ impl References {
             }
         }
     }
+
+    pub(crate) fn gauge(&self) {
+        stats::gauge!("encode.nvenc.references", self.window);
+    }
 }
 
 #[cfg(test)]

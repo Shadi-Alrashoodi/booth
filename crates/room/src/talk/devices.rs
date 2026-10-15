@@ -122,6 +122,11 @@ impl Which {
     }
 }
 
+pub(super) fn gauge() {
+    let open = lock(&OPEN);
+    stats::gauge!("room.devices.open", *open);
+}
+
 fn note_open(room: u64, device: &Which, thread: StreamThread) {
     let mut open = lock(&OPEN);
     open.retain(|opened| opened.thread.running());

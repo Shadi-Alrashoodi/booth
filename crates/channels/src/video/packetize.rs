@@ -58,6 +58,10 @@ impl Packetizer {
         usize::from(MAX_DATA) * self.largest_shard - FRAME_HEADER
     }
 
+    pub fn gauge(&self) {
+        stats::gauge!("channels.packetizer.packets", self.packets);
+    }
+
     // Each frame's parity by parity_for_loss, from the viewers' loss.
     pub fn packetize_for_loss(
         &mut self,

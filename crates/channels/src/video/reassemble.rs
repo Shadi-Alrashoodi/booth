@@ -369,6 +369,28 @@ impl Reassembler {
         self.loss.loss(now)
     }
 
+    pub fn gauge(&self) {
+        let stored = self.pending.iter().map(|pending| &pending.stored);
+        stats::gauge!("channels.reassembler.pending", self.pending);
+        stats::gauge!(
+            "channels.reassembler.pending.stored",
+            self,
+            stored.clone().map(Vec::len).sum(),
+            stored.map(Vec::capacity).sum()
+        );
+        stats::gauge!("channels.reassembler.spare", self.spare);
+        stats::gauge!(
+            "channels.reassembler.spare.bytes",
+            self,
+            self.spare.iter().map(Vec::len).sum(),
+            self.spare.iter().map(Vec::capacity).sum()
+        );
+        stats::gauge!("channels.reassembler.out", self.out);
+        stats::gauge!("channels.reassembler.events", self.events);
+        stats::gauge!("channels.reassembler.recent", self.recent);
+        self.loss.gauge();
+    }
+
     fn run(&mut self, now: Instant) {
         self.advance(now);
         if let Some((first, last)) = self.gathered {

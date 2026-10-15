@@ -3,6 +3,7 @@
 mod inbound;
 mod jitter;
 mod link;
+pub mod mem;
 mod stream;
 mod thresholds;
 mod trace;

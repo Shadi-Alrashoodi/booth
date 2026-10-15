@@ -17,6 +17,11 @@ pub struct Backlog {
 }
 
 impl Backlog {
+    #[cfg(feature = "memstats")]
+    pub fn gauge(&self) {
+        stats::gauge!("app.backlog.lines", self.lines);
+    }
+
     pub fn add(&mut self, text: String) {
         self.lines.push((win::utc_stamp(), text));
     }

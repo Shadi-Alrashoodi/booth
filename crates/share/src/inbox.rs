@@ -204,6 +204,16 @@ impl Inbox {
     pub(crate) fn take_encode_ms(&self) -> Vec<f32> {
         std::mem::take(&mut self.lock().encode_ms)
     }
+
+    pub(crate) fn gauge(&self) {
+        if !stats::mem::ON {
+            return;
+        }
+        let waiting = self.lock();
+        stats::gauge!("share.inbox.packets", waiting.packets);
+        stats::gauge!("share.inbox.spare", waiting.spare);
+        stats::gauge!("share.inbox.encode_ms", waiting.encode_ms);
+    }
 }
 
 #[cfg(test)]

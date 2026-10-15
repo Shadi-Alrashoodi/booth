@@ -550,6 +550,9 @@ impl Screen {
             }
             if now >= next_second {
                 next_second += SECOND;
+                self.gauge();
+                reassembler.gauge();
+                stats::gauge!("share.screen.batch", batch);
                 let loss = reassembler.loss(now).percent();
                 self.asks.loss(loss, &mut self.back);
                 self.send_back(report);
@@ -970,6 +973,19 @@ impl Screen {
     fn set_link(&mut self, link: LinkNumbers) {
         self.one_way_ms = link.one_way_ms.unwrap_or(0.0);
         self.link_loss = show_link(&mut self.strip, link);
+    }
+
+    fn gauge(&self) {
+        stats::gauge!("share.screen.back", self.back);
+        stats::gauge!("share.screen.gpu_times", self.gpu_times);
+        stats::gauge!("share.screen.waiting", self.waiting.0);
+        stats::gauge!("share.screen.settled", self.settled);
+        stats::gauge!("share.screen.decoders_made", self.new_decoders.made);
+        stats::gauge!("share.screen.holds", self.new_decoders.holds);
+        stats::gauge!("share.screen.trace", self.strip.trace);
+        self.inbox.gauge();
+        self.decoder.gauge();
+        self.viewer.gauge();
     }
 
     // The strip says so while this PC controls, with the release key as the
