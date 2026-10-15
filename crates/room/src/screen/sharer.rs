@@ -206,7 +206,9 @@ fn share(
         }
         match sharing.state() {
             OwnShare::Sharing { number: now, fps } if now == number => {
-                if fps != asked_fps {
+                // Not while capture is paused: a new frame rate opens the
+                // source again. It is applied once a picture comes back.
+                if fps != asked_fps && !sharer.paused() {
                     asked_fps = fps;
                     sharer.set_fps(u32::from(fps), &mut say).map_err(ran)?;
                     log!(
@@ -286,20 +288,25 @@ fn share(
                 interval: Duration::from_secs(1) / sharer.fps(),
                 internet: applied.is_some_and(|facts| facts.internet > 0),
             };
-            let decision = rate.second(now, &second);
-            if let Some(line) = rate.line(&decision) {
-                log!(log, "share {number}: {line}");
-            }
-            if decision.backoff.is_some() {
-                watchers.lost.backed_off();
-            }
-            if let Some(kbps) = decision.rate_kbps {
-                set_bitrate(&mut sharer, kbps, log, number);
-            }
             let slow = second
                 .encode_ms
                 .is_some_and(|ms| ms > second.interval.as_secs_f32() * 1000.0);
-            if let Some(step) = decision.step
+            // While capture is paused nothing goes out to judge the link by,
+            // and a step opens the source again, which a monitor that left
+            // the desktop would not survive.
+            let decision = (!sharer.paused()).then(|| rate.second(now, &second));
+            if let Some(decision) = &decision {
+                if let Some(line) = rate.line(decision) {
+                    log!(log, "share {number}: {line}");
+                }
+                if decision.backoff.is_some() {
+                    watchers.lost.backed_off();
+                }
+                if let Some(kbps) = decision.rate_kbps {
+                    set_bitrate(&mut sharer, kbps, log, number);
+                }
+            }
+            if let Some(step) = decision.and_then(|decision| decision.step)
                 && take_step(&mut sharer, step, &mut say).map_err(ran)?
             {
                 log!(
@@ -777,6 +784,7 @@ impl Audience for Watchers<'_> {
             PauseReason::Taken => Paused::Taken,
             PauseReason::Disconnected => Paused::Disconnected,
             PauseReason::Changing(_) => Paused::Changing,
+            PauseReason::Missing => Paused::Missing,
         };
         self.sharing.tell(ShareNews::Paused {
             share: self.number,

@@ -7,6 +7,7 @@ mod convert;
 mod device;
 mod duplication;
 mod error;
+mod missing;
 mod monitors;
 mod pattern;
 pub mod reference;
@@ -88,8 +89,10 @@ pub enum Next {
     // No new picture for the frame loop's whole wait, 100 ms: the screen is
     // still.
     Idle,
-    // Windows took the desktop away. next() keeps trying and returns Idle
-    // until it is back, then a Frame.
+    // Windows took the desktop away, or the monitor left it. next() keeps
+    // trying and returns Idle until it is back, then a Frame; a monitor
+    // still away after about 30 s is an error instead. A pause whose reason
+    // changes in kind is told again.
     Paused(PauseReason),
 }
 
@@ -140,6 +143,9 @@ pub enum PauseReason {
     // Anything else Windows answered while the desktop was changing; the
     // text says what.
     Changing(String),
+    // The monitor is not on the desktop: turned off, asleep with the PC, or
+    // unplugged. Sharing stops if it is not back within about 30 s.
+    Missing,
 }
 
 impl fmt::Display for PauseReason {
@@ -155,6 +161,11 @@ impl fmt::Display for PauseReason {
                 "this Windows session is disconnected. Sharing goes on when it is back",
             ),
             PauseReason::Changing(what) => write!(f, "{what}. Sharing goes on when Windows lets go"),
+            PauseReason::Missing => write!(
+                f,
+                "the monitor left the desktop: it was turned off, went to sleep or was unplugged. Sharing goes on if it is back within {} s",
+                (missing::LOOK_EVERY * missing::LOOKS).as_secs()
+            ),
         }
     }
 }

@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+use std::mem;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,12 +27,14 @@ use crate::cap::{Decision, FpsCap};
 use crate::convert::{Converter, Layout, Plan, Target};
 use crate::device;
 use crate::error::{CaptureError, ErrorKind, is_device_lost, meaning};
+use crate::missing::{Missed, Missing};
 use crate::monitors::{Monitor, Rotation, find};
 use crate::{CursorKind, CursorShape, CursorUpdate, Frame, Next, Options, PauseReason};
 
 // How long next() waits for a change before it answers Idle, and how often
-// it tries to get the desktop back while paused. Either is how long a share
-// thread may take to notice it was told to stop.
+// it tries to get the desktop back while paused; a monitor that left the
+// desktop is looked for only once a second (missing.rs). Either is how long
+// a share thread may take to notice it was told to stop.
 const IDLE_WAIT: Duration = Duration::from_millis(100);
 const RETRY: Duration = Duration::from_millis(100);
 
@@ -84,7 +87,10 @@ pub struct Capture {
     cap: FpsCap,
     pending: Option<Pending>,
     skipped: u32,
-    paused: bool,
+    // While paused, the reason last told.
+    paused: Option<PauseReason>,
+    // A monitor that left the desktop is waited for (missing.rs).
+    missing: Missing,
     number: u64,
     pointer: (i32, i32, bool),
     qpc_frequency: i64,
@@ -174,7 +180,8 @@ impl Capture {
             cap: FpsCap::new(options.max_fps),
             pending: None,
             skipped: 0,
-            paused: false,
+            paused: None,
+            missing: Missing::default(),
             number: 0,
             pointer: (0, 0, false),
             qpc_frequency: qpc_frequency.max(1),
@@ -214,17 +221,21 @@ impl Capture {
             if self.duplication.is_none() {
                 // The first try is at once, since a mode change is often
                 // over by then; while paused, one try per call, RETRY apart.
-                if self.paused {
+                if self.paused.is_some() {
                     thread::sleep(RETRY);
                 }
                 if let Some(reason) = self.reopen()? {
-                    if self.paused {
+                    // Told again only when the reason changes in kind: a
+                    // monitor that left the desktop has a deadline the
+                    // others do not.
+                    let told = self.paused.as_ref().map(mem::discriminant);
+                    if told == Some(mem::discriminant(&reason)) {
                         return Ok(Next::Idle);
                     }
-                    self.paused = true;
+                    self.paused = Some(reason.clone());
                     return Ok(Next::Paused(reason));
                 }
-                self.paused = false;
+                self.paused = None;
                 idle_at = Instant::now() + IDLE_WAIT;
             }
             let now = Instant::now();
@@ -595,7 +606,8 @@ impl Capture {
         }))
     }
 
-    // Some(reason) when Windows will not give the desktop back yet.
+    // Some(reason) when Windows will not give the desktop back yet, or the
+    // monitor is not listed and has not been away long enough to give up.
     fn reopen(&mut self) -> Result<Option<PauseReason>, CaptureError> {
         #[cfg(test)]
         {
@@ -604,7 +616,21 @@ impl Capture {
                 return Ok(Some(reason.clone()));
             }
         }
-        let (_, output) = find(&self.monitor.id)?;
+        let now = Instant::now();
+        if !self.missing.due(now) {
+            return Ok(Some(PauseReason::Missing));
+        }
+        let output = match find(&self.monitor.id) {
+            Ok((_, output)) => output,
+            Err(err) if err.kind() == ErrorKind::MonitorGone => {
+                return match self.missing.missed(now) {
+                    Missed::Wait => Ok(Some(PauseReason::Missing)),
+                    Missed::GiveUp => Err(err),
+                };
+            }
+            Err(err) => return Err(err),
+        };
+        self.missing.found();
         match duplicate(&self.device, &output, &self.monitor, self.options) {
             Ok((duplication, plan)) => {
                 self.rebuild(plan)?;
@@ -959,7 +985,7 @@ mod tests {
             match capture.next().unwrap() {
                 Next::Frame(_) => {
                     assert_eq!(capture.reopens, 5);
-                    assert!(!capture.paused);
+                    assert!(capture.paused.is_none());
                     return;
                 }
                 Next::Cursor(_) => {}

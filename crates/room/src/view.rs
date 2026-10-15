@@ -130,6 +130,9 @@ pub enum Paused {
     Disconnected,
     // Windows is changing the display.
     Changing,
+    // The shared monitor is off or unplugged; the share stops if it is not
+    // back within about 30 s.
+    Missing,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

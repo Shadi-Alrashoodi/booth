@@ -1818,6 +1818,9 @@ pub(crate) fn paused_sentence(paused: Paused) -> &'static str {
         Paused::Changing => {
             "Sharing is paused while Windows changes the display. It goes on by itself."
         }
+        Paused::Missing => {
+            "Sharing is paused while the monitor is off. It goes on by itself if the monitor is back within 30 seconds."
+        }
     }
 }
 

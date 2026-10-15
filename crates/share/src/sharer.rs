@@ -687,6 +687,11 @@ impl Sharer {
         Ok(())
     }
 
+    // Capture is paused: no picture comes until it gives one again.
+    pub fn paused(&self) -> bool {
+        self.paused
+    }
+
     // Stops the pacer; packets it has not sent are dropped.
     pub fn finish(mut self) -> SharerNumbers {
         self.numbers.pace = self.pacer.numbers();

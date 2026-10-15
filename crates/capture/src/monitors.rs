@@ -437,8 +437,10 @@ pub(crate) fn find(id: &MonitorId) -> Result<(IDXGIAdapter1, IDXGIOutput), Captu
         .into_iter()
         .find(|(_, info)| info.luid == id.adapter_luid)
     else {
+        // Not worth waiting for: a driver that restarted made a new adapter,
+        // and the device capture holds died with the old one.
         return Err(CaptureError::new(
-            ErrorKind::MonitorGone,
+            ErrorKind::DeviceLost,
             format!(
                 "could not find the graphics adapter driving {}: it was removed or its driver restarted. Choose the monitor again",
                 id.device_name
