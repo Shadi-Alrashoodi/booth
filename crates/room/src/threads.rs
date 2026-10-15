@@ -63,6 +63,11 @@ const MAX_STUN_SERVERS: usize = 4;
 // state lock for it. The receive thread builds one at most this often; what
 // came in between is shown by the timer thread at the end of the gap.
 const VIEW_GAP: Duration = Duration::from_millis(10);
+// Instant counts the time this PC is asleep and pace::awake does not, so
+// what the first moved on past the second between two timer passes is time
+// asleep. Under this it is the two read a clock tick apart, or the clocks
+// drifting over a long wait.
+const ASLEEP_AT_LEAST: Duration = Duration::from_secs(1);
 
 pub(crate) enum Side {
     Host(Box<Host>),
@@ -87,6 +92,17 @@ impl Side {
         match self {
             Side::Host(host) => host.on_timer(now, socket),
             Side::Client(client) => client.on_timer(now, socket),
+        }
+    }
+
+    // True when the view changed.
+    fn slept(&mut self, asleep: Duration, now: Instant, socket: &Socket) -> bool {
+        match self {
+            Side::Host(host) => {
+                host.slept(asleep, now);
+                false
+            }
+            Side::Client(client) => client.slept(asleep, now, socket),
         }
     }
 
@@ -1064,6 +1080,22 @@ impl Waiting {
     }
 }
 
+struct Sleeps {
+    at: Instant,
+    awake: Duration,
+}
+
+impl Sleeps {
+    // How long this PC was asleep since the last call, when it was.
+    fn since_last(&mut self, now: Instant, awake: Duration) -> Option<Duration> {
+        let passed = now.saturating_duration_since(self.at);
+        let ran = awake.saturating_sub(self.awake);
+        self.at = now;
+        self.awake = awake;
+        Some(passed.saturating_sub(ran)).filter(|&asleep| asleep >= ASLEEP_AT_LEAST)
+    }
+}
+
 fn timers(shared: &Arc<Shared>, inbox: &Receiver<Command>, timer: Timer) {
     // With every CPU busy, at normal priority this thread woke 6 to 24 ms
     // late at the 99th percentile, waiting for a CPU after its timer fired
@@ -1083,13 +1115,21 @@ fn timers(shared: &Arc<Shared>, inbox: &Receiver<Command>, timer: Timer) {
     // meanwhile.
     let mut relisting = false;
     let mut relist_again = false;
+    let mut sleeps = Sleeps {
+        at: Instant::now(),
+        awake: pace::awake(),
+    };
     loop {
         let now = Instant::now();
+        let asleep = sleeps.since_last(now, pace::awake());
         let (changed, planned, name) = {
             let mut state = lock(&shared.state);
+            // Before the pass, so nothing in it takes the sleep for silence.
+            let woke = asleep.is_some_and(|asleep| state.side.slept(asleep, now, &shared.socket));
             // A view the receive thread held back goes with this pass.
             let owed = std::mem::take(&mut state.view_owed);
-            let changed = state.side.on_timer(now, &shared.socket) || changed_by_command || owed;
+            let changed =
+                state.side.on_timer(now, &shared.socket) || changed_by_command || owed || woke;
             // Commands change the state too, and each one is followed by a
             // pass through here.
             after_step(shared, &mut state, now);
@@ -1328,5 +1368,25 @@ mod tests {
         let two = names[..2].to_vec();
         assert_eq!(first_stun_servers(two.clone(), &log), two);
         assert!(captured.lines().is_empty());
+    }
+
+    #[test]
+    fn sleep_is_what_instant_counted_past_the_awake_time() {
+        let ms = Duration::from_millis;
+        let start = Instant::now();
+        let mut sleeps = Sleeps {
+            at: start,
+            awake: ms(500_000),
+        };
+        // Awake all along, then the two clocks read a tick apart.
+        assert_eq!(sleeps.since_last(start + ms(1_000), ms(501_000)), None);
+        assert_eq!(sleeps.since_last(start + ms(2_000), ms(501_984)), None);
+        // 21 s by Instant, 1 s of it awake.
+        assert_eq!(
+            sleeps.since_last(start + ms(23_000), ms(502_984)),
+            Some(ms(20_000))
+        );
+        // An Instant that stops while the PC sleeps sees no sleep at all.
+        assert_eq!(sleeps.since_last(start + ms(24_000), ms(503_984)), None);
     }
 }

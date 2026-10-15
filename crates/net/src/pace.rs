@@ -44,7 +44,7 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
 };
 
-pub use timer::{Signal, Timer, Woken, wait};
+pub use timer::{Signal, Timer, Woken, awake, wait};
 
 // The high-resolution timer wakes about 0.5 ms late, under 1 ms late at the
 // 99th percentile, and once in a few thousand wakes 1.5 to 3 ms late on a

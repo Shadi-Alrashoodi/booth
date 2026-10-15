@@ -14,6 +14,7 @@ use windows_sys::Win32::System::Threading::{
     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateEventW, CreateWaitableTimerExW, INFINITE,
     SetEvent, SetWaitableTimerEx, TIMER_ALL_ACCESS, WaitForMultipleObjects, WaitForSingleObject,
 };
+use windows_sys::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTime;
 
 // A synchronization timer: a wait that it ends also resets it, so a timer
 // that fired while nobody waited costs one early wake-up at most.
@@ -218,4 +219,16 @@ pub fn wait(signal: &Signal, timer: Option<&Timer>) -> io::Result<Woken> {
 fn wait_error(what: &str) -> io::Error {
     let err = io::Error::last_os_error();
     io::Error::new(err.kind(), format!("could not wait on {what}: {err}"))
+}
+
+// How long this PC has run since it started, to the clock tick, with the
+// time it spent asleep or hibernated left out. An Instant on Windows counts
+// that time, and the room needs to tell the two apart.
+#[allow(unsafe_code)]
+pub fn awake() -> Duration {
+    let mut ticks = 0u64;
+    // SAFETY: `ticks` is a local that outlives the call, which fails only
+    // for a null pointer.
+    unsafe { QueryUnbiasedInterruptTime(&mut ticks) };
+    Duration::from_nanos(ticks.saturating_mul(100))
 }

@@ -1184,6 +1184,24 @@ impl Host {
         changed
     }
 
+    // Instant counted the time this PC was asleep, when nobody could be
+    // heard. A friend heard since the wake, on the receive thread before this
+    // pass, stays heard now rather than ahead of it.
+    pub(crate) fn slept(&mut self, asleep: Duration, now: Instant) {
+        if self.closed {
+            return;
+        }
+        for peer in &mut self.peers {
+            peer.last_heard = (peer.last_heard + asleep).min(now);
+        }
+        log!(
+            self.log,
+            "this pc was asleep for {}; the silence of {} in the room counts from the wake",
+            secs(asleep),
+            counted(self.peers.len() as u64, "friend", "friends")
+        );
+    }
+
     fn gauge(&self) {
         stats::gauge!("room.host.keys", self.keys);
         stats::gauge!("room.host.peers", self.peers);
@@ -5752,6 +5770,60 @@ mod tests {
 
     const OUTSIDE_V6: &str = "[2001:db8::7]:41105";
     const MOVED_V6: &str = "[2001:db8:1::7]:41105";
+
+    // This PC slept 20 s, and nobody in the room was silent for it. Ben was
+    // heard last 5 s before the sleep, so 10 s after the wake makes his
+    // lost_after. Cara, heard after the wake on the receive thread before
+    // the timer pass, counts from then and not past it.
+    #[test]
+    fn time_asleep_is_not_silence() {
+        let start = Instant::now();
+        let (log, captured) = Log::capture(256);
+        let mut rig = Rig::with_log(start, log);
+        let lost_after = rig.host.timers.lost_after;
+        let (mut ben, mut ana, mut cara) = (Guest::new(), Guest::new(), Guest::new());
+        ben.join(&mut rig, "Ben", start);
+        ana.join(&mut rig, "Ana", start + Duration::from_secs(5));
+        let asleep = Duration::from_secs(20);
+        let woke = start + Duration::from_secs(25);
+        cara.join(&mut rig, "Cara", woke);
+        let pass = woke + Duration::from_millis(2);
+        rig.host.slept(asleep, pass);
+        rig.tick(pass);
+        assert_eq!(
+            rig.host.view(pass, 0).people.len(),
+            4,
+            "nobody let go at the wake"
+        );
+        assert!(
+            captured
+                .lines()
+                .iter()
+                .any(|line| line.starts_with("this pc was asleep for 20.0 s;")),
+            "the sleep is logged"
+        );
+        let ben_lost = start + asleep + lost_after;
+        rig.tick(ben_lost - Duration::from_millis(1));
+        assert_eq!(rig.host.view(ben_lost, 0).people.len(), 4);
+        rig.tick(ben_lost);
+        assert_eq!(
+            rig.host.view(ben_lost, 0).people.len(),
+            3,
+            "Ben, 15 s awake and silent"
+        );
+        rig.tick(pass + lost_after - Duration::from_millis(1));
+        assert_eq!(
+            rig.host.view(pass, 0).people.len(),
+            2,
+            "Ana went at the wake plus 15 s"
+        );
+        rig.tick(pass + lost_after);
+        assert_eq!(
+            rig.host.view(pass, 0).people.len(),
+            1,
+            "Cara counted from the pass"
+        );
+    }
 
     // A dual-stack host: one STUN server sees it over IPv4, the other over
     // IPv6, both at `start`. Then the router drops: Ana, in the room from

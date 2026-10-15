@@ -615,6 +615,48 @@ impl Client {
         }
     }
 
+    // Instant counted the time this PC was asleep, when the host could not be
+    // heard. A host that stayed awake lets this PC go at lost_after, and
+    // from then drops its packets as for an unknown session; asleep for
+    // nearly that long, the network coming back after the wake can take the
+    // rest. Then a new handshake, which works either way: what this PC
+    // watches is asked for again behind its Hello, as when a session runs
+    // out, and the host's silence counts from the wake. A shorter sleep
+    // keeps the session, which also keeps this PC's own share and remote
+    // control. True when the view changed.
+    pub(crate) fn slept(&mut self, asleep: Duration, now: Instant, socket: &Socket) -> bool {
+        if self.state == LinkState::Closed {
+            return false;
+        }
+        let on = |at: Instant| (at + asleep).min(now);
+        self.last_heard = (self.last_heard + asleep).min(now);
+        self.silent_since = self.silent_since.map(on);
+        self.name_new_since = self.name_new_since.map(on);
+        let rejoin = asleep + self.timers.reconnecting_after >= self.timers.lost_after
+            && matches!(self.state, LinkState::Live | LinkState::Reconnecting);
+        if !rejoin {
+            log!(
+                self.log,
+                "this pc was asleep for {}; the host's silence counts from the wake",
+                secs(asleep)
+            );
+            return false;
+        }
+        log!(
+            self.log,
+            "this pc was asleep for {}; the host may have let it go meanwhile, so it joins again with a new handshake and keeps what it watches",
+            secs(asleep)
+        );
+        if self.state == LinkState::Live {
+            self.state = LinkState::Reconnecting;
+            self.silence_began(now, socket);
+        }
+        self.last_heard = now;
+        self.back_to_ladder(now);
+        self.fast_until = Some(now + FAST_PHASE);
+        true
+    }
+
     pub(crate) fn on_timer(&mut self, now: Instant, socket: &Socket) -> bool {
         self.gauge();
         if self.state == LinkState::Closed {
@@ -2713,6 +2755,42 @@ mod tests {
             assert!(rig.client.secret.is_some());
             (rig, session)
         }
+    }
+
+    // Asleep longer than reconnecting_after: the host may have let this PC
+    // go, so it joins again at the wake rather than lost_after later, and
+    // keeps what it watches. A short sleep only moves the silence on.
+    #[test]
+    fn joins_again_at_the_wake_and_keeps_the_watch() {
+        let timers = Timers::default();
+        let start = Instant::now();
+        let (mut rig, _) = Rig::connected(timers, start);
+        rig.client.screen.watched = Some(4);
+        rig.host.wire.packets();
+        let woke = start + Duration::from_secs(20);
+        assert!(rig.client.slept(Duration::from_secs(20), woke, &rig.socket));
+        assert_eq!(rig.client.state, LinkState::Reconnecting);
+        rig.tick(woke);
+        let (kind, mut session, response) = rig.host.answer_all(woke).pop().expect("a try");
+        assert_eq!(kind, InitKind::Known, "a new handshake at the wake");
+        rig.deliver(&response, woke);
+        assert!(rig.host.open_all(&mut session) > 0);
+        rig.deliver(&ping(&mut session, 0), woke);
+        assert_eq!(rig.client.state, LinkState::Live);
+        assert_eq!(rig.client.screen.watched, Some(4), "the watch is kept");
+
+        // Too short for a host that stayed awake to have let it go: the
+        // session stays, and the sleep is not silence.
+        let heard = woke + Duration::from_secs(1);
+        rig.deliver(&ping(&mut session, 1), heard);
+        let napped = heard + Duration::from_secs(8);
+        assert!(
+            !rig.client
+                .slept(Duration::from_secs(8), napped, &rig.socket)
+        );
+        assert!(rig.client.sessions.current.is_some());
+        rig.tick(napped + timers.reconnecting_after - Duration::from_millis(1));
+        assert_eq!(rig.client.state, LinkState::Live, "the nap is not silence");
     }
 
     #[test]
