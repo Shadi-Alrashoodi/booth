@@ -23,7 +23,7 @@ Press Host, then Copy, and send the invite to a friend. They paste it under Join
 
 If a friend cannot get in, Booth gives them a code for the host to paste under the invite. Failing that, forward UDP 41000 to the host's PC, or use Tailscale or WireGuard.
 
-The first time, Booth asks for administrator rights to add its firewall rule. Use a wired or USB headset: Booth has no echo cancellation.
+The first time, Booth asks for administrator rights to add its firewall rule. On Windows 11 22H2 or later Booth asks Windows to cancel echo, and Settings says under Echo cancellation whether your microphone has it. Where it has none, use a wired or USB headset.
 
 Push to talk is on by default: hold Right Ctrl to talk. Hotkeys work while a game has focus, unless the game runs as administrator. See and change them in Settings.
 
@@ -33,6 +33,7 @@ Push to talk is on by default: hold Right Ctrl to talk. Hotkeys work while a gam
 - Screen sharing with Desktop Duplication and GPU encoding, H.264 or HEVC, up to 1440p at 120 fps. On Intel graphics Booth encodes in software for now, H.264 up to 1080p at 60 fps.
 - Median capture to display on my PCs: about 5 ms at 1440p120 with host and viewer on one PC, 22 to 32 ms over the internet to a laptop on Wi-Fi.
 - Ping, jitter and loss always on screen in a room.
+- Echo cancellation where Windows has it, noise suppression (off by default, it adds 10 to 20 ms), automatic volume, and a volume for each friend.
 
 ## Building
 
