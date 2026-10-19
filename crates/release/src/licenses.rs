@@ -36,6 +36,24 @@ const STANDARD: &[(&str, &str)] = &[
     ("BSL-1.0", include_str!("../licenses/BSL-1.0.txt")),
 ];
 
+// Crates under MIT that ship no text of it and no copyright notice, and
+// whose repository has none either, each read by a person for that version.
+// The MIT text goes in without the template's copyright line, which nothing
+// fills, after a note that says so in Booth's words.
+struct Answer {
+    name: &'static str,
+    version: &'static str,
+    note: &'static str,
+}
+
+const ANSWERS: &[Answer] = &[Answer {
+    name: "realfft",
+    version: "3.5.0",
+    note: "realfft 3.5.0 gives its license as MIT in its Cargo.toml and README, and neither the crate nor its repository (https://github.com/HEnquist/realfft, tag v3.5.0) has a license file or a copyright notice. Its Cargo.toml names HEnquist <henrik.enquist@gmail.com> as its author. The MIT license follows without the copyright line, for which there is no notice to copy.",
+}];
+
+const MIT_TEMPLATE: &str = include_str!("../licenses/MIT.txt");
+
 // Code in Booth's own crates copied from another project, and the pinned file
 // in third_party whose notice covers it. tools\fetch-third-party.ps1 checks
 // that file against its hash.
@@ -282,7 +300,14 @@ pub fn license_crate(package: &Package) -> Result<(Crate, Option<String>), Strin
     // other licenses; then the preferred licenses.
     let chosen: Vec<String> = alternatives
         .into_iter()
-        .filter(|set| set.iter().all(|l| shipped(l) || own_words || standard_text(l).is_some()))
+        .filter(|set| {
+            set.iter().all(|l| {
+                shipped(l)
+                    || own_words
+                    || standard_text(l).is_some()
+                    || answered(package, l).is_some()
+            })
+        })
         .min_by_key(|set| {
             (
                 set.iter().filter(|l| !shipped(l)).count(),
@@ -349,6 +374,16 @@ pub fn license_crate(package: &Package) -> Result<(Crate, Option<String>), Strin
             manual = Some(format!(
                 "{label}: ships no {license} text; the standard text is used"
             ));
+        } else if let Some(text) = answered(package, license) {
+            texts.push(Text {
+                label: license.clone(),
+                from: None,
+                body: text,
+                standard: true,
+            });
+            manual = Some(format!(
+                "{label}: ships no {license} text or notice anywhere; the release tool's answer is used"
+            ));
         }
     }
     for (i, file) in files.iter().enumerate() {
@@ -389,6 +424,20 @@ fn standard_text(license: &str) -> Option<&'static str> {
         .iter()
         .find(|(id, _)| *id == license)
         .map(|(_, text)| *text)
+}
+
+// The note, then the MIT text from its grant on, for a crate in ANSWERS.
+fn answered(package: &Package, license: &str) -> Option<String> {
+    let answer = ANSWERS
+        .iter()
+        .find(|a| a.name == package.name && a.version == package.version)
+        .filter(|_| license == "MIT")?;
+    let grant = MIT_TEMPLATE.find("Permission is hereby granted")?;
+    Some(format!(
+        "{}\n{}",
+        wrap(answer.note, ""),
+        normalize(&MIT_TEMPLATE[grant..])
+    ))
 }
 
 // "GPL-2.0-only", "GPL-2.0-or-later" and "GPL-2.0+" share one text, and an
@@ -950,6 +999,31 @@ mod tests {
             err.contains("sample 1.0.0") && err.contains("add an answer"),
             "{err}"
         );
+    }
+
+    // A crate answered by hand gets the MIT grant after its note, with no
+    // made-up copyright line, and only the version that was read.
+    #[test]
+    fn answered_crate_gets_the_grant_and_its_note() {
+        let folder = Folder::new("answered");
+        let mut package = folder.package("MIT");
+        package.name = "realfft".into();
+        package.version = "3.5.0".into();
+        let (krate, manual) = license_crate(&package).unwrap();
+        assert_eq!(krate.texts.len(), 1);
+        let text = &krate.texts[0];
+        assert!(text.standard);
+        assert!(
+            text.body
+                .starts_with("realfft 3.5.0 gives its license as MIT")
+        );
+        assert!(text.body.contains("\n\nPermission is hereby granted"));
+        assert!(!text.body.contains("<year>") && !text.body.contains("Copyright"));
+        assert!(manual.unwrap().contains("answer"));
+
+        package.version = "3.5.1".into();
+        let err = license_crate(&package).err().unwrap();
+        assert!(err.contains("add an answer"), "{err}");
     }
 
     // The GPL text is recognised as the other half of the choice, so it is
