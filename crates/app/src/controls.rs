@@ -633,6 +633,130 @@ fn value_at(x: f32, left: f32, right: f32, lowest: u32, highest: u32) -> u32 {
     lowest + (fraction * (highest - lowest) as f32).round() as u32
 }
 
+// The meter below on a slider's row, with a handle for a level in dB within
+// `range`: the bar is the sound, the handle where it starts to count. The
+// whole line runs from `floor` dB of full scale to 0, and `sound` is the
+// level and its peak as meter takes them. Drag or click on the line; with
+// focus the arrow keys step by 1 dB, Page Up and Page Down by 10, Home and
+// End go to the ends of `range`. The value is written at the right.
+pub fn level_slider(
+    ui: &mut Ui,
+    id: Id,
+    value: &mut i32,
+    range: RangeInclusive<i32>,
+    floor: i32,
+    sound: (f32, f32),
+    label: &str,
+) -> Response {
+    let (lowest, highest) = (*range.start(), (*range.end()).max(*range.start()));
+    let widest = text_width(ui, &format!("{lowest} dB"), theme::mono());
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::hover());
+    let track_rect = Rect::from_min_max(
+        rect.min,
+        pos2(
+            (rect.right() - widest - SIDE).max(rect.left()),
+            rect.bottom(),
+        ),
+    );
+    let mut response = ui.interact(track_rect, id, Sense::click_and_drag());
+    let (left, right) = (
+        track_rect.left() + HANDLE.x / 2.0,
+        (track_rect.right() - HANDLE.x / 2.0).max(track_rect.left() + HANDLE.x / 2.0),
+    );
+    let span = (-floor).max(1);
+    let before = *value;
+    let mut next = (*value).clamp(lowest, highest);
+    if let Some(pointer) = response.interact_pointer_pos()
+        && right > left
+    {
+        let fraction = ((pointer.x - left) / (right - left)).clamp(0.0, 1.0);
+        next = (floor + (fraction * span as f32).round() as i32).clamp(lowest, highest);
+    }
+    if response.has_focus() {
+        ui.memory_mut(|memory| {
+            memory.set_focus_lock_filter(
+                id,
+                EventFilter {
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    ..EventFilter::default()
+                },
+            );
+        });
+        next = ui.input(|input| {
+            let presses = |key| input.num_presses(key) as i32;
+            if presses(Key::Home) > 0 {
+                return lowest;
+            }
+            if presses(Key::End) > 0 {
+                return highest;
+            }
+            let step = presses(Key::ArrowRight) + presses(Key::ArrowUp)
+                - presses(Key::ArrowLeft)
+                - presses(Key::ArrowDown)
+                + 10 * (presses(Key::PageUp) - presses(Key::PageDown));
+            (next + step).clamp(lowest, highest)
+        });
+    }
+    ui.input(|input| {
+        let requests = |action| input.num_accesskit_action_requests(id, action) as i32;
+        let step = requests(accesskit::Action::Increment) - requests(accesskit::Action::Decrement);
+        next = (next + step).clamp(lowest, highest);
+    });
+    *value = next;
+    if next != before {
+        response.mark_changed();
+    }
+    response.widget_info(|| WidgetInfo::slider(true, f64::from(next), label));
+    ui.ctx().accesskit_node_builder(id, |node| {
+        node.set_min_numeric_value(f64::from(lowest));
+        node.set_max_numeric_value(f64::from(highest));
+        node.set_numeric_value_step(1.0);
+    });
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let per_point = ui.pixels_per_point();
+    let line = |to: f32| {
+        Rect::from_min_max(
+            pos2(track_rect.left(), rect.center().y - TRACK / 2.0),
+            pos2(
+                track_rect.left() + track_rect.width() * to.clamp(0.0, 1.0),
+                rect.center().y + TRACK / 2.0,
+            ),
+        )
+        .round_to_pixels(per_point)
+    };
+    let painter = ui.painter();
+    painter.rect_filled(line(1.0), TRACK_RADIUS, theme::CONTROL);
+    let (level, peak) = sound;
+    for (to, color) in [(peak.max(level), ASH), (level, CHALK)] {
+        if to > 0.0 {
+            painter.rect_filled(line(to), TRACK_RADIUS, color);
+        }
+    }
+    let at = left + (right - left) * (next - floor) as f32 / span as f32;
+    let handle =
+        Rect::from_center_size(pos2(at, rect.center().y), HANDLE).round_to_pixels(per_point);
+    painter.rect_filled(handle, TRACK_RADIUS, CHALK);
+    let mut text = ui.new_child(
+        UiBuilder::new()
+            .max_rect(Rect::from_min_max(
+                pos2(track_rect.right(), rect.top()),
+                rect.max,
+            ))
+            .layout(Layout::right_to_left(Align::Center)),
+    );
+    one_line(&mut text, &format!("{next} dB"), theme::mono(), CHALK);
+    if response.has_focus() && keyboard_focus(ui) {
+        ring(
+            ui,
+            track_rect.shrink2(vec2(0.0, (ROW_HEIGHT - HANDLE.y) / 2.0)),
+        );
+    }
+    response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
 // A level along the same 4 px track as the slider, in chalk up to the level
 // and in ash on to its peak: a level is not a verdict, so it is never sage.
 pub fn meter(ui: &mut Ui, fraction: f32, peak: f32, label: &str) {
@@ -1243,6 +1367,40 @@ pub(crate) mod tests {
         let middle = line.center().x;
         let at = value_at(middle, line.left() + 3.0, line.right() - 3.0, 1, 80);
         assert!((40..=41).contains(&at), "{at}");
+    }
+
+    // The sensitivity on the meter's own -60 to 0 scale: its keys as the
+    // slider's, kept within -60 to -20, and a click past -20 on the line
+    // stops there.
+    #[test]
+    fn level_slider_keys_and_click() {
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        let id = Id::new("sensitivity");
+        let mut value = -50;
+        let step = |events: Vec<Event>, value: &mut i32| {
+            frame(&ctx, events, |ui| {
+                level_slider(ui, id, value, -60..=-20, -60, (0.4, 0.6), "S").rect
+            })
+            .0
+        };
+        let line = step(Vec::new(), &mut value);
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        step(Vec::new(), &mut value);
+        step(vec![key(Key::ArrowRight), key(Key::PageUp)], &mut value);
+        assert_eq!(value, -39);
+        step(vec![key(Key::End)], &mut value);
+        assert_eq!(value, -20);
+        step(vec![key(Key::PageDown); 9], &mut value);
+        assert_eq!(value, -60);
+        let near_end = pos2(line.right() - 2.0, line.center().y);
+        step(press(near_end), &mut value);
+        step(release(near_end), &mut value);
+        assert_eq!(value, -20);
+        let middle = pos2(line.center().x, line.center().y);
+        step(press(middle), &mut value);
+        step(release(middle), &mut value);
+        assert!((-31..=-29).contains(&value), "{value}");
     }
 
     // One device pixel until the scale reaches 200 percent, never a part of

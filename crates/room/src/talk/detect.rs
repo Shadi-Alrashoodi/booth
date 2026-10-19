@@ -20,9 +20,10 @@ const ONSET_DB: f32 = 12.0;
 // Once started, a block this far over the floor still counts as voice, so
 // the end of a word does not end it early.
 const HOLD_DB: f32 = 6.0;
-// Nothing quieter is a voice however quiet the room: a microphone that
-// gives digital silence would otherwise send on its own hiss.
-const QUIETEST_VOICE_DB: f32 = -50.0;
+// Nothing quieter is a voice however quiet the room, unless the open mic
+// sensitivity in Settings says otherwise: a microphone that gives digital
+// silence would otherwise send on its own hiss.
+pub const QUIETEST_VOICE_DB: i8 = -50;
 // The floor follows a quieter room at once and a louder one no faster than
 // this, so a voice that goes on for more than a second, or music, does not
 // become the floor and cut itself off.
@@ -41,6 +42,7 @@ pub(crate) struct Detector {
     heard: usize,
     floor: f32,
     voice: bool,
+    quietest_db: f32,
     // Samples of tail left once the voice stopped.
     tail: usize,
     // Uniform over 0..=u32::MAX; the operating system's generator outside
@@ -60,8 +62,17 @@ impl Detector {
             heard: 0,
             floor: SILENCE_DB,
             voice: false,
+            quietest_db: f32::from(QUIETEST_VOICE_DB),
             tail: 0,
             random,
+        }
+    }
+
+    // Nothing quieter than `db` is a voice.
+    pub(crate) fn quietest(self, db: i8) -> Detector {
+        Detector {
+            quietest_db: f32::from(db),
+            ..self
         }
     }
 
@@ -96,7 +107,7 @@ impl Detector {
         };
 
         let over = if self.voice { HOLD_DB } else { ONSET_DB };
-        let voice = level >= QUIETEST_VOICE_DB && level >= self.floor + over;
+        let voice = level >= self.quietest_db && level >= self.floor + over;
         if voice {
             self.voice = true;
             self.tail = 0;
@@ -252,6 +263,19 @@ mod tests {
         let voice = tone(400, 0.1, 0);
         let sent = run(&mut detector, &voice);
         assert!(sent.iter().all(|&on| on));
+    }
+
+    // A sensitivity of -40 turns away a voice at -45 that the room's floor
+    // alone would send, and the default sends it.
+    #[test]
+    fn the_sensitivity_turns_away_what_is_quieter() {
+        let mut seed = 13;
+        let mut quiet_room = noise(1000, -75.0, &mut seed);
+        quiet_room.extend(tone(300, 10f32.powf(-42.0 / 20.0), 0));
+        let sent = |detector: &mut Detector| run(detector, &quiet_room).iter().any(|&on| on);
+        assert!(sent(&mut Detector::with_random(|| 0)));
+        assert!(!sent(&mut Detector::with_random(|| 0).quietest(-40)));
+        assert!(sent(&mut Detector::with_random(|| 0).quietest(-60)));
     }
 
     #[test]

@@ -36,6 +36,7 @@ mod wire;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
+use std::ops::RangeInclusive;
 use std::sync::atomic::{
     AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
@@ -116,8 +117,14 @@ pub struct VoiceConfig {
     // speech. On by default; each person can turn it off for their own
     // stream.
     pub constant_rate: bool,
+    // In open mic, nothing quieter than this is a voice, in dB of full
+    // scale, SENSITIVITY_DB at most.
+    pub sensitivity_db: i8,
     pub devices: Devices,
 }
+
+pub use detect::QUIETEST_VOICE_DB as DEFAULT_SENSITIVITY_DB;
+pub const SENSITIVITY_DB: RangeInclusive<i8> = -60..=-20;
 
 impl Default for VoiceConfig {
     fn default() -> VoiceConfig {
@@ -126,6 +133,7 @@ impl Default for VoiceConfig {
             output: Choice::Default,
             talk: TalkMode::PushToTalk,
             constant_rate: true,
+            sensitivity_db: DEFAULT_SENSITIVITY_DB,
             devices: Devices::Windows,
         }
     }
@@ -236,6 +244,7 @@ impl Timing {
 pub(crate) struct Shared {
     talk: TalkMode,
     constant_rate: bool,
+    sensitivity_db: i8,
     // A host sends its own voice as Relayed from its own slot, since
     // clients take only that kind.
     host: bool,
@@ -285,6 +294,9 @@ impl Shared {
         Arc::new(Shared {
             talk: config.talk,
             constant_rate: config.constant_rate,
+            sensitivity_db: config
+                .sensitivity_db
+                .clamp(*SENSITIVITY_DB.start(), *SENSITIVITY_DB.end()),
             host,
             held: AtomicBool::new(false),
             muted: AtomicBool::new(false),

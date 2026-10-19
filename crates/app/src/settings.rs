@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use input::{Action, Bindings, Chord};
 use invite::BuildError;
-use room::TalkMode;
+use room::{DEFAULT_SENSITIVITY_DB, SENSITIVITY_DB, TalkMode};
 use voice::audio::{Choice, Direction};
 
 const FILE: &str = "settings.txt";
@@ -23,6 +23,8 @@ const INPUT_DEVICE: &str = "input_device";
 const OUTPUT_DEVICE: &str = "output_device";
 const TALK_MODE: &str = "talk_mode";
 const CONSTANT_RATE_VOICE: &str = "constant_rate_voice";
+// In dB, written only when moved off room::DEFAULT_SENSITIVITY_DB.
+const OPEN_MIC_SENSITIVITY: &str = "open_mic_sensitivity";
 const HOTKEY_PUSH_TO_TALK: &str = "hotkey_push_to_talk";
 const HOTKEY_MUTE: &str = "hotkey_mute";
 const HOTKEY_DEAFEN: &str = "hotkey_deafen";
@@ -40,7 +42,7 @@ const SHARE_MONITOR: &str = "share_monitor";
 // address. Only on is saved.
 const CHECK_FOR_NEW_VERSIONS: &str = "check_for_new_versions";
 // Every key this version knows, in the order a save adds the missing ones.
-const KEYS: [&str; 20] = [
+const KEYS: [&str; 21] = [
     NAME,
     PORT,
     STUN_SERVERS,
@@ -56,6 +58,7 @@ const KEYS: [&str; 20] = [
     OUTPUT_DEVICE,
     TALK_MODE,
     CONSTANT_RATE_VOICE,
+    OPEN_MIC_SENSITIVITY,
     VIDEO_UPLOAD_MBITS,
     VSYNC_IN_VIEWER,
     HIDE_STRIP_IN_FULLSCREEN,
@@ -93,6 +96,8 @@ pub struct Settings {
     // Push to talk and constant-rate voice, the defaults, are never saved.
     open_mic: bool,
     variable_rate: bool,
+    // None means room::DEFAULT_SENSITIVITY_DB.
+    sensitivity_db: Option<i8>,
     // Only the ones off their defaults are saved.
     hotkeys: Bindings,
     // None means DEFAULT_UPLOAD_MBITS. Vsync and the strip's hide are off
@@ -245,6 +250,15 @@ impl Settings {
         self.hotkeys = hotkeys;
     }
 
+    pub fn sensitivity_db(&self) -> i8 {
+        self.sensitivity_db.unwrap_or(DEFAULT_SENSITIVITY_DB)
+    }
+
+    pub fn set_sensitivity_db(&mut self, db: i8) {
+        let db = db.clamp(*SENSITIVITY_DB.start(), *SENSITIVITY_DB.end());
+        self.sensitivity_db = (db != DEFAULT_SENSITIVITY_DB).then_some(db);
+    }
+
     pub fn upload_mbits(&self) -> u32 {
         self.upload_mbits.unwrap_or(DEFAULT_UPLOAD_MBITS)
     }
@@ -353,6 +367,7 @@ impl Settings {
             OUTPUT_DEVICE => self.output_device.clone(),
             TALK_MODE => self.open_mic.then(|| String::from(OPEN_MIC)),
             CONSTANT_RATE_VOICE => self.variable_rate.then(|| String::from("off")),
+            OPEN_MIC_SENSITIVITY => self.sensitivity_db.map(|db| db.to_string()),
             VIDEO_UPLOAD_MBITS => self.upload_mbits.map(|mbits| mbits.to_string()),
             VSYNC_IN_VIEWER => self.vsync.then(|| String::from("on")),
             HIDE_STRIP_IN_FULLSCREEN => self.hide_strip.then(|| String::from("on")),
@@ -425,6 +440,20 @@ impl Settings {
                         ));
                     }
                 };
+            }
+            OPEN_MIC_SENSITIVITY => {
+                let db = value
+                    .parse::<i8>()
+                    .ok()
+                    .filter(|db| SENSITIVITY_DB.contains(db))
+                    .ok_or_else(|| {
+                        format!(
+                            "{OPEN_MIC_SENSITIVITY} is a number of dB from {} to {}; set it again in settings",
+                            SENSITIVITY_DB.start(),
+                            SENSITIVITY_DB.end()
+                        )
+                    })?;
+                self.set_sensitivity_db(db);
             }
             VIDEO_UPLOAD_MBITS => {
                 let mbits = value
@@ -1141,6 +1170,34 @@ mod tests {
                 "settings: line 2 skipped: constant_rate_voice is on or off; set it again in settings",
             ]
         );
+    }
+
+    // Written only when moved off -50, kept within -60 to -20, and a value
+    // outside that or not a number is a line skipped and said.
+    #[test]
+    fn open_mic_sensitivity_round_trip() {
+        let folder = Folder::new("sensitivity");
+        let mut settings = Settings::default();
+        assert_eq!(settings.sensitivity_db(), -50);
+        settings.set_sensitivity_db(-35);
+        settings.save(&folder.0).unwrap();
+        assert_eq!(
+            fs::read_to_string(folder.file()).unwrap(),
+            "open_mic_sensitivity = -35\r\n"
+        );
+        let (loaded, _) = Settings::load(&folder.0);
+        assert_eq!(loaded.sensitivity_db(), -35);
+        settings.set_sensitivity_db(-90);
+        assert_eq!(settings.sensitivity_db(), -60);
+        settings.set_sensitivity_db(-50);
+        assert_eq!(settings, Settings::default());
+        let (settings, problems) =
+            parse(b"open_mic_sensitivity = -10\nopen_mic_sensitivity = loud\n");
+        assert_eq!(settings, Settings::default());
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems[0].ends_with(
+            "open_mic_sensitivity is a number of dB from -60 to -20; set it again in settings"
+        ));
     }
 
     #[test]

@@ -52,7 +52,7 @@ impl Mouth {
             repair: Encoder::new(Mode::Repair, constant_rate)?,
             mode: Mode::LowDelay,
             expected_loss: 0,
-            detector: Detector::new(),
+            detector: Detector::new().quietest(shared.sensitivity_db),
             pcm: [0.0; MAX_FRAME],
             filled: 0,
             first: None,

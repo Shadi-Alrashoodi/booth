@@ -2,7 +2,9 @@ use eframe::egui::{
     Align, Key, Layout, Rect, Response, ScrollArea, Sense, Ui, UiBuilder, WidgetType, vec2,
 };
 use input::{Action, Bindings, Chord};
-use room::{BlockedKey, KnownDevice, KnownDevices, TalkMode};
+use room::{
+    BlockedKey, DEFAULT_SENSITIVITY_DB, KnownDevice, KnownDevices, SENSITIVITY_DB, TalkMode,
+};
 use voice::audio::{Choice, DeviceList, Direction};
 use zeroize::Zeroize;
 
@@ -40,6 +42,7 @@ pub struct Draft {
     pub output: Choice,
     pub talk: TalkMode,
     pub constant_rate: bool,
+    pub sensitivity_db: i8,
     pub upload_mbits: u32,
     pub vsync: bool,
     pub hide_strip: bool,
@@ -102,6 +105,7 @@ impl Draft {
             output: saved.device(Direction::Output),
             talk: saved.talk_mode(),
             constant_rate: saved.constant_rate(),
+            sensitivity_db: saved.sensitivity_db(),
             upload_mbits: saved.upload_mbits(),
             vsync: saved.vsync(),
             hide_strip: saved.hide_strip(),
@@ -131,6 +135,7 @@ impl Draft {
         next.set_device(Direction::Output, &self.output);
         next.set_talk_mode(self.talk);
         next.set_constant_rate(self.constant_rate);
+        next.set_sensitivity_db(self.sensitivity_db);
         next.set_upload_mbits(self.upload_mbits);
         next.set_vsync(self.vsync);
         next.set_hide_strip(self.hide_strip);
@@ -451,11 +456,12 @@ fn refused_line(draft: &Draft, action: Action) -> Option<String> {
     Some(messages::key_used(other))
 }
 
-// The input and output device, each a list with Windows default first.
-// Under the input list, the warning for a thin or hands-free microphone,
-// then the meter of the microphone this screen has open. Then how you talk
-// and constant-rate voice, each with its one sentence when it is the choice
-// that costs something.
+// The input device, a list with Windows default first, with the warning for
+// a thin or hands-free microphone under it. Then how you talk, and the meter
+// of the microphone this screen has open, after what the room does to it;
+// in open mic the meter is also the sensitivity, a handle on its own scale.
+// Then the output device, and constant-rate voice. Each choice that costs
+// something has its one sentence.
 fn voice(ui: &mut Ui, draft: &mut Draft, audio: &SettingsAudio) {
     ui.add_space(SECTION_GAP);
     head(ui, "Voice");
@@ -475,20 +481,6 @@ fn voice(ui: &mut Ui, draft: &mut Draft, audio: &SettingsAudio) {
     if let Some(warning) = audio.microphone().and_then(messages::microphone_warning) {
         line(ui, &warning, WARN);
     }
-    ui.add_space(STEP);
-    // The loudest 5 ms block is what the open mic gate goes by.
-    let (level, peak) = audio.level().map_or((0.0, 0.0), |level| {
-        (meter_fraction(level.loudest), meter_fraction(level.peak))
-    });
-    controls::meter(ui, level, peak, "Microphone level");
-    match audio.problem() {
-        Some(problem) => line(ui, problem, BAD),
-        None => line(ui, messages::MICROPHONE_OPEN, ASH),
-    };
-
-    ui.add_space(FIELD_GAP);
-    label(ui, "Output device");
-    device_list(ui, Direction::Output, &mut draft.output, outputs);
 
     ui.add_space(FIELD_GAP);
     label(ui, "How you talk");
@@ -505,6 +497,31 @@ fn voice(ui: &mut Ui, draft: &mut Draft, audio: &SettingsAudio) {
     if draft.talk == TalkMode::OpenMic {
         line(ui, messages::OPEN_MIC, ASH);
     }
+
+    ui.add_space(STEP);
+    // The loudest 5 ms block is what the open mic gate goes by.
+    let (level, peak) = audio.level().map_or((0.0, 0.0), |level| {
+        (meter_fraction(level.loudest), meter_fraction(level.peak))
+    });
+    if draft.talk == TalkMode::OpenMic {
+        let id = ui.id().with("sensitivity");
+        let mut db = i32::from(draft.sensitivity_db);
+        let range = i32::from(*SENSITIVITY_DB.start())..=i32::from(*SENSITIVITY_DB.end());
+        let floor = METER_FLOOR_DB as i32;
+        let sound = (level, peak);
+        controls::level_slider(ui, id, &mut db, range, floor, sound, "Open mic sensitivity");
+        draft.sensitivity_db = i8::try_from(db).unwrap_or(DEFAULT_SENSITIVITY_DB);
+    } else {
+        controls::meter(ui, level, peak, "Microphone level");
+    }
+    match audio.problem() {
+        Some(problem) => line(ui, problem, BAD),
+        None => line(ui, messages::MICROPHONE_OPEN, ASH),
+    };
+
+    ui.add_space(FIELD_GAP);
+    label(ui, "Output device");
+    device_list(ui, Direction::Output, &mut draft.output, outputs);
 
     ui.add_space(FIELD_GAP);
     let id = ui.id().with("constant rate");
@@ -868,6 +885,19 @@ mod tests {
         let next = draft.settings(&saved).unwrap();
         assert_eq!(next.talk_mode(), TalkMode::PushToTalk);
         assert!(!next.constant_rate());
+    }
+
+    #[test]
+    fn sensitivity_saved() {
+        let mut draft = typed("");
+        assert_eq!(draft.sensitivity_db, -50);
+        draft.sensitivity_db = -32;
+        let next = draft.settings(&Settings::default()).unwrap();
+        assert_eq!(next.sensitivity_db(), -32);
+        assert_eq!(
+            Draft::new(&next, KnownDevices::default(), String::new()).sensitivity_db,
+            -32
+        );
     }
 
     fn chord(text: &str) -> Chord {

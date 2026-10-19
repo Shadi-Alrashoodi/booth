@@ -132,6 +132,7 @@ impl Setup {
             output: self.settings.device(Direction::Output),
             talk: self.settings.talk_mode(),
             constant_rate: self.settings.constant_rate(),
+            sensitivity_db: self.settings.sensitivity_db(),
             #[cfg(feature = "memstats")]
             devices: crate::memstats::devices().unwrap_or(Devices::Windows),
             #[cfg(not(feature = "memstats"))]

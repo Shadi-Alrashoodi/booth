@@ -956,7 +956,7 @@ mod tests {
         let ctx = context();
         let mut menu = RowMenu::default();
         let mut percent = 100;
-        let mut draw = |events: Vec<Event>, menu: &mut RowMenu, percent: &mut u32| {
+        let draw = |events: Vec<Event>, menu: &mut RowMenu, percent: &mut u32| {
             let (row, _) = frame(&ctx, events, |ui| {
                 let (rect, _) = ui.allocate_exact_size(vec2(360.0, ROW_HEIGHT), Sense::hover());
                 let row = ui.interact(rect, ui.id().with("tom's row"), Sense::click());

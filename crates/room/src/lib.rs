@@ -71,7 +71,9 @@ pub use remote::{
 pub use reply::{ReplyAccepted, ReplyRefused};
 // What the panel needs to name a monitor and say how the viewer opens.
 pub use share::{Capturing, Monitor, MonitorId, Show, monitors};
-pub use talk::{Devices, MOST_VOLUME, TalkMode, VoiceConfig};
+pub use talk::{
+    DEFAULT_SENSITIVITY_DB, Devices, MOST_VOLUME, SENSITIVITY_DB, TalkMode, VoiceConfig,
+};
 pub use threads::AddressHook;
 pub use view::View;
 
