@@ -60,6 +60,16 @@ impl Processor {
         self.volume.gain_db()
     }
 
+    // On the capture thread, when the microphone opened again after a gap,
+    // or another one did: no half block from before it goes out with what
+    // comes after, and the gain starts over for whichever microphone this
+    // is. RNNoise keeps its memory of the last block, since a new one would
+    // allocate here; at most its fade out of the old sound is heard.
+    pub fn restart(&mut self) {
+        self.denoise.clear();
+        self.volume = Volume::new();
+    }
+
     // For the panel, which reads it whenever it draws.
     pub fn level(&self) -> Arc<Level> {
         Arc::clone(&self.level)

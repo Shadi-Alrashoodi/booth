@@ -95,6 +95,19 @@ impl Mouth {
         stats::gauge!("room.mouth.sealed", self.sealed);
     }
 
+    // The microphone opened again after a gap. The part of a frame from
+    // before it does not go out with what comes after, and a spell that was
+    // going ended with the gap, as when the stream closes (see Drop).
+    pub(crate) fn restart(&mut self) {
+        self.filled = 0;
+        self.first = None;
+        if self.sending {
+            self.sending = false;
+            self.shared.sending.store(false, Ordering::Relaxed);
+            self.shared.changed();
+        }
+    }
+
     fn frame(&mut self) {
         let frame = self.mode.frame_samples();
         let heard = match self.shared.talk {

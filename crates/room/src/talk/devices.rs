@@ -14,7 +14,7 @@
 // over, whatever the headset's driver does in between.
 
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -492,21 +492,40 @@ fn open_microphone(
     let wanted = (config.noise_suppression, config.automatic_volume);
     let switches = Arc::new(Switches::new(wanted.0, wanted.1));
     let mut processor = Processor::new(Arc::clone(&switches));
+    // Set at each open: a microphone opened again after a gap, or another
+    // one once Windows' default moved, starts afresh.
+    let fresh = Arc::new(AtomicBool::new(false));
+    let opened = Arc::clone(&fresh);
     let audio = move |samples: &[f32], at: Instant| {
+        if fresh.swap(false, Ordering::Relaxed) {
+            processor.restart();
+            mouth.restart();
+        }
         let (samples, at) = processor.run(samples, at);
         mouth.hear(samples, at);
     };
     let mut said = on_event(Arc::clone(shared), log.clone(), Side::Microphone);
+    let away = Arc::clone(shared);
     // Where Windows already suppresses noise or evens out the volume on
     // this microphone, Booth's own stage stands down rather than do it
-    // twice. Opened comes before the first packet.
+    // twice. Opened comes before the first packet, on the same thread.
     let events = move |event: Event| {
-        if let Event::Opened(info) = &event {
-            let effects = info.effects;
-            let noise = wanted.0 && !effects.noise_suppression;
-            let volume = wanted.1 && !effects.automatic_gain;
-            switches.noise_suppression.store(noise, Ordering::Relaxed);
-            switches.automatic_volume.store(volume, Ordering::Relaxed);
+        match &event {
+            Event::Opened(info) => {
+                let effects = info.effects;
+                let noise = wanted.0 && !effects.noise_suppression;
+                let volume = wanted.1 && !effects.automatic_gain;
+                switches.noise_suppression.store(noise, Ordering::Relaxed);
+                switches.automatic_volume.store(volume, Ordering::Relaxed);
+                opened.store(true, Ordering::Relaxed);
+            }
+            // No packet comes to end a spell while the microphone is away,
+            // and nothing is sent.
+            Event::Lost(_) | Event::Gone(_) | Event::Failed(_) => {
+                if away.sending.swap(false, Ordering::Relaxed) {
+                    away.changed();
+                }
+            }
         }
         said(event);
     };

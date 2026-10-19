@@ -1207,6 +1207,50 @@ fn chosen_devices_open_once_they_are_plugged_in() {
     ana.room().talk(false);
 }
 
+// A chosen microphone unplugged in the middle of a word: Ana's row stops
+// saying she talks at once, not only when it is back, and Mara stops hearing
+// her. Plugged in again, her words start afresh and Mara hears them.
+#[test]
+fn a_microphone_unplugged_mid_word_stops_sending() {
+    let _alone = alone();
+    let host = Voiced::host("Mara", timers(), silence);
+    let (mut config, microphone, speakers) =
+        voiced("Ana", timers(), tone_660, TalkMode::PushToTalk, true);
+    config.voice.input = Choice::Device(String::from("pods"));
+    microphone.plug("pods", "Headset");
+    let ana = Voiced::join((config, microphone, speakers), host_invite(&host.member));
+    settled(&host, &[&ana]);
+    ana.room().talk(true);
+    ana.member
+        .wait_for(Duration::from_secs(2), "Ana sends", |v| v.voice.sending);
+    host.member
+        .wait_for(Duration::from_secs(2), "Mara hears Ana", |v| {
+            talking(v, "Ana")
+        });
+
+    ana.microphone.unplug("pods");
+    ana.member
+        .wait_for(Duration::from_secs(1), "Ana no longer sends", |v| {
+            !v.voice.sending && v.voice.microphone.is_some()
+        });
+    host.member
+        .wait_for(Duration::from_secs(2), "Mara no longer hears Ana", |v| {
+            !talking(v, "Ana")
+        });
+
+    ana.microphone.plug("pods", "Headset");
+    ana.member
+        .wait_for(Duration::from_secs(2), "Ana sends again", |v| {
+            v.voice.sending && v.voice.microphone.is_none()
+        });
+    host.member
+        .wait_for(Duration::from_secs(2), "Mara hears Ana again", |v| {
+            talking(v, "Ana")
+        });
+    assert_eq!(ana.microphone.record().opens.len(), 2);
+    ana.room().talk(false);
+}
+
 // A volume for one person, set on this PC alone: Ana turns Mara down to half
 // before Mara says a word, and it holds from the first one; then off, which
 // is silence; then up to 150 percent. Mara's own sending does not change.

@@ -88,6 +88,17 @@ fn playback_keeps_up_and_trips_on_feedback() {
     assert!(!playback.tripped());
 }
 
+// A microphone opened again, perhaps another one, starts from no gain: what
+// automatic volume learnt of the one before says nothing about it.
+#[test]
+fn restart_forgets_the_gain() {
+    let mut processor = Processor::new(Arc::new(Switches::new(false, true)));
+    through(&mut processor, &speech(4, -40.0));
+    assert!(processor.gain_db() > 10.0, "{} dB", processor.gain_db());
+    processor.restart();
+    assert_eq!(processor.gain_db(), 0.0);
+}
+
 // Speech in 400 ms words with 200 ms of the room between them, at `db` dBFS
 // RMS over a room 35 dB quieter, after a second of the room alone.
 fn speech(seconds: usize, db: f32) -> Vec<f32> {
