@@ -319,9 +319,9 @@ impl Capture {
             duplication: &duplication,
             released: false,
         };
-        let cursor = self.cursor_update(&info, &duplication)?;
         let fresh = std::mem::take(&mut self.fresh);
         if info.LastPresentTime == 0 && !fresh {
+            let cursor = self.cursor_update(&info, &duplication, false)?;
             drop(resource);
             if let Err(err) = held.release() {
                 self.release_failed(err)?;
@@ -337,6 +337,7 @@ impl Capture {
         unsafe { texture.GetDesc(&mut desc) };
         // The texture's own size is the one that counts; the mode Windows
         // reported can be the rotated one.
+        let before = self.layout.plan;
         self.rebuild(Plan::new(
             desc.Width,
             desc.Height,
@@ -344,6 +345,9 @@ impl Capture {
             self.options.max_width,
             self.options.max_height,
         ))?;
+        // Scaled with the plan this frame is made in, while it is still held.
+        let resized = self.layout.plan != before;
+        let cursor = self.cursor_update(&info, &duplication, resized)?;
         let view = self.source_view(&texture, &desc)?;
         let slot = 1 - self.last_out;
         self.converter
@@ -529,10 +533,13 @@ impl Capture {
         Ok((texture, view))
     }
 
+    // `resized`: this frame is made at another size or rotation than the
+    // last, so a pointer that has not moved sits elsewhere in it.
     fn cursor_update(
         &mut self,
         info: &DXGI_OUTDUPL_FRAME_INFO,
         duplication: &IDXGIOutputDuplication,
+        resized: bool,
     ) -> Result<Option<CursorUpdate>, CaptureError> {
         let moved = info.LastMouseUpdateTime != 0;
         if moved {
@@ -548,7 +555,7 @@ impl Capture {
         } else {
             None
         };
-        if !moved && shape.is_none() {
+        if !moved && shape.is_none() && !resized {
             return Ok(None);
         }
         let (scale_x, scale_y) = self.layout.plan.scale();
@@ -957,6 +964,48 @@ mod tests {
             }
         }
         println!("no picture came: the desktop is still");
+    }
+
+    // After that change a pointer that did not move is in other frame
+    // pixels, so it goes out again, scaled for the new size.
+    #[test]
+    fn a_still_pointer_is_sent_again_in_the_new_size() {
+        let _turn = desktop_turn();
+        let Some(mut capture) = primary_capture() else {
+            return;
+        };
+        let duplication = capture.duplication.clone().unwrap();
+        let plan = capture.plan();
+        capture.pointer = (1000, 600, true);
+        let still = DXGI_OUTDUPL_FRAME_INFO::default();
+        assert!(
+            capture
+                .cursor_update(&still, &duplication, false)
+                .unwrap()
+                .is_none()
+        );
+        let smaller = Plan::new(
+            plan.source_width / 2,
+            plan.source_height / 2,
+            plan.rotation,
+            capture.options.max_width,
+            capture.options.max_height,
+        );
+        capture.rebuild(smaller).unwrap();
+        let update = capture
+            .cursor_update(&still, &duplication, true)
+            .unwrap()
+            .unwrap();
+        let (scale_x, scale_y) = smaller.scale();
+        assert_eq!(
+            (update.x, update.y),
+            (
+                (1000.0 * scale_x).round() as i32,
+                (600.0 * scale_y).round() as i32
+            )
+        );
+        assert_eq!(update.scale, scale_x);
+        assert!(update.visible && update.shape.is_none());
     }
 
     #[test]
