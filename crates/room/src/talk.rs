@@ -83,8 +83,8 @@ const NEW_EAR_BURST: f64 = (2 * MAX_ROSTER) as f64;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TalkMode {
-    // The default, since there is no echo cancellation: an open mic next to
-    // speakers echoes.
+    // The default, since an open mic next to speakers echoes wherever
+    // Windows cannot cancel it.
     #[default]
     PushToTalk,
     OpenMic,
