@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 
 use super::devices::{Choice, Direction};
+use super::echo::{Echo, Effects};
 use super::error::AudioError;
 use super::format::{Format, RATE, from_mono, to_mono};
 use super::level::{Level, Meter, Reading};
@@ -96,6 +97,9 @@ pub struct StreamInfo {
     pub pro_audio: bool,
     // When Windows refused the first ask and the stream opened on a second.
     pub refused: Option<Refused>,
+    // What Windows does to a microphone's sound before Booth gets it.
+    pub effects: Effects,
+    pub echo: Echo,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -283,6 +287,21 @@ impl Capture {
         events: impl FnMut(Event) + Send + 'static,
     ) -> Result<Capture, AudioError> {
         Capture::start_with(wasapi::device, choice, audio, events)
+    }
+
+    // As start, with Windows' echo cancellation where the microphone has it
+    // (see wasapi.rs), listening to `reference`, the output device Booth
+    // plays to, or to Windows default with None. The stream info says what
+    // came of it.
+    pub fn start_cancelling_echo(
+        choice: Choice,
+        reference: Option<String>,
+        audio: impl FnMut(&[f32], Instant) + Send + 'static,
+        events: impl FnMut(Event) + Send + 'static,
+    ) -> Result<Capture, AudioError> {
+        let make =
+            move |direction, wake| wasapi::device_cancelling_echo(direction, wake, reference);
+        Capture::start_with(make, choice, audio, events)
     }
 
     // `make` runs on the new thread, which is where the device has to live.

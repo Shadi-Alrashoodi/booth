@@ -489,15 +489,33 @@ fn open_microphone(
     mut mouth: Mouth,
     log: &Log,
 ) -> Result<Capture, AudioError> {
-    let switches = Switches::new(config.noise_suppression, config.automatic_volume);
-    let mut processor = Processor::new(Arc::new(switches));
+    let wanted = (config.noise_suppression, config.automatic_volume);
+    let switches = Arc::new(Switches::new(wanted.0, wanted.1));
+    let mut processor = Processor::new(Arc::clone(&switches));
     let audio = move |samples: &[f32], at: Instant| {
         let (samples, at) = processor.run(samples, at);
         mouth.hear(samples, at);
     };
-    let events = on_event(Arc::clone(shared), log.clone(), Side::Microphone);
+    let mut said = on_event(Arc::clone(shared), log.clone(), Side::Microphone);
+    // Where Windows already suppresses noise or evens out the volume on
+    // this microphone, Booth's own stage stands down rather than do it
+    // twice. Opened comes before the first packet.
+    let events = move |event: Event| {
+        if let Event::Opened(info) = &event {
+            let effects = info.effects;
+            let noise = wanted.0 && !effects.noise_suppression;
+            let volume = wanted.1 && !effects.automatic_gain;
+            switches.noise_suppression.store(noise, Ordering::Relaxed);
+            switches.automatic_volume.store(volume, Ordering::Relaxed);
+        }
+        said(event);
+    };
     let choice = config.input.clone();
     match &config.devices {
+        Devices::Windows if config.echo_cancellation => {
+            let reference = config.output.id().map(str::to_owned);
+            Capture::start_cancelling_echo(choice, reference, audio, events)
+        }
         Devices::Windows => Capture::start(choice, audio, events),
         Devices::Fake { microphone, .. } => {
             Capture::start_with(microphone.device(), choice, audio, events)
@@ -602,8 +620,17 @@ fn opened(info: &StreamInfo) -> String {
             )
         })
         .unwrap_or_default();
+    let processing = match info.direction {
+        Direction::Input => format!(
+            ", echo cancellation {}, windows noise suppression {}, windows gain control {}",
+            info.echo,
+            yes_no(info.effects.noise_suppression),
+            yes_no(info.effects.automatic_gain)
+        ),
+        Direction::Output => String::new(),
+    };
     format!(
-        "opened: {}, period {:.2} ms ({} frames), engine {} Hz, resampled by windows {}, bluetooth hands-free {}, small period {}, pro audio {}, stream ({}){refused}",
+        "opened: {}, period {:.2} ms ({} frames), engine {} Hz, resampled by windows {}, bluetooth hands-free {}, small period {}, pro audio {}, stream ({}), stream latency {:.2} ms{processing}{refused}",
         crate::log::quoted(&info.device),
         info.period_ms(),
         info.period_frames,
@@ -612,6 +639,7 @@ fn opened(info: &StreamInfo) -> String {
         yes_no(info.hands_free),
         yes_no(info.small_period),
         yes_no(info.pro_audio),
-        info.format
+        info.format,
+        info.stream_latency.as_secs_f64() * 1000.0
     )
 }

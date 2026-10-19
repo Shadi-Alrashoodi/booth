@@ -40,7 +40,7 @@ use crate::theme::{self, WINDOW};
 use crate::tray::{self, Tray};
 use crate::update::{self, Update};
 use crate::volumes::Volumes;
-use crate::{Args, controls, messages, monitors, win};
+use crate::{Args, controls, messages, monitors, win, winver};
 
 const STATS_KEY: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::I);
@@ -133,6 +133,7 @@ impl Setup {
             talk: self.settings.talk_mode(),
             constant_rate: self.settings.constant_rate(),
             sensitivity_db: self.settings.sensitivity_db(),
+            echo_cancellation: self.settings.echo_cancellation() && winver::cancels_echo(),
             noise_suppression: self.settings.noise_suppression(),
             automatic_volume: self.settings.automatic_volume(),
             #[cfg(feature = "memstats")]
@@ -1216,7 +1217,8 @@ impl eframe::App for App {
                             // microphone is closed until the window is back.
                             let showing =
                                 ui.input(|input| input.viewport().minimized != Some(true));
-                            audio.follow(&draft.input, &draft.output, showing);
+                            let echo = draft.echo_cancellation && winver::cancels_echo();
+                            audio.follow(&draft.input, &draft.output, echo, showing);
                             press = settings_screen::show(ui, draft, audio);
                             if audio.level().is_some() {
                                 ui.request_repaint_after(METER_REPAINT);

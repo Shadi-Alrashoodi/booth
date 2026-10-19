@@ -4,6 +4,8 @@
 // compatibility mode for Windows 8" makes it say 6.2. The page the kernel maps
 // into every process has the version the kernel really is.
 
+use std::sync::OnceLock;
+
 use windows_sys::Wdk::System::SystemServices::{KUSER_SHARED_DATA, RtlGetVersion};
 use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
 
@@ -32,6 +34,17 @@ pub struct WindowsVersion {
     pub major: u32,
     pub minor: u32,
     pub build: u32,
+}
+
+// Windows 11 22H2, the first that lets a program point Windows' echo
+// cancellation at the speakers it plays to.
+const ECHO_CANCELLATION_BUILD: u32 = 22621;
+
+// Whether Booth asks Windows for echo cancellation here. Not on Windows 10
+// or Windows 11 before 22H2, nor when Windows would not say which it is.
+pub fn cancels_echo() -> bool {
+    static CAN: OnceLock<bool> = OnceLock::new();
+    *CAN.get_or_init(|| this_pc().is_some_and(|version| version.build >= ECHO_CANCELLATION_BUILD))
 }
 
 // None if Windows would not say, and then Booth goes on and finds out.

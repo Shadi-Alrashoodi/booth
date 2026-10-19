@@ -1,12 +1,18 @@
 // On this PC's own devices. Nothing here records sound or makes any: the
 // devices are listed, the output plays silence for a fraction of a second,
-// and the microphone is only asked for its period and format, never started.
+// and the microphone is asked for its period and format, and opened once
+// for a moment to see what Windows does to it, what it hears going nowhere.
 
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use voice::audio::{self, AudioError, Choice, Direction, Event, Render};
+use voice::audio::{self, AudioError, Capture, Choice, Direction, Echo, Event, Render};
+
+// The tests that open a stream take turns: opening a Bluetooth headset's
+// microphone switches it to hands-free, and its output stream stops while
+// it does.
+static ONE_STREAM_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 #[test]
 fn lists_the_devices_on_this_pc() {
@@ -50,6 +56,9 @@ fn the_watch_reads_the_same_lists_and_stops_quickly() {
 // settle, far under the one second allowed.
 #[test]
 fn the_default_output_plays_silence_and_reports_its_latency() {
+    let _turn = ONE_STREAM_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (tx, rx) = mpsc::channel();
     let sizes = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(&sizes);
@@ -150,4 +159,46 @@ fn default_microphone_probe() {
         None => println!("engine period now: not offered"),
     }
     assert!(probe.period > Duration::ZERO);
+}
+
+// The default microphone opened asking for Windows' echo cancellation, as a
+// room does with the switch on: what Windows lists as on for it, and what
+// came of the ask, which depends on its driver and this Windows.
+#[test]
+fn default_microphone_with_echo_cancellation() {
+    let _turn = ONE_STREAM_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (tx, rx) = mpsc::channel();
+    let capture = Capture::start_cancelling_echo(
+        Choice::Default,
+        None,
+        |_: &[f32], _| {},
+        move |event| {
+            let _ = tx.send(event);
+        },
+    )
+    .expect("start the capture thread");
+    let info = match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Event::Opened(info)) => info,
+        Ok(Event::Failed(AudioError::NoDevice(_))) => {
+            println!("no microphone on this PC; skipped");
+            return;
+        }
+        other => panic!("the default microphone did not open: {other:?}"),
+    };
+    capture.stop();
+    println!("device: {}", info.device);
+    println!("windows effects on: {:?}", info.effects);
+    println!("echo cancellation: {}", info.echo);
+    println!(
+        "period {:.2} ms, stream latency {:.2} ms",
+        info.period_ms(),
+        info.stream_latency.as_secs_f64() * 1000.0
+    );
+    assert_ne!(info.echo, Echo::NotAsked);
+    assert_eq!(info.echo.cancelled(), info.echo != Echo::Missing);
+    if info.effects.echo_cancellation {
+        assert_eq!(info.echo, Echo::Device);
+    }
 }

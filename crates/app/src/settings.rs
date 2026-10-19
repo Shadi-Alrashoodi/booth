@@ -25,6 +25,8 @@ const TALK_MODE: &str = "talk_mode";
 const CONSTANT_RATE_VOICE: &str = "constant_rate_voice";
 // In dB, written only when moved off room::DEFAULT_SENSITIVITY_DB.
 const OPEN_MIC_SENSITIVITY: &str = "open_mic_sensitivity";
+// On unless turned off; only off is saved.
+const ECHO_CANCELLATION: &str = "echo_cancellation";
 // Off unless turned on, since it adds delay; only on is saved.
 const NOISE_SUPPRESSION: &str = "noise_suppression";
 // On unless turned off; only off is saved.
@@ -46,7 +48,7 @@ const SHARE_MONITOR: &str = "share_monitor";
 // address. Only on is saved.
 const CHECK_FOR_NEW_VERSIONS: &str = "check_for_new_versions";
 // Every key this version knows, in the order a save adds the missing ones.
-const KEYS: [&str; 23] = [
+const KEYS: [&str; 24] = [
     NAME,
     PORT,
     STUN_SERVERS,
@@ -63,6 +65,7 @@ const KEYS: [&str; 23] = [
     TALK_MODE,
     CONSTANT_RATE_VOICE,
     OPEN_MIC_SENSITIVITY,
+    ECHO_CANCELLATION,
     NOISE_SUPPRESSION,
     AUTOMATIC_VOLUME,
     VIDEO_UPLOAD_MBITS,
@@ -104,6 +107,7 @@ pub struct Settings {
     variable_rate: bool,
     // None means room::DEFAULT_SENSITIVITY_DB.
     sensitivity_db: Option<i8>,
+    no_echo_cancellation: bool,
     noise_suppression: bool,
     fixed_volume: bool,
     // Only the ones off their defaults are saved.
@@ -267,6 +271,14 @@ impl Settings {
         self.sensitivity_db = (db != DEFAULT_SENSITIVITY_DB).then_some(db);
     }
 
+    pub fn echo_cancellation(&self) -> bool {
+        !self.no_echo_cancellation
+    }
+
+    pub fn set_echo_cancellation(&mut self, on: bool) {
+        self.no_echo_cancellation = !on;
+    }
+
     pub fn noise_suppression(&self) -> bool {
         self.noise_suppression
     }
@@ -392,6 +404,7 @@ impl Settings {
             TALK_MODE => self.open_mic.then(|| String::from(OPEN_MIC)),
             CONSTANT_RATE_VOICE => self.variable_rate.then(|| String::from("off")),
             OPEN_MIC_SENSITIVITY => self.sensitivity_db.map(|db| db.to_string()),
+            ECHO_CANCELLATION => self.no_echo_cancellation.then(|| String::from("off")),
             NOISE_SUPPRESSION => self.noise_suppression.then(|| String::from("on")),
             AUTOMATIC_VOLUME => self.fixed_volume.then(|| String::from("off")),
             VIDEO_UPLOAD_MBITS => self.upload_mbits.map(|mbits| mbits.to_string()),
@@ -509,7 +522,8 @@ impl Settings {
             VSYNC_IN_VIEWER
             | HIDE_STRIP_IN_FULLSCREEN
             | CHECK_FOR_NEW_VERSIONS
-            | NOISE_SUPPRESSION => {
+            | NOISE_SUPPRESSION
+            | ECHO_CANCELLATION => {
                 let on = match value {
                     "on" => true,
                     "off" => false,
@@ -519,6 +533,7 @@ impl Settings {
                     VSYNC_IN_VIEWER => self.vsync = on,
                     HIDE_STRIP_IN_FULLSCREEN => self.hide_strip = on,
                     NOISE_SUPPRESSION => self.noise_suppression = on,
+                    ECHO_CANCELLATION => self.no_echo_cancellation = !on,
                     _ => self.check_for_new_versions = on,
                 }
             }
@@ -1239,6 +1254,20 @@ mod tests {
         assert!(problems[0].ends_with(
             "open_mic_sensitivity is a number of dB from -60 to -20; set it again in settings"
         ));
+    }
+
+    #[test]
+    fn echo_cancellation_round_trip() {
+        let folder = Folder::new("echo cancellation");
+        let mut settings = Settings::default();
+        assert!(settings.echo_cancellation());
+        settings.set_echo_cancellation(false);
+        settings.save(&folder.0).unwrap();
+        assert_eq!(
+            fs::read_to_string(folder.file()).unwrap(),
+            "echo_cancellation = off\r\n"
+        );
+        assert!(!Settings::load(&folder.0).0.echo_cancellation());
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::devices::{Choice, Direction};
+use super::echo::{Echo, Effects};
 use super::error::AudioError;
 use super::format::{Format, Sample};
 use super::stream::{Control, Device, DeviceStream, Packet, StreamInfo, Wake};
@@ -255,6 +256,8 @@ impl FakeDevice {
                 buffer_frames: setup.buffer_frames,
                 pro_audio: false,
                 refused: None,
+                effects: Effects::default(),
+                echo: Echo::NotAsked,
             },
             started: None,
             ticks_seen: 0,

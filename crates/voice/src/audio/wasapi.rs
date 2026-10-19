@@ -28,6 +28,16 @@ use windows::Win32::Media::Audio::{
     IMMDeviceEnumerator, IMMEndpoint, IMMNotificationClient, IMMNotificationClient_Vtbl,
     MMDeviceEnumerator, WAVE_FORMAT_PCM, WAVEFORMATEX, eCapture, eConsole, eRender,
 };
+use windows::Win32::Media::Audio::{
+    AUDCLNT_STREAMOPTIONS_NONE, AUDIO_DUCKING_OPTIONS_DO_NOT_DUCK_OTHER_STREAMS, AUDIO_EFFECT,
+    AUDIO_EFFECT_STATE_ON, AudioCategory_Communications, AudioClientProperties,
+    IAcousticEchoCancellationControl, IAudioClient2, IAudioClientDuckingControl,
+    IAudioEffectsManager,
+};
+use windows::Win32::Media::KernelStreaming::{
+    AUDIO_EFFECT_TYPE_ACOUSTIC_ECHO_CANCELLATION, AUDIO_EFFECT_TYPE_AUTOMATIC_GAIN_CONTROL,
+    AUDIO_EFFECT_TYPE_DEEP_NOISE_SUPPRESSION, AUDIO_EFFECT_TYPE_NOISE_SUPPRESSION,
+};
 use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToStringAlloc};
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
@@ -41,6 +51,7 @@ use windows::Win32::System::Threading::{
 use windows::core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, PCWSTR, PWSTR, w};
 
 use super::devices::{Choice, DeviceList, Direction, Endpoint, Lists};
+use super::echo::{Echo, Effect, Effects, reference_fits};
 use super::error::AudioError;
 use super::format::{Format, RATE, plan};
 use super::microphone::hands_free;
@@ -256,13 +267,64 @@ impl Session {
         })
     }
 
-    fn open(&self, direction: Direction, choice: &Choice) -> Result<WasapiStream, AudioError> {
+    // A microphone asked for echo cancellation is opened as any other first.
+    // If Windows lists echo cancellation on for it there, it is the
+    // microphone's own and nothing changes. Otherwise it is opened again in
+    // the communications category, where Windows may cancel echo itself,
+    // and kept that way only if it does, against speakers it can listen to;
+    // else it is opened as before. One found without is remembered in
+    // `missing`, so the next open of it is a single one.
+    fn open(
+        &self,
+        direction: Direction,
+        choice: &Choice,
+        echo: Option<&Wish>,
+        missing: &mut Option<String>,
+    ) -> Result<WasapiStream, AudioError> {
+        let mut stream = self.open_as(direction, choice, false)?;
+        let Some(wish) = echo.filter(|_| direction == Direction::Input) else {
+            return Ok(stream);
+        };
+        if stream.info.effects.echo_cancellation {
+            stream.info.echo = Echo::Device;
+            return Ok(stream);
+        }
+        if missing.as_deref() == Some(stream.info.id.as_str()) {
+            stream.info.echo = Echo::Missing;
+            return Ok(stream);
+        }
+        drop(stream);
+        if let Ok(mut talking) = self.open_as(direction, choice, true)
+            && talking.info.effects.echo_cancellation
+            && let Some(reference) = talking.point_echo(wish.reference.as_deref())
+        {
+            let ducking_off = talking.duck_nothing();
+            talking.info.echo = Echo::Windows {
+                reference,
+                ducking_off,
+            };
+            return Ok(talking);
+        }
+        let mut stream = self.open_as(direction, choice, false)?;
+        *missing = Some(stream.info.id.clone());
+        stream.info.echo = Echo::Missing;
+        Ok(stream)
+    }
+
+    // In the communications category, `talking`, every client made on the
+    // way gets it before anything else is asked of it.
+    fn open_as(
+        &self,
+        direction: Direction,
+        choice: &Choice,
+        talking: bool,
+    ) -> Result<WasapiStream, AudioError> {
         let (device, id, name) = self.find(direction, choice)?;
         let fail = |step: &'static str| {
             let name = name.clone();
             move |err: windows::core::Error| classify(&err, direction, &name, step)
         };
-        let client: IAudioClient = activate(&device).map_err(fail("open"))?;
+        let client: IAudioClient = activate_as(&device, talking).map_err(fail("open"))?;
         let (engine, engine_bytes) = mix_format(&client, direction, &name)?;
         drop(client);
         let first = Ask::first(engine, engine_bytes);
@@ -272,9 +334,9 @@ impl Session {
         let small = if first.convert {
             None
         } else {
-            activate::<IAudioClient3>(&device)
+            activate_as::<IAudioClient3>(&device, talking)
                 .ok()
-                .and_then(|client3| init_small(&device, client3, &first.bytes))
+                .and_then(|client3| init_small(&device, client3, &first.bytes, talking))
         };
         let (client, period_frames, small_period, ask, refused) = match small {
             Some((client3, frames)) => {
@@ -283,11 +345,11 @@ impl Session {
             }
             None => {
                 let engine_now = || {
-                    let client: IAudioClient = activate(&device)?;
+                    let client: IAudioClient = activate_as(&device, talking)?;
                     Ok(Format::parse(&mix_bytes(&client)?).ok())
                 };
                 let (client, ask, refused) =
-                    init_with(first, |ask| init_shared(&device, ask), engine_now)
+                    init_with(first, |ask| init_shared(&device, ask, talking), engine_now)
                         .map_err(fail("open"))?;
                 let mut default = 0i64;
                 // SAFETY: one local for the call to fill.
@@ -312,6 +374,10 @@ impl Session {
             // SAFETY: as above.
             Direction::Output => Io::Render(unsafe { client.GetService() }.map_err(fail("open"))?),
         };
+        let effects = match direction {
+            Direction::Input => effects(&client),
+            Direction::Output => Effects::default(),
+        };
         Ok(WasapiStream {
             frame_bytes: ask.format.frame_bytes(),
             info: StreamInfo {
@@ -329,6 +395,8 @@ impl Session {
                 buffer_frames,
                 pro_audio: false,
                 refused,
+                effects,
+                echo: Echo::NotAsked,
             },
             io,
             client,
@@ -496,8 +564,12 @@ fn init_with<C>(
 
 // A fresh client each time: one that refused a format, or the small period,
 // is left in a state Initialize may not accept.
-fn init_shared(device: &IMMDevice, ask: &Ask) -> windows::core::Result<IAudioClient> {
-    let client: IAudioClient = activate(device)?;
+fn init_shared(
+    device: &IMMDevice,
+    ask: &Ask,
+    talking: bool,
+) -> windows::core::Result<IAudioClient> {
+    let client: IAudioClient = activate_as(device, talking)?;
     let mut flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
     if ask.convert {
         flags |= AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
@@ -517,6 +589,7 @@ fn init_small(
     device: &IMMDevice,
     client: IAudioClient3,
     wave_bytes: &[u8],
+    talking: bool,
 ) -> Option<(IAudioClient3, u32)> {
     let periods = engine_periods(&client, wave_bytes).ok()?;
     let wave = wave_bytes.as_ptr().cast::<WAVEFORMATEX>();
@@ -534,7 +607,7 @@ fn init_small(
         Ok(()) => client,
         Err(err) if err.code() == AUDCLNT_E_ENGINE_PERIODICITY_LOCKED => {
             let running = current_period(&client)?;
-            let client: IAudioClient3 = activate(device).ok()?;
+            let client: IAudioClient3 = activate_as(device, talking).ok()?;
             // SAFETY: as above.
             unsafe {
                 client.InitializeSharedAudioStream(
@@ -619,6 +692,60 @@ fn activate<T: Interface>(device: &IMMDevice) -> windows::core::Result<T> {
     // SAFETY: a call on a live interface; the new one comes back with its
     // own reference.
     unsafe { device.Activate(CLSCTX_ALL, None) }
+}
+
+// A client for a stream in the communications category when `talking`, the
+// category Windows cancels echo in. It has to be set before the client is
+// asked for its format, its periods or anything else.
+fn activate_as<T: Interface>(device: &IMMDevice, talking: bool) -> windows::core::Result<T> {
+    let client: T = activate(device)?;
+    if talking {
+        let two: IAudioClient2 = client.cast()?;
+        let properties = AudioClientProperties {
+            cbSize: size_of::<AudioClientProperties>() as u32,
+            bIsOffload: false.into(),
+            eCategory: AudioCategory_Communications,
+            Options: AUDCLNT_STREAMOPTIONS_NONE,
+        };
+        // SAFETY: a whole AudioClientProperties that outlives the call.
+        unsafe { two.SetClientProperties(&properties) }?;
+    }
+    Ok(client)
+}
+
+// What Windows lists as on for an initialized capture stream. Windows 10
+// has no list, and lists nothing.
+fn effects(client: &IAudioClient) -> Effects {
+    // SAFETY: GetService on an initialized client.
+    let Ok(manager) = (unsafe { client.GetService::<IAudioEffectsManager>() }) else {
+        return Effects::default();
+    };
+    let mut list: *mut AUDIO_EFFECT = ptr::null_mut();
+    let mut count = 0u32;
+    // SAFETY: two locals for the call to fill. The list is ours to free,
+    // and is freed below once read.
+    if unsafe { manager.GetAudioEffects(&mut list, &mut count) }.is_err() || list.is_null() {
+        return Effects::default();
+    }
+    // SAFETY: Windows handed out `count` whole effects at `list`.
+    let listed = unsafe { slice::from_raw_parts(list, count as usize) };
+    let effects = Effects::from_listed(listed.iter().map(|effect| {
+        let kind = if effect.id == AUDIO_EFFECT_TYPE_ACOUSTIC_ECHO_CANCELLATION {
+            Effect::EchoCancellation
+        } else if effect.id == AUDIO_EFFECT_TYPE_NOISE_SUPPRESSION
+            || effect.id == AUDIO_EFFECT_TYPE_DEEP_NOISE_SUPPRESSION
+        {
+            Effect::NoiseSuppression
+        } else if effect.id == AUDIO_EFFECT_TYPE_AUTOMATIC_GAIN_CONTROL {
+            Effect::AutomaticGain
+        } else {
+            Effect::Other
+        };
+        (kind, effect.state == AUDIO_EFFECT_STATE_ON)
+    }));
+    // SAFETY: allocated by COM for the caller; nothing reads it after this.
+    unsafe { CoTaskMemFree(Some(list as *const c_void)) };
+    effects
 }
 
 fn device_id(device: &IMMDevice) -> Option<String> {
@@ -771,6 +898,43 @@ impl WasapiStream {
     fn fail(&self, step: &'static str) -> impl Fn(windows::core::Error) -> AudioError + '_ {
         move |err| classify(&err, self.info.direction, &self.info.device, step)
     }
+
+    // Points Windows' canceller at `reference`, the speakers Booth plays to,
+    // or leaves it on Windows default for None. None back when it cannot
+    // listen to them.
+    fn point_echo(&self, reference: Option<&str>) -> Option<Option<String>> {
+        // SAFETY: GetService on an initialized client.
+        let control = unsafe { self.client.GetService::<IAcousticEchoCancellationControl>() };
+        if !reference_fits(control.is_ok(), reference) {
+            return None;
+        }
+        let (Ok(control), Some(id)) = (control, reference) else {
+            return Some(None);
+        };
+        let wide: Vec<u16> = id.encode_utf16().chain([0]).collect();
+        // SAFETY: `wide` is NUL-terminated and outlives the call.
+        unsafe { control.SetEchoCancellationRenderEndpoint(PCWSTR(wide.as_ptr())) }
+            .ok()
+            .map(|()| Some(id.to_owned()))
+    }
+
+    // A stream in the communications category can make Windows lower
+    // every other program's sound while it is open, and Mute closes it,
+    // so every mute would fade the game out and back. True once Windows
+    // was told not to.
+    fn duck_nothing(&self) -> bool {
+        // SAFETY: GetService on an initialized client.
+        let Ok(ducking) = (unsafe { self.client.GetService::<IAudioClientDuckingControl>() })
+        else {
+            return false;
+        };
+        // SAFETY: a call on a live interface with a plain value.
+        unsafe {
+            ducking
+                .SetDuckingOptionsForCurrentStream(AUDIO_DUCKING_OPTIONS_DO_NOT_DUCK_OTHER_STREAMS)
+        }
+        .is_ok()
+    }
 }
 
 impl DeviceStream for WasapiStream {
@@ -890,6 +1054,24 @@ pub(crate) struct Windows {
     _watch: Option<Registration>,
     session: Session,
     direction: Direction,
+    echo: Option<Wish>,
+    missing: Option<String>,
+}
+
+// Echo cancellation asked of a capture stream, and the speakers Booth plays
+// to: the device chosen in Settings, or None for Windows default.
+pub(crate) struct Wish {
+    pub(crate) reference: Option<String>,
+}
+
+pub(crate) fn device_cancelling_echo(
+    direction: Direction,
+    wake: Wake,
+    reference: Option<String>,
+) -> Result<Windows, AudioError> {
+    let mut windows = device(direction, wake)?;
+    windows.echo = Some(Wish { reference });
+    Ok(windows)
 }
 
 pub(crate) fn device(direction: Direction, wake: Wake) -> Result<Windows, AudioError> {
@@ -911,6 +1093,8 @@ pub(crate) fn device(direction: Direction, wake: Wake) -> Result<Windows, AudioE
         _watch: watch,
         session,
         direction,
+        echo: None,
+        missing: None,
     })
 }
 
@@ -918,7 +1102,9 @@ impl Device for Windows {
     type Stream = WasapiStream;
 
     fn open(&mut self, choice: &Choice) -> Result<WasapiStream, AudioError> {
-        self.session.open(self.direction, choice)
+        let echo = self.echo.as_ref();
+        self.session
+            .open(self.direction, choice, echo, &mut self.missing)
     }
 }
 

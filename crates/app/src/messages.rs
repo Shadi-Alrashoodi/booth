@@ -7,7 +7,7 @@ use room::view::{
     AddressChanged, NameAnswer, NameView, Notice, PasteState, ReplyState, Role, RouterState,
 };
 use room::{ChatRefused, DamagedList, KnownError, List, ReplyRefused, RoomError};
-use voice::audio::Microphone;
+use voice::audio::{Echo, Microphone};
 
 use crate::elevated::Exit;
 use crate::running::{self, PortHolder};
@@ -433,6 +433,42 @@ pub const NO_STUN: &str = "With no STUN servers Booth cannot learn your outside 
 pub const MICROPHONE_OPEN: &str = "The microphone is open while this screen shows the meter.";
 pub const HEAR_YOURSELF: &str = "Use headphones.";
 pub const NOISE_SUPPRESSION_DELAY: &str = "Adds 10 to 20 ms of delay.";
+pub const WINDOWS_DOES_IT: &str = "Windows already does this for this microphone.";
+pub const ECHO_OLD_WINDOWS: &str = "Not available on this version of Windows.";
+pub const ECHO_DEVICE: &str = "On: this microphone cancels echo itself.";
+pub const ECHO_ON: &str = "On: speakers are fine.";
+pub const ECHO_ON_DUCKING: &str = "On: speakers are fine. Windows may lower other sounds while your microphone is open; Sound settings, More sound settings, Communications changes that.";
+pub const ECHO_MISSING: &str =
+    "This microphone has no echo cancellation in Windows. Use a headset.";
+pub const ECHO_WHILE_HEARING: &str = "Off while Hear yourself plays.";
+pub const ECHO_OFF: &str = "Off: use a headset, or friends hear themselves.";
+
+// Under Echo cancellation, from what the meter's microphone opened with.
+pub fn echo_line(
+    windows_can: bool,
+    on: bool,
+    hearing: bool,
+    echo: Option<&Echo>,
+) -> Option<&'static str> {
+    if !windows_can {
+        return Some(ECHO_OLD_WINDOWS);
+    }
+    if !on {
+        return Some(ECHO_OFF);
+    }
+    if hearing {
+        return Some(ECHO_WHILE_HEARING);
+    }
+    match echo? {
+        Echo::NotAsked => None,
+        Echo::Device => Some(ECHO_DEVICE),
+        Echo::Windows {
+            ducking_off: true, ..
+        } => Some(ECHO_ON),
+        Echo::Windows { .. } => Some(ECHO_ON_DUCKING),
+        Echo::Missing => Some(ECHO_MISSING),
+    }
+}
 pub const HEAR_YOURSELF_TRIPPED: &str =
     "Turned off: the microphone heard the speakers. Use headphones.";
 
@@ -700,6 +736,52 @@ pub fn notice(notice: &Notice) -> String {
 
 #[cfg(test)]
 mod tests {
+    // What Echo cancellation says under it, for each way it can go.
+    #[test]
+    fn echo_lines() {
+        let windows = |ducking_off| Echo::Windows {
+            reference: None,
+            ducking_off,
+        };
+        let line =
+            |can, on, hearing, echo: Option<Echo>| echo_line(can, on, hearing, echo.as_ref());
+        assert_eq!(
+            line(false, true, false, Some(Echo::Device)),
+            Some(ECHO_OLD_WINDOWS)
+        );
+        assert_eq!(line(true, false, false, Some(Echo::Device)), Some(ECHO_OFF));
+        assert_eq!(
+            line(true, true, true, Some(Echo::NotAsked)),
+            Some(ECHO_WHILE_HEARING)
+        );
+        assert_eq!(line(true, true, false, None), None);
+        assert_eq!(
+            line(true, true, false, Some(Echo::Device)),
+            Some(ECHO_DEVICE)
+        );
+        assert_eq!(line(true, true, false, Some(windows(true))), Some(ECHO_ON));
+        assert_eq!(
+            line(true, true, false, Some(windows(false))),
+            Some(ECHO_ON_DUCKING)
+        );
+        assert_eq!(
+            line(true, true, false, Some(Echo::Missing)),
+            Some(ECHO_MISSING)
+        );
+        for text in [
+            ECHO_OLD_WINDOWS,
+            ECHO_OFF,
+            ECHO_WHILE_HEARING,
+            ECHO_DEVICE,
+            ECHO_ON,
+            ECHO_ON_DUCKING,
+            ECHO_MISSING,
+            WINDOWS_DOES_IT,
+        ] {
+            assert_sentences(text);
+        }
+    }
+
     use super::*;
     use room::view::NameMatch;
 

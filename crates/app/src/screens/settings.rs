@@ -7,7 +7,7 @@ use input::{Action, Bindings, Chord};
 use room::{
     BlockedKey, DEFAULT_SENSITIVITY_DB, KnownDevice, KnownDevices, SENSITIVITY_DB, TalkMode,
 };
-use voice::audio::{Choice, DeviceList, Direction};
+use voice::audio::{Choice, DeviceList, Direction, Echo};
 use zeroize::Zeroize;
 
 use crate::controls::{self, Button, Lead};
@@ -19,7 +19,7 @@ use crate::theme::{
     SECTION_GAP, SIDE, STEP, WARN,
 };
 use crate::update;
-use crate::win;
+use crate::{win, winver};
 
 // Far above the 253 characters a name can have, so a long paste is refused
 // with the sentence rather than cut to something that passes.
@@ -45,6 +45,7 @@ pub struct Draft {
     pub talk: TalkMode,
     pub constant_rate: bool,
     pub sensitivity_db: i8,
+    pub echo_cancellation: bool,
     pub noise_suppression: bool,
     pub automatic_volume: bool,
     pub upload_mbits: u32,
@@ -110,6 +111,7 @@ impl Draft {
             talk: saved.talk_mode(),
             constant_rate: saved.constant_rate(),
             sensitivity_db: saved.sensitivity_db(),
+            echo_cancellation: saved.echo_cancellation(),
             noise_suppression: saved.noise_suppression(),
             automatic_volume: saved.automatic_volume(),
             upload_mbits: saved.upload_mbits(),
@@ -142,6 +144,7 @@ impl Draft {
         next.set_talk_mode(self.talk);
         next.set_constant_rate(self.constant_rate);
         next.set_sensitivity_db(self.sensitivity_db);
+        next.set_echo_cancellation(self.echo_cancellation);
         next.set_noise_suppression(self.noise_suppression);
         next.set_automatic_volume(self.automatic_volume);
         next.set_upload_mbits(self.upload_mbits);
@@ -465,8 +468,10 @@ fn refused_line(draft: &Draft, action: Action) -> Option<String> {
 }
 
 // The input device, a list with Windows default first, with the warning for
-// a thin or hands-free microphone under it, then noise suppression and
-// automatic volume, which the meter follows as they are switched. Then how
+// a thin or hands-free microphone under it, then echo cancellation, noise
+// suppression and automatic volume, which the meter follows as they are
+// switched; Booth's own two stand down where Windows already does the same
+// for the microphone. Then how
 // you talk, and the meter of the microphone this screen has open, after
 // what the room does to it; in open mic the meter is also the sensitivity, a
 // handle on its own scale. Hear yourself plays that same sound. Then the
@@ -493,17 +498,39 @@ fn voice(ui: &mut Ui, draft: &mut Draft, audio: &mut SettingsAudio) {
     }
 
     ui.add_space(FIELD_GAP);
-    let id = ui.id().with("noise suppression");
+    let id = ui.id().with("echo cancellation");
     let kind = WidgetType::Checkbox;
+    let name = "Echo cancellation";
+    if controls::choice_row(ui, id, draft.echo_cancellation, name, None, kind).clicked() {
+        draft.echo_cancellation = !draft.echo_cancellation;
+    }
+    let echo = audio.echo();
+    let can = winver::cancels_echo();
+    let on = draft.echo_cancellation;
+    if let Some(text) = messages::echo_line(can, on, audio.hearing(), echo.as_ref()) {
+        let color = if echo == Some(Echo::Missing) && on {
+            WARN
+        } else {
+            ASH
+        };
+        line(ui, text, color);
+    }
+
+    let windows = audio.effects().unwrap_or_default();
+    ui.add_space(STEP);
+    let id = ui.id().with("noise suppression");
     let name = "Noise suppression";
     if controls::choice_row(ui, id, draft.noise_suppression, name, None, kind).clicked() {
         draft.noise_suppression = !draft.noise_suppression;
     }
-    line(ui, messages::NOISE_SUPPRESSION_DELAY, ASH);
+    if windows.noise_suppression {
+        line(ui, messages::WINDOWS_DOES_IT, ASH);
+    } else {
+        line(ui, messages::NOISE_SUPPRESSION_DELAY, ASH);
+    }
     let switches = audio.switches();
-    switches
-        .noise_suppression
-        .store(draft.noise_suppression, Ordering::Relaxed);
+    let noise = draft.noise_suppression && !windows.noise_suppression;
+    switches.noise_suppression.store(noise, Ordering::Relaxed);
 
     ui.add_space(STEP);
     let id = ui.id().with("automatic volume");
@@ -512,10 +539,11 @@ fn voice(ui: &mut Ui, draft: &mut Draft, audio: &mut SettingsAudio) {
     if controls::choice_row(ui, id, draft.automatic_volume, name, None, kind).clicked() {
         draft.automatic_volume = !draft.automatic_volume;
     }
-    audio
-        .switches()
-        .automatic_volume
-        .store(draft.automatic_volume, Ordering::Relaxed);
+    if windows.automatic_gain {
+        line(ui, messages::WINDOWS_DOES_IT, ASH);
+    }
+    let volume = draft.automatic_volume && !windows.automatic_gain;
+    switches.automatic_volume.store(volume, Ordering::Relaxed);
 
     ui.add_space(FIELD_GAP);
     label(ui, "How you talk");
@@ -938,6 +966,15 @@ mod tests {
         let next = draft.settings(&saved).unwrap();
         assert_eq!(next.talk_mode(), TalkMode::PushToTalk);
         assert!(!next.constant_rate());
+    }
+
+    #[test]
+    fn echo_cancellation_saved() {
+        let mut draft = typed("");
+        assert!(draft.echo_cancellation);
+        draft.echo_cancellation = false;
+        let next = draft.settings(&Settings::default()).unwrap();
+        assert!(!next.echo_cancellation());
     }
 
     #[test]

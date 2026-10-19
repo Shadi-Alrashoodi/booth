@@ -120,6 +120,9 @@ pub struct VoiceConfig {
     // In open mic, nothing quieter than this is a voice, in dB of full
     // scale, SENSITIVITY_DB at most.
     pub sensitivity_db: i8,
+    // Windows' echo cancellation asked of the microphone (see voice's
+    // wasapi.rs). Off here; the app asks for it where Windows can do it.
+    pub echo_cancellation: bool,
     // RNNoise on the microphone, off by default: it adds 10 to 20 ms.
     pub noise_suppression: bool,
     // A quiet microphone brought up to a steady level, on by default.
@@ -138,6 +141,7 @@ impl Default for VoiceConfig {
             talk: TalkMode::PushToTalk,
             constant_rate: true,
             sensitivity_db: DEFAULT_SENSITIVITY_DB,
+            echo_cancellation: false,
             noise_suppression: false,
             automatic_volume: true,
             devices: Devices::Windows,

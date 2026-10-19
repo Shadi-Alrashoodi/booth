@@ -13,8 +13,8 @@ use std::thread;
 
 use eframe::egui::Context;
 use voice::audio::{
-    self, AudioError, Capture, Choice, Direction, Event, Level, Lists, Microphone, Probe, Reading,
-    Render, Watch,
+    self, AudioError, Capture, Choice, Direction, Echo, Effects, Event, Level, Lists, Microphone,
+    Probe, Reading, Render, StreamInfo, Watch,
 };
 use voice::process::{Playback, Processor, Switches};
 
@@ -47,13 +47,16 @@ impl SettingsAudio {
         // while it is off.
         let playback = Playback::default();
         let feed = playback.clone();
-        let open: Open = Arc::new(move |choice, mut processor: Processor, events| {
+        let open: Open = Arc::new(move |choice, echo, mut processor: Processor, events| {
             let feed = feed.clone();
             let audio = move |samples: &[f32], at| {
                 let (out, _) = processor.run(samples, at);
                 feed.push(out);
             };
-            Capture::start(choice, audio, events)
+            match echo {
+                Some(reference) => Capture::start_cancelling_echo(choice, reference, audio, events),
+                None => Capture::start(choice, audio, events),
+            }
         });
         // A device that will not answer gets no warning; the meter's own
         // line says what is wrong with it.
@@ -82,13 +85,18 @@ impl SettingsAudio {
     // picked on the screen and is closed while the window is minimized, and
     // a stream that ended starts again when the device lists change, which
     // is when its device may be back. Hear yourself follows the output
-    // device, and stops with the meter or once it heard itself.
-    pub fn follow(&mut self, input: &Choice, output: &Choice, showing: bool) {
+    // device, and stops with the meter or once it heard itself. With `echo`
+    // the meter's microphone asks Windows for echo cancellation, as a room
+    // would, except while Hear yourself plays: the canceller would take the
+    // voice coming back as echo and cancel the voice itself.
+    pub fn follow(&mut self, input: &Choice, output: &Choice, echo: bool, showing: bool) {
         match &self.speakers {
             Some(_) if !showing || self.playback.tripped() => self.hear(false, output),
             Some((playing, _)) if playing != output => self.hear(true, output),
             _ => {}
         }
+        let wish = (echo && !self.hearing()).then(|| output.id().map(str::to_owned));
+        self.mic.ask_echo(wish);
         let opened = self.mic.follow(input, showing);
         self.check.follow(input, opened);
         let lists = match &self.watch {
@@ -124,6 +132,15 @@ impl SettingsAudio {
     // None while no stream runs.
     pub fn level(&self) -> Option<Reading> {
         self.mic.level()
+    }
+
+    // What the meter's microphone opened with, while it runs.
+    pub fn echo(&self) -> Option<Echo> {
+        self.mic.info().map(|info| info.echo)
+    }
+
+    pub fn effects(&self) -> Option<Effects> {
+        self.mic.info().map(|info| info.effects)
     }
 
     pub fn hearing(&self) -> bool {
@@ -181,7 +198,13 @@ impl Drop for SettingsAudio {
 }
 
 type Events = Box<dyn FnMut(Event) + Send>;
-type Open = Arc<dyn Fn(Choice, Processor, Events) -> Result<Capture, AudioError> + Send + Sync>;
+// The choice, and echo cancellation asked for against the given output
+// device (None inside for Windows default), or not asked for.
+type Open = Arc<
+    dyn Fn(Choice, Option<Option<String>>, Processor, Events) -> Result<Capture, AudioError>
+        + Send
+        + Sync,
+>;
 
 enum Stream {
     Off,
@@ -214,6 +237,7 @@ struct Mic {
     ctx: Context,
     open: Open,
     switches: Arc<Switches>,
+    echo: Option<Option<String>>,
     choice: Choice,
     stream: Stream,
     // The window is minimized, and the microphone closed until it shows.
@@ -236,6 +260,7 @@ impl Mic {
             ctx: ctx.clone(),
             open,
             switches,
+            echo: None,
             choice: choice.clone(),
             stream: Stream::Off,
             hidden: false,
@@ -267,6 +292,17 @@ impl Mic {
         self.take_news()
     }
 
+    // Echo cancellation asked for or not, against which output device: the
+    // microphone opens again when that changes.
+    fn ask_echo(&mut self, echo: Option<Option<String>>) {
+        if echo != self.echo {
+            self.echo = echo;
+            if !self.hidden {
+                self.replace(true);
+            }
+        }
+    }
+
     // The device lists changed, so a device that went away may be back.
     fn retry(&mut self) {
         if self.ended && !self.hidden {
@@ -283,6 +319,7 @@ impl Mic {
         let latest = Arc::clone(&self.turn);
         let open = Arc::clone(&self.open);
         let switches = Arc::clone(&self.switches);
+        let echo = self.echo.clone();
         let choice = self.choice.clone();
         let events_in = self.events_in.clone();
         let repaint = self.ctx.clone();
@@ -300,7 +337,8 @@ impl Mic {
                 });
                 let processor = Processor::new(switches);
                 let level = processor.level();
-                let _ = started_in.send(open(choice, processor, events).map(|on| (on, level)));
+                let opened = open(choice, echo, processor, events);
+                let _ = started_in.send(opened.map(|on| (on, level)));
                 repaint.request_repaint();
             });
         match spawned {
@@ -369,6 +407,13 @@ impl Mic {
         };
         capture.info()?;
         Some(level.read())
+    }
+
+    fn info(&self) -> Option<StreamInfo> {
+        let Stream::On(capture, _) = &self.stream else {
+            return None;
+        };
+        capture.info()
     }
 }
 
@@ -543,7 +588,7 @@ mod tests {
 
     fn fake_open(fake: &Fake) -> Open {
         let fake = fake.clone();
-        Arc::new(move |choice, mut processor: Processor, events| {
+        Arc::new(move |choice, _echo, mut processor: Processor, events| {
             let audio = move |samples: &[f32], at| {
                 processor.run(samples, at);
             };
