@@ -72,8 +72,11 @@ fn playback_keeps_up_and_trips_on_feedback() {
     assert_eq!(&all[..960], &long[1440..]);
     assert!(all[960..].iter().all(|&s| s == 0.0));
 
+    // With noise suppression on, the packets that finish no block come in
+    // between, empty.
     for _ in 0..59 {
         playback.push(&tone(0, 240, 0.9));
+        playback.push(&[]);
     }
     assert!(!playback.tripped());
     playback.push(&tone(0, 240, 0.9));

@@ -129,8 +129,12 @@ impl Playback {
         lock(&self.0).tripped
     }
 
-    // On the capture thread.
+    // On the capture thread. With noise suppression on, a packet that did
+    // not finish a block gives nothing, which says nothing about feedback.
     pub fn push(&self, samples: &[f32]) {
+        if samples.is_empty() {
+            return;
+        }
         let mut queue = lock(&self.0);
         if !queue.on {
             return;
