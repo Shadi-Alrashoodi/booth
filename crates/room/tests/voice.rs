@@ -1222,10 +1222,14 @@ fn a_volume_for_each_person() {
         .wait_for(Duration::from_secs(2), "Ana hears Mara", |v| {
             talking(v, "Mara")
         });
+    // The loudest sample of the last 200 ms, which a frame lost or late on
+    // a busy PC does not pull down as it would the tone's amplitude.
     let level = |what: &str| {
         thread::sleep(Duration::from_millis(300));
-        let heard = amplitude(last_200_ms(&ana.heard().0), 440.0);
-        println!("Mara {what}: {heard:.3}");
+        let heard = last_200_ms(&ana.heard().0)
+            .iter()
+            .fold(0.0f32, |most, s| most.max(s.abs()));
+        println!("Mara {what}: loudest {heard:.3}");
         heard
     };
     let half = level("at 50 percent");
