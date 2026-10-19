@@ -15,7 +15,8 @@ const MOST_PEOPLE: usize = 256;
 
 #[derive(Default)]
 pub struct Volumes {
-    // None for a panel with no data folder, which saves nothing.
+    // None for a panel with no data folder, or a file it could not read,
+    // which saves nothing.
     dir: Option<PathBuf>,
     // The last one changed first.
     people: Vec<([u8; 32], u8)>,
@@ -23,22 +24,27 @@ pub struct Volumes {
 }
 
 impl Volumes {
-    // Unreadable, it is as if no one was turned up or down, with the reason.
+    // Unreadable, it is as if no one was turned up or down, with the reason,
+    // and nothing is written over the people in it.
     pub fn load(dir: &Path) -> (Volumes, Option<String>) {
         let path = dir.join(FILE);
-        let (people, problem) = match settings::read(&path) {
-            Ok(bytes) => (parse(&bytes), None),
+        match settings::read(&path) {
+            Ok(bytes) => {
+                let volumes = Volumes {
+                    dir: Some(dir.to_owned()),
+                    people: parse(&bytes),
+                    unsaved: false,
+                };
+                (volumes, None)
+            }
             Err(err) => (
-                Vec::new(),
-                Some(format!("could not read {}: {err}", path.display())),
+                Volumes::default(),
+                Some(format!(
+                    "could not read {}: {err}; volumes changed now are not saved",
+                    path.display()
+                )),
             ),
-        };
-        let volumes = Volumes {
-            dir: Some(dir.to_owned()),
-            people,
-            unsaved: false,
-        };
-        (volumes, problem)
+        }
     }
 
     pub fn get(&self, key: &[u8; 32]) -> u8 {
@@ -93,7 +99,8 @@ impl Drop for Volumes {
 fn parse(bytes: &[u8]) -> Vec<([u8; 32], u8)> {
     let mut people: Vec<([u8; 32], u8)> = Vec::new();
     let text = String::from_utf8_lossy(bytes);
-    for line in text.lines() {
+    // Notepad has written a byte order mark in front in the past.
+    for line in text.strip_prefix('\u{feff}').unwrap_or(&text).lines() {
         let mut parts = line.split_whitespace();
         let (Some(key), Some(percent), None) = (parts.next(), parts.next(), parts.next()) else {
             continue;
@@ -187,6 +194,36 @@ mod tests {
         );
         let people = parse(text.as_bytes());
         assert_eq!(people, [([0xab; 32], 70), ([0xcd; 32], 150)]);
+    }
+
+    #[test]
+    fn a_byte_order_mark_is_not_part_of_the_first_key() {
+        let text = format!(
+            "\u{feff}{} 70\r\n{} 20\r\n",
+            "ab".repeat(32),
+            "cd".repeat(32)
+        );
+        assert_eq!(parse(text.as_bytes()), [([0xab; 32], 70), ([0xcd; 32], 20)]);
+    }
+
+    #[test]
+    fn unreadable_file_kept() {
+        let dir = folder("unreadable");
+        // Windows will not open a folder as a file, which stands in for a
+        // file another program holds open without sharing.
+        std::fs::create_dir(dir.join(FILE)).unwrap();
+        let (mut volumes, problem) = Volumes::load(&dir);
+        let problem = problem.expect("a reason");
+        assert!(
+            problem.ends_with("; volumes changed now are not saved"),
+            "{problem}"
+        );
+        volumes.set([7; 32], 40);
+        assert_eq!(volumes.get(&[7; 32]), 40);
+        volumes.save().unwrap();
+        drop(volumes);
+        assert!(dir.join(FILE).is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
