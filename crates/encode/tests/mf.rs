@@ -40,10 +40,15 @@ impl Case {
     }
 }
 
-/// The first hardware GPU, or WARP when there is none, for the software
-/// encoder.
-fn gpu() -> Gpu {
-    common::hardware().unwrap_or_else(common::warp)
+/// The first hardware GPU, for the software encoder too, or None with the
+/// reason printed. WARP maps an NV12 texture with a size that covers only
+/// its luma plane, so Frames cannot fill one there.
+fn gpu() -> Option<Gpu> {
+    let gpu = common::hardware();
+    if gpu.is_none() {
+        println!("skipped: no hardware GPU on this PC to make the NV12 frames on");
+    }
+    gpu
 }
 
 /// The encoder, or None with the reason printed when this PC does not have
@@ -112,7 +117,9 @@ fn megabits(bytes: usize, seconds: f64) -> f64 {
 
 fn first_frame(case: Case) {
     let _turn = common::turn();
-    let gpu = gpu();
+    let Some(gpu) = gpu() else {
+        return;
+    };
     let Some(mut encoder) = open(&gpu, case, Preset::P1) else {
         return;
     };
@@ -193,7 +200,9 @@ fn software_first_frame() {
 
 fn forced_idr(case: Case) {
     let _turn = common::turn();
-    let gpu = gpu();
+    let Some(gpu) = gpu() else {
+        return;
+    };
     let Some(mut encoder) = open(&gpu, case, Preset::P1) else {
         return;
     };
@@ -236,7 +245,9 @@ fn software_forced_idr() {
 
 fn recover_with_idr(case: Case) {
     let _turn = common::turn();
-    let gpu = gpu();
+    let Some(gpu) = gpu() else {
+        return;
+    };
     let Some(mut encoder) = open(&gpu, case, Preset::P1) else {
         return;
     };
@@ -276,7 +287,9 @@ fn software_recover_with_idr() {
 
 fn bitrate_holds_over_2_s(case: Case) {
     let _turn = common::turn();
-    let gpu = gpu();
+    let Some(gpu) = gpu() else {
+        return;
+    };
     let Some(mut encoder) = open(&gpu, case, Preset::P1) else {
         return;
     };
@@ -326,7 +339,9 @@ fn software_bitrate_holds_over_2_s() {
 
 fn bitrate_change(case: Case) {
     let _turn = common::turn();
-    let gpu = gpu();
+    let Some(gpu) = gpu() else {
+        return;
+    };
     let Some(mut encoder) = open(&gpu, case, Preset::P1) else {
         return;
     };
@@ -399,7 +414,9 @@ fn software_bitrate_change() {
 
 fn one_frame_in_flight(case: Case) {
     let _turn = common::turn();
-    let gpu = gpu();
+    let Some(gpu) = gpu() else {
+        return;
+    };
     let Some(mut encoder) = open(&gpu, case, Preset::P1) else {
         return;
     };
@@ -439,7 +456,9 @@ fn software_one_frame_in_flight() {
 #[test]
 fn encode_time_next_to_nvenc() {
     let _turn = common::turn();
-    let gpu = gpu();
+    let Some(gpu) = gpu() else {
+        return;
+    };
     let mut lines = Vec::new();
     for (case, kind) in [
         (HARDWARE, Kind::Nvenc),
@@ -497,7 +516,9 @@ fn encode_time_next_to_nvenc() {
 
 fn decodable_stream(case: Case) {
     let _turn = common::turn();
-    let gpu = gpu();
+    let Some(gpu) = gpu() else {
+        return;
+    };
     let Some(mut encoder) = open(&gpu, case, Preset::P1) else {
         return;
     };
@@ -554,7 +575,9 @@ fn software_decodable_stream() {
 
 fn refused_frames(case: Case) {
     let _turn = common::turn();
-    let gpu = gpu();
+    let Some(gpu) = gpu() else {
+        return;
+    };
     let Some(mut encoder) = open(&gpu, case, Preset::P1) else {
         return;
     };
