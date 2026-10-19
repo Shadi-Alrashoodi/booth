@@ -1,0 +1,79 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: powershell
+    env:
+      # .cargo\config.toml names the CMake that comes with the Visual Studio
+      # 2022 Build Tools, which the runner does not have; its own is on PATH.
+      CMAKE: cmake
+      CARGO_INCREMENTAL: 0
+    steps:
+      # Git for Windows checks text files out with CRLF unless told not to.
+      # The tests should see the same bytes as a checkout on my PC.
+      - run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - run: rustup toolchain install
+
+      # FFmpeg is not built here. The third_party\ffmpeg folder the releases
+      # are built with is in the ffmpeg-8.1.3 release, and with it in place
+      # fetch-third-party.ps1 finds the pinned build and leaves it.
+      - name: FFmpeg
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $url = 'https://github.com/Shadi-Alrashoodi/booth/releases/download/ffmpeg-8.1.3/ffmpeg-8.1.3-build.zip'
+          $sha256 = '758C4E28537B68056E18734F02C79A887E892365F5213C6DCA3C2C2D76590872'
+          $zip = Join-Path $env:RUNNER_TEMP 'ffmpeg-8.1.3-build.zip'
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          $got = (Get-FileHash $zip -Algorithm SHA256).Hash
+          if ($got -ne $sha256) { throw "the FFmpeg download does not match the pinned hash: expected $sha256, got $got" }
+          Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $env:GITHUB_WORKSPACE 'third_party\ffmpeg')
+
+      - run: powershell -ExecutionPolicy Bypass -File tools\fetch-third-party.ps1
+
+      # The version tools\release.ps1 checks with.
+      - name: cargo-deny
+        id: setup
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $name = 'cargo-deny-0.20.2-x86_64-pc-windows-msvc'
+          $sha256 = '975A22143262FD27476D19EE00C7AF67978426E40E1DEE94EED6BBADE1CF87DC'
+          $archive = Join-Path $env:RUNNER_TEMP "$name.tar.gz"
+          Invoke-WebRequest -Uri "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/$name.tar.gz" -OutFile $archive -UseBasicParsing
+          $got = (Get-FileHash $archive -Algorithm SHA256).Hash
+          if ($got -ne $sha256) { throw "the cargo-deny download does not match the pinned hash: expected $sha256, got $got" }
+          & (Join-Path $env:SystemRoot 'System32\tar.exe') -xzf $archive -C $env:RUNNER_TEMP
+          if ($LASTEXITCODE -ne 0) { throw "could not unpack $archive (tar exit code $LASTEXITCODE)" }
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $env:RUNNER_TEMP $name)
+
+      # Each check runs once the setup above has worked, whatever the checks
+      # before it found, so one run shows every problem.
+      - if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: cargo deny --locked check --hide-inclusion-graph
+
+      - if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: cargo clippy --workspace --locked -- -D warnings
+
+      # --show-output puts the line each hardware test prints when the runner
+      # has no GPU encoder, monitor or microphone for it into the log.
+      - if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        timeout-minutes: 60
+        run: cargo test --workspace --locked --no-fail-fast -- --show-output
+
+      - if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: cargo build --release --locked -p app
