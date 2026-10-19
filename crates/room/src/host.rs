@@ -1323,6 +1323,10 @@ impl Host {
         }
     }
 
+    pub(crate) fn set_volume(&mut self, key: [u8; 32], percent: u8) {
+        self.talk.set_volume(key, percent);
+    }
+
     // The host is in the room too. Its line shows here at once and goes to
     // everyone else in the same order as what clients say. `text` has been
     // through chat::clean_text.

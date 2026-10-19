@@ -204,8 +204,10 @@ impl FrameSource for Played {
 }
 
 pub(crate) enum ToSpeaker {
-    Add([u8; 32], Arc<Mutex<Ear>>),
+    // With the volume this PC plays them at, 1.0 as they come.
+    Add([u8; 32], Arc<Mutex<Ear>>, f32),
     Remove([u8; 32]),
+    Volume([u8; 32], f32),
 }
 
 // What the mixer plays: every talker, and the share cue, which goes through
@@ -277,19 +279,21 @@ impl Speaker {
         let began = Instant::now();
         while let Ok(order) = self.orders.try_recv() {
             match order {
-                ToSpeaker::Add(key, ear) => {
+                ToSpeaker::Add(key, ear, gain) => {
                     let played = Played {
                         ear,
                         shared: Arc::clone(&self.shared),
                         next_start: 0,
                     };
                     self.mixer.add(Key::Talker(key), Sound::Talker(played));
+                    self.mixer.set_gain(&Key::Talker(key), gain);
                 }
                 // The room keeps its own reference for a while, so the
                 // decoder is not freed here.
                 ToSpeaker::Remove(key) => {
                     self.mixer.remove(&Key::Talker(key));
                 }
+                ToSpeaker::Volume(key, gain) => self.mixer.set_gain(&Key::Talker(key), gain),
             }
         }
         let began_us = self.clock.micros(began);
@@ -363,7 +367,7 @@ mod tests {
         let mut speaker = Speaker::new(orders, Arc::clone(&shared), clock);
         let ear = Arc::new(Mutex::new(Ear::new().unwrap()));
         orders_in
-            .send(ToSpeaker::Add([1; 32], Arc::clone(&ear)))
+            .send(ToSpeaker::Add([1; 32], Arc::clone(&ear), 1.0))
             .unwrap();
         shared.render_now.latency_us.store(5000, Ordering::Relaxed);
         let mut out = [0.0f32; 240];

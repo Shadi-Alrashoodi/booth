@@ -20,6 +20,7 @@ mod strip;
 mod theme;
 mod tray;
 mod update;
+mod volumes;
 mod win;
 mod winver;
 

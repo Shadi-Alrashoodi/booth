@@ -39,6 +39,7 @@ use crate::strip::{self, Sweep};
 use crate::theme::{self, WINDOW};
 use crate::tray::{self, Tray};
 use crate::update::{self, Update};
+use crate::volumes::Volumes;
 use crate::{Args, controls, messages, monitors, win};
 
 const STATS_KEY: KeyboardShortcut =
@@ -450,6 +451,15 @@ impl App {
             words: chord.to_string(),
             flags: Arc::clone(&self.flags),
         };
+        // Before anyone is heard, so each is heard at their own volume
+        // from the first word.
+        let (volumes, volume_error) = match &self.setup {
+            Ok(setup) => Volumes::load(&setup.config.data_dir),
+            Err(_) => (Volumes::default(), None),
+        };
+        for (key, percent) in volumes.each() {
+            room.set_volume(key, percent);
+        }
         let room = Arc::new(room);
         self.target.enter(Arc::clone(&room));
         self.screen = Screen::Room(Box::new(InRoom::new(
@@ -460,6 +470,8 @@ impl App {
             devices,
             self.target.clone(),
             panic,
+            volumes,
+            volume_error.map(|error| messages::sentence(&error)),
         )));
         self.sweep = Sweep::default();
     }

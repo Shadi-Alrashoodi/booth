@@ -442,3 +442,45 @@ fn two_talkers_through_their_buffers_at_a_short_period() {
         assert_eq!((stats.depth_frames, stats.concealed, stats.lost), (1, 0, 0));
     }
 }
+
+// Each talker's own volume, applied before the mix: from the first sample
+// for a talker turned down before they spoke, and over 2.5 ms when changed
+// while they talk, never past what was asked. Turned to nothing they are
+// still pulled, so they come back on time when turned up again.
+#[test]
+fn each_talker_has_a_volume_of_their_own() {
+    let mut mixer: Mixer<u32, Talker> = Mixer::new();
+    mixer.add(1, Talker::Level(Level(0.2)));
+    mixer.add(2, Talker::Level(Level(0.1)));
+    mixer.set_gain(&1, 0.5);
+    let mut out = [0.0f32; 240];
+    mixer.render(&mut out);
+    assert!(out.iter().all(|&s| (s - 0.2).abs() < 1e-6), "{out:?}");
+
+    mixer.set_gain(&2, 0.0);
+    mixer.render(&mut out);
+    // Down from 0.1 to nothing over the first 120 samples, a step at a time.
+    assert!(out.windows(2).all(|pair| pair[1] <= pair[0] + 1e-6));
+    assert!((out[0] - 0.2).abs() < 0.002, "{}", out[0]);
+    assert!(out[120..].iter().all(|&s| (s - 0.1).abs() < 1e-6));
+
+    mixer.add(3, Talker::Counter(Counter::new(240, 0)));
+    mixer.set_gain(&3, 0.0);
+    for _ in 0..4 {
+        mixer.render(&mut out);
+    }
+    assert!(out.iter().all(|&s| (s - 0.1).abs() < 1e-6));
+    assert_eq!(pulls(&mut mixer, 3), 4);
+    mixer.set_gain(&1, 1.5);
+    mixer.set_gain(&2, f32::NAN);
+    mixer.render(&mut out);
+    // 0.3 from the first, 0.1 from the second back at its own level, and
+    // the counter still off.
+    assert!(
+        out[120..].iter().all(|&s| (s - 0.4).abs() < 1e-6),
+        "{:?}",
+        &out[120..]
+    );
+    // A talker who is not in the mix is no one's business.
+    mixer.set_gain(&9, 0.0);
+}

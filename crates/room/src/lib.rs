@@ -71,7 +71,7 @@ pub use remote::{
 pub use reply::{ReplyAccepted, ReplyRefused};
 // What the panel needs to name a monitor and say how the viewer opens.
 pub use share::{Capturing, Monitor, MonitorId, Show, monitors};
-pub use talk::{Devices, TalkMode, VoiceConfig};
+pub use talk::{Devices, MOST_VOLUME, TalkMode, VoiceConfig};
 pub use threads::AddressHook;
 pub use view::View;
 
@@ -357,6 +357,14 @@ impl Room {
     /// Undeafened, the microphone opens again unless muted before.
     pub fn deafen(&self, deafened: bool) {
         self.threads.deafen(deafened);
+    }
+
+    /// How loud this PC plays the person with `key`, in percent of how
+    /// their voice comes: 0 is not at all, 100 as it comes, up to
+    /// MOST_VOLUME. Kept for the rest of the room, for someone who joins
+    /// later too; nothing about it leaves this PC.
+    pub fn set_volume(&self, key: [u8; 32], percent: u8) {
+        self.threads.set_volume(key, percent.min(MOST_VOLUME));
     }
 
     /// Asks to share this PC's screen at `fps` frames a second: `monitor`,

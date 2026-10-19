@@ -66,6 +66,12 @@ struct Voice<K, S> {
     held: [f32; MAX_FRAME],
     start: usize,
     len: usize,
+    // This talker's own volume, which moves to `wanted` over FADE samples
+    // so a slider dragged mid-word does not click. A talker who has not
+    // played yet starts at it.
+    gain: f32,
+    wanted: f32,
+    played: bool,
 }
 
 impl<K, S: FrameSource> Voice<K, S> {
@@ -75,6 +81,7 @@ impl<K, S: FrameSource> Voice<K, S> {
     // current frame: less than one frame (under 5 ms, under 10 ms in the 10 ms
     // mode), and that is the frame playing out, not added delay.
     fn add_into(&mut self, out: &mut [f32]) {
+        let step = 1.0 / FADE as f32;
         let mut done = 0;
         while done < out.len() {
             if self.len == 0 {
@@ -82,6 +89,7 @@ impl<K, S: FrameSource> Voice<K, S> {
                     Some(len) if len > 0 => {
                         self.start = 0;
                         self.len = len.min(MAX_FRAME);
+                        self.played = true;
                     }
                     _ => return,
                 }
@@ -89,7 +97,8 @@ impl<K, S: FrameSource> Voice<K, S> {
             let take = self.len.min(out.len() - done);
             let from = &self.held[self.start..self.start + take];
             for (sum, sample) in out[done..done + take].iter_mut().zip(from) {
-                *sum += sample;
+                self.gain += (self.wanted - self.gain).clamp(-step, step);
+                *sum += sample * self.gain;
             }
             self.start += take;
             self.len -= take;
@@ -133,8 +142,23 @@ impl<K: PartialEq, S: FrameSource> Mixer<K, S> {
             held: [0.0; MAX_FRAME],
             start: 0,
             len: 0,
+            gain: 1.0,
+            wanted: 1.0,
+            played: false,
         });
         replaced
+    }
+
+    // 1.0 plays the talker as they come, 0.0 not at all; over 1.0 louder,
+    // with the limiter after the mix as for any other loud sum.
+    pub fn set_gain(&mut self, key: &K, gain: f32) {
+        let Some(voice) = self.voices.iter_mut().find(|voice| voice.key == *key) else {
+            return;
+        };
+        voice.wanted = if gain.is_finite() { gain.max(0.0) } else { 1.0 };
+        if !voice.played {
+            voice.gain = voice.wanted;
+        }
     }
 
     // The talker's next 2.5 ms still play, fading out, so someone who leaves

@@ -33,6 +33,7 @@ mod ear;
 mod mouth;
 mod wire;
 
+use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{
@@ -63,6 +64,9 @@ pub(crate) use ear::{Ear, Speaker, ToSpeaker};
 pub(crate) use mouth::HOST_SLOT;
 pub(crate) use wire::{Frame, MAX_VOICE, read_relayed, read_spoken};
 
+// A friend's voice goes from 0, not heard, to half again as loud as it
+// comes.
+pub const MOST_VOLUME: u8 = 150;
 // JitterStats counts loss over the last 2 s, so a talker not heard for that
 // long has nothing new to report.
 pub(crate) const HEARD_LATELY: Duration = Duration::from_secs(2);
@@ -516,6 +520,10 @@ pub(crate) struct Talk {
     latest: Option<[u8; 32]>,
     dropped: u64,
     new_ears: Bucket,
+    // The volume this PC plays each person at, by key, where it is not 1.0:
+    // set from the panel, kept for people not in the room yet, and never
+    // sent anywhere.
+    volumes: HashMap<[u8; 32], f32>,
 }
 
 impl Talk {
@@ -542,6 +550,7 @@ impl Talk {
             latest: None,
             dropped: 0,
             new_ears: Bucket::full(now, NEW_EAR_BURST),
+            volumes: HashMap::new(),
         }
     }
 
@@ -591,7 +600,10 @@ impl Talk {
             None => match Ear::new() {
                 Ok(ear) => {
                     let ear = Arc::new(Mutex::new(ear));
-                    let _ = self.speaker.send(ToSpeaker::Add(key, Arc::clone(&ear)));
+                    let gain = self.volumes.get(&key).copied().unwrap_or(1.0);
+                    let _ = self
+                        .speaker
+                        .send(ToSpeaker::Add(key, Arc::clone(&ear), gain));
                     self.talkers.push(Talker {
                         key,
                         ear,
@@ -627,6 +639,18 @@ impl Talk {
 
     pub(crate) fn dropped(&mut self) {
         self.dropped += 1;
+    }
+
+    // Under the state lock, as the talkers join the mix, so the speaker
+    // gets the two in the order they happened.
+    pub(crate) fn set_volume(&mut self, key: [u8; 32], percent: u8) {
+        let gain = f32::from(percent.min(MOST_VOLUME)) / 100.0;
+        if percent == 100 {
+            self.volumes.remove(&key);
+        } else {
+            self.volumes.insert(key, gain);
+        }
+        let _ = self.speaker.send(ToSpeaker::Volume(key, gain));
     }
 
     // Someone left: their buffer leaves the mixer.

@@ -131,6 +131,13 @@ impl Side {
         }
     }
 
+    fn set_volume(&mut self, key: [u8; 32], percent: u8) {
+        match self {
+            Side::Host(host) => host.set_volume(key, percent),
+            Side::Client(client) => client.set_volume(key, percent),
+        }
+    }
+
     fn say(&mut self, text: String, now: Instant, socket: &Socket) -> Result<(), ChatRefused> {
         match self {
             Side::Host(host) => host.say(text, now, socket),
@@ -760,6 +767,10 @@ impl Threads {
         let microphone = self.voice.set_muted(muted);
         let what = if muted { "muted" } else { "unmuted" };
         self.voice_changed(what, microphone);
+    }
+
+    pub(crate) fn set_volume(&self, key: [u8; 32], percent: u8) {
+        self.with_side(|side, _, _| side.set_volume(key, percent));
     }
 
     // Deafened, this PC also stops sending; see talk::Shared::set_muted.

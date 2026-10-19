@@ -507,6 +507,20 @@ pub fn row_menu(name: &str) -> String {
     format!("{name}, Enter opens the row menu")
 }
 
+pub fn volume_label(name: &str) -> String {
+    format!("Volume for {name}")
+}
+
+// After a person's name, while this PC plays them at anything but 100
+// percent. Their own Mute is theirs; this one is yours.
+pub fn volume_word(percent: u8) -> Option<String> {
+    match percent {
+        100 => None,
+        0 => Some(String::from("muted by you")),
+        _ => Some(format!("{percent} %")),
+    }
+}
+
 // While this PC is controlled.
 pub const SETTINGS_LOCKED: &str = "The hotkeys, the panic key and the sharing settings cannot change while someone controls this PC. Stop control, then press Save again.";
 

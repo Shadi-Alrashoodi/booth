@@ -13,7 +13,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{Event, Frame, Key, Margin, Modifiers, Response, Ui, WidgetInfo, WidgetType};
+use eframe::egui::{
+    Event, Frame, Id, Key, Margin, Modifiers, Response, Ui, WidgetInfo, WidgetType,
+};
+use room::MOST_VOLUME;
 use room::view::{LinkState, Person, Role, View};
 
 use crate::controls::{self, Button};
@@ -285,11 +288,13 @@ pub struct RowMenu {
     open: Option<[u8; 32]>,
     // Opened from the keyboard: its first item takes the focus.
     focus: bool,
+    // The open menu's row, which Esc gives the focus back to.
+    row: Option<Id>,
 }
 
 impl RowMenu {
-    // The row, once drawn with `row` sensing clicks: right-click, or Enter
-    // or Shift+F10 while it has focus, opens its menu, and again closes it.
+    // The row, once drawn with `row` sensing clicks: a click, or Enter or
+    // Shift+F10 while it has focus, opens its menu, and again closes it.
     // Windows' Menu key does not reach the panel (egui has no key for it),
     // so Shift+F10, which Windows treats as the same, stands in.
     pub fn follow_row(&mut self, ui: &Ui, row: &Response, key: [u8; 32], name: &str) {
@@ -315,7 +320,7 @@ impl RowMenu {
                     _ => false,
                 })
             });
-        if !row.secondary_clicked() && !keyboard {
+        if !row.clicked() && !row.secondary_clicked() && !keyboard {
             return;
         }
         if self.open == Some(key) {
@@ -323,7 +328,12 @@ impl RowMenu {
         } else {
             self.open = Some(key);
             self.focus = keyboard;
+            self.row = Some(row.id);
         }
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open.is_some()
     }
 
     // Each frame, with the rows that have a menu: one that left the room,
@@ -334,14 +344,28 @@ impl RowMenu {
         }
     }
 
-    // Under the open row. Esc closes it, and so does picking an item, or
-    // the row losing every item (the control it would end has ended).
-    pub fn show(&mut self, ui: &mut Ui, key: [u8; 32], items: &[MenuItem]) -> Option<MenuItem> {
+    // Under the open row: the person's volume, when given with their name,
+    // then the row's items. Esc closes it and gives the focus back to the
+    // row; picking an item closes it, and so does the row losing all it
+    // had (the control it would end has ended).
+    pub fn show(
+        &mut self,
+        ui: &mut Ui,
+        key: [u8; 32],
+        volume: Option<(&mut u32, &str)>,
+        items: &[MenuItem],
+    ) -> Option<MenuItem> {
         if self.open != Some(key) {
             return None;
         }
-        if items.is_empty() || ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
-        {
+        if ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.open = None;
+            if let Some(row) = self.row.take() {
+                ui.memory_mut(|memory| memory.request_focus(row));
+            }
+            return None;
+        }
+        if items.is_empty() && volume.is_none() {
             self.open = None;
             return None;
         }
@@ -357,6 +381,18 @@ impl RowMenu {
             .inner_margin(margin)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                if let Some((percent, name)) = volume {
+                    let id = ui.id().with(("volume", key));
+                    let most = u32::from(MOST_VOLUME);
+                    let label = messages::volume_label(name);
+                    let response = controls::slider(ui, id, percent, 0..=most, "%", &label);
+                    if std::mem::take(&mut self.focus) {
+                        response.request_focus();
+                    }
+                }
+                if items.is_empty() {
+                    return;
+                }
                 ui.horizontal(|ui| {
                     for item in items {
                         let response = Button::new(item.text()).height(ROW_HEIGHT).show(ui);
@@ -843,7 +879,7 @@ mod tests {
         let (rect, _) = ui.allocate_exact_size(vec2(360.0, ROW_HEIGHT), Sense::hover());
         let row = ui.interact(rect, ui.id().with("tom's row"), Sense::click());
         menu.follow_row(ui, &row, TOM, "Tom");
-        menu.show(ui, TOM, &[MenuItem::EndControl])
+        menu.show(ui, TOM, None, &[MenuItem::EndControl])
     }
 
     fn secondary(at: Pos2, pressed: bool) -> Event {
@@ -911,14 +947,66 @@ mod tests {
         }
     }
 
+    // A person's volume comes first in their row's menu: opened from the
+    // keyboard it takes the focus, the arrows and Page Down move it, and Esc
+    // closes the menu with the focus back on the row. A plain click opens
+    // it too.
+    #[test]
+    fn row_menu_volume() {
+        let ctx = context();
+        let mut menu = RowMenu::default();
+        let mut percent = 100;
+        let mut draw = |events: Vec<Event>, menu: &mut RowMenu, percent: &mut u32| {
+            let (row, _) = frame(&ctx, events, |ui| {
+                let (rect, _) = ui.allocate_exact_size(vec2(360.0, ROW_HEIGHT), Sense::hover());
+                let row = ui.interact(rect, ui.id().with("tom's row"), Sense::click());
+                menu.follow_row(ui, &row, TOM, "Tom");
+                menu.show(ui, TOM, Some((percent, "Tom")), &[]);
+                row.id
+            });
+            row
+        };
+        draw(Vec::new(), &mut menu, &mut percent);
+        draw(
+            vec![key(Key::Tab, Modifiers::NONE)],
+            &mut menu,
+            &mut percent,
+        );
+        draw(
+            vec![key(Key::Enter, Modifiers::NONE)],
+            &mut menu,
+            &mut percent,
+        );
+        assert!(menu.is_open());
+        draw(Vec::new(), &mut menu, &mut percent);
+        for step in [Key::ArrowLeft, Key::PageDown] {
+            draw(vec![key(step, Modifiers::NONE)], &mut menu, &mut percent);
+        }
+        assert_eq!(percent, 89);
+        let row = draw(
+            vec![key(Key::Escape, Modifiers::NONE)],
+            &mut menu,
+            &mut percent,
+        );
+        assert!(!menu.is_open());
+        draw(Vec::new(), &mut menu, &mut percent);
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(row));
+
+        let on_row = ROW.center();
+        draw(vec![Event::PointerMoved(on_row)], &mut menu, &mut percent);
+        draw(press(on_row), &mut menu, &mut percent);
+        draw(release(on_row), &mut menu, &mut percent);
+        assert!(menu.is_open());
+    }
+
     #[test]
     fn a_menu_with_nothing_left_in_it_closes() {
         let ctx = context();
         let mut menu = RowMenu {
             open: Some(TOM),
-            focus: false,
+            ..RowMenu::default()
         };
-        let (picked, _) = frame(&ctx, Vec::new(), |ui| menu.show(ui, TOM, &[]));
+        let (picked, _) = frame(&ctx, Vec::new(), |ui| menu.show(ui, TOM, None, &[]));
         assert_eq!(picked, None);
         assert_ne!(menu.open, Some(TOM));
     }

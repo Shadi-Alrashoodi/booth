@@ -573,7 +573,7 @@ impl std::error::Error for SaveError {
 }
 
 // Nothing there reads as an empty file.
-fn read(path: &Path) -> io::Result<Vec<u8>> {
+pub(crate) fn read(path: &Path) -> io::Result<Vec<u8>> {
     match fs::read(path) {
         Ok(bytes) => Ok(bytes),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -584,8 +584,8 @@ fn read(path: &Path) -> io::Result<Vec<u8>> {
 // Written in full next to the old file, flushed to disk, then renamed over
 // it, so a crash or a full disk leaves the old file or the new one and
 // never half of either. Windows replaces the target in the rename.
-fn replace(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), SaveError> {
-    let temp = temp_path(dir);
+pub(crate) fn replace(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), SaveError> {
+    let temp = temp_path(dir, path);
     let wrote = File::create(&temp).and_then(|mut file| {
         file.write_all(bytes)?;
         file.sync_all()
@@ -605,8 +605,9 @@ fn replace(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), SaveError> {
 }
 
 // Two Booths on the same profile saving at once each get their own.
-fn temp_path(dir: &Path) -> PathBuf {
-    dir.join(format!("settings.{}.tmp", std::process::id()))
+fn temp_path(dir: &Path, path: &Path) -> PathBuf {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    dir.join(format!("{stem}.{}.tmp", std::process::id()))
 }
 
 // Lines without their line break, "\n" or "\r\n", and without a leading
@@ -884,12 +885,12 @@ mod tests {
         let before = "address_name = old.example.net\r\nvideo_upload = 15\r\n";
         fs::write(folder.file(), before).unwrap();
         // A folder where the new file would go stands in for a full disk.
-        fs::create_dir(temp_path(&folder.0)).unwrap();
+        fs::create_dir(temp_path(&folder.0, &folder.file())).unwrap();
         let err = named("new.example.net").save(&folder.0).unwrap_err();
         assert!(matches!(err, SaveError::Write { .. }), "{err}");
         assert_eq!(fs::read_to_string(folder.file()).unwrap(), before);
 
-        fs::remove_dir(temp_path(&folder.0)).unwrap();
+        fs::remove_dir(temp_path(&folder.0, &folder.file())).unwrap();
         named("new.example.net").save(&folder.0).unwrap();
         let left: Vec<_> = fs::read_dir(&folder.0)
             .unwrap()

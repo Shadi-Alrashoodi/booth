@@ -7,11 +7,11 @@ use eframe::egui::{
     Align, Color32, Key, Layout, Modifiers, Rect, Response, ScrollArea, Sense, Stroke, Ui, vec2,
 };
 use invite::ReplyCode;
-use room::Room;
 use room::view::{
     InviteView, LinkState, MappingWord, NameView, Notice, OwnShare, PasteState, Person, ReplyState,
     ReplyView, Role, ShareView, TalkMode, View, Voice,
 };
+use room::{MOST_VOLUME, Room};
 use voice::audio::{AudioError, Choice};
 
 use crate::controls::{self, Button, Lead};
@@ -27,6 +27,7 @@ use crate::theme::{
     self, AMBER, ASH, BAD, CHALK, CONTROL_HEIGHT, FIELD_GAP, HALF_STEP, QUIET_DOT, ROW_HEIGHT,
     SIDE, STEP, TALKING, WARN,
 };
+use crate::volumes::Volumes;
 use crate::win;
 
 // A reply code is about 110 characters. The cap is the invite field's: far
@@ -66,6 +67,10 @@ pub struct InRoom {
     allow_wait: AllowWait,
     decline: Decline,
     menu: RowMenu,
+    // How loud this PC plays each person, set in their row's menu and
+    // written when it closes.
+    volumes: Volumes,
+    volume_error: Option<String>,
 }
 
 // Hold to talk as the room was last told, and whether the button was drawn
@@ -121,6 +126,7 @@ pub enum Step {
 }
 
 impl InRoom {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         room: Arc<Room>,
         typed_room_name: String,
@@ -129,6 +135,8 @@ impl InRoom {
         devices: [Choice; 2],
         target: Target,
         panic: PanicKey,
+        volumes: Volumes,
+        volume_error: Option<String>,
     ) -> InRoom {
         InRoom {
             room,
@@ -150,6 +158,8 @@ impl InRoom {
             allow_wait: AllowWait::default(),
             decline: Decline::default(),
             menu: RowMenu::default(),
+            volumes,
+            volume_error,
         }
     }
 
@@ -940,10 +950,11 @@ impl InRoom {
         let gone = matches!(client_link, Some(LinkState::Lost | LinkState::Closed));
         let stale = gone || client_link == Some(LinkState::Reconnecting);
         let offered = self.control_offered;
+        // Everyone else's row has a menu: their volume, first.
         let with_menu: Vec<[u8; 32]> = view
             .people
             .iter()
-            .filter(|person| !control::menu_items(view, person, offered).is_empty())
+            .filter(|person| !person.is_you)
             .map(|person| person.key)
             .collect();
         self.menu.keep_only(&with_menu);
@@ -958,7 +969,15 @@ impl InRoom {
                 .count()
                 > 1;
             let dim = gone || person.reconnecting;
-            let word = control::state_word(view, person, offered);
+            let state = control::state_word(view, person, offered);
+            let volume = (!person.is_you)
+                .then(|| messages::volume_word(self.volumes.get(&person.key)))
+                .flatten();
+            let word = match (state, volume) {
+                (Some(state), Some(volume)) => Some(format!("{state}, {volume}")),
+                (state, volume) => volume.or(state.map(str::to_owned)),
+            };
+            let word = word.as_deref();
             if person.is_you {
                 self.your_row(ui, &view.voice, person, word, dim, ends_here(view));
                 let paused = paused_line(self.keys);
@@ -978,11 +997,9 @@ impl InRoom {
             }
             let rect = row_rect(ui, ROW_HEIGHT);
             let items = control::menu_items(view, person, offered);
-            if !items.is_empty() {
-                // Under the row's own buttons, which take their clicks first.
-                let row = ui.interact(rect, ui.id().with(("row", person.key)), Sense::click());
-                self.menu.follow_row(ui, &row, person.key, &person.name);
-            }
+            // Under the row's own buttons, which take their clicks first.
+            let row = ui.interact(rect, ui.id().with(("row", person.key)), Sense::click());
+            self.menu.follow_row(ui, &row, person.key, &person.name);
             let rtt = person.rtt_ms.filter(|_| !dim).map(strip::round_trip);
             let rtt_width = rtt.as_deref().map_or(0.0, |text| {
                 controls::text_width(ui, text, theme::mono_caption())
@@ -1036,13 +1053,33 @@ impl InRoom {
                 _ => {}
             }
             let before = ui.cursor().top();
-            if let Some(MenuItem::EndControl) = self.menu.show(ui, person.key, &items) {
+            let was = self.volumes.get(&person.key);
+            let mut percent = u32::from(was);
+            let volume = Some((&mut percent, person.name.as_str()));
+            if let Some(MenuItem::EndControl) = self.menu.show(ui, person.key, volume, &items) {
                 self.room.end_control();
+            }
+            let percent = u8::try_from(percent).unwrap_or(MOST_VOLUME);
+            if percent != was {
+                self.volumes.set(person.key, percent);
+                self.room.set_volume(person.key, percent);
             }
             // An open menu ends with space of its own under its button.
             if ui.cursor().top() > before {
                 row_last = false;
             }
+        }
+        // Written once the menu closes, not at each step of a drag.
+        if !self.menu.is_open()
+            && let Err(err) = self.volumes.save()
+        {
+            self.volume_error = Some(messages::sentence(&err.to_string()));
+        }
+        if let Some(error) = &self.volume_error {
+            row_last = false;
+            controls::gutter(ui, 0.0, STEP, |ui| {
+                controls::prose(ui, error.as_str(), theme::caption(), BAD);
+            });
         }
         // 8 px of window tone under the last row, so the focus ring around a
         // button on it stays in the list's tone instead of reaching into the

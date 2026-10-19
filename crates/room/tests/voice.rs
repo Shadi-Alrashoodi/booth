@@ -1197,6 +1197,56 @@ fn chosen_devices_open_once_they_are_plugged_in() {
     ana.room().talk(false);
 }
 
+// A volume for one person, set on this PC alone: Ana turns Mara down to half
+// before Mara says a word, and it holds from the first one; then off, which
+// is silence; then up to 150 percent. Mara's own sending does not change.
+#[test]
+fn a_volume_for_each_person() {
+    let _alone = alone();
+    let host = Voiced::host("Mara", timers(), tone_440);
+    let ana = Voiced::join(
+        voiced("Ana", timers(), silence, TalkMode::PushToTalk, true),
+        host_invite(&host.member),
+    );
+    settled(&host, &[&ana]);
+    let mara = ana
+        .view()
+        .people
+        .iter()
+        .find(|person| person.name == "Mara")
+        .expect("Mara in Ana's list")
+        .key;
+    ana.room().set_volume(mara, 50);
+    host.room().talk(true);
+    ana.member
+        .wait_for(Duration::from_secs(2), "Ana hears Mara", |v| {
+            talking(v, "Mara")
+        });
+    let level = |what: &str| {
+        thread::sleep(Duration::from_millis(300));
+        let heard = amplitude(last_200_ms(&ana.heard().0), 440.0);
+        println!("Mara {what}: {heard:.3}");
+        heard
+    };
+    let half = level("at 50 percent");
+    assert!((0.08..0.12).contains(&half), "{half}");
+    let loudest = ana
+        .heard()
+        .0
+        .iter()
+        .fold(0.0f32, |most, s| most.max(s.abs()));
+    assert!(loudest < 0.11, "the first word came at {loudest}");
+    ana.room().set_volume(mara, 0);
+    assert!(level("at 0") < 0.001);
+    ana.room().set_volume(mara, 150);
+    let loud = level("at 150 percent");
+    assert!((0.26..0.34).contains(&loud), "{loud}");
+    ana.room().set_volume(mara, 200);
+    assert!((0.26..0.34).contains(&level("asked for 200")));
+    assert!(host.view().numbers.voice_sent > 0);
+    host.room().talk(false);
+}
+
 // 2.5 s into the microphone's stream a 1 kHz tone starts, late enough for
 // three people to settle first.
 const LATER_TONE_AT: u64 = 120_000;
