@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 stats.workspace = true
 opus.workspace = true
+nnnoiseless.workspace = true
 getrandom.workspace = true
 crossbeam-channel.workspace = true
 windows = { workspace = true, features = [

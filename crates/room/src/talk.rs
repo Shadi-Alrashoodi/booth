@@ -120,6 +120,8 @@ pub struct VoiceConfig {
     // In open mic, nothing quieter than this is a voice, in dB of full
     // scale, SENSITIVITY_DB at most.
     pub sensitivity_db: i8,
+    // RNNoise on the microphone, off by default: it adds 10 to 20 ms.
+    pub noise_suppression: bool,
     // A quiet microphone brought up to a steady level, on by default.
     pub automatic_volume: bool,
     pub devices: Devices,
@@ -136,6 +138,7 @@ impl Default for VoiceConfig {
             talk: TalkMode::PushToTalk,
             constant_rate: true,
             sensitivity_db: DEFAULT_SENSITIVITY_DB,
+            noise_suppression: false,
             automatic_volume: true,
             devices: Devices::Windows,
         }

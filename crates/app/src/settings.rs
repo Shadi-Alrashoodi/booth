@@ -25,6 +25,8 @@ const TALK_MODE: &str = "talk_mode";
 const CONSTANT_RATE_VOICE: &str = "constant_rate_voice";
 // In dB, written only when moved off room::DEFAULT_SENSITIVITY_DB.
 const OPEN_MIC_SENSITIVITY: &str = "open_mic_sensitivity";
+// Off unless turned on, since it adds delay; only on is saved.
+const NOISE_SUPPRESSION: &str = "noise_suppression";
 // On unless turned off; only off is saved.
 const AUTOMATIC_VOLUME: &str = "automatic_volume";
 const HOTKEY_PUSH_TO_TALK: &str = "hotkey_push_to_talk";
@@ -44,7 +46,7 @@ const SHARE_MONITOR: &str = "share_monitor";
 // address. Only on is saved.
 const CHECK_FOR_NEW_VERSIONS: &str = "check_for_new_versions";
 // Every key this version knows, in the order a save adds the missing ones.
-const KEYS: [&str; 22] = [
+const KEYS: [&str; 23] = [
     NAME,
     PORT,
     STUN_SERVERS,
@@ -61,6 +63,7 @@ const KEYS: [&str; 22] = [
     TALK_MODE,
     CONSTANT_RATE_VOICE,
     OPEN_MIC_SENSITIVITY,
+    NOISE_SUPPRESSION,
     AUTOMATIC_VOLUME,
     VIDEO_UPLOAD_MBITS,
     VSYNC_IN_VIEWER,
@@ -101,6 +104,7 @@ pub struct Settings {
     variable_rate: bool,
     // None means room::DEFAULT_SENSITIVITY_DB.
     sensitivity_db: Option<i8>,
+    noise_suppression: bool,
     fixed_volume: bool,
     // Only the ones off their defaults are saved.
     hotkeys: Bindings,
@@ -263,6 +267,14 @@ impl Settings {
         self.sensitivity_db = (db != DEFAULT_SENSITIVITY_DB).then_some(db);
     }
 
+    pub fn noise_suppression(&self) -> bool {
+        self.noise_suppression
+    }
+
+    pub fn set_noise_suppression(&mut self, on: bool) {
+        self.noise_suppression = on;
+    }
+
     pub fn automatic_volume(&self) -> bool {
         !self.fixed_volume
     }
@@ -380,6 +392,7 @@ impl Settings {
             TALK_MODE => self.open_mic.then(|| String::from(OPEN_MIC)),
             CONSTANT_RATE_VOICE => self.variable_rate.then(|| String::from("off")),
             OPEN_MIC_SENSITIVITY => self.sensitivity_db.map(|db| db.to_string()),
+            NOISE_SUPPRESSION => self.noise_suppression.then(|| String::from("on")),
             AUTOMATIC_VOLUME => self.fixed_volume.then(|| String::from("off")),
             VIDEO_UPLOAD_MBITS => self.upload_mbits.map(|mbits| mbits.to_string()),
             VSYNC_IN_VIEWER => self.vsync.then(|| String::from("on")),
@@ -493,7 +506,10 @@ impl Settings {
                     }
                 };
             }
-            VSYNC_IN_VIEWER | HIDE_STRIP_IN_FULLSCREEN | CHECK_FOR_NEW_VERSIONS => {
+            VSYNC_IN_VIEWER
+            | HIDE_STRIP_IN_FULLSCREEN
+            | CHECK_FOR_NEW_VERSIONS
+            | NOISE_SUPPRESSION => {
                 let on = match value {
                     "on" => true,
                     "off" => false,
@@ -502,6 +518,7 @@ impl Settings {
                 match key {
                     VSYNC_IN_VIEWER => self.vsync = on,
                     HIDE_STRIP_IN_FULLSCREEN => self.hide_strip = on,
+                    NOISE_SUPPRESSION => self.noise_suppression = on,
                     _ => self.check_for_new_versions = on,
                 }
             }
@@ -1222,6 +1239,20 @@ mod tests {
         assert!(problems[0].ends_with(
             "open_mic_sensitivity is a number of dB from -60 to -20; set it again in settings"
         ));
+    }
+
+    #[test]
+    fn noise_suppression_round_trip() {
+        let folder = Folder::new("noise suppression");
+        let mut settings = Settings::default();
+        assert!(!settings.noise_suppression());
+        settings.set_noise_suppression(true);
+        settings.save(&folder.0).unwrap();
+        assert_eq!(
+            fs::read_to_string(folder.file()).unwrap(),
+            "noise_suppression = on\r\n"
+        );
+        assert!(Settings::load(&folder.0).0.noise_suppression());
     }
 
     #[test]

@@ -42,6 +42,9 @@ windows = "0.62"
 socket2 = "0.6"
 crossbeam-channel = "0.5"
 opus = "=0.4.0"
+# Noise suppression, RNNoise in Rust, BSD-3-Clause. Its default features
+# are its command line tool's.
+nnnoiseless = { version = "=0.5.2", default-features = false }
 # Forward error correction for video, MIT AND BSD-3-Clause.
 reed-solomon-simd = "=3.1.0"
 # Build only: the NVENC layout test and the FFmpeg field accessors.

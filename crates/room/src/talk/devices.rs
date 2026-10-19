@@ -489,7 +489,7 @@ fn open_microphone(
     mut mouth: Mouth,
     log: &Log,
 ) -> Result<Capture, AudioError> {
-    let switches = Switches::new(config.automatic_volume);
+    let switches = Switches::new(config.noise_suppression, config.automatic_volume);
     let mut processor = Processor::new(Arc::new(switches));
     let audio = move |samples: &[f32], at: Instant| {
         let (samples, at) = processor.run(samples, at);

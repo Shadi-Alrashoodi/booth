@@ -432,6 +432,7 @@ pub const NO_STUN: &str = "With no STUN servers Booth cannot learn your outside 
 // room, said where it happens.
 pub const MICROPHONE_OPEN: &str = "The microphone is open while this screen shows the meter.";
 pub const HEAR_YOURSELF: &str = "Use headphones.";
+pub const NOISE_SUPPRESSION_DELAY: &str = "Adds 10 to 20 ms of delay.";
 pub const HEAR_YOURSELF_TRIPPED: &str =
     "Turned off: the microphone heard the speakers. Use headphones.";
 

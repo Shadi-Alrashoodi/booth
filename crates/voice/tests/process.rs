@@ -4,7 +4,7 @@ use std::f32::consts::TAU;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use voice::process::{Playback, Processor, Switches};
+use voice::process::{NOISE_SUPPRESSION_DELAY, Playback, Processor, Switches};
 
 // 440 Hz at `amplitude` for `samples` samples, from sample `from` on.
 fn tone(from: usize, samples: usize, amplitude: f32) -> Vec<f32> {
@@ -19,7 +19,7 @@ fn tone(from: usize, samples: usize, amplitude: f32) -> Vec<f32> {
 // block in it, which a short loud word sets where the 50 ms RMS would not.
 #[test]
 fn nothing_on_passes_the_sound_and_meters_it() {
-    let mut processor = Processor::new(Arc::new(Switches::new(false)));
+    let mut processor = Processor::new(Arc::new(Switches::new(false, false)));
     let level = processor.level();
     let start = Instant::now();
     let mut sent = Vec::new();
@@ -137,7 +137,7 @@ fn through(processor: &mut Processor, signal: &[f32]) -> Vec<f32> {
 #[test]
 fn automatic_volume_evens_out_quiet_and_loud() {
     for (db, gain) in [(-34.0, 14.0), (-50.0, 20.0), (-10.0, -10.0)] {
-        let mut processor = Processor::new(Arc::new(Switches::new(true)));
+        let mut processor = Processor::new(Arc::new(Switches::new(false, true)));
         let out = through(&mut processor, &speech(6, db));
         let heard = words_db(&out);
         println!(
@@ -155,7 +155,7 @@ fn automatic_volume_evens_out_quiet_and_loud() {
         through(&mut processor, &vec![0.0; 3 * 48_000]);
         assert_eq!(processor.gain_db(), held);
     }
-    let switches = Arc::new(Switches::new(false));
+    let switches = Arc::new(Switches::new(false, false));
     let mut processor = Processor::new(Arc::clone(&switches));
     let quiet = speech(3, -34.0);
     assert_eq!(through(&mut processor, &quiet), quiet);
@@ -164,4 +164,117 @@ fn automatic_volume_evens_out_quiet_and_loud() {
         .store(true, std::sync::atomic::Ordering::Relaxed);
     through(&mut processor, &quiet);
     assert!(processor.gain_db() > 5.0);
+}
+
+// Something RNNoise takes for a voice, which a steady tone is not (it takes
+// a 440 Hz tone out by 20 dB): 150 Hz with its harmonics and a little
+// vibrato, in 250 ms syllables 150 ms apart from the second second on, and
+// white noise at -48 dBFS RMS all along.
+fn noisy_voice(n: usize) -> (f32, bool) {
+    let t = n as f32 / 48_000.0;
+    let phase = t % 0.4;
+    let pitch = 150.0 + 8.0 * (TAU * 5.0 * t).sin();
+    let voice: f32 = (1..20)
+        .map(|h| (TAU * pitch * h as f32 * t).sin() / h as f32)
+        .sum();
+    let envelope = if t > 1.0 && phase < 0.25 {
+        (TAU * phase / 0.5).sin()
+    } else {
+        0.0
+    };
+    let mut seed = (n as u32).wrapping_mul(0x9e37_79b9) ^ 0x5bd1_e995;
+    seed ^= seed << 13;
+    seed ^= seed >> 17;
+    seed ^= seed << 5;
+    let noise = 0.007 * (seed as f32 / u32::MAX as f32 * 2.0 - 1.0);
+    (0.08 * voice * envelope + noise, phase < 0.25)
+}
+
+fn rms_db(samples: &[f32]) -> f32 {
+    10.0 * (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).log10()
+}
+
+// With noise suppression on, the noise between syllables drops by well over
+// 10 dB while the syllables stay within 2 dB; nothing is lost or repeated
+// whatever the packet size, and each 10 ms block comes out 10 ms after it
+// went in, with the capture time moved back to match.
+#[test]
+fn noise_suppression_quiets_the_room_and_keeps_the_voice() {
+    let mut processor = Processor::new(Arc::new(Switches::new(true, false)));
+    let start = Instant::now();
+    let total = 4 * 48_000;
+    let signal: Vec<f32> = (0..total).map(|n| noisy_voice(n).0).collect();
+    let mut out = Vec::new();
+    let mut fed = 0;
+    for size in [128usize, 441, 480, 7, 1024].into_iter().cycle() {
+        if fed >= total {
+            break;
+        }
+        let packet = &signal[fed..(fed + size).min(total)];
+        let captured = start + Duration::from_nanos(fed as u64 * 1_000_000_000 / 48_000);
+        let (done, when) = processor.run(packet, captured);
+        if !done.is_empty() {
+            let block_start = out.len();
+            let expected =
+                start + Duration::from_nanos(block_start as u64 * 1_000_000_000 / 48_000);
+            let off = when.max(expected - NOISE_SUPPRESSION_DELAY)
+                - when.min(expected - NOISE_SUPPRESSION_DELAY);
+            assert!(off < Duration::from_micros(30), "{off:?}");
+            assert_eq!(done.len() % 480, 0);
+        }
+        out.extend_from_slice(done);
+        fed += packet.len();
+    }
+    assert_eq!(out.len(), total / 480 * 480);
+    // Out is 480 samples behind in.
+    let (mut words, mut gaps, mut words_in, mut gaps_in) = (vec![], vec![], vec![], vec![]);
+    for n in 2 * 48_000..out.len() - 480 {
+        let phase = (n as f32 / 48_000.0) % 0.4;
+        let (heard, kept) = (out[n + 480], signal[n]);
+        if (0.05..0.2).contains(&phase) {
+            words.push(heard);
+            words_in.push(kept);
+        } else if (0.27..0.38).contains(&phase) {
+            gaps.push(heard);
+            gaps_in.push(kept);
+        }
+    }
+    let (gap_in, gap_out) = (rms_db(&gaps_in), rms_db(&gaps));
+    let (word_in, word_out) = (rms_db(&words_in), rms_db(&words));
+    println!("gaps {gap_in:.1} -> {gap_out:.1} dB, syllables {word_in:.1} -> {word_out:.1} dB");
+    assert!(gap_out < gap_in - 12.0);
+    assert!((word_out - word_in).abs() < 2.0);
+}
+
+// What the processing costs on the capture thread for each 10 ms packet,
+// both stages on: printed, and held under a tenth of the packet in a
+// release build.
+#[test]
+fn processing_time() {
+    let mut processor = Processor::new(Arc::new(Switches::new(true, true)));
+    let signal: Vec<f32> = (0..10 * 48_000).map(|n| noisy_voice(n).0).collect();
+    let start = Instant::now();
+    let mut took: Vec<Duration> = signal
+        .chunks(480)
+        .map(|packet| {
+            let began = Instant::now();
+            std::hint::black_box(processor.run(packet, start));
+            began.elapsed()
+        })
+        .collect();
+    took.sort_unstable();
+    let at = |share: f64| took[((took.len() - 1) as f64 * share).round() as usize];
+    let build = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    println!(
+        "{build} build: noise suppression and automatic volume, a 10 ms packet in median {:.1} us, p99 {:.1} us",
+        at(0.5).as_secs_f64() * 1e6,
+        at(0.99).as_secs_f64() * 1e6
+    );
+    if !cfg!(debug_assertions) {
+        assert!(at(0.5) < Duration::from_millis(1), "{:?}", at(0.5));
+    }
 }

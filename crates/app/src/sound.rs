@@ -61,7 +61,7 @@ impl SettingsAudio {
             let probe = audio::probe(Direction::Input, choice).ok()?;
             Some(Microphone::new(&probe.engine, probe.hands_free))
         });
-        let switches = Arc::new(Switches::new(true));
+        let switches = Arc::new(Switches::new(false, true));
         SettingsAudio {
             watch,
             mic: Mic::new(ctx, open, Arc::clone(&switches), input),
@@ -585,7 +585,7 @@ mod tests {
         let mut mic = Mic::new(
             &Context::default(),
             fake_open(&fake),
-            Arc::new(Switches::new(true)),
+            Arc::new(Switches::new(false, true)),
             &Choice::Default,
         );
         wait_until("a is opening", || fake.record().at_once == 1);
@@ -615,7 +615,7 @@ mod tests {
         let mut mic = Mic::new(
             &Context::default(),
             fake_open(&fake),
-            Arc::new(Switches::new(true)),
+            Arc::new(Switches::new(false, true)),
             &Choice::Default,
         );
         frames_until(&mut mic, &Choice::Default, |mic| mic.level().is_some());
@@ -651,7 +651,7 @@ mod tests {
         let mut mic = Mic::new(
             &Context::default(),
             fake_open(&fake),
-            Arc::new(Switches::new(true)),
+            Arc::new(Switches::new(false, true)),
             &a,
         );
         wait_until("a is opening", || fake.record().at_once == 1);
@@ -678,7 +678,7 @@ mod tests {
         let mut mic = Mic::new(
             &Context::default(),
             fake_open(&fake),
-            Arc::new(Switches::new(true)),
+            Arc::new(Switches::new(false, true)),
             &pods,
         );
         frames_until(&mut mic, &pods, |mic| mic.problem.is_some());

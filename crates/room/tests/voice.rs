@@ -1247,6 +1247,75 @@ fn a_volume_for_each_person() {
     host.room().talk(false);
 }
 
+// A voice RNNoise takes for one, 150 Hz with its harmonics in 250 ms
+// syllables 150 ms apart, over white noise at -48 dBFS RMS, the same on
+// both channels.
+fn noisy_voice(frame: u64, _: u16) -> f32 {
+    let t = frame as f64 / RATE as f64;
+    let phase = t % 0.4;
+    let pitch = 150.0 + 8.0 * (TAU * 5.0 * t).sin();
+    let voice: f64 = (1..20)
+        .map(|h| (TAU * pitch * f64::from(h) * t).sin() / f64::from(h))
+        .sum();
+    let envelope = if phase < 0.25 {
+        (TAU * phase / 0.5).sin()
+    } else {
+        0.0
+    };
+    let mut seed = (frame as u32).wrapping_mul(0x9e37_79b9) ^ 0x5bd1_e995;
+    seed ^= seed << 13;
+    seed ^= seed >> 17;
+    seed ^= seed << 5;
+    let noise = 0.007 * (f64::from(seed) / f64::from(u32::MAX) * 2.0 - 1.0);
+    (0.08 * voice * envelope + noise) as f32
+}
+
+// Noise suppression on Mara's microphone, end to end: what Ana hears
+// between syllables drops well under what it is with it off, the syllables
+// themselves stay, and the delay it adds shows in mouth to ear.
+#[test]
+fn noise_suppression_end_to_end() {
+    let _alone = alone();
+    let mut quiet = Vec::new();
+    for on in [false, true] {
+        let (mut config, microphone, speakers) =
+            voiced("Mara", timers(), noisy_voice, TalkMode::PushToTalk, true);
+        config.voice.noise_suppression = on;
+        let host = Voiced::host_with((config, microphone, speakers));
+        let ana = Voiced::join(
+            voiced("Ana", timers(), silence, TalkMode::PushToTalk, true),
+            host_invite(&host.member),
+        );
+        settled(&host, &[&ana]);
+        host.room().talk(true);
+        ana.member
+            .wait_for(Duration::from_secs(2), "Ana hears Mara", |v| {
+                talking(v, "Mara")
+            });
+        thread::sleep(Duration::from_millis(2500));
+        let heard = ana.heard().0;
+        let last = &heard[heard.len() - 2 * RATE as usize..];
+        let mut blocks: Vec<f64> = last
+            .chunks(480)
+            .map(|block| {
+                let power = block.iter().map(|&s| f64::from(s * s)).sum::<f64>() / 480.0;
+                10.0 * power.max(1e-12).log10()
+            })
+            .collect();
+        blocks.sort_by(f64::total_cmp);
+        let (gaps, words) = (blocks[blocks.len() / 10], blocks[blocks.len() * 9 / 10]);
+        let mouth_to_ear = ana.view().numbers.mouth_to_ear.map(|m| m.avg_ms);
+        println!(
+            "noise suppression {on}: quiet blocks {gaps:.1} dB, loud {words:.1} dB, mouth to ear {mouth_to_ear:?} ms"
+        );
+        assert!(words > -32.0, "{words}");
+        quiet.push(gaps);
+        host.room().talk(false);
+    }
+    assert!(quiet[0] > -55.0, "{quiet:?}");
+    assert!(quiet[1] < quiet[0] - 10.0, "{quiet:?}");
+}
+
 // A quiet microphone: a second of nothing, then 440 Hz at -37 dBFS RMS.
 fn quiet_after_a_second(frame: u64, _: u16) -> f32 {
     if frame < RATE {

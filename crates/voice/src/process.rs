@@ -1,8 +1,9 @@
 // What the microphone goes through before anyone hears it, the same in a
-// room and in Settings' microphone test, on the capture thread: automatic
-// volume, then the level, after everything else, since that is what the
-// meter shows and what the open mic gate reads.
+// room and in Settings' microphone test, on the capture thread: noise
+// suppression, automatic volume, then the level, after everything else,
+// since that is what the meter shows and what the open mic gate reads.
 
+mod denoise;
 mod volume;
 
 use std::collections::VecDeque;
@@ -11,17 +12,22 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use crate::audio::{Level, Meter};
+use denoise::Denoise;
 use volume::Volume;
+
+pub use denoise::DELAY as NOISE_SUPPRESSION_DELAY;
 
 // Which stages run, read once a packet: a room sets them when it opens the
 // microphone, Settings' test as its switches move.
 pub struct Switches {
+    pub noise_suppression: AtomicBool,
     pub automatic_volume: AtomicBool,
 }
 
 impl Switches {
-    pub fn new(automatic_volume: bool) -> Switches {
+    pub fn new(noise_suppression: bool, automatic_volume: bool) -> Switches {
         Switches {
+            noise_suppression: AtomicBool::new(noise_suppression),
             automatic_volume: AtomicBool::new(automatic_volume),
         }
     }
@@ -29,6 +35,7 @@ impl Switches {
 
 pub struct Processor {
     switches: Arc<Switches>,
+    denoise: Denoise,
     volume: Volume,
     out: Vec<f32>,
     meter: Meter,
@@ -40,6 +47,7 @@ impl Processor {
     pub fn new(switches: Arc<Switches>) -> Processor {
         Processor {
             switches,
+            denoise: Denoise::new(),
             volume: Volume::new(),
             out: Vec::with_capacity(4096),
             meter: Meter::default(),
@@ -58,15 +66,25 @@ impl Processor {
     }
 
     // One packet of mono 48 kHz captured from `captured` on. What comes out
-    // is the same sound processed, and when its first sample was captured.
+    // is the same sound processed, and when its first sample was captured:
+    // with noise suppression on, in whole 10 ms blocks, none at all from a
+    // packet that did not finish one.
     pub fn run(&mut self, samples: &[f32], captured: Instant) -> (&[f32], Instant) {
         self.out.clear();
-        self.out.extend_from_slice(samples);
+        let mut first = captured;
+        if self.switches.noise_suppression.load(Ordering::Relaxed) {
+            if let Some(at) = self.denoise.run(samples, captured, &mut self.out) {
+                first = at;
+            }
+        } else {
+            self.denoise.clear();
+            self.out.extend_from_slice(samples);
+        }
         if self.switches.automatic_volume.load(Ordering::Relaxed) {
             self.volume.run(&mut self.out);
         }
         self.meter.push(&self.out, &self.level);
-        (&self.out, captured)
+        (&self.out, first)
     }
 }
 
