@@ -13,8 +13,10 @@ use std::thread;
 
 use eframe::egui::Context;
 use voice::audio::{
-    self, AudioError, Capture, Choice, Direction, Event, Lists, Microphone, Probe, Reading, Watch,
+    self, AudioError, Capture, Choice, Direction, Event, Level, Lists, Microphone, Probe, Reading,
+    Watch,
 };
+use voice::process::Processor;
 
 use crate::messages;
 
@@ -31,10 +33,14 @@ impl SettingsAudio {
         let repaint = ctx.clone();
         let watch = Watch::start(move || repaint.request_repaint())
             .map_err(|err| messages::sentence(&err.to_string()));
-        // The meter reads the level the capture thread keeps; the samples
-        // themselves go nowhere.
-        let open: Open =
-            Arc::new(|choice, events| Capture::start(choice, |_: &[f32], _| {}, events));
+        // The meter reads the level of what the processing gives, the same
+        // as a room's; the samples themselves go nowhere.
+        let open: Open = Arc::new(|choice, mut processor: Processor, events| {
+            let audio = move |samples: &[f32], at| {
+                processor.run(samples, at);
+            };
+            Capture::start(choice, audio, events)
+        });
         // A device that will not answer gets no warning; the meter's own
         // line says what is wrong with it.
         let ask: Ask = Arc::new(|choice| {
@@ -93,13 +99,13 @@ impl SettingsAudio {
 }
 
 type Events = Box<dyn FnMut(Event) + Send>;
-type Open = Arc<dyn Fn(Choice, Events) -> Result<Capture, AudioError> + Send + Sync>;
+type Open = Arc<dyn Fn(Choice, Processor, Events) -> Result<Capture, AudioError> + Send + Sync>;
 
 enum Stream {
     Off,
-    // Handed over by the thread that starts it.
-    Starting(Receiver<Result<Capture, AudioError>>),
-    On(Capture),
+    // Handed over by the thread that starts it, with its processing's level.
+    Starting(Receiver<Result<(Capture, Arc<Level>), AudioError>>),
+    On(Capture, Arc<Level>),
 }
 
 impl Stream {
@@ -108,11 +114,11 @@ impl Stream {
         match self {
             Stream::Off => {}
             Stream::Starting(started) => {
-                if let Ok(Ok(capture)) = started.recv() {
+                if let Ok(Ok((capture, _))) = started.recv() {
                     capture.stop();
                 }
             }
-            Stream::On(capture) => capture.stop(),
+            Stream::On(capture, _) => capture.stop(),
         }
     }
 }
@@ -207,7 +213,9 @@ impl Mic {
                     let _ = events_in.send((turn, event));
                     on_event.request_repaint();
                 });
-                let _ = started_in.send(open(choice, events));
+                let processor = Processor::new();
+                let level = processor.level();
+                let _ = started_in.send(open(choice, processor, events).map(|on| (on, level)));
                 repaint.request_repaint();
             });
         match spawned {
@@ -228,7 +236,7 @@ impl Mic {
         let mut opened = false;
         if let Stream::Starting(started) = &self.stream {
             match started.try_recv() {
-                Ok(Ok(capture)) => self.stream = Stream::On(capture),
+                Ok(Ok((capture, level))) => self.stream = Stream::On(capture, level),
                 Ok(Err(err)) => {
                     self.stream = Stream::Off;
                     self.problem = Some(messages::sentence(&err.to_string()));
@@ -271,11 +279,11 @@ impl Mic {
     }
 
     fn level(&self) -> Option<Reading> {
-        let Stream::On(capture) = &self.stream else {
+        let Stream::On(capture, level) = &self.stream else {
             return None;
         };
         capture.info()?;
-        Some(capture.level())
+        Some(level.read())
     }
 }
 
@@ -450,8 +458,11 @@ mod tests {
 
     fn fake_open(fake: &Fake) -> Open {
         let fake = fake.clone();
-        Arc::new(move |choice, events| {
-            Capture::start_with(fake.device(), choice, |_: &[f32], _| {}, events)
+        Arc::new(move |choice, mut processor: Processor, events| {
+            let audio = move |samples: &[f32], at| {
+                processor.run(samples, at);
+            };
+            Capture::start_with(fake.device(), choice, audio, events)
         })
     }
 

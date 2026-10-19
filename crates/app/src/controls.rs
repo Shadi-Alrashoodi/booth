@@ -633,9 +633,9 @@ fn value_at(x: f32, left: f32, right: f32, lowest: u32, highest: u32) -> u32 {
     lowest + (fraction * (highest - lowest) as f32).round() as u32
 }
 
-// A level along the same 4 px track as the slider, in chalk up to the level:
-// a level is not a verdict, so it is never sage.
-pub fn meter(ui: &mut Ui, fraction: f32, label: &str) {
+// A level along the same 4 px track as the slider, in chalk up to the level
+// and in ash on to its peak: a level is not a verdict, so it is never sage.
+pub fn meter(ui: &mut Ui, fraction: f32, peak: f32, label: &str) {
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), TRACK), Sense::hover());
     response.widget_info(|| {
@@ -650,11 +650,13 @@ pub fn meter(ui: &mut Ui, fraction: f32, label: &str) {
     let track = rect.round_to_pixels(per_point);
     ui.painter()
         .rect_filled(track, TRACK_RADIUS, theme::CONTROL);
-    if fraction > 0.0 {
-        let mut bar = track;
-        bar.set_right(track.left() + track.width() * fraction.min(1.0));
-        ui.painter()
-            .rect_filled(bar.round_to_pixels(per_point), TRACK_RADIUS, CHALK);
+    for (to, color) in [(peak.max(fraction), ASH), (fraction, CHALK)] {
+        if to > 0.0 {
+            let mut bar = track;
+            bar.set_right(track.left() + track.width() * to.min(1.0));
+            ui.painter()
+                .rect_filled(bar.round_to_pixels(per_point), TRACK_RADIUS, color);
+        }
     }
 }
 

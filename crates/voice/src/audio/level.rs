@@ -11,15 +11,19 @@ const BLOCKS: usize = 10;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Reading {
-    // Both 0 to 1, linear, over the last 50 ms.
+    // All 0 to 1, linear, over the last 50 ms.
     pub peak: f32,
     pub rms: f32,
+    // The RMS of the loudest 5 ms block: what the open mic gate reads,
+    // block by block.
+    pub loudest: f32,
 }
 
 #[derive(Debug, Default)]
 pub struct Level {
     peak: AtomicU32,
     rms: AtomicU32,
+    loudest: AtomicU32,
 }
 
 impl Level {
@@ -29,12 +33,15 @@ impl Level {
         Reading {
             peak: f32::from_bits(self.peak.load(Ordering::Relaxed)),
             rms: f32::from_bits(self.rms.load(Ordering::Relaxed)),
+            loudest: f32::from_bits(self.loudest.load(Ordering::Relaxed)),
         }
     }
 
     fn publish(&self, reading: Reading) {
         self.peak.store(reading.peak.to_bits(), Ordering::Relaxed);
         self.rms.store(reading.rms.to_bits(), Ordering::Relaxed);
+        self.loudest
+            .store(reading.loudest.to_bits(), Ordering::Relaxed);
     }
 
     pub(crate) fn clear(&self) {
@@ -82,11 +89,22 @@ impl Meter {
                         count + block.count,
                     )
                 });
-        let rms = if count == 0 {
-            0.0
-        } else {
-            (squares / f64::from(count)).sqrt() as f32
+        let rms = |squares: f64, count: u32| {
+            if count == 0 {
+                0.0
+            } else {
+                (squares / f64::from(count)).sqrt() as f32
+            }
         };
-        Reading { peak, rms }
+        let loudest = self
+            .done
+            .iter()
+            .map(|block| rms(block.squares, block.count))
+            .fold(0.0f32, f32::max);
+        Reading {
+            peak,
+            rms: rms(squares, count),
+            loudest,
+        }
     }
 }

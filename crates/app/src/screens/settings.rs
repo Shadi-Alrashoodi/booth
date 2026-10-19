@@ -476,10 +476,11 @@ fn voice(ui: &mut Ui, draft: &mut Draft, audio: &SettingsAudio) {
         line(ui, &warning, WARN);
     }
     ui.add_space(STEP);
-    let level = audio
-        .level()
-        .map_or(0.0, |level| meter_fraction(level.peak));
-    controls::meter(ui, level, "Microphone level");
+    // The loudest 5 ms block is what the open mic gate goes by.
+    let (level, peak) = audio.level().map_or((0.0, 0.0), |level| {
+        (meter_fraction(level.loudest), meter_fraction(level.peak))
+    });
+    controls::meter(ui, level, peak, "Microphone level");
     match audio.problem() {
         Some(problem) => line(ui, problem, BAD),
         None => line(ui, messages::MICROPHONE_OPEN, ASH),

@@ -25,7 +25,8 @@ mod watch;
 pub use devices::{Choice, DeviceList, Direction, Endpoint, ListedDevice, Lists, Resolved};
 pub use error::AudioError;
 pub use format::{Format, FormatError, Plan, RATE, Sample, from_mono, plan, to_mono};
-pub use level::Reading;
+pub(crate) use level::Meter;
+pub use level::{Level, Reading};
 pub use microphone::{Microphone, hands_free};
 pub use stream::{
     Capture, Device, DeviceStream, Event, LOOK_AGAIN, Packet, REOPEN_AFTER, Refused, Render,
