@@ -24,7 +24,7 @@ use voice::audio::fake::Fake;
 use voice::audio::{
     AudioError, Capture, Choice, Direction, Event, Render, StreamInfo, StreamThread,
 };
-use voice::process::Processor;
+use voice::process::{Processor, Switches};
 
 use super::ear::Speaker;
 use super::mouth::Mouth;
@@ -489,7 +489,8 @@ fn open_microphone(
     mut mouth: Mouth,
     log: &Log,
 ) -> Result<Capture, AudioError> {
-    let mut processor = Processor::new();
+    let switches = Switches::new(config.automatic_volume);
+    let mut processor = Processor::new(Arc::new(switches));
     let audio = move |samples: &[f32], at: Instant| {
         let (samples, at) = processor.run(samples, at);
         mouth.hear(samples, at);

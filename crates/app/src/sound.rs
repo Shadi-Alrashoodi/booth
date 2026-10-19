@@ -16,7 +16,7 @@ use voice::audio::{
     self, AudioError, Capture, Choice, Direction, Event, Level, Lists, Microphone, Probe, Reading,
     Render, Watch,
 };
-use voice::process::{Playback, Processor};
+use voice::process::{Playback, Processor, Switches};
 
 use crate::messages;
 
@@ -30,6 +30,9 @@ pub struct SettingsAudio {
     // output device while the switch is on. Never saved: it is off each
     // time the screen opens.
     playback: Playback,
+    // What the meter's microphone goes through, as the screen's switches
+    // are now.
+    switches: Arc<Switches>,
     speakers: Option<(Choice, Render)>,
     speakers_problem: Arc<Mutex<Option<String>>>,
 }
@@ -58,15 +61,21 @@ impl SettingsAudio {
             let probe = audio::probe(Direction::Input, choice).ok()?;
             Some(Microphone::new(&probe.engine, probe.hands_free))
         });
+        let switches = Arc::new(Switches::new(true));
         SettingsAudio {
             watch,
-            mic: Mic::new(ctx, open, input),
+            mic: Mic::new(ctx, open, Arc::clone(&switches), input),
             check: Check::new(ctx, ask, input),
             lists: None,
             playback,
+            switches,
             speakers: None,
             speakers_problem: Arc::default(),
         }
+    }
+
+    pub fn switches(&self) -> &Switches {
+        &self.switches
     }
 
     // Once a frame while the screen is up. The meter follows the device
@@ -204,6 +213,7 @@ impl Stream {
 struct Mic {
     ctx: Context,
     open: Open,
+    switches: Arc<Switches>,
     choice: Choice,
     stream: Stream,
     // The window is minimized, and the microphone closed until it shows.
@@ -220,11 +230,12 @@ struct Mic {
 }
 
 impl Mic {
-    fn new(ctx: &Context, open: Open, choice: &Choice) -> Mic {
+    fn new(ctx: &Context, open: Open, switches: Arc<Switches>, choice: &Choice) -> Mic {
         let (events_in, events) = mpsc::channel();
         let mut mic = Mic {
             ctx: ctx.clone(),
             open,
+            switches,
             choice: choice.clone(),
             stream: Stream::Off,
             hidden: false,
@@ -271,6 +282,7 @@ impl Mic {
         let (started_in, started) = mpsc::channel();
         let latest = Arc::clone(&self.turn);
         let open = Arc::clone(&self.open);
+        let switches = Arc::clone(&self.switches);
         let choice = self.choice.clone();
         let events_in = self.events_in.clone();
         let repaint = self.ctx.clone();
@@ -286,7 +298,7 @@ impl Mic {
                     let _ = events_in.send((turn, event));
                     on_event.request_repaint();
                 });
-                let processor = Processor::new();
+                let processor = Processor::new(switches);
                 let level = processor.level();
                 let _ = started_in.send(open(choice, processor, events).map(|on| (on, level)));
                 repaint.request_repaint();
@@ -570,7 +582,12 @@ mod tests {
             &[("a", "Headset A"), ("b", "Headset B"), ("c", "Headset C")],
             Some("a"),
         );
-        let mut mic = Mic::new(&Context::default(), fake_open(&fake), &Choice::Default);
+        let mut mic = Mic::new(
+            &Context::default(),
+            fake_open(&fake),
+            Arc::new(Switches::new(true)),
+            &Choice::Default,
+        );
         wait_until("a is opening", || fake.record().at_once == 1);
         let mut slowest = Duration::ZERO;
         for id in ["b", "c"] {
@@ -595,7 +612,12 @@ mod tests {
     #[test]
     fn the_microphone_closes_while_the_window_is_minimized() {
         let fake = Fake::new(Setup::default(), &[("a", "Headset A")], Some("a"));
-        let mut mic = Mic::new(&Context::default(), fake_open(&fake), &Choice::Default);
+        let mut mic = Mic::new(
+            &Context::default(),
+            fake_open(&fake),
+            Arc::new(Switches::new(true)),
+            &Choice::Default,
+        );
         frames_until(&mut mic, &Choice::Default, |mic| mic.level().is_some());
         mic.follow(&Choice::Default, false);
         assert!(mic.level().is_none());
@@ -626,7 +648,12 @@ mod tests {
         );
         let a = Choice::Device(String::from("a"));
         let b = Choice::Device(String::from("b"));
-        let mut mic = Mic::new(&Context::default(), fake_open(&fake), &a);
+        let mut mic = Mic::new(
+            &Context::default(),
+            fake_open(&fake),
+            Arc::new(Switches::new(true)),
+            &a,
+        );
         wait_until("a is opening", || fake.record().at_once == 1);
         mic.follow(&b, true);
         let mut said = None;
@@ -648,7 +675,12 @@ mod tests {
     fn a_chosen_microphone_opens_once_it_is_plugged_in() {
         let fake = Fake::new(Setup::default(), &[("b", "Headset B")], Some("b"));
         let pods = Choice::Device(String::from("pods"));
-        let mut mic = Mic::new(&Context::default(), fake_open(&fake), &pods);
+        let mut mic = Mic::new(
+            &Context::default(),
+            fake_open(&fake),
+            Arc::new(Switches::new(true)),
+            &pods,
+        );
         frames_until(&mut mic, &pods, |mic| mic.problem.is_some());
         assert!(!mic.ended);
         fake.plug("pods", "Headset");

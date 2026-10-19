@@ -97,6 +97,7 @@ pub fn quiet_voice() -> VoiceConfig {
             microphone: Fake::new(setup, &[("mic", "Test microphone")], Some("mic")),
             speakers: Fake::new(setup, &[("out", "Test speakers")], Some("out")),
         },
+        automatic_volume: false,
         ..VoiceConfig::default()
     }
 }

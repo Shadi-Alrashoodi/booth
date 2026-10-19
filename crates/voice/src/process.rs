@@ -1,15 +1,35 @@
 // What the microphone goes through before anyone hears it, the same in a
-// room and in Settings' microphone test, on the capture thread. For now
-// only its level is taken, after everything else, since that is what the
+// room and in Settings' microphone test, on the capture thread: automatic
+// volume, then the level, after everything else, since that is what the
 // meter shows and what the open mic gate reads.
 
+mod volume;
+
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use crate::audio::{Level, Meter};
+use volume::Volume;
+
+// Which stages run, read once a packet: a room sets them when it opens the
+// microphone, Settings' test as its switches move.
+pub struct Switches {
+    pub automatic_volume: AtomicBool,
+}
+
+impl Switches {
+    pub fn new(automatic_volume: bool) -> Switches {
+        Switches {
+            automatic_volume: AtomicBool::new(automatic_volume),
+        }
+    }
+}
 
 pub struct Processor {
+    switches: Arc<Switches>,
+    volume: Volume,
     out: Vec<f32>,
     meter: Meter,
     level: Arc<Level>,
@@ -17,12 +37,19 @@ pub struct Processor {
 
 impl Processor {
     // Off the capture thread: it allocates.
-    pub fn new() -> Processor {
+    pub fn new(switches: Arc<Switches>) -> Processor {
         Processor {
+            switches,
+            volume: Volume::new(),
             out: Vec::with_capacity(4096),
             meter: Meter::default(),
             level: Arc::default(),
         }
+    }
+
+    // What automatic volume does to the microphone now, in dB.
+    pub fn gain_db(&self) -> f32 {
+        self.volume.gain_db()
     }
 
     // For the panel, which reads it whenever it draws.
@@ -35,14 +62,11 @@ impl Processor {
     pub fn run(&mut self, samples: &[f32], captured: Instant) -> (&[f32], Instant) {
         self.out.clear();
         self.out.extend_from_slice(samples);
+        if self.switches.automatic_volume.load(Ordering::Relaxed) {
+            self.volume.run(&mut self.out);
+        }
         self.meter.push(&self.out, &self.level);
         (&self.out, captured)
-    }
-}
-
-impl Default for Processor {
-    fn default() -> Processor {
-        Processor::new()
     }
 }
 

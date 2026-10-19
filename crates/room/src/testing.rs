@@ -131,6 +131,7 @@ pub(crate) fn fake_voice() -> crate::talk::VoiceConfig {
             microphone: Fake::new(setup, &[("mic", "Test microphone")], Some("mic")),
             speakers: Fake::new(setup, &[("out", "Test speakers")], Some("out")),
         },
+        automatic_volume: false,
         ..crate::talk::VoiceConfig::default()
     }
 }

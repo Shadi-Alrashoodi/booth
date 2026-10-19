@@ -25,6 +25,8 @@ const TALK_MODE: &str = "talk_mode";
 const CONSTANT_RATE_VOICE: &str = "constant_rate_voice";
 // In dB, written only when moved off room::DEFAULT_SENSITIVITY_DB.
 const OPEN_MIC_SENSITIVITY: &str = "open_mic_sensitivity";
+// On unless turned off; only off is saved.
+const AUTOMATIC_VOLUME: &str = "automatic_volume";
 const HOTKEY_PUSH_TO_TALK: &str = "hotkey_push_to_talk";
 const HOTKEY_MUTE: &str = "hotkey_mute";
 const HOTKEY_DEAFEN: &str = "hotkey_deafen";
@@ -42,7 +44,7 @@ const SHARE_MONITOR: &str = "share_monitor";
 // address. Only on is saved.
 const CHECK_FOR_NEW_VERSIONS: &str = "check_for_new_versions";
 // Every key this version knows, in the order a save adds the missing ones.
-const KEYS: [&str; 21] = [
+const KEYS: [&str; 22] = [
     NAME,
     PORT,
     STUN_SERVERS,
@@ -59,6 +61,7 @@ const KEYS: [&str; 21] = [
     TALK_MODE,
     CONSTANT_RATE_VOICE,
     OPEN_MIC_SENSITIVITY,
+    AUTOMATIC_VOLUME,
     VIDEO_UPLOAD_MBITS,
     VSYNC_IN_VIEWER,
     HIDE_STRIP_IN_FULLSCREEN,
@@ -98,6 +101,7 @@ pub struct Settings {
     variable_rate: bool,
     // None means room::DEFAULT_SENSITIVITY_DB.
     sensitivity_db: Option<i8>,
+    fixed_volume: bool,
     // Only the ones off their defaults are saved.
     hotkeys: Bindings,
     // None means DEFAULT_UPLOAD_MBITS. Vsync and the strip's hide are off
@@ -259,6 +263,14 @@ impl Settings {
         self.sensitivity_db = (db != DEFAULT_SENSITIVITY_DB).then_some(db);
     }
 
+    pub fn automatic_volume(&self) -> bool {
+        !self.fixed_volume
+    }
+
+    pub fn set_automatic_volume(&mut self, on: bool) {
+        self.fixed_volume = !on;
+    }
+
     pub fn upload_mbits(&self) -> u32 {
         self.upload_mbits.unwrap_or(DEFAULT_UPLOAD_MBITS)
     }
@@ -368,6 +380,7 @@ impl Settings {
             TALK_MODE => self.open_mic.then(|| String::from(OPEN_MIC)),
             CONSTANT_RATE_VOICE => self.variable_rate.then(|| String::from("off")),
             OPEN_MIC_SENSITIVITY => self.sensitivity_db.map(|db| db.to_string()),
+            AUTOMATIC_VOLUME => self.fixed_volume.then(|| String::from("off")),
             VIDEO_UPLOAD_MBITS => self.upload_mbits.map(|mbits| mbits.to_string()),
             VSYNC_IN_VIEWER => self.vsync.then(|| String::from("on")),
             HIDE_STRIP_IN_FULLSCREEN => self.hide_strip.then(|| String::from("on")),
@@ -468,6 +481,17 @@ impl Settings {
                         )
                     })?;
                 self.set_upload_mbits(mbits);
+            }
+            AUTOMATIC_VOLUME => {
+                self.fixed_volume = match value {
+                    "on" => false,
+                    "off" => true,
+                    _ => {
+                        return Err(format!(
+                            "{AUTOMATIC_VOLUME} is on or off; set it again in settings"
+                        ));
+                    }
+                };
             }
             VSYNC_IN_VIEWER | HIDE_STRIP_IN_FULLSCREEN | CHECK_FOR_NEW_VERSIONS => {
                 let on = match value {
@@ -1198,6 +1222,22 @@ mod tests {
         assert!(problems[0].ends_with(
             "open_mic_sensitivity is a number of dB from -60 to -20; set it again in settings"
         ));
+    }
+
+    #[test]
+    fn automatic_volume_round_trip() {
+        let folder = Folder::new("automatic volume");
+        let mut settings = Settings::default();
+        assert!(settings.automatic_volume());
+        settings.set_automatic_volume(false);
+        settings.save(&folder.0).unwrap();
+        assert_eq!(
+            fs::read_to_string(folder.file()).unwrap(),
+            "automatic_volume = off\r\n"
+        );
+        assert!(!Settings::load(&folder.0).0.automatic_volume());
+        let (loaded, problems) = parse(b"automatic_volume = on\n");
+        assert!(problems.is_empty() && loaded == Settings::default());
     }
 
     #[test]

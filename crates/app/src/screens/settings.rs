@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use eframe::egui::{
     Align, Key, Layout, Rect, Response, ScrollArea, Sense, Ui, UiBuilder, WidgetType, vec2,
 };
@@ -43,6 +45,7 @@ pub struct Draft {
     pub talk: TalkMode,
     pub constant_rate: bool,
     pub sensitivity_db: i8,
+    pub automatic_volume: bool,
     pub upload_mbits: u32,
     pub vsync: bool,
     pub hide_strip: bool,
@@ -106,6 +109,7 @@ impl Draft {
             talk: saved.talk_mode(),
             constant_rate: saved.constant_rate(),
             sensitivity_db: saved.sensitivity_db(),
+            automatic_volume: saved.automatic_volume(),
             upload_mbits: saved.upload_mbits(),
             vsync: saved.vsync(),
             hide_strip: saved.hide_strip(),
@@ -136,6 +140,7 @@ impl Draft {
         next.set_talk_mode(self.talk);
         next.set_constant_rate(self.constant_rate);
         next.set_sensitivity_db(self.sensitivity_db);
+        next.set_automatic_volume(self.automatic_volume);
         next.set_upload_mbits(self.upload_mbits);
         next.set_vsync(self.vsync);
         next.set_hide_strip(self.hide_strip);
@@ -457,11 +462,12 @@ fn refused_line(draft: &Draft, action: Action) -> Option<String> {
 }
 
 // The input device, a list with Windows default first, with the warning for
-// a thin or hands-free microphone under it. Then how you talk, and the meter
-// of the microphone this screen has open, after what the room does to it;
-// in open mic the meter is also the sensitivity, a handle on its own scale.
-// Then the output device, and constant-rate voice. Each choice that costs
-// something has its one sentence.
+// a thin or hands-free microphone under it, then automatic volume. Then how
+// you talk, and the meter of the microphone this screen has open, after
+// what the room does to it; in open mic the meter is also the sensitivity, a
+// handle on its own scale. Hear yourself plays that same sound. Then the
+// output device, and constant-rate voice. Each choice that costs something
+// has its one sentence.
 fn voice(ui: &mut Ui, draft: &mut Draft, audio: &mut SettingsAudio) {
     ui.add_space(SECTION_GAP);
     head(ui, "Voice");
@@ -481,6 +487,18 @@ fn voice(ui: &mut Ui, draft: &mut Draft, audio: &mut SettingsAudio) {
     if let Some(warning) = audio.microphone().and_then(messages::microphone_warning) {
         line(ui, &warning, WARN);
     }
+
+    ui.add_space(FIELD_GAP);
+    let id = ui.id().with("automatic volume");
+    let kind = WidgetType::Checkbox;
+    let name = "Automatic volume";
+    if controls::choice_row(ui, id, draft.automatic_volume, name, None, kind).clicked() {
+        draft.automatic_volume = !draft.automatic_volume;
+    }
+    audio
+        .switches()
+        .automatic_volume
+        .store(draft.automatic_volume, Ordering::Relaxed);
 
     ui.add_space(FIELD_GAP);
     label(ui, "How you talk");
@@ -903,6 +921,15 @@ mod tests {
         let next = draft.settings(&saved).unwrap();
         assert_eq!(next.talk_mode(), TalkMode::PushToTalk);
         assert!(!next.constant_rate());
+    }
+
+    #[test]
+    fn automatic_volume_saved() {
+        let mut draft = typed("");
+        assert!(draft.automatic_volume);
+        draft.automatic_volume = false;
+        let next = draft.settings(&Settings::default()).unwrap();
+        assert!(!next.automatic_volume());
     }
 
     #[test]

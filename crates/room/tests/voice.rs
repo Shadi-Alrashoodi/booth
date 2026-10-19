@@ -1247,6 +1247,49 @@ fn a_volume_for_each_person() {
     host.room().talk(false);
 }
 
+// A quiet microphone: a second of nothing, then 440 Hz at -37 dBFS RMS.
+fn quiet_after_a_second(frame: u64, _: u16) -> f32 {
+    if frame < RATE {
+        0.0
+    } else {
+        sine(frame, 440.0, 0.02)
+    }
+}
+
+// Automatic volume, on unless turned off: a quiet microphone reaches Ana
+// about 17 dB louder a few seconds in, and with it off exactly as it was
+// sent.
+#[test]
+fn automatic_volume_brings_a_quiet_microphone_up() {
+    let _alone = alone();
+    for (on, heard_at) in [(false, 0.017..0.023), (true, 0.12..0.17)] {
+        let (mut config, microphone, speakers) = voiced(
+            "Mara",
+            timers(),
+            quiet_after_a_second,
+            TalkMode::PushToTalk,
+            true,
+        );
+        config.voice.automatic_volume = on;
+        let host = Voiced::host_with((config, microphone, speakers));
+        let ana = Voiced::join(
+            voiced("Ana", timers(), silence, TalkMode::PushToTalk, true),
+            host_invite(&host.member),
+        );
+        settled(&host, &[&ana]);
+        host.room().talk(true);
+        ana.member
+            .wait_for(Duration::from_secs(2), "Ana hears Mara", |v| {
+                talking(v, "Mara")
+            });
+        thread::sleep(Duration::from_secs(4));
+        let heard = amplitude(last_200_ms(&ana.heard().0), 440.0);
+        println!("automatic volume {on}: Ana hears {heard:.3} of 0.020");
+        assert!(heard_at.contains(&heard), "{heard}");
+        host.room().talk(false);
+    }
+}
+
 // 2.5 s into the microphone's stream a 1 kHz tone starts, late enough for
 // three people to settle first.
 const LATER_TONE_AT: u64 = 120_000;

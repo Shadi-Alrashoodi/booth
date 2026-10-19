@@ -57,7 +57,8 @@ fn device(signal: fn(u64, u16) -> f32, id: &str, name: &str, period: u32, close:
 }
 
 // A member's config with a fake microphone playing `signal` and fake
-// speakers, and the two fakes to look at.
+// speakers, and the two fakes to look at. Automatic volume is off, so what
+// the far side hears is the signal as it was sent.
 pub fn voiced(
     name: &str,
     timers: Timers,
@@ -86,6 +87,7 @@ pub fn voiced_at(
         },
         talk,
         constant_rate,
+        automatic_volume: false,
         ..VoiceConfig::default()
     };
     (config, microphone, speakers)
