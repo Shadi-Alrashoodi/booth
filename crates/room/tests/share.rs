@@ -373,14 +373,19 @@ fn video_reaches_only_the_watchers() {
         outbox.pointer(100 + x, 200, true, id);
     }
     for member in [&host, bo] {
-        // Each look takes what has come, and the pointer and its shape can
-        // come in different looks, so both are kept until both are here.
+        // Each look takes what has come, and the five pointers and the shape
+        // can come over several looks, so what came is kept until the last
+        // pointer and the shape are both here.
         let mut got = seen(&member.room().watching(), 0, Duration::ZERO);
-        poll(WAIT, "pointer and shape", || {
+        poll(WAIT, "the last pointer and the shape", || {
             let more = seen(&member.room().watching(), 0, Duration::ZERO);
             got.pointer = more.pointer.or(got.pointer.take());
             got.shapes.extend(more.shapes);
-            (got.pointer.is_some() && !got.shapes.is_empty()).then_some(())
+            let last = got
+                .pointer
+                .as_ref()
+                .is_some_and(|(_, pointer)| pointer.x == 104);
+            (last && !got.shapes.is_empty()).then_some(())
         });
         let (at, pointer) = got.pointer.expect("a pointer");
         assert_eq!(
