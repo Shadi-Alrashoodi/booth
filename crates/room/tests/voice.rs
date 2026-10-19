@@ -259,7 +259,17 @@ fn three_hear_each_other_not_themselves() {
             talking(v, "Ana")
         });
     thread::sleep(Duration::from_millis(400));
-    let on = |who: &Voiced, hz| amplitude(last_200_ms(&who.heard().0), hz);
+    // Each 50 ms measured on its own, then the mean. On a busy PC the jitter
+    // buffer can grow by a 5 ms frame inside the window, and the tone after
+    // that step is out of phase with the tone before it: measured over the
+    // whole 200 ms the two cancel, down to 0.6 of the 660 Hz level. 50 ms
+    // still holds whole cycles of both tones.
+    let on = |who: &Voiced, hz| {
+        let heard = who.heard().0;
+        let blocks = last_200_ms(&heard).chunks(2400);
+        let count = blocks.len() as f64;
+        blocks.map(|block| amplitude(block, hz)).sum::<f64>() / count
+    };
     let (host_440, host_660) = (on(&host, 440.0), on(&host, 660.0));
     let (bo_440, ana_440) = (on(&bo, 440.0), on(&ana, 440.0));
     println!(
