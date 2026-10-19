@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use super::devices::{Choice, Direction};
 use super::error::AudioError;
 use super::format::{Format, Sample};
-use super::stream::{Device, DeviceStream, Packet, StreamInfo, Wake};
+use super::stream::{Control, Device, DeviceStream, Packet, StreamInfo, Wake};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Setup {
@@ -55,7 +55,9 @@ struct State {
     setup: Setup,
     devices: Mutex<Vec<(String, String)>>,
     default: Mutex<Option<String>>,
-    wake: Mutex<Option<Wake>>,
+    // One for each stream thread on these devices that has not ended, as
+    // Windows tells every stream.
+    wakes: Mutex<Vec<Wake>>,
     // Every device stops sending events, as a hung driver would.
     stalled: AtomicBool,
     // The next packet captured comes after lost sound.
@@ -109,7 +111,7 @@ impl Fake {
                         .collect(),
                 ),
                 default: Mutex::new(default.map(str::to_owned)),
-                wake: Mutex::new(None),
+                wakes: Mutex::new(Vec::new()),
                 stalled: AtomicBool::new(false),
                 glitch: AtomicBool::new(false),
                 record: Mutex::new(Record::default()),
@@ -125,22 +127,24 @@ impl Fake {
     {
         let state = Arc::clone(&self.state);
         move |direction, wake| {
-            *lock(&state.wake) = Some(wake);
+            lock(&state.wakes).push(wake);
             Ok(FakeDevice { state, direction })
         }
     }
 
     // The device goes away. As on Windows, a stream on it stops being
     // signalled, and only fails when it is read, written or checked. The
-    // default stays as it was: Windows' notice of a new one arrives on
-    // another thread in no fixed order, so a test sends it with set_default
-    // when it wants it.
+    // devices-changed notice goes at once; the default stays as it was:
+    // Windows' notice of a new one arrives on another thread in no fixed
+    // order, so a test sends it with set_default when it wants it.
     pub fn unplug(&self, id: &str) {
         lock(&self.state.devices).retain(|(have, _)| have != id);
+        self.tell_devices();
     }
 
     pub fn plug(&self, id: &str, name: &str) {
         lock(&self.state.devices).push((id.to_owned(), name.to_owned()));
+        self.tell_devices();
     }
 
     pub fn set_default(&self, id: Option<&str>) {
@@ -172,9 +176,11 @@ impl Fake {
     }
 
     fn tell(&self, id: Option<String>) {
-        if let Some(wake) = lock(&self.state.wake).as_ref() {
-            wake.default_changed(id);
-        }
+        lock(&self.state.wakes).retain(|wake| wake.send(Control::DefaultChanged(id.clone())));
+    }
+
+    fn tell_devices(&self) {
+        lock(&self.state.wakes).retain(|wake| wake.send(Control::DevicesChanged));
     }
 }
 

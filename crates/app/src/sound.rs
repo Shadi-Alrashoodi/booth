@@ -253,10 +253,9 @@ impl Mic {
                     self.ended = false;
                     opened = true;
                 }
-                Event::Lost(err) => self.problem = Some(messages::sentence(&err.to_string())),
-                Event::Gone(err) => {
+                // Either way the stream opens the device again by itself.
+                Event::Lost(err) | Event::Gone(err) => {
                     self.problem = Some(messages::sentence(&err.to_string()));
-                    self.ended = true;
                 }
                 Event::Failed(err) => {
                     // With no microphone at all under Windows default the
@@ -556,6 +555,25 @@ mod tests {
         }
         assert_eq!(said, None);
         assert!(!mic.ended);
+    }
+
+    // A microphone chosen before and not plugged in: the meter says why, and
+    // opens it once it is plugged in, by itself and only once, without a
+    // new stream from the list change that came with the plug.
+    #[test]
+    fn a_chosen_microphone_opens_once_it_is_plugged_in() {
+        let fake = Fake::new(Setup::default(), &[("b", "Headset B")], Some("b"));
+        let pods = Choice::Device(String::from("pods"));
+        let mut mic = Mic::new(&Context::default(), fake_open(&fake), &pods);
+        frames_until(&mut mic, &pods, |mic| mic.problem.is_some());
+        assert!(!mic.ended);
+        fake.plug("pods", "Headset");
+        mic.retry();
+        frames_until(&mut mic, &pods, |mic| mic.level().is_some());
+        assert_eq!(mic.problem, None);
+        let record = fake.record();
+        assert_eq!(record.opens.len(), 1);
+        assert_eq!(record.most_at_once, 1);
     }
 
     // A slow answer about a device that was passed over never shows under the

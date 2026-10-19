@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::RecvTimeoutError;
 use voice::audio::fake::{Fake, Setup};
-use voice::audio::{AudioError, Capture, Choice, Event, REOPEN_AFTER, Render, StreamInfo};
+use voice::audio::{
+    AudioError, Capture, Choice, Event, LOOK_AGAIN, REOPEN_AFTER, Render, StreamInfo,
+};
 
 const PERIOD: u32 = 128;
 // 128 frames at 48 kHz.
@@ -284,18 +286,25 @@ fn lost_default_device_reopens_after_a_second() {
     capture.stop();
 }
 
+// A device chosen in settings that goes away says so once, opens nothing
+// else meanwhile, however long it is away, and opens again the moment it is
+// plugged back in.
 #[test]
-fn chosen_device_gone_ends_the_stream() {
+fn a_chosen_device_that_goes_away_opens_again_once_it_is_back() {
     let fake = Fake::new(
         Setup::default(),
         &[("a", "Headset A"), ("b", "Speakers B")],
         Some("b"),
     );
+    let frames = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&frames);
     let (on_event, rx) = events();
     let capture = Capture::start_with(
         fake.device(),
         Choice::Device(String::from("a")),
-        |_: &[f32], _| {},
+        move |samples: &[f32], _| {
+            counted.fetch_add(samples.len() as u64, Ordering::Relaxed);
+        },
         on_event,
     )
     .unwrap();
@@ -305,13 +314,85 @@ fn chosen_device_gone_ends_the_stream() {
         (_, Event::Gone(err)) => assert!(err.is_lost(), "{err}"),
         (_, other) => panic!("expected Gone, got {other:?}"),
     }
-    // Not opened again, on b or anything else.
-    assert!(
-        rx.recv_timeout(REOPEN_AFTER + Duration::from_millis(300))
-            .is_err()
-    );
+    // Past a look of its own, and an unrelated device coming and going.
+    std::thread::sleep(LOOK_AGAIN + Duration::from_millis(300));
+    fake.plug("c", "Speakers C");
+    fake.unplug("c");
+    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+    assert!(capture.info().is_none());
     assert_eq!(fake.record().opens.len(), 1);
+
+    let plugged = Instant::now();
+    fake.plug("a", "Headset A");
+    let (at, info) = opened(&rx);
+    println!(
+        "opened again {:.1} ms after the plug",
+        (at - plugged).as_secs_f64() * 1000.0
+    );
+    assert_eq!(info.id, "a");
+    assert!(at - plugged < Duration::from_millis(200));
+    let now = frames.load(Ordering::Relaxed);
+    wait_for(&frames, now + 1_280);
+    let opens: Vec<String> = fake.record().opens.into_iter().map(|(_, id)| id).collect();
+    assert_eq!(opens, ["a", "a"]);
     capture.stop();
+}
+
+// A headset's microphone and speakers on the same devices, both waiting for
+// it: one plug opens both.
+#[test]
+fn both_streams_on_a_headset_hear_its_plug() {
+    let fake = Fake::new(Setup::default(), &[("b", "Speakers B")], Some("b"));
+    let (on_capture, captured) = events();
+    let (on_render, rendered) = events();
+    let headset = || Choice::Device(String::from("pods"));
+    let capture =
+        Capture::start_with(fake.device(), headset(), |_: &[f32], _| {}, on_capture).unwrap();
+    let render = Render::start_with(
+        fake.device(),
+        headset(),
+        |samples: &mut [f32]| samples.fill(0.0),
+        on_render,
+    )
+    .unwrap();
+    for rx in [&captured, &rendered] {
+        match next(rx) {
+            (_, Event::Gone(AudioError::NotConnected { .. })) => {}
+            (_, other) => panic!("expected Gone, got {other:?}"),
+        }
+    }
+    fake.plug("pods", "Headset");
+    assert_eq!(opened(&captured).1.id, "pods");
+    assert_eq!(opened(&rendered).1.id, "pods");
+    capture.stop();
+    render.stop();
+}
+
+// A stream waiting for its device to come back stops at once.
+#[test]
+fn a_stream_waiting_for_its_device_stops_at_once() {
+    let fake = Fake::new(Setup::default(), &[("b", "Speakers B")], Some("b"));
+    let (on_event, rx) = events();
+    let render = Render::start_with(
+        fake.device(),
+        Choice::Device(String::from("a")),
+        |samples: &mut [f32]| samples.fill(0.0),
+        on_event,
+    )
+    .unwrap();
+    match next(&rx) {
+        (_, Event::Gone(AudioError::NotConnected { .. })) => {}
+        (_, other) => panic!("expected Gone, got {other:?}"),
+    }
+    let thread = render.thread();
+    assert!(thread.running());
+    let stopping = Instant::now();
+    render.stop();
+    let took = stopping.elapsed();
+    println!("stop while waiting: {:.2} ms", took.as_secs_f64() * 1000.0);
+    assert!(took < Duration::from_millis(100), "{took:?}");
+    assert!(!thread.running());
+    assert!(rx.try_recv().is_err());
 }
 
 // A device that goes away stops being signalled, so only the check on a
@@ -402,8 +483,9 @@ fn capture_counts_lost_sound_but_not_on_the_first_packet() {
     capture.stop();
 }
 
+// Not plugged in when the stream starts: said at once, and opened when it is.
 #[test]
-fn a_chosen_device_that_is_not_there_fails_at_once() {
+fn a_chosen_device_that_is_not_there_says_so_at_once() {
     let fake = Fake::new(Setup::default(), &[("b", "Speakers B")], Some("b"));
     let (on_event, rx) = events();
     let capture = Capture::start_with(
@@ -414,9 +496,12 @@ fn a_chosen_device_that_is_not_there_fails_at_once() {
     )
     .unwrap();
     match next(&rx) {
-        (_, Event::Failed(AudioError::NotConnected { .. })) => {}
+        (_, Event::Gone(AudioError::NotConnected { .. })) => {}
         (_, other) => panic!("expected NotConnected, got {other:?}"),
     }
+    assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    fake.plug("a", "Headset A");
+    assert_eq!(opened(&rx).1.id, "a");
     capture.stop();
 }
 

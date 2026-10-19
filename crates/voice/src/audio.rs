@@ -28,8 +28,8 @@ pub use format::{Format, FormatError, Plan, RATE, Sample, from_mono, plan, to_mo
 pub use level::Reading;
 pub use microphone::{Microphone, hands_free};
 pub use stream::{
-    Capture, Device, DeviceStream, Event, Packet, REOPEN_AFTER, Refused, Render, StreamInfo,
-    StreamThread, Wake,
+    Capture, Device, DeviceStream, Event, LOOK_AGAIN, Packet, REOPEN_AFTER, Refused, Render,
+    StreamInfo, StreamThread, Wake,
 };
 pub use wasapi::{EnginePeriods, Probe};
 pub use watch::Watch;

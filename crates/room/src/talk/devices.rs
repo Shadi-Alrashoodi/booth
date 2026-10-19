@@ -563,7 +563,18 @@ fn on_event(shared: Arc<Shared>, log: Log, side: Side) -> impl FnMut(Event) + Se
                     error: Some(err),
                 };
             }
-            Event::Gone(err) | Event::Failed(err) => {
+            Event::Gone(err) => {
+                log!(
+                    log,
+                    "voice: {} not there, opened again once it is back: {err}",
+                    side.word()
+                );
+                *lock(status) = Status {
+                    info: None,
+                    error: Some(err),
+                };
+            }
+            Event::Failed(err) => {
                 log!(log, "voice: {} stopped: {err}", side.word());
                 *lock(status) = Status {
                     info: None,

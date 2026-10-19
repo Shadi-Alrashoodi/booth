@@ -895,17 +895,16 @@ pub(crate) struct Windows {
 pub(crate) fn device(direction: Direction, wake: Wake) -> Result<Windows, AudioError> {
     let session = Session::new()?;
     // Without the watch the stream still runs; it only stays on the old
-    // default until it is opened again.
+    // default until it is opened again, and looks for a chosen device that
+    // went away only every LOOK_AGAIN.
     let watch = session
-        .watch(move |notice| {
-            if let Notice::DefaultChanged {
+        .watch(move |notice| match notice {
+            Notice::DefaultChanged {
                 direction: which,
                 id,
-            } = notice
-                && which == direction
-            {
-                wake.default_changed(id);
-            }
+            } if which == direction => wake.default_changed(id),
+            Notice::DefaultChanged { .. } => {}
+            Notice::DevicesChanged => wake.devices_changed(),
         })
         .ok();
     Ok(Windows {

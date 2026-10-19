@@ -1130,6 +1130,73 @@ fn unplugged_microphone_is_said() {
     ana.room().talk(false);
 }
 
+// A microphone and speakers chosen in settings that are not plugged in when
+// the room starts: the lines under your row say so, and once they are
+// plugged in they open, the lines go, and voice goes both ways. Speakers
+// that drop out in the middle come back with everyone still in the mix.
+#[test]
+fn chosen_devices_open_once_they_are_plugged_in() {
+    let _alone = alone();
+    let host = Voiced::host("Mara", timers(), tone_440);
+    let (mut config, microphone, speakers) =
+        voiced("Ana", timers(), tone_660, TalkMode::PushToTalk, true);
+    config.voice.input = Choice::Device(String::from("pods"));
+    config.voice.output = Choice::Device(String::from("pods"));
+    let ana = Voiced::join((config, microphone, speakers), host_invite(&host.member));
+    settled(&host, &[&ana]);
+    ana.member
+        .wait_for(Duration::from_secs(2), "both lines", |v| {
+            v.voice.microphone.is_some() && v.voice.speakers.is_some()
+        });
+    let plugged = Instant::now();
+    ana.microphone.plug("pods", "Headset");
+    ana.speakers.plug("pods", "Headset");
+    ana.member
+        .wait_for(Duration::from_secs(2), "both lines go", |v| {
+            v.voice.microphone.is_none() && v.voice.speakers.is_none()
+        });
+    println!(
+        "both open and their lines gone {:.0} ms after the plug",
+        ms(plugged.elapsed())
+    );
+    ana.room().talk(true);
+    host.room().talk(true);
+    host.member
+        .wait_for(Duration::from_secs(2), "Mara hears Ana", |v| {
+            talking(v, "Ana")
+        });
+    ana.member
+        .wait_for(Duration::from_secs(2), "Ana hears Mara", |v| {
+            talking(v, "Mara")
+        });
+    thread::sleep(Duration::from_millis(300));
+    assert!(amplitude(last_200_ms(&ana.heard().0), 440.0) > 0.12);
+
+    ana.speakers.unplug("pods");
+    ana.member
+        .wait_for(Duration::from_secs(1), "the speakers' line", |v| {
+            v.voice.speakers.is_some()
+        });
+    let before = ana.heard().0.len();
+    ana.speakers.plug("pods", "Headset");
+    ana.member
+        .wait_for(Duration::from_secs(2), "the speakers' line goes", |v| {
+            v.voice.speakers.is_none()
+        });
+    thread::sleep(Duration::from_millis(300));
+    let heard = ana.heard().0;
+    assert!(
+        heard.len() - before >= 9_600,
+        "{} samples",
+        heard.len() - before
+    );
+    assert!(amplitude(last_200_ms(&heard), 440.0) > 0.12);
+    let opens = |fake: &Fake| fake.record().opens.len();
+    assert_eq!((opens(&ana.microphone), opens(&ana.speakers)), (1, 2));
+    host.room().talk(false);
+    ana.room().talk(false);
+}
+
 // 2.5 s into the microphone's stream a 1 kHz tone starts, late enough for
 // three people to settle first.
 const LATER_TONE_AT: u64 = 120_000;

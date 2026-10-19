@@ -62,6 +62,15 @@ impl AudioError {
         matches!(self, AudioError::Lost { .. })
     }
 
+    // Not there to open: unplugged or turned off before the open, or gone
+    // while it was being opened.
+    pub fn is_away(&self) -> bool {
+        matches!(
+            self,
+            AudioError::NotConnected { .. } | AudioError::Lost { .. }
+        )
+    }
+
     pub fn direction(&self) -> Option<Direction> {
         match self {
             AudioError::NoDevice(direction)

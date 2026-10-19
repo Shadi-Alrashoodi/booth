@@ -3,6 +3,7 @@
 // stream, blocking on the device's event; the timeout on that wait is there
 // only so a stop request is seen when the device has gone quiet.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -23,6 +24,11 @@ const WAIT: Duration = Duration::from_millis(20);
 // and come back in about this time when they switch profiles, and Windows
 // needs a moment to pick the next default.
 pub const REOPEN_AFTER: Duration = Duration::from_secs(1);
+// A device chosen in settings that is away is tried again whenever Windows
+// says the devices changed, and at least this often: a format change in the
+// sound settings ends a stream with no such notice, and a stream whose
+// watch could not be registered gets none at all.
+pub const LOOK_AGAIN: Duration = Duration::from_secs(2);
 // The queued average follows the last 16 or so writes.
 const QUEUED_SHIFT: u32 = 4;
 
@@ -120,7 +126,9 @@ pub enum Event {
     // The device went away or failed while the stream ran, under Windows
     // default. The stream opens again on the default in REOPEN_AFTER.
     Lost(AudioError),
-    // The device chosen in settings went away. The stream has ended.
+    // The device chosen in settings is not there: unplugged or turned off
+    // when the stream opened, or since. Said once; the stream opens it again
+    // once it is back, with Opened.
     Gone(AudioError),
     // Could not open, or failed on a chosen device. The stream has ended,
     // except under Windows default with no device at all, where it opens as
@@ -132,6 +140,8 @@ pub(crate) enum Control {
     Stop,
     // The Windows default changed to this endpoint, or to none.
     DefaultChanged(Option<String>),
+    // A device was added, removed, turned on or off.
+    DevicesChanged,
 }
 
 // Handed to a device when the thread starts, so a notification from Windows
@@ -142,7 +152,16 @@ pub struct Wake(Sender<Control>);
 impl Wake {
     pub fn default_changed(&self, id: Option<String>) {
         // The thread may have ended; nothing is waiting then.
-        let _ = self.0.send(Control::DefaultChanged(id));
+        self.send(Control::DefaultChanged(id));
+    }
+
+    pub fn devices_changed(&self) {
+        self.send(Control::DevicesChanged);
+    }
+
+    // False once the thread has ended.
+    pub(crate) fn send(&self, control: Control) -> bool {
+        self.0.send(control).is_ok()
     }
 }
 
@@ -496,6 +515,7 @@ where
                         rx: &rx,
                         shared: &thread_shared,
                         pro_audio: raised.is_some(),
+                        notices: Cell::new(0),
                     };
                     run.run(&mut device, &mut work, &mut *events);
                 }
@@ -528,11 +548,19 @@ struct Run<'a> {
     rx: &'a Receiver<Control>,
     shared: &'a Shared,
     pro_audio: bool,
+    // Devices-changed notices seen so far, whichever wait read them, so one
+    // that came while a device was being opened still counts once the open
+    // has found it away.
+    notices: Cell<u64>,
 }
 
 impl Run<'_> {
     fn run<D: Device>(&self, device: &mut D, work: &mut Work, events: &mut dyn FnMut(Event)) {
+        // A chosen device that is away has said so, and says nothing more
+        // until it opens again.
+        let mut away = false;
         loop {
+            let seen = self.notices.get();
             let mut stream = match device.open(self.choice) {
                 Ok(stream) => stream,
                 // A default that vanished while it was being opened, as a
@@ -541,6 +569,18 @@ impl Run<'_> {
                 Err(err) if *self.choice == Choice::Default && err.is_lost() => {
                     events(Event::Lost(err));
                     if self.pause(REOPEN_AFTER) {
+                        continue;
+                    }
+                    return;
+                }
+                // A device chosen in settings that is unplugged or turned off
+                // opens once it is back, as Windows default does.
+                Err(err) if *self.choice != Choice::Default && err.is_away() => {
+                    if !away {
+                        away = true;
+                        events(Event::Gone(err));
+                    }
+                    if self.wait_for_devices(seen) {
                         continue;
                     }
                     return;
@@ -575,6 +615,7 @@ impl Run<'_> {
             }
             let end = match work.start(&mut stream) {
                 Ok(()) => {
+                    away = false;
                     self.shared.set_info(Some(info.clone()));
                     events(Event::Opened(info.clone()));
                     self.pump(&mut stream, work, &info.id)
@@ -596,9 +637,18 @@ impl Run<'_> {
                             return;
                         }
                     }
+                    // Opened again as soon as Windows says the devices
+                    // changed since this open. The unplug that ended it
+                    // usually has already, so the next open comes at once
+                    // and finds a quick replug.
                     Choice::Device(_) if err.is_lost() => {
-                        events(Event::Gone(err));
-                        return;
+                        if !away {
+                            away = true;
+                            events(Event::Gone(err));
+                        }
+                        if !self.wait_for_devices(seen) {
+                            return;
+                        }
                     }
                     Choice::Device(_) => {
                         events(Event::Failed(err));
@@ -642,9 +692,14 @@ impl Run<'_> {
                         return Some(End::Switch);
                     }
                 }
+                Ok(Control::DevicesChanged) => self.noticed(),
                 Err(TryRecvError::Empty) => return None,
             }
         }
+    }
+
+    fn noticed(&self) {
+        self.notices.set(self.notices.get() + 1);
     }
 
     // False when asked to stop.
@@ -655,6 +710,7 @@ impl Run<'_> {
             match self.rx.recv_timeout(left) {
                 Ok(Control::Stop) | Err(RecvTimeoutError::Disconnected) => return false,
                 Ok(Control::DefaultChanged(_)) => {}
+                Ok(Control::DevicesChanged) => self.noticed(),
                 Err(RecvTimeoutError::Timeout) => return true,
             }
         }
@@ -668,8 +724,26 @@ impl Run<'_> {
             match self.rx.recv() {
                 Ok(Control::DefaultChanged(Some(_))) => return true,
                 Ok(Control::DefaultChanged(None)) => {}
+                Ok(Control::DevicesChanged) => self.noticed(),
                 Ok(Control::Stop) | Err(_) => return false,
             }
         }
+    }
+
+    // A chosen device found away by the open made after `seen` notices:
+    // until Windows says the devices changed since, or LOOK_AGAIN. False when
+    // asked to stop.
+    fn wait_for_devices(&self, seen: u64) -> bool {
+        let until = Instant::now() + LOOK_AGAIN;
+        while self.notices.get() == seen {
+            let left = until.saturating_duration_since(Instant::now());
+            match self.rx.recv_timeout(left) {
+                Ok(Control::Stop) | Err(RecvTimeoutError::Disconnected) => return false,
+                Ok(Control::DefaultChanged(_)) => {}
+                Ok(Control::DevicesChanged) => self.noticed(),
+                Err(RecvTimeoutError::Timeout) => return true,
+            }
+        }
+        true
     }
 }
