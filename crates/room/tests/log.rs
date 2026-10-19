@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{Member, config, loopback, timers};
+use common::{LEAVE_WITH_SAVE, Member, config, loopback, timers};
 use keys::Identity;
 use room::view::LinkState;
 
@@ -53,15 +53,9 @@ fn logged_join_keeps_the_secrets() {
     });
     // The writer is stopped inside leave(), which the panel waits on.
     let took = client.leave();
-    assert!(
-        took < Duration::from_millis(200),
-        "client leave took {took:?}"
-    );
+    assert!(took < LEAVE_WITH_SAVE, "client leave took {took:?}");
     let took = host.leave();
-    assert!(
-        took < Duration::from_millis(200),
-        "host leave took {took:?}"
-    );
+    assert!(took < LEAVE_WITH_SAVE, "host leave took {took:?}");
 
     let host_text = fs::read_to_string(&host_log).expect("the host wrote a log");
     let client_text = fs::read_to_string(&client_log).expect("the client wrote a log");

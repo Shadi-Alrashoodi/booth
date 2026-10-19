@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use common::{
     FakeStun, Folder, Forwarder, Member, OUTSIDE, StrictRouter, config_in, invite_to, loopback,
-    timers,
+    poll, timers,
 };
 use invite::{Answers, Candidate, CandidateKind, ReplyCode};
 use keys::Identity;
@@ -16,6 +16,10 @@ use room::{Candidates, KnownHost, Room, Timers};
 fn live(v: &View) -> bool {
     v.strip.state == LinkState::Live
 }
+
+// Leave gives a room's last save saver.rs's FINISH_WAIT and lets a slower
+// one land by itself, so a list is read once the room's changes are in it.
+const SAVE_WAIT: Duration = Duration::from_secs(5);
 
 // A host and a friend who joined it once with an invite, both gone again,
 // with what each kept in its own folder.
@@ -57,13 +61,19 @@ fn joined_once(test: &str, through: Option<&Forwarder>) -> Before {
     client.leave();
     host.leave();
 
-    let hosts = Room::known_hosts(&client_dir.0).expect("the list reads");
+    let hosts = poll(SAVE_WAIT, "the host on the friend's list", || {
+        let hosts = Room::known_hosts(&client_dir.0).expect("the list reads");
+        (hosts.len() == 1 && hosts[0].room_name() == "Host's room").then_some(hosts)
+    });
     assert_eq!(hosts.len(), 1);
     let known = hosts[0].clone();
     assert_eq!(known.host_key(), host_identity.public());
     assert_eq!(known.room_name(), "Host's room");
     assert_eq!(known.host_name(), "Host");
-    let devices = Room::known_devices(&host_dir.0).expect("the list reads");
+    let devices = poll(SAVE_WAIT, "Ana on the host's list", || {
+        let devices = Room::known_devices(&host_dir.0).expect("the list reads");
+        (devices.devices.len() == 1 && devices.devices[0].name == "Ana").then_some(devices)
+    });
     assert_eq!(devices.devices.len(), 1);
     assert_eq!(devices.devices[0].key, *client_identity.public());
     assert_eq!(devices.devices[0].name, "Ana");
@@ -174,15 +184,19 @@ fn friend_keeps_the_hosts_addresses() {
     client.leave();
     host.leave();
 
-    let hosts = Room::known_hosts(&client_dir.0).expect("the list reads");
     let public = |port: u16| Candidate {
         kind: CandidateKind::Public,
         addr: SocketAddr::from((*OUTSIDE.ip(), port)),
     };
-    assert_eq!(
-        hosts[0].candidates(),
-        [lan, public(OUTSIDE.port()), public(host_port)]
-    );
+    let want = [lan, public(OUTSIDE.port()), public(host_port)];
+    let hosts = poll(SAVE_WAIT, "the host's addresses on the list", || {
+        let hosts = Room::known_hosts(&client_dir.0).expect("the list reads");
+        hosts
+            .first()
+            .is_some_and(|known| known.candidates() == want)
+            .then_some(hosts)
+    });
+    assert_eq!(hosts[0].candidates(), want);
 }
 
 #[test]
@@ -209,7 +223,10 @@ fn rejoin_past_a_strict_router_with_a_code() {
         client.wait_for(Duration::from_secs(2), "client live", live);
         client.leave();
         host.leave();
-        let known = Room::known_hosts(&client_dir.0).expect("the list reads")[0].clone();
+        let known = poll(SAVE_WAIT, "the host on the friend's list", || {
+            let hosts = Room::known_hosts(&client_dir.0).expect("the list reads");
+            hosts.first().cloned()
+        });
         let before = Before {
             host_dir,
             client_dir,

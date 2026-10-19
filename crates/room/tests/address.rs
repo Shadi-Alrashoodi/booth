@@ -10,8 +10,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use common::{
-    FakeNameserver, FakeStun, FakeSystem, Forwarder, Member, NAME, OUTSIDE, fresh_log, lookup,
-    loopback, poll, read_log, timers, wake,
+    FakeNameserver, FakeStun, FakeSystem, Forwarder, LEAVE_WITH_SAVE, Member, NAME, OUTSIDE,
+    fresh_log, lookup, loopback, poll, read_log, timers, wake,
 };
 use invite::{Answers, Candidate, CandidateKind, Invite, ReplyCode};
 use keys::Identity;
@@ -632,8 +632,8 @@ fn a_burst_of_address_changes_asks_stun_once() {
 }
 
 // The app turns the room's own watch on in both roles. A room is opened and
-// left many times in one run, and leave must still take under 200 ms with
-// Windows' registration to cancel on the way out.
+// left many times in one run, and leave must still take no longer than
+// LEAVE_WITH_SAVE with Windows' registration to cancel on the way out.
 #[test]
 fn address_watch_comes_and_goes_with_the_room() {
     let host_log = fresh_log("address", "watch", "host");
@@ -652,7 +652,7 @@ fn address_watch_comes_and_goes_with_the_room() {
         for (who, member) in [("client", &mut client), ("host", &mut host)] {
             let took = member.leave();
             assert!(
-                took < Duration::from_millis(200),
+                took < LEAVE_WITH_SAVE,
                 "round {round}: {who} leave took {took:?}"
             );
         }

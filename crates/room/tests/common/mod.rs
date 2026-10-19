@@ -48,6 +48,11 @@ pub fn poll<T>(limit: Duration, what: &str, mut found: impl FnMut() -> Option<T>
     }
 }
 
+// What leave may take in a room whose known list changed: the 200 ms the
+// room's own stop has, and saver.rs's FINISH_WAIT of 500 ms on top for the
+// list's last write, which a busy disk can use all of.
+pub const LEAVE_WITH_SAVE: Duration = Duration::from_millis(700);
+
 pub fn config(name: &str, timers: Timers) -> Config {
     config_in(name, timers, data_dir())
 }

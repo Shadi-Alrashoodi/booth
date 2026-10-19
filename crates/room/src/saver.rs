@@ -166,6 +166,18 @@ mod tests {
         }
     }
 
+    // finish() gives the write FINISH_WAIT and lets a slower one go on by
+    // itself. These tests read the file and the log after it, so they wait
+    // for the thread to end.
+    fn finish_and_wait(saver: &mut Saver) {
+        saver.finish();
+        let ended = saver.done.recv_timeout(Duration::from_secs(10));
+        assert!(
+            matches!(ended, Err(RecvTimeoutError::Disconnected)),
+            "the saver thread was still writing 10 s after finish"
+        );
+    }
+
     fn folder(test: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("booth-saver-{test}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -185,7 +197,7 @@ mod tests {
         for count in 1..=20 {
             handle.save(devices(count));
         }
-        saver.finish();
+        finish_and_wait(&mut saver);
         let lines = captured.lines();
         assert!(!lines.is_empty() && lines.len() <= 2, "{lines:?}");
         assert!(
@@ -208,7 +220,7 @@ mod tests {
         known::remove_device(&dir, &[2; 32]).expect("removed in settings");
         let mut saver = Saver::start(turn, log).expect("the saver starts");
         saver.handle().save(devices(2));
-        saver.finish();
+        finish_and_wait(&mut saver);
         let kept = known::devices(&dir).expect("the list reads");
         assert_eq!(kept.devices.len(), 1);
         assert_eq!(kept.devices[0].key, [1; 32]);
@@ -225,7 +237,7 @@ mod tests {
         let (_, turn) = known::room_devices(&dir);
         let mut saver = Saver::start(turn, log).expect("the saver starts");
         saver.handle().save(devices(3));
-        saver.finish();
+        finish_and_wait(&mut saver);
         assert_eq!(captured.lines(), ["saved devices.bin"]);
         assert_eq!(known::devices(&dir).unwrap().devices.len(), 3);
         let _ = fs::remove_dir_all(&dir);

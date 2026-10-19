@@ -2,7 +2,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{Member, host_invite, timers};
+use common::{LEAVE_WITH_SAVE, Member, host_invite, timers};
 use room::Timers;
 use room::view::{LinkState, Notice, Role, TracePoint};
 
@@ -133,7 +133,7 @@ fn client_leaving_leaves_the_host_alone() {
     });
 
     let took = client.leave();
-    assert!(took < Duration::from_millis(200), "leave took {took:?}");
+    assert!(took < LEAVE_WITH_SAVE, "leave took {took:?}");
     let alone = host.wait_for(Duration::from_secs(1), "host alone again", |v| {
         v.strip.state == LinkState::Alone
     });
@@ -153,7 +153,7 @@ fn host_leaving_closes_the_room() {
     });
 
     let took = host.leave();
-    assert!(took < Duration::from_millis(200), "leave took {took:?}");
+    assert!(took < LEAVE_WITH_SAVE, "leave took {took:?}");
     let closed = client.wait_for(Duration::from_secs(1), "room closed", |v| {
         v.notice == Some(Notice::RoomClosed)
     });

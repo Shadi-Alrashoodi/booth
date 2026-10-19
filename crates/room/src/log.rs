@@ -26,7 +26,8 @@ use crate::view::PathWord;
 // slow disk costs lines and never holds up a packet.
 const WAITING_LINES: usize = 1024;
 const ROTATE_AFTER: u64 = 1024 * 1024;
-// leave() runs on the panel's thread and has 200 ms for everything. A writer
+// leave() runs on the panel's thread and has 200 ms for its own work, and
+// saver.rs's FINISH_WAIT on top for the known list's last write. A writer
 // stuck in a write (a stalled USB or network drive, a file held by a virus
 // scanner) gets this long in all, then finishes on its own.
 const STOP_WAIT: Duration = Duration::from_millis(100);

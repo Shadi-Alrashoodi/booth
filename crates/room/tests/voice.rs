@@ -14,7 +14,9 @@ use common::voiced::{
     Cue, PERIOD, RATE, Voiced, alone, cues, frames, heard_cues, ms, settled, silence, sine,
     slow_to_close, talking, tone_440, tone_660, voiced, voiced_at, you_talk,
 };
-use common::{Forwarder, Hand, Member, host_invite, invite_to, loopback, poll, timers};
+use common::{
+    Forwarder, Hand, LEAVE_WITH_SAVE, Member, host_invite, invite_to, loopback, poll, timers,
+};
 use room::view::{LinkState, OwnShare, RunningShare, View, VoiceLoss};
 use room::{Devices, Show, TalkMode, Timers, VideoConfig, VideoSource, VoiceConfig};
 use voice::audio::fake::{Fake, Setup};
@@ -1636,7 +1638,7 @@ fn leave_closes_quick_devices() {
         mic.at_once,
         out.at_once
     );
-    assert!(took < Duration::from_millis(200), "{took:?}");
+    assert!(took < LEAVE_WITH_SAVE, "{took:?}");
     assert_eq!((mic.at_once, out.at_once), (0, 0));
     assert_eq!((mic.stops, out.stops), (1, 1));
     let text = common::read_log(&log);
@@ -1690,7 +1692,7 @@ fn slow_headset_holds_up_nothing() {
     let port = host.member.port();
     let took = host.member.leave();
     let left = Instant::now();
-    assert!(took < Duration::from_millis(200), "leave took {took:?}");
+    assert!(took < LEAVE_WITH_SAVE, "leave took {took:?}");
 
     let (mut config, microphone, speakers) =
         voiced("Mara", timers(), tone_660, TalkMode::PushToTalk, true);
