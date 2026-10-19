@@ -14,9 +14,9 @@ use std::thread;
 use eframe::egui::Context;
 use voice::audio::{
     self, AudioError, Capture, Choice, Direction, Event, Level, Lists, Microphone, Probe, Reading,
-    Watch,
+    Render, Watch,
 };
-use voice::process::Processor;
+use voice::process::{Playback, Processor};
 
 use crate::messages;
 
@@ -26,6 +26,12 @@ pub struct SettingsAudio {
     check: Check,
     // As the watch last read them, taken once a frame by follow.
     lists: Option<Result<Lists, String>>,
+    // Hear yourself: what the meter's microphone gives, played on the
+    // output device while the switch is on. Never saved: it is off each
+    // time the screen opens.
+    playback: Playback,
+    speakers: Option<(Choice, Render)>,
+    speakers_problem: Arc<Mutex<Option<String>>>,
 }
 
 impl SettingsAudio {
@@ -34,10 +40,15 @@ impl SettingsAudio {
         let watch = Watch::start(move || repaint.request_repaint())
             .map_err(|err| messages::sentence(&err.to_string()));
         // The meter reads the level of what the processing gives, the same
-        // as a room's; the samples themselves go nowhere.
-        let open: Open = Arc::new(|choice, mut processor: Processor, events| {
+        // as a room's; the samples go to Hear yourself, which drops them
+        // while it is off.
+        let playback = Playback::default();
+        let feed = playback.clone();
+        let open: Open = Arc::new(move |choice, mut processor: Processor, events| {
+            let feed = feed.clone();
             let audio = move |samples: &[f32], at| {
-                processor.run(samples, at);
+                let (out, _) = processor.run(samples, at);
+                feed.push(out);
             };
             Capture::start(choice, audio, events)
         });
@@ -52,14 +63,23 @@ impl SettingsAudio {
             mic: Mic::new(ctx, open, input),
             check: Check::new(ctx, ask, input),
             lists: None,
+            playback,
+            speakers: None,
+            speakers_problem: Arc::default(),
         }
     }
 
     // Once a frame while the screen is up. The meter follows the device
     // picked on the screen and is closed while the window is minimized, and
     // a stream that ended starts again when the device lists change, which
-    // is when its device may be back.
-    pub fn follow(&mut self, input: &Choice, showing: bool) {
+    // is when its device may be back. Hear yourself follows the output
+    // device, and stops with the meter or once it heard itself.
+    pub fn follow(&mut self, input: &Choice, output: &Choice, showing: bool) {
+        match &self.speakers {
+            Some(_) if !showing || self.playback.tripped() => self.hear(false, output),
+            Some((playing, _)) if playing != output => self.hear(true, output),
+            _ => {}
+        }
         let opened = self.mic.follow(input, showing);
         self.check.follow(input, opened);
         let lists = match &self.watch {
@@ -95,6 +115,59 @@ impl SettingsAudio {
     // None while no stream runs.
     pub fn level(&self) -> Option<Reading> {
         self.mic.level()
+    }
+
+    pub fn hearing(&self) -> bool {
+        self.speakers.is_some()
+    }
+
+    // The speakers open and close on a thread of their own; neither waits
+    // here.
+    pub fn hear(&mut self, on: bool, output: &Choice) {
+        if let Some((_, render)) = self.speakers.take() {
+            render.let_go();
+        }
+        // Off keeps a trip, so the line under the switch still says why.
+        self.playback.set_on(on);
+        *lock(&self.speakers_problem) = None;
+        if !on {
+            return;
+        }
+        let playback = self.playback.clone();
+        let problem = Arc::clone(&self.speakers_problem);
+        let events = move |event| {
+            *lock(&problem) = match event {
+                Event::Opened(_) => None,
+                Event::Lost(err) | Event::Gone(err) | Event::Failed(err) => {
+                    Some(messages::sentence(&err.to_string()))
+                }
+            };
+        };
+        match Render::start(output.clone(), move |out| playback.fill(out), events) {
+            Ok(render) => self.speakers = Some((output.clone(), render)),
+            Err(err) => {
+                self.playback.set_on(false);
+                *lock(&self.speakers_problem) = Some(messages::sentence(&err.to_string()));
+            }
+        }
+    }
+
+    // Hear yourself turned itself off: the microphone heard the speakers.
+    pub fn tripped(&self) -> bool {
+        self.playback.tripped()
+    }
+
+    pub fn hear_problem(&self) -> Option<String> {
+        lock(&self.speakers_problem).clone()
+    }
+}
+
+// Closing the screen never waits for a headset slow to let go.
+impl Drop for SettingsAudio {
+    fn drop(&mut self) {
+        if let Some((_, render)) = self.speakers.take() {
+            render.let_go();
+        }
     }
 }
 

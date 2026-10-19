@@ -210,7 +210,7 @@ impl Draft {
 // and their head alone. Save and Cancel sit at the bottom edge on a bar in
 // panel tone rather than after the last setting, so they stay in reach
 // however long the list above them grows; the list scrolls.
-pub fn show(ui: &mut Ui, draft: &mut Draft, audio: &SettingsAudio) -> Option<Press> {
+pub fn show(ui: &mut Ui, draft: &mut Draft, audio: &mut SettingsAudio) -> Option<Press> {
     controls::title_row(ui, Lead::Title("Settings"), &[]);
     let rest = ui.available_rect_before_wrap();
     let (list, bar) = rest.split_top_bottom_at_y(rest.bottom() - BAR_HEIGHT);
@@ -462,7 +462,7 @@ fn refused_line(draft: &Draft, action: Action) -> Option<String> {
 // in open mic the meter is also the sensitivity, a handle on its own scale.
 // Then the output device, and constant-rate voice. Each choice that costs
 // something has its one sentence.
-fn voice(ui: &mut Ui, draft: &mut Draft, audio: &SettingsAudio) {
+fn voice(ui: &mut Ui, draft: &mut Draft, audio: &mut SettingsAudio) {
     ui.add_space(SECTION_GAP);
     head(ui, "Voice");
     let lists = audio.lists();
@@ -519,9 +519,27 @@ fn voice(ui: &mut Ui, draft: &mut Draft, audio: &SettingsAudio) {
         None => line(ui, messages::MICROPHONE_OPEN, ASH),
     };
 
+    ui.add_space(STEP);
+    let id = ui.id().with("hear yourself");
+    let hearing = audio.hearing();
+    let kind = WidgetType::Checkbox;
+    // Turned on or off once the output list below is drawn from the lists
+    // it borrows.
+    let toggle = controls::choice_row(ui, id, hearing, "Hear yourself", None, kind).clicked();
+    if let Some(problem) = audio.hear_problem() {
+        line(ui, &problem, BAD);
+    } else if audio.tripped() {
+        line(ui, messages::HEAR_YOURSELF_TRIPPED, WARN);
+    } else {
+        line(ui, messages::HEAR_YOURSELF, ASH);
+    }
+
     ui.add_space(FIELD_GAP);
     label(ui, "Output device");
     device_list(ui, Direction::Output, &mut draft.output, outputs);
+    if toggle {
+        audio.hear(!hearing, &draft.output);
+    }
 
     ui.add_space(FIELD_GAP);
     let id = ui.id().with("constant rate");

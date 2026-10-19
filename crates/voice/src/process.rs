@@ -3,7 +3,8 @@
 // only its level is taken, after everything else, since that is what the
 // meter shows and what the open mic gate reads.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use crate::audio::{Level, Meter};
@@ -43,4 +44,83 @@ impl Default for Processor {
     fn default() -> Processor {
         Processor::new()
     }
+}
+
+// At most 20 ms waits between the microphone and the speakers; past that the
+// oldest goes, so two devices whose clocks drift apart never add delay.
+const PLAYBACK_MOST: usize = 960;
+// Close to full scale for 300 ms on end is the speakers feeding the
+// microphone, not a voice.
+const TRIP_PEAK: f32 = 0.708;
+const TRIP_SAMPLES: usize = 14_400;
+
+// Settings' Hear yourself: the processed microphone handed from the capture
+// thread to a render thread, each holding the lock only to copy. Nothing is
+// added to it: what plays is what a room would send.
+#[derive(Clone, Default)]
+pub struct Playback(Arc<Mutex<Queue>>);
+
+#[derive(Default)]
+struct Queue {
+    on: bool,
+    tripped: bool,
+    samples: VecDeque<f32>,
+    // Samples in a row in packets that came close to full scale.
+    loud: usize,
+}
+
+impl Playback {
+    // Off the audio threads: turning it on makes room for the queue.
+    pub fn set_on(&self, on: bool) {
+        let mut queue = lock(&self.0);
+        queue.on = on;
+        queue.samples.clear();
+        queue.loud = 0;
+        if on {
+            queue.tripped = false;
+            queue.samples.reserve(PLAYBACK_MOST + 4096);
+        }
+    }
+
+    // Turned itself off: the microphone heard the speakers.
+    pub fn tripped(&self) -> bool {
+        lock(&self.0).tripped
+    }
+
+    // On the capture thread.
+    pub fn push(&self, samples: &[f32]) {
+        let mut queue = lock(&self.0);
+        if !queue.on {
+            return;
+        }
+        let peak = samples.iter().fold(0.0f32, |most, s| most.max(s.abs()));
+        queue.loud = if peak >= TRIP_PEAK {
+            queue.loud + samples.len()
+        } else {
+            0
+        };
+        if queue.loud >= TRIP_SAMPLES {
+            queue.on = false;
+            queue.tripped = true;
+            queue.samples.clear();
+            return;
+        }
+        queue.samples.extend(samples);
+        let over = queue.samples.len().saturating_sub(PLAYBACK_MOST);
+        queue.samples.drain(..over);
+    }
+
+    // On the render thread: what has come, then silence.
+    pub fn fill(&self, out: &mut [f32]) {
+        let mut queue = lock(&self.0);
+        let have = queue.samples.len().min(out.len());
+        for (to, from) in out.iter_mut().zip(queue.samples.drain(..have)) {
+            *to = from;
+        }
+        out[have..].fill(0.0);
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }

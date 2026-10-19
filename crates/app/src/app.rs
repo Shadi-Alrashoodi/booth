@@ -1214,7 +1214,7 @@ impl eframe::App for App {
                             // microphone is closed until the window is back.
                             let showing =
                                 ui.input(|input| input.viewport().minimized != Some(true));
-                            audio.follow(&draft.input, showing);
+                            audio.follow(&draft.input, &draft.output, showing);
                             press = settings_screen::show(ui, draft, audio);
                             if audio.level().is_some() {
                                 ui.request_repaint_after(METER_REPAINT);

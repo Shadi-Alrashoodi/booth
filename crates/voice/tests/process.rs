@@ -3,7 +3,7 @@
 use std::f32::consts::TAU;
 use std::time::{Duration, Instant};
 
-use voice::process::Processor;
+use voice::process::{Playback, Processor};
 
 // 440 Hz at `amplitude` for `samples` samples, from sample `from` on.
 fn tone(from: usize, samples: usize, amplitude: f32) -> Vec<f32> {
@@ -43,4 +43,43 @@ fn nothing_on_passes_the_sound_and_meters_it() {
     // The loud 480 sit across two 5 ms blocks, one of them nearly all loud.
     assert!(reading.loudest > 0.3, "{reading:?}");
     assert!(reading.rms < reading.loudest * 0.75, "{reading:?}");
+}
+
+// Hear yourself's queue: nothing while off; on, what went in comes out in
+// order and then silence; never more than 20 ms behind, so what plays is the
+// newest; and sound near full scale for 300 ms turns it off until it is
+// turned on again.
+#[test]
+fn playback_keeps_up_and_trips_on_feedback() {
+    let playback = Playback::default();
+    let mut out = [1.0f32; 480];
+    playback.push(&[0.3; 240]);
+    playback.fill(&mut out);
+    assert!(out.iter().all(|&s| s == 0.0));
+
+    playback.set_on(true);
+    let voice = tone(0, 240, 0.2);
+    playback.push(&voice);
+    playback.fill(&mut out);
+    assert_eq!(&out[..240], &voice[..]);
+    assert!(out[240..].iter().all(|&s| s == 0.0));
+
+    let long = tone(0, 2400, 0.2);
+    playback.push(&long);
+    let mut all = [0.0f32; 2400];
+    playback.fill(&mut all);
+    assert_eq!(&all[..960], &long[1440..]);
+    assert!(all[960..].iter().all(|&s| s == 0.0));
+
+    for _ in 0..59 {
+        playback.push(&tone(0, 240, 0.9));
+    }
+    assert!(!playback.tripped());
+    playback.push(&tone(0, 240, 0.9));
+    assert!(playback.tripped());
+    playback.push(&voice);
+    playback.fill(&mut out);
+    assert!(out.iter().all(|&s| s == 0.0));
+    playback.set_on(true);
+    assert!(!playback.tripped());
 }

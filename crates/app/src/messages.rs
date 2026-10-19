@@ -431,6 +431,9 @@ pub const NO_STUN: &str = "With no STUN servers Booth cannot learn your outside 
 // Under the level meter: the one time Booth opens the microphone outside a
 // room, said where it happens.
 pub const MICROPHONE_OPEN: &str = "The microphone is open while this screen shows the meter.";
+pub const HEAR_YOURSELF: &str = "Use headphones.";
+pub const HEAR_YOURSELF_TRIPPED: &str =
+    "Turned off: the microphone heard the speakers. Use headphones.";
 
 pub const OPEN_MIC: &str = "Booth sends while it hears you, and a moment after.";
 pub const CONSTANT_RATE_OFF: &str =
