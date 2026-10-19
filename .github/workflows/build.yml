@@ -73,7 +73,15 @@ jobs:
       # has no GPU encoder, monitor or microphone for it into the log.
       - if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         timeout-minutes: 60
-        run: cargo test --workspace --locked --no-fail-fast -- --show-output
+        run: cargo test --workspace --locked --no-fail-fast -- --show-output --skip client_follows_the_hosts_ping_from_a_new_address --skip video_reaches_only_the_watchers
+
+      # On four busy cores these two miss what they wait for: the host's
+      # notice that lasts only until the friend is heard again, and a 256 KB
+      # pointer shape crossing two control streams within 3 s. Their files
+      # run again here, one test at a time.
+      - if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        timeout-minutes: 20
+        run: cargo test -p room --locked --no-fail-fast --test address --test share -- --show-output --test-threads=1
 
       - if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: cargo build --release --locked -p app
