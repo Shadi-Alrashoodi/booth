@@ -197,8 +197,7 @@ fn default_microphone_with_echo_cancellation() {
         info.stream_latency.as_secs_f64() * 1000.0
     );
     assert_ne!(info.echo, Echo::NotAsked);
-    assert_eq!(info.echo.cancelled(), info.echo != Echo::Missing);
-    if info.effects.echo_cancellation {
-        assert_eq!(info.echo, Echo::Device);
-    }
+    // The microphone's own canceller, or Windows' in the communications
+    // category: either way Windows lists it on the stream Booth kept.
+    assert_eq!(info.echo.cancelled(), info.effects.echo_cancellation);
 }
