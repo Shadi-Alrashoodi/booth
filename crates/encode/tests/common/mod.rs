@@ -28,6 +28,10 @@ use encode::annexb::{self, ListChange, MemoryOp, Pps, SliceHeader, Sps, hevc};
 
 pub const NVIDIA: u32 = 0x10de;
 
+// The Microsoft Basic Render Driver: the CPU pretending to be a GPU, which a
+// PC without a graphics card can list without the software flag.
+const BASIC_RENDER: (u32, u32) = (0x1414, 0x8c);
+
 pub struct Gpu {
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,
@@ -70,7 +74,9 @@ pub fn hardware() -> Option<Gpu> {
             break;
         };
         let desc = unsafe { adapter.GetDesc1() }.expect("adapter description");
-        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0
+            && (desc.VendorId, desc.DeviceId) != BASIC_RENDER
+        {
             let adapter: IDXGIAdapter = adapter.cast().expect("IDXGIAdapter");
             return Some(device_on(Some(&adapter), false, &desc.Description));
         }
