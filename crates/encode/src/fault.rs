@@ -48,7 +48,8 @@ pub fn stall(codec: Codec, frames: u64) {
 /// The next NVENC encoder opened fails the frame after the `frames` it
 /// gives back: the driver encodes it, and its release of the output buffer
 /// is then reported as failed, the way a driver error after the submit
-/// comes back.
+/// comes back. One closed before then hands the frames left to the next
+/// one opened, as a share's encoder opened again for a watcher's limits.
 pub fn fail_nvenc(frames: u64) {
     faults().nvenc_fails = Some(frames);
 }
@@ -75,6 +76,10 @@ pub(crate) fn take_stall(codec: Codec) -> Option<u64> {
 
 pub(crate) fn take_nvenc_failure() -> Option<u64> {
     faults().nvenc_fails.take()
+}
+
+pub(crate) fn give_back_nvenc_failure(frames: u64) {
+    faults().nvenc_fails.get_or_insert(frames);
 }
 
 pub(crate) fn take_software_failure() -> Option<u64> {

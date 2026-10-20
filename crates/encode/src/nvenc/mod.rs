@@ -181,6 +181,15 @@ pub(crate) struct Nvenc {
     fail_in: Option<u64>,
 }
 
+#[cfg(feature = "fault")]
+impl Drop for Nvenc {
+    fn drop(&mut self) {
+        if let Some(frames) = self.fail_in {
+            crate::fault::give_back_nvenc_failure(frames);
+        }
+    }
+}
+
 impl Nvenc {
     pub(crate) fn open(
         device: &ID3D11Device,
