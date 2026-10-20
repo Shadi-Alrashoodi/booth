@@ -5,6 +5,7 @@ use invite::{CodeError, Version};
 use keys::KeyError;
 use room::view::{
     AddressChanged, NameAnswer, NameView, Notice, PasteState, ReplyState, Role, RouterState,
+    Unheard,
 };
 use room::{ChatRefused, DamagedList, KnownError, List, ReplyRefused, RoomError};
 use voice::audio::{Echo, Microphone};
@@ -549,6 +550,19 @@ pub fn row_menu(name: &str) -> String {
 
 pub fn volume_label(name: &str) -> String {
     format!("Volume for {name}")
+}
+
+// In the sharer's row menu while this PC watches: what it asks the share to
+// keep to.
+pub const WATCH_AT: &str = "Watch at";
+pub const CAP_FOR_EVERYONE: &str = "The lowest cap for each setting applies to everyone watching.";
+
+pub fn cap_unheard(unheard: Unheard) -> &'static str {
+    match unheard {
+        Unheard::Host => "The host needs Booth 1.2.0 or later for a cap.",
+        Unheard::Sharer => "The sharer needs Booth 1.2.0 or later for a cap.",
+        Unheard::Both => "The host and the sharer need Booth 1.2.0 or later for a cap.",
+    }
 }
 
 // After a person's name, while this PC plays them at anything but 100

@@ -6637,6 +6637,45 @@ mod tests {
         }
     }
 
+    // A watcher whose copy reads limits hears once that the sharer's does
+    // not, so its menu can say why a cap does nothing.
+    #[test]
+    fn the_watcher_of_an_older_sharer_hears_its_cap_goes_unheard() {
+        let older = Version {
+            major: 1,
+            minor: 1,
+            patch: 0,
+        };
+        let start = Instant::now();
+        let mut rig = Rig::new(start);
+        rig.host.version = peer::LIMITS_SINCE;
+        let mut ana = Guest::new();
+        ana.join_as(&mut rig, "Ana", older, None, start);
+        let mut bo = Guest::new();
+        bo.join_as(&mut rig, "Bo", peer::LIMITS_SINCE, None, start);
+        let share = granted(&mut rig, &mut ana, start);
+        bo.say(
+            &mut rig,
+            &Message::Watch {
+                share,
+                on: true,
+                hevc: true,
+            },
+            start,
+        );
+        let limits = control::WatchLimits::default();
+        bo.say(&mut rig, &Message::WatchLimits { share, limits }, start);
+        bo.read(start);
+        let told: Vec<_> = messages(&mut bo.reliable)
+            .into_iter()
+            .filter_map(|message| match message {
+                Message::ShareLimits { share, limits } => Some((share, limits)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(told, [(share, None)]);
+    }
+
     // A sharer whose Hello is older than FEEDBACK_SINCE reads recover
     // requests on the control stream only, a newer one on the feedback
     // stream. A watcher's feedback is taken from either, and nothing else

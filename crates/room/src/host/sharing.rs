@@ -21,7 +21,7 @@ use crate::screen::{
 };
 use crate::socket::Socket;
 use crate::talk::{Outlet, Sent};
-use crate::view::{ChatLine, CurrentShare, LineKind, ShareView};
+use crate::view::{ChatLine, CurrentShare, LineKind, ShareView, Unheard};
 
 // A watcher's loss report counts for this long, as a listener's voice
 // report does.
@@ -128,6 +128,9 @@ pub(super) struct Watcher {
     // IDR ask the sharer sends no pointer shape either. Other asks are
     // dropped, since a viewer asks again while frames keep failing.
     join_idr_waits: bool,
+    // Told that the sharer is too old to hear its cap (ShareLimits with
+    // nothing in it).
+    told_unheard: bool,
     // The sharer's clock offset it was last told.
     told_clock: Option<(i64, bool)>,
     // Its viewer decodes HEVC, as its Watch said.
@@ -201,6 +204,7 @@ impl Watcher {
         self.told_clock = None;
         self.join_idr_waits = false;
         self.limits = None;
+        self.told_unheard = false;
     }
 
     // True when an IDR ask for this watcher may go now.
@@ -1385,6 +1389,7 @@ impl Host {
             });
             peer.flush(socket, now);
         } else {
+            self.tell_unheard(number, now, socket);
             return;
         }
         log!(
@@ -1397,6 +1402,36 @@ impl Host {
                 .kbps
                 .map_or_else(String::new, |kbps| format!(", {kbps} kbit/s"))
         );
+    }
+
+    // The sharer reads no limits: each watcher whose copy does hears once,
+    // so its menu can say why a cap does nothing.
+    fn tell_unheard(&mut self, number: u32, now: Instant, socket: &Socket) {
+        for peer in &mut self.peers {
+            if peer.share.watching == Some(number)
+                && peer.link.limits_read
+                && !std::mem::replace(&mut peer.share.watcher.told_unheard, true)
+            {
+                peer.link.queue(&Message::ShareLimits {
+                    share: number,
+                    limits: None,
+                });
+                peer.flush(socket, now);
+            }
+        }
+    }
+
+    // This host's viewer, on a share whose sharer reads no limits.
+    fn cap_unheard(&self) -> Option<Unheard> {
+        let live = self
+            .live
+            .as_ref()
+            .filter(|live| self.screen.watched == Some(live.number))?;
+        let reads = self
+            .peers
+            .iter()
+            .any(|peer| peer.key == live.sharer && peer.link.limits_read);
+        (!reads).then_some(Unheard::Sharer)
     }
 
     fn tell_sharer_facts(&mut self, facts: Facts, now: Instant, socket: &Socket) {
@@ -1565,6 +1600,8 @@ impl Host {
             viewer_open: self.screen.watching.showing(),
             problem: self.screen.problem.clone(),
             control: self.control_view(),
+            cap: self.screen.watching.cap(),
+            cap_unheard: self.cap_unheard(),
         }
     }
 

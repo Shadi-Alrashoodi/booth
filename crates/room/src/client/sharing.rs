@@ -18,7 +18,7 @@ use crate::screen::{
 };
 use crate::socket::Socket;
 use crate::talk::Outlet;
-use crate::view::{ChatLine, CurrentShare, LineKind, LinkState, ShareView};
+use crate::view::{ChatLine, CurrentShare, LineKind, LinkState, ShareView, Unheard};
 
 // Who shares in a roster, and their share.
 fn sharer_of(roster: &Roster) -> Option<(&Entry, EntryShare)> {
@@ -416,6 +416,12 @@ impl Client {
             } if own_share == Some(share) => {
                 self.screen.sharing.set_limits(limits);
             }
+            Message::ShareLimits {
+                share,
+                limits: None,
+            } if self.screen.watched == Some(share) => {
+                self.sharer_unread = Some(share);
+            }
             Message::SharerClock {
                 share,
                 offset_us,
@@ -641,6 +647,20 @@ impl Client {
             viewer_open: self.screen.watching.showing(),
             problem: self.screen.problem.clone(),
             control: self.control_view(),
+            cap: self.screen.watching.cap(),
+            cap_unheard: self.cap_unheard(),
+        }
+    }
+
+    // A host whose Hello is older than LIMITS_SINCE never passes a cap on,
+    // and the host says so of a sharer that old.
+    fn cap_unheard(&self) -> Option<Unheard> {
+        let share = self.screen.watched?;
+        match (!self.link.limits_read, self.sharer_unread == Some(share)) {
+            (true, true) => Some(Unheard::Both),
+            (true, false) => Some(Unheard::Host),
+            (false, true) => Some(Unheard::Sharer),
+            (false, false) => None,
         }
     }
 

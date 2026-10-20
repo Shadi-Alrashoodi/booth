@@ -1056,8 +1056,16 @@ impl InRoom {
             let was = self.volumes.get(&person.key);
             let mut percent = u32::from(was);
             let volume = Some((&mut percent, person.name.as_str()));
-            if let Some(MenuItem::EndControl) = self.menu.show(ui, person.key, volume, &items) {
+            let watched = view.share.watching && current.is_some_and(|c| c.key == person.key);
+            let mut cap = view.share.cap;
+            let asked = watched.then_some((&mut cap, view.share.cap_unheard));
+            if let Some(MenuItem::EndControl) =
+                self.menu.show(ui, person.key, volume, asked, &items)
+            {
                 self.room.end_control();
+            }
+            if cap != view.share.cap {
+                self.room.cap_watch(cap);
             }
             let percent = u8::try_from(percent).unwrap_or(MOST_VOLUME);
             if percent != was {

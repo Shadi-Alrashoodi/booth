@@ -68,6 +68,18 @@ pub struct ShareView {
     pub problem: Option<String>,
     // Remote control of the current share, from this PC's side.
     pub control: ControlView,
+    // While this PC watches: what it asks the share to keep to
+    // (Room::cap_watch), and who cannot honor that, if anyone.
+    pub cap: WatchCap,
+    pub cap_unheard: Option<Unheard>,
+}
+
+// Who runs a Booth older than 1.2.0, which takes no cap from a watcher.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unheard {
+    Host,
+    Sharer,
+    Both,
 }
 
 // At most one of asked_by and controlled_by, and one of asking and

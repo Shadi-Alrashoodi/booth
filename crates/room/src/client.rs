@@ -419,6 +419,8 @@ pub(crate) struct Client {
     // The host's word on the clock of the friend whose share this PC
     // watches: the share, the friend's clock minus the host's, and "about".
     sharer_clock: Option<(u32, i64, bool)>,
+    // The share whose sharer the host said is too old to hear a cap.
+    sharer_unread: Option<u32>,
     // The frame rate the host has for this PC's share, which its roster
     // shows: the one asked with, then what the share's thread said it runs
     // at. Kept here because the roster copy can be a step behind.
@@ -573,6 +575,7 @@ impl Client {
             screen: Screen::new(clock, false, setup.screen, setup.joined),
             video_out: Arc::default(),
             sharer_clock: None,
+            sharer_unread: None,
             told_fps: None,
             input_events: Vec::with_capacity(crate::remote::MAX_EVENTS),
         }

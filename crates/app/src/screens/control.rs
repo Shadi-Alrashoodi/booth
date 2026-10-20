@@ -17,7 +17,7 @@ use eframe::egui::{
     Event, Frame, Id, Key, Margin, Modifiers, Response, Ui, WidgetInfo, WidgetType,
 };
 use room::MOST_VOLUME;
-use room::view::{LinkState, Person, Role, View};
+use room::view::{LinkState, Person, Role, Unheard, View, WatchCap};
 
 use crate::controls::{self, Button};
 use crate::messages;
@@ -280,6 +280,52 @@ pub fn menu_items(view: &View, person: &Person, offered: bool) -> Vec<MenuItem> 
     }
 }
 
+// The parts of a watch cap, each a list with no cap first.
+const HEIGHTS: [(Option<u16>, &str); 3] = [
+    (None, "Automatic"),
+    (Some(1080), "1080p"),
+    (Some(1440), "1440p"),
+];
+const RATES: [(Option<u8>, &str); 2] = [(None, "Full"), (Some(60), "60 fps")];
+const BITRATES: [(Option<u32>, &str); 3] = [
+    (None, "Automatic"),
+    (Some(8_000), "8 Mbit/s"),
+    (Some(15_000), "15 Mbit/s"),
+];
+
+// "Watch at": a list of choices for each part of the cap, as Settings has
+// them, or why a cap would do nothing.
+fn watch_at(ui: &mut Ui, id: Id, cap: &mut WatchCap, unheard: Option<Unheard>) {
+    ui.add_space(HALF_STEP);
+    controls::text(ui, messages::WATCH_AT, theme::body(), CHALK);
+    ui.add_space(HALF_STEP);
+    if let Some(unheard) = unheard {
+        controls::prose(ui, messages::cap_unheard(unheard), theme::caption(), ASH);
+        return;
+    }
+    controls::prose(ui, messages::CAP_FOR_EVERYONE, theme::caption(), ASH);
+    choices(ui, id.with(0), "Resolution", &HEIGHTS, &mut cap.height);
+    choices(ui, id.with(1), "Frame rate", &RATES, &mut cap.fps);
+    choices(ui, id.with(2), "Bitrate", &BITRATES, &mut cap.kbps);
+}
+
+fn choices<T: Copy + PartialEq>(
+    ui: &mut Ui,
+    id: Id,
+    label: &str,
+    offered: &[(Option<T>, &str)],
+    value: &mut Option<T>,
+) {
+    ui.add_space(STEP);
+    controls::text(ui, label, theme::body(), ASH);
+    for (i, &(choice, name)) in offered.iter().enumerate() {
+        let kind = WidgetType::RadioButton;
+        if controls::choice_row(ui, id.with(i), *value == choice, name, None, kind).clicked() {
+            *value = choice;
+        }
+    }
+}
+
 // Which row's menu is open. It opens under its row rather than floating
 // over the list, so nothing covers the names, and it reads in Tab order
 // right after the row it belongs to.
@@ -345,14 +391,16 @@ impl RowMenu {
     }
 
     // Under the open row: the person's volume, when given with their name,
-    // then the row's items. Esc closes it and gives the focus back to the
-    // row; picking an item closes it, and so does the row losing all it
-    // had (the control it would end has ended).
+    // what this PC asks of their share while it watches it (watch_at), then
+    // the row's items. Esc closes it and gives the focus back to the row;
+    // picking an item closes it, and so does the row losing all it had (the
+    // control it would end has ended). A cap stays open for the next pick.
     pub fn show(
         &mut self,
         ui: &mut Ui,
         key: [u8; 32],
         volume: Option<(&mut u32, &str)>,
+        cap: Option<(&mut WatchCap, Option<Unheard>)>,
         items: &[MenuItem],
     ) -> Option<MenuItem> {
         if self.open != Some(key) {
@@ -365,7 +413,7 @@ impl RowMenu {
             }
             return None;
         }
-        if items.is_empty() && volume.is_none() {
+        if items.is_empty() && volume.is_none() && cap.is_none() {
             self.open = None;
             return None;
         }
@@ -389,6 +437,9 @@ impl RowMenu {
                     if std::mem::take(&mut self.focus) {
                         response.request_focus();
                     }
+                }
+                if let Some((cap, unheard)) = cap {
+                    watch_at(ui, ui.id().with(("cap", key)), cap, unheard);
                 }
                 if items.is_empty() {
                     return;
@@ -879,7 +930,7 @@ mod tests {
         let (rect, _) = ui.allocate_exact_size(vec2(360.0, ROW_HEIGHT), Sense::hover());
         let row = ui.interact(rect, ui.id().with("tom's row"), Sense::click());
         menu.follow_row(ui, &row, TOM, "Tom");
-        menu.show(ui, TOM, None, &[MenuItem::EndControl])
+        menu.show(ui, TOM, None, None, &[MenuItem::EndControl])
     }
 
     fn secondary(at: Pos2, pressed: bool) -> Event {
@@ -951,6 +1002,45 @@ mod tests {
     // keyboard it takes the focus, the arrows and Page Down move it, and Esc
     // closes the menu with the focus back on the row. A plain click opens
     // it too.
+    // Watch at from the keyboard: Tab goes down its choices and Enter picks
+    // one, the menu staying open; with an older host there is nothing to
+    // pick, only why.
+    #[test]
+    fn row_menu_watch_at() {
+        let ctx = context();
+        let mut menu = RowMenu::default();
+        let draw = |events: Vec<Event>, menu: &mut RowMenu, cap: &mut WatchCap, older| {
+            frame(&ctx, events, |ui| {
+                let (rect, _) = ui.allocate_exact_size(vec2(360.0, ROW_HEIGHT), Sense::hover());
+                let row = ui.interact(rect, ui.id().with("tom's row"), Sense::click());
+                menu.follow_row(ui, &row, TOM, "Tom");
+                menu.show(ui, TOM, None, Some((cap, older)), &[]);
+            });
+        };
+        let tab = || vec![key(Key::Tab, Modifiers::NONE)];
+        let enter = || vec![key(Key::Enter, Modifiers::NONE)];
+        let mut cap = WatchCap::default();
+        let open = [Vec::new(), tab(), enter(), Vec::new()];
+        for events in open.into_iter().chain([tab(), tab(), enter()]) {
+            draw(events, &mut menu, &mut cap, None);
+        }
+        assert_eq!(cap.height, Some(1080));
+        for events in [tab(), tab(), tab(), enter()] {
+            draw(events, &mut menu, &mut cap, None);
+        }
+        assert_eq!(
+            (cap.height, cap.fps, cap.kbps),
+            (Some(1080), Some(60), None)
+        );
+        assert!(menu.is_open());
+
+        let mut untouched = WatchCap::default();
+        for events in [tab(), enter(), tab(), enter(), tab(), enter()] {
+            draw(events, &mut menu, &mut untouched, Some(Unheard::Host));
+        }
+        assert_eq!(untouched, WatchCap::default());
+    }
+
     #[test]
     fn row_menu_volume() {
         let ctx = context();
@@ -961,7 +1051,7 @@ mod tests {
                 let (rect, _) = ui.allocate_exact_size(vec2(360.0, ROW_HEIGHT), Sense::hover());
                 let row = ui.interact(rect, ui.id().with("tom's row"), Sense::click());
                 menu.follow_row(ui, &row, TOM, "Tom");
-                menu.show(ui, TOM, Some((percent, "Tom")), &[]);
+                menu.show(ui, TOM, Some((percent, "Tom")), None, &[]);
                 row.id
             });
             row
@@ -1006,7 +1096,7 @@ mod tests {
             open: Some(TOM),
             ..RowMenu::default()
         };
-        let (picked, _) = frame(&ctx, Vec::new(), |ui| menu.show(ui, TOM, None, &[]));
+        let (picked, _) = frame(&ctx, Vec::new(), |ui| menu.show(ui, TOM, None, None, &[]));
         assert_eq!(picked, None);
         assert_ne!(menu.open, Some(TOM));
     }
