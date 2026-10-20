@@ -29,6 +29,8 @@ use crate::{Clock, Line};
 // since the last change. Once a frame would be too fast to read.
 const STRIP_EVERY: Duration = Duration::from_millis(250);
 const SECOND: Duration = Duration::from_secs(1);
+// A wait between two frames shown that anyone sees as the picture stopping.
+const STALL: Duration = Duration::from_millis(100);
 
 // The first decode failure is shown, since without a log it would be lost;
 // the next few go to the log word for word, and after that only the count.
@@ -159,6 +161,10 @@ pub struct Window {
     // Each comes once the GPU's time for its picture is in.
     pub end_to_end_ms: Vec<f32>,
     pub presented: u64,
+    // The longest wait between two frames shown, of the waits that ended
+    // in this window. A still screen sends nothing, so on a desktop a long
+    // one is not always a stall.
+    pub longest_gap: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -203,9 +209,12 @@ impl Times {
         }
     }
 
-    fn presented(&mut self) {
-        self.quarter.presented += 1;
-        self.second.presented += 1;
+    // `gap` is the wait since the frame shown before, None for the first.
+    fn presented(&mut self, gap: Option<Duration>) {
+        for window in [&mut self.quarter, &mut self.second] {
+            window.presented += 1;
+            window.longest_gap = window.longest_gap.max(gap);
+        }
     }
 
     fn into_numbers(self, numbers: &mut ViewerNumbers) {
@@ -723,8 +732,13 @@ impl Screen {
         };
         let presented = self.present(Some(video))?;
         if let Some(returned) = presented {
+            let gap = self
+                .numbers
+                .last_present
+                .map(|last| returned.saturating_duration_since(last));
             self.numbers.presented += 1;
-            self.times.presented();
+            self.numbers.stalls += u64::from(gap.is_some_and(|gap| gap > STALL));
+            self.times.presented(gap);
             self.numbers.first_present.get_or_insert(returned);
             self.numbers.last_present = Some(returned);
             let shown = Shown {
@@ -1281,7 +1295,7 @@ mod tests {
                 if frame % 2 == 0 {
                     times.add(Stage::EndToEnd, 3.0);
                 }
-                times.presented();
+                times.presented(Some(Duration::from_millis(8)));
             }
             let second = std::mem::take(&mut times.second);
             assert_eq!(second.decode_ms.len(), 1000);
@@ -1301,5 +1315,25 @@ mod tests {
             ),
             (1000, 1000, 500)
         );
+    }
+
+    // A wait counts in the window it ended in, so a picture that froze
+    // across a second's turn shows up once, in the second it came back.
+    #[test]
+    fn the_longest_gap_is_the_window_it_ended_in() {
+        let mut times = Times::new(false);
+        let gap = |ms| Some(Duration::from_millis(ms));
+        times.presented(None);
+        assert_eq!(times.second.longest_gap, None);
+        for ms in [8, 22, 8] {
+            times.presented(gap(ms));
+        }
+        let first = std::mem::take(&mut times.second);
+        assert_eq!((first.presented, first.longest_gap), (4, gap(22)));
+        times.presented(gap(1212));
+        times.presented(gap(8));
+        let second = std::mem::take(&mut times.second);
+        assert_eq!((second.presented, second.longest_gap), (2, gap(1212)));
+        assert_eq!(times.quarter.longest_gap, gap(1212));
     }
 }

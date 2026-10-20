@@ -119,6 +119,9 @@ pub struct ViewerNumbers {
     // picture. Before that such frames count in before_first_idr.
     pub decode_failed: u64,
     pub presented: u64,
+    // Waits of more than screen::STALL between two frames shown. A still
+    // screen sends nothing, so on a desktop not every one is a stall.
+    pub stalls: u64,
     // The codec of the last picture decoded, and how often a new codec's
     // IDR brought a new decoder in place of one that had given pictures:
     // the share's first HEVC IDR is not a change.

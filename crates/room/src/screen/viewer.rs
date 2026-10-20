@@ -339,6 +339,7 @@ impl Tally {
         if self.latency.len() == LATENCY_SECONDS {
             self.latency.pop_front();
         }
+        let slowest_ms = window.end_to_end_ms.iter().copied().reduce(f32::max);
         self.latency
             .push_back(std::mem::take(&mut window.end_to_end_ms));
         stats::gauge!("room.watch_tally.latency", self.latency);
@@ -367,7 +368,9 @@ impl Tally {
                     one_way_ms.unwrap_or(0.0),
                 ))
             }),
+            slowest_ms,
             fps: u32::try_from(window.presented).unwrap_or(u32::MAX),
+            longest_gap_ms: window.longest_gap.map(|gap| gap.as_secs_f32() * 1000.0),
             video_loss_pct: loss,
             shown: numbers.presented,
             repaired: numbers.reassembly.repaired,
@@ -376,6 +379,7 @@ impl Tally {
                 .reassembly
                 .dropped()
                 .saturating_sub(numbers.lost_before_first_idr),
+            stalls: numbers.stalls,
             decode_failed: numbers.decode_failed,
             before_first_idr: numbers.before_first_idr,
             present_path: numbers.path.map(|path| match path {
@@ -601,6 +605,7 @@ mod tests {
         );
         assert_eq!(numbers.decode_ms, Some(2.0));
         assert_eq!(numbers.fps, 118);
+        assert_eq!(numbers.longest_gap_ms, None);
         assert_eq!(numbers.capture_to_display_level, view::Level::Good);
         assert_eq!(
             numbers.knob,
@@ -610,5 +615,48 @@ mod tests {
                 dropped: 40
             })
         );
+    }
+
+    // Unlike the median and p95, the slowest frame and the longest wait are
+    // the last second's alone; stalls count since watching started.
+    #[test]
+    fn slowest_frame_and_longest_gap_of_the_second() {
+        let mut tally = Tally::new(None);
+        let viewer = ViewerNumbers {
+            stalls: 3,
+            ..ViewerNumbers::default()
+        };
+        let mut second = |end_to_end_ms: Vec<f32>, longest_gap_ms: u64| {
+            let window = share::Window {
+                end_to_end_ms,
+                presented: 60,
+                longest_gap: Some(Duration::from_millis(longest_gap_ms)),
+                ..share::Window::default()
+            };
+            tally.second(
+                Second {
+                    elapsed: Duration::from_secs(1),
+                    loss: None,
+                    window,
+                    numbers: &viewer,
+                },
+                false,
+                0,
+                60,
+                None,
+            )
+        };
+        let first = second(vec![4.0, 31.5, 5.0], 250);
+        assert_eq!(
+            (first.slowest_ms, first.longest_gap_ms),
+            (Some(31.5), Some(250.0))
+        );
+        let next = second(vec![4.5, 6.0], 17);
+        assert_eq!(
+            (next.slowest_ms, next.longest_gap_ms),
+            (Some(6.0), Some(17.0))
+        );
+        let empty = second(Vec::new(), 17);
+        assert_eq!((empty.slowest_ms, empty.stalls), (None, 3));
     }
 }

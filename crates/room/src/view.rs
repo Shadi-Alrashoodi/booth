@@ -628,8 +628,12 @@ pub struct WatchingNumbers {
     // was taken over a jittery link.
     pub capture_to_display: Option<Latency>,
     pub capture_to_display_level: Level,
-    // Frames shown in the last second.
+    // The slowest frame of the last second, capture to display.
+    pub slowest_ms: Option<f32>,
+    // Frames shown in the last second, and the longest wait between two of
+    // them that ended in it.
     pub fps: u32,
+    pub longest_gap_ms: Option<f32>,
     // Of the share's packets over the last 2 s, the number that sets the
     // sharer's parity.
     pub video_loss_pct: Option<f32>,
@@ -638,6 +642,9 @@ pub struct WatchingNumbers {
     pub shown: u64,
     pub repaired: u64,
     pub dropped: u64,
+    // Since watching started, waits of more than 100 ms between two frames
+    // shown.
+    pub stalls: u64,
     // Frames that came whole but did not decode, and frames that came whole
     // before the first IDR and so could not.
     pub decode_failed: u64,
