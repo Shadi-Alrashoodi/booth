@@ -339,6 +339,22 @@ pub(crate) fn open(
             chosen.kind = kind;
             opened = source.encoder(kind, Codec::H264, size, fps, settings);
         }
+        let default = capture::Options::default();
+        if chosen.codec == Codec::H264
+            && (size.0 > default.max_width || size.1 > default.max_height)
+        {
+            // H.264 keeps to the box every share had before 4K: 4K at 120
+            // fps is past the levels its decoders have to take.
+            drop(opened);
+            drop(source);
+            known = chosen.hevc;
+            options = capture::Options {
+                max_width: options.max_width.min(default.max_width),
+                max_height: options.max_height.min(default.max_height),
+                ..options
+            };
+            continue;
+        }
         match opened {
             Ok(encoder) => {
                 return Ok(Opened {

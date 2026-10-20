@@ -238,6 +238,9 @@ pub struct Sharer {
     software: Option<OnSoftware>,
     // What capture was last asked for.
     options: capture::Options,
+    // What the watchers take, from the host (set_limit): the box a picture
+    // fits in and the most frames a second. None keeps capture's defaults.
+    limit: Option<capture::Options>,
     // How many times the source opened again. A picture goes out again
     // only on the source that made it: the one before is on a texture of
     // its own device.
@@ -386,6 +389,7 @@ impl Sharer {
             notes_said,
             software,
             options,
+            limit: None,
             reopens: 0,
             fallback: None,
         })
@@ -522,6 +526,22 @@ impl Sharer {
         self.reopen(options, say)
     }
 
+    // The largest picture and the most frames a second every watcher takes,
+    // from the host. A box past capture's default only counts while the
+    // share is in HEVC, and source::open keeps H.264 to that default. True
+    // when the source opened again for it.
+    pub fn set_limit(
+        &mut self,
+        limit: capture::Options,
+        say: &mut dyn FnMut(Line),
+    ) -> Result<bool, String> {
+        if self.limit == Some(limit) {
+            return Ok(false);
+        }
+        self.limit = Some(limit);
+        self.reopen(self.source_options(self.setup.fps), say)
+    }
+
     pub fn stepped_down(&self) -> bool {
         self.small.is_some()
     }
@@ -543,24 +563,15 @@ impl Sharer {
     // size while stepped down, and on the software encoder no more than it
     // took when the share went onto it.
     fn source_options(&self, fps: u32) -> capture::Options {
-        match (self.small, self.software) {
-            (Some((max_width, max_height)), _)
-            | (
-                None,
-                Some(OnSoftware {
-                    limits: (max_width, max_height),
-                    ..
-                }),
-            ) => capture::Options {
-                max_width,
-                max_height,
-                max_fps: fps.min(SMALL_FPS),
-            },
-            (None, None) => capture::Options {
-                max_fps: fps,
-                ..capture::Options::default()
-            },
-        }
+        let largest = match self.codec() {
+            Some(Codec::Hevc) => self.limit,
+            _ => self.limit.map(within_default),
+        };
+        options_for(
+            fps,
+            self.small.or(self.software.map(|software| software.limits)),
+            largest,
+        )
     }
 
     // True when the source opened again, which it does only for options
@@ -1291,9 +1302,82 @@ impl Switches {
     }
 }
 
+// Capture's options at `fps`: within `small` (step_down's size, or what
+// the software encoder took) at no more than its rate, and within the
+// watchers' limit; with neither, the limit's box or capture's default.
+fn options_for(
+    fps: u32,
+    small: Option<(u32, u32)>,
+    limit: Option<capture::Options>,
+) -> capture::Options {
+    let options = match small {
+        Some((max_width, max_height)) => capture::Options {
+            max_width,
+            max_height,
+            max_fps: fps.min(SMALL_FPS),
+        },
+        None => capture::Options {
+            max_fps: fps,
+            ..limit.unwrap_or_default()
+        },
+    };
+    match limit {
+        Some(limit) => capture::Options {
+            max_width: options.max_width.min(limit.max_width),
+            max_height: options.max_height.min(limit.max_height),
+            max_fps: options.max_fps.min(limit.max_fps),
+        },
+        None => options,
+    }
+}
+
+// A limit with its box brought down to capture's default, which is all
+// H.264 is sent at.
+fn within_default(limit: capture::Options) -> capture::Options {
+    let default = capture::Options::default();
+    capture::Options {
+        max_width: limit.max_width.min(default.max_width),
+        max_height: limit.max_height.min(default.max_height),
+        ..limit
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The watchers' limit sets the box when nothing smaller does, and each
+    // side and the rate are the smaller of the two.
+    #[test]
+    fn capture_keeps_to_the_watchers_limit() {
+        let default = capture::Options::default();
+        let four_k = capture::Options {
+            max_width: 4096,
+            max_height: 2160,
+            max_fps: 120,
+        };
+        let capped = capture::Options {
+            max_width: 1920,
+            max_height: 1080,
+            max_fps: 60,
+        };
+        let options = |max_width, max_height, max_fps| capture::Options {
+            max_width,
+            max_height,
+            max_fps,
+        };
+        assert_eq!(options_for(144, None, None), options(4096, 1440, 144));
+        assert_eq!(options_for(144, None, Some(four_k)), four_k);
+        assert_eq!(options_for(120, None, Some(capped)), capped);
+        assert_eq!(
+            options_for(120, Some((1920, 1080)), Some(four_k)),
+            options(1920, 1080, 60)
+        );
+        assert_eq!(options_for(120, Some((2560, 1440)), Some(capped)), capped);
+        assert_eq!(within_default(four_k), options(4096, 1440, 120));
+        assert_eq!(within_default(capped), capped);
+        assert_eq!(within_default(default), default);
+    }
 
     // A viewer without HEVC comes and goes: H.264 at once, HEVC a gap after
     // it left, and never two changes within a gap.

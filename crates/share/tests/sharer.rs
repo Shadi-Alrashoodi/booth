@@ -110,6 +110,72 @@ fn gpu() -> Option<(MutexGuard<'static, ()>, capture::Adapter)> {
     Some((turn, adapter.clone()))
 }
 
+// The watchers' limit from the host: a 4K pattern goes out at its own size
+// in HEVC, a 1080p60 cap brings it down, and H.264 stays within 4096x1440.
+#[test]
+fn the_watchers_limit_sizes_the_share() {
+    let Some((_turn, adapter)) = gpu() else {
+        return;
+    };
+    if adapter.vendor_id != NVIDIA {
+        println!("skipped: no NVIDIA GPU, so no NVENC to share 4K in HEVC with");
+        return;
+    }
+    let four_k = capture::Options {
+        max_width: 4096,
+        max_height: 2160,
+        max_fps: 120,
+    };
+    let capped = capture::Options {
+        max_width: 1920,
+        max_height: 1080,
+        max_fps: 60,
+    };
+    for codec in [Codec::Hevc, Codec::H264] {
+        let setup = Setup {
+            choice: Choice::Pattern {
+                adapter: adapter.clone(),
+                width: 3840,
+                height: 2160,
+                busy: false,
+            },
+            fps: 120,
+            settings: Settings::default(),
+            encoder: None,
+            codec: Some(codec),
+            takes_hevc: codec == Codec::Hevc,
+            payload: PAYLOAD_LAN,
+            spread: false,
+            clock: Clock::starting(Instant::now()),
+            keep_times: false,
+        };
+        let mut said = Vec::new();
+        let mut sharer = Sharer::open(setup, |_: &[u8]| {}, &mut |line| said.push(line))
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(sharer.size(), (2560, 1440));
+        sharer
+            .set_limit(four_k, &mut |line| said.push(line))
+            .unwrap_or_else(|err| panic!("{err}"));
+        let wanted = match codec {
+            Codec::Hevc => (3840, 2160),
+            Codec::H264 => (2560, 1440),
+        };
+        assert_eq!(
+            (sharer.size(), sharer.codec()),
+            (wanted, Some(codec)),
+            "{said:?}"
+        );
+        sharer
+            .set_limit(capped, &mut |line| said.push(line))
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(
+            (sharer.size(), sharer.fps()),
+            ((1920, 1080), 60),
+            "{said:?}"
+        );
+    }
+}
+
 #[test]
 fn a_pattern_share_answers_the_room() {
     let Some((_turn, adapter)) = gpu() else {
