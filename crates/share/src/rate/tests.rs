@@ -1137,18 +1137,135 @@ fn steps_down_under_8_and_up_at_10() {
     rate.allow(9_900);
     assert_eq!(rate.second(at(start, 30), &internet).step, Some(Step::Up));
     // The last internet watcher leaves: LAN viewers do not count, so it
-    // steps back up whatever the rate.
+    // steps back up whatever the rate, after the clean seconds.
     let mut rate = Rate::new(7_000);
     rate.second(at(start, 0), &internet);
     let lan = sending(1_000);
+    run(&mut rate, start, 1, 8, lan);
     assert_eq!(rate.second(at(start, 9), &lan).step, None, "10 s apart");
     assert_eq!(rate.second(at(start, 10), &lan).step, Some(Step::Up));
 
-    // LAN viewers never step it down, whatever the rate.
+    // On a LAN path a rate the setting allows never steps it down, however
+    // low.
     let mut rate = Rate::new(2_000);
     for n in 0..20 {
         assert_eq!(rate.second(at(start, n), &lan).step, None);
     }
+}
+
+// A LAN that backoffs take under 8 steps down too, since a 1440p IDR does
+// not get through a link that slow in one burst. It stays down while the
+// link stays slow, and steps back up once the rate is back at the rate
+// allowed and has held clean.
+#[test]
+fn a_slow_lan_steps_down_and_back_up() {
+    let start = Instant::now();
+    let lossy = Second {
+        lost: 10,
+        round_trip: queue_beside(),
+        ..sending(14_000)
+    };
+    let mut rate = Rate::new(15_000);
+    let steps: Vec<Option<Step>> = run(&mut rate, start, 0, 5, lossy)
+        .iter()
+        .map(|decision| decision.step)
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            None,
+            None,
+            None,
+            None,
+            Some(Step::Down(SteppedDown::LowRate))
+        ]
+    );
+    assert_eq!(rate.rate_kbps(), 7_680);
+
+    let mut slow = Rate::new(15_000);
+    run(&mut slow, start, 0, 5, lossy);
+    for n in 5..65 {
+        let second = if n % 4 == 0 { lossy } else { sending(1_000) };
+        assert_eq!(slow.second(at(start, n), &second).step, None, "second {n}");
+    }
+    assert_eq!(slow.small(), Some(SteppedDown::LowRate));
+
+    // The climb needs a link seen to carry the rate.
+    let up = (5..300)
+        .find(|&n| {
+            let clean = sending(rate.rate_kbps());
+            rate.second(at(start, n), &clean).step == Some(Step::Up)
+        })
+        .expect("it steps back up");
+    assert!(up >= 14, "second {up}, within 10 s of the step down");
+    assert_eq!(rate.rate_kbps(), 15_000);
+    assert_eq!(rate.small(), None);
+}
+
+// One backoff on a LAN path is a moment's loss, even when it takes the rate
+// under 8: a cut for shards lost goes to 0.8 of what arrived. And a share
+// stepped down there whose rate a lower allowance brings down to it waits
+// for clean seconds at it before stepping up.
+#[test]
+fn a_lan_share_keeps_full_size_through_one_cut() {
+    let start = Instant::now();
+    let light = sending(4_000);
+    let mut rate = Rate::new(15_000);
+    run(&mut rate, start, 0, 3, light);
+    let cut = rate.second(
+        at(start, 3),
+        &Second {
+            shard_loss: Some(60.0),
+            ..sending(14_000)
+        },
+    );
+    assert_eq!(cut.backoff, Some(Sign::ShardLoss));
+    assert!(
+        rate.rate_kbps() < STEP_DOWN_BELOW_KBPS,
+        "{}",
+        rate.rate_kbps()
+    );
+    assert_eq!(cut.step, None);
+    for n in 4..30 {
+        assert_eq!(rate.second(at(start, n), &light).step, None, "second {n}");
+    }
+
+    let lossy = Second {
+        lost: 10,
+        round_trip: queue_beside(),
+        ..sending(14_000)
+    };
+    let mut rate = Rate::new(15_000);
+    run(&mut rate, start, 0, 5, lossy);
+    assert_eq!(rate.small(), Some(SteppedDown::LowRate));
+    let quiet = sending(1_000);
+    assert!(
+        run(&mut rate, start, 5, 10, quiet)
+            .iter()
+            .all(|decision| decision.step.is_none())
+    );
+    assert_eq!(rate.allow(7_000), Some(7_000));
+    let up = (15..30).find(|&n| rate.second(at(start, n), &quiet).step == Some(Step::Up));
+    assert_eq!(up, Some(19));
+}
+
+// A first cut that lands on the rate floor leaves no lower rate to cut to;
+// the loss that goes on there still steps a LAN share down.
+#[test]
+fn a_lan_share_cut_to_the_floor_steps_down() {
+    let start = Instant::now();
+    let lossy = Second {
+        shard_loss: Some(80.0),
+        ..sending(4_000)
+    };
+    let mut rate = Rate::new(15_000);
+    let first = rate.second(start, &lossy);
+    assert_eq!(first.backoff, Some(Sign::ShardLoss));
+    assert_eq!(rate.rate_kbps(), RATE_FLOOR_KBPS);
+    assert_eq!(first.step, None);
+    let down = (1..10).find(|&n| rate.second(at(start, n), &lossy).step.is_some());
+    assert_eq!(down, Some(2));
+    assert_eq!(rate.small(), Some(SteppedDown::LowRate));
 }
 
 // The old case where the rate never got back to 10: an upload setting of

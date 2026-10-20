@@ -234,7 +234,18 @@ pub const FAST_CLIMB: f64 = 1.15;
 // what a 10 to 12 Mbit/s link carries. Stepping up there put the new
 // encoder's IDR into a full queue: 9 steps in 200 s and freezes of 1 to 5 s
 // on a simulated link.
+//
+// On a LAN path the watchers are not counted against the setting, so a rate
+// under 8 that the setting itself allows keeps the share full size. One that
+// backoffs took under 8 and under the rate allowed steps down there too: a
+// LAN that slow cannot take a 1440p IDR in one burst. Through 3 Mbit/s and a
+// 200 ms queue each IDR of the test pattern, about 1 Mbit at any rate, lost
+// its tail, and the picture never came back; stepped down it held 60 fps.
+// Not on the first backoff (LAN_CUTS): a light share cut once for a moment's
+// loss goes to 0.8 of the little it sends, under 8 at once. It steps back up
+// once the rate is back at the rate allowed, after the same clean seconds.
 pub const STEP_DOWN_BELOW_KBPS: u32 = 8_000;
+pub const LAN_CUTS: u32 = 2;
 pub const STEP_UP_FROM_KBPS: u32 = 10_000;
 pub const STEPS_APART: Duration = Duration::from_secs(10);
 pub const STEP_UP_CLEAN_SECONDS: u32 = 5;
@@ -386,7 +397,8 @@ pub struct Second {
 // Why a share runs at 1080p60.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SteppedDown {
-    // Under 8 Mbit/s for someone watching over an internet path.
+    // Under 8 Mbit/s for someone watching over an internet path, or backed
+    // off under 8 on a LAN path.
     LowRate,
     // The encoder took longer than a frame interval.
     SlowEncode,
@@ -531,6 +543,8 @@ pub struct Rate {
     last_backoff: Option<Instant>,
     // Clean seconds in a row: no sign of a queue, or one ignored.
     clean: u32,
+    // Backoffs since the link last held clean for STEP_UP_CLEAN_SECONDS.
+    cuts: u32,
     // Seconds in a row the round trip has risen, and of those the ones past
     // AT_ONCE_MARGINS times the margin, and how far it was over the floor in
     // the last second that measured it.
@@ -567,6 +581,7 @@ impl Rate {
             rate_kbps: allowed_kbps,
             last_backoff: None,
             clean: 0,
+            cuts: 0,
             risen: 0,
             far: 0,
             rise_before: None,
@@ -650,6 +665,11 @@ impl Rate {
         let was = self.rate_kbps;
         if allowed_kbps < self.rate_kbps || self.rate_kbps == self.allowed_kbps {
             self.rate_kbps = allowed_kbps;
+        }
+        // Brought down to the new allowance, the rate has not held clean
+        // there yet, and on a LAN path being at it would step a share up.
+        if self.rate_kbps < was {
+            self.clean = 0;
         }
         self.allowed_kbps = allowed_kbps;
         self.at_allowed();
@@ -828,6 +848,9 @@ impl Rate {
             None if near && past => self.clean = 0,
             None => self.clean += 1,
         }
+        if self.clean >= STEP_UP_CLEAN_SECONDS {
+            self.cuts = 0;
+        }
         if decision.ignored.is_some() {
             self.ignored_run += 1;
             self.ignored_seconds += 1;
@@ -873,7 +896,13 @@ impl Rate {
     // came down.
     fn back_off(&mut self, now: Instant, from_kbps: u32) -> bool {
         let floor = RATE_FLOOR_KBPS.min(self.allowed_kbps);
-        if !apart(self.last_backoff, now, BACKOFF_GAP) || self.rate_kbps <= floor {
+        if !apart(self.last_backoff, now, BACKOFF_GAP) {
+            return false;
+        }
+        // Nothing lower to go to, but a link still losing at the floor counts
+        // toward a LAN share's step down.
+        if self.rate_kbps <= floor {
+            self.cuts += 1;
             return false;
         }
         self.queued_kbps = Some(from_kbps);
@@ -881,6 +910,7 @@ impl Rate {
         self.rate_kbps = cut.clamp(floor, self.rate_kbps);
         self.last_backoff = Some(now);
         self.backoffs += 1;
+        self.cuts += 1;
         self.loss.clear();
         self.risen = 0;
         self.far = 0;
@@ -921,7 +951,11 @@ impl Rate {
         let slow = self.slow >= SLOW_SECONDS;
         let step = match self.small {
             None if slow => Some(Step::Down(SteppedDown::SlowEncode)),
-            None if apart && second.internet && self.rate_kbps < STEP_DOWN_BELOW_KBPS => {
+            None if apart
+                && self.rate_kbps < STEP_DOWN_BELOW_KBPS
+                && (second.internet
+                    || (self.rate_kbps < self.allowed_kbps && self.cuts >= LAN_CUTS)) =>
+            {
                 Some(Step::Down(SteppedDown::LowRate))
             }
             // Small already: from now on it stays small.
@@ -929,7 +963,7 @@ impl Rate {
                 self.small = Some(SteppedDown::SlowEncode);
                 None
             }
-            Some(SteppedDown::LowRate) if apart && (!second.internet || self.full_size_again()) => {
+            Some(SteppedDown::LowRate) if apart && self.full_size_again(second.internet) => {
                 Some(Step::Up)
             }
             _ => None,
@@ -946,13 +980,14 @@ impl Rate {
         step
     }
 
-    // Small for the rate, and the rate is back up (STEP_UP_FROM_KBPS), past
-    // the careful climb, and has held clean there (STEP_UP_CLEAN_SECONDS).
-    fn full_size_again(&self) -> bool {
+    // Small for the rate, and the rate is back up (STEP_UP_FROM_KBPS, or the
+    // rate allowed on a LAN path), past the careful climb, and has held clean
+    // there (STEP_UP_CLEAN_SECONDS).
+    fn full_size_again(&self, internet: bool) -> bool {
         self.clean >= STEP_UP_CLEAN_SECONDS
             && self.queued_kbps.is_none()
             && (self.rate_kbps >= STEP_UP_FROM_KBPS
-                || (self.allowed_kbps >= STEP_DOWN_BELOW_KBPS
+                || ((!internet || self.allowed_kbps >= STEP_DOWN_BELOW_KBPS)
                     && self.rate_kbps >= self.allowed_kbps))
     }
 }
