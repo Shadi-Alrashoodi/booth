@@ -1,6 +1,7 @@
 // Each test file uses a different part of this.
 #![allow(dead_code)]
 
+pub mod link;
 pub mod voiced;
 
 use std::fs;

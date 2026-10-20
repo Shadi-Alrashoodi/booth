@@ -4,9 +4,11 @@
 // fullscreen; a few presents later the strip says whether DWM stepped
 // aside ("flip") or drew the picture into the desktop ("composed"), and no
 // word there means Windows has not said. Once a second it prints what the
-// viewer measured, with "not known" for no word.
+// viewer measured, with "not known" for no word. --fullscreen starts it
+// fullscreen, as room's share_numbers does to give a desktop share the
+// whole monitor moving.
 //
-//   cargo run --release -p viewer --example viewer_pattern -- [--vsync] [--fps N]
+//   cargo run --release -p viewer --example viewer_pattern -- [--vsync] [--fps N] [--fullscreen]
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -24,17 +26,20 @@ const HEIGHT: u32 = 1440;
 struct Args {
     vsync: bool,
     fps: u32,
+    fullscreen: bool,
 }
 
 fn parse() -> Result<Args, String> {
     let mut args = Args {
         vsync: false,
         fps: 120,
+        fullscreen: false,
     };
     let mut words = std::env::args().skip(1);
     while let Some(word) = words.next() {
         match word.as_str() {
             "--vsync" => args.vsync = true,
+            "--fullscreen" => args.fullscreen = true,
             "--fps" => {
                 let fps = words.next().ok_or("--fps needs a number")?;
                 args.fps = fps
@@ -43,7 +48,11 @@ fn parse() -> Result<Args, String> {
                     .filter(|&fps| (1..=1000).contains(&fps))
                     .ok_or_else(|| format!("{fps} is not a frame rate from 1 to 1000"))?;
             }
-            other => return Err(format!("{other} is not an option; try --vsync or --fps N")),
+            other => {
+                return Err(format!(
+                    "{other} is not an option; try --vsync, --fps N or --fullscreen"
+                ));
+            }
         }
     }
     Ok(args)
@@ -92,6 +101,9 @@ fn run(args: &Args) -> Result<(), String> {
     let mut options = Options::new("Booth viewer pattern", WIDTH, HEIGHT);
     options.vsync = args.vsync;
     let mut viewer = Viewer::open(&options).map_err(|err| err.to_string())?;
+    if args.fullscreen {
+        viewer.set_fullscreen(true);
+    }
     println!(
         "viewer on {}, tearing {}, {}; F11 for fullscreen, close the window to stop",
         viewer.adapter(),
