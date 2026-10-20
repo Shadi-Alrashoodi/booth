@@ -15,7 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::voiced::heard_cues;
-use common::{Member, code_to_invite, config, loopback, poll, timers};
+use common::{Member, code_to_invite, config, fresh_log, loopback, poll, read_log, timers};
 use room::view::{Codec, LineKind, LinkState, OwnShare, SharingNumbers, View, WatchingNumbers};
 use room::{Config, Devices, LossKnob, Show, VideoConfig, VideoSource};
 use voice::audio::fake::Fake;
@@ -736,6 +736,74 @@ fn gpu_encoder_fails(sharer: &Member, watcher: &Member) {
     // It never stopped on an error.
     assert_eq!(lines(&view, LineKind::Problem), [gpu_failed]);
     encode::fault::clear();
+}
+
+// The switch to the software encoder as the watcher sees it, timed from the
+// two logs: from the sharer's line that NVENC failed to the watcher's first
+// H.264 frame, then each second's longest wait between frames for 5 s. Run
+// in release while another share keeps the GPU's encoders busy, as the
+// stall after the switch showed only then:
+//
+//   cargo test --release -p room --test video -- --ignored --nocapture software_switch_in_time
+#[test]
+#[ignore = "an acceptance run, in release with another share going"]
+fn software_switch_in_time() {
+    let _turn = turn();
+    if !ready() || !takes_hevc() {
+        return;
+    }
+    let small = || VideoConfig {
+        source: VideoSource::Pattern {
+            width: 1280,
+            height: 720,
+            busy: false,
+        },
+        ..pattern(None)
+    };
+    let host_log = fresh_log("video", "software_switch", "host");
+    let ana_log = fresh_log("video", "software_switch", "ana");
+    let mut host_config = config_with("Mara", small(), 2000);
+    host_config.log = Some(host_log.clone());
+    let mut ana_config = config_with("Ana", small(), 2000);
+    ana_config.log = Some(ana_log.clone());
+    let (host, friends) = room_of(host_config, vec![ana_config]);
+    let ana = &friends[0];
+    encode::fault::fail_nvenc(240);
+    let number = shares(&host, 120);
+    watches(ana, number);
+    let in_h264 = || {
+        let numbers = ana.view().numbers.watching?;
+        (numbers.codec == Some(Codec::H264)).then_some(numbers)
+    };
+    let mut watched = poll(Duration::from_secs(10), "frames in H.264", in_h264);
+    let mut gaps = Vec::new();
+    for _ in 0..5 {
+        watched = next_second(ana, &watched);
+        gaps.push(watched.longest_gap_ms.unwrap_or(f32::MAX));
+    }
+    encode::fault::clear();
+    drop(friends);
+    drop(host);
+    let at = |log: &str, words: &str| -> f64 {
+        let line = log
+            .lines()
+            .find(|line| line.contains(words))
+            .unwrap_or_else(|| panic!("no line with {words:?} in:\n{log}"));
+        // "2026-09-24T21:12:03.456Z ...": the time of day, in ms.
+        let parts: Vec<f64> = line[11..23]
+            .split([':', '.'])
+            .map(|part| part.parse().expect("a stamp"))
+            .collect();
+        ((parts[0] * 60.0 + parts[1]) * 60.0 + parts[2]) * 1000.0 + parts[3]
+    };
+    let failed = at(&read_log(&host_log), "could not encode frame");
+    let shown = at(&read_log(&ana_log), "starts H.264");
+    let switch_ms = shown - failed;
+    println!(
+        "the switch: NVENC failed, then the first H.264 frame came {switch_ms:.0} ms later; the longest wait in each second after it: {gaps:?} ms"
+    );
+    assert!(switch_ms < 250.0, "{switch_ms:.0} ms");
+    assert!(gaps.iter().all(|&ms| ms < 1000.0), "{gaps:?}");
 }
 
 // The target for loss, with the knob on the watcher's side: at 5 percent
