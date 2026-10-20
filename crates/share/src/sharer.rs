@@ -563,7 +563,12 @@ impl Sharer {
     // size while stepped down, and on the software encoder no more than it
     // took when the share went onto it.
     fn source_options(&self, fps: u32) -> capture::Options {
-        let largest = match self.codec() {
+        self.source_options_in(self.codec(), fps)
+    }
+
+    // The same for a share in `codec`.
+    fn source_options_in(&self, codec: Option<Codec>, fps: u32) -> capture::Options {
+        let largest = match codec {
             Some(Codec::Hevc) => self.limit,
             _ => self.limit.map(within_default),
         };
@@ -678,8 +683,13 @@ impl Sharer {
                 if (frame.width, frame.height) != self.size {
                     self.new_size(&frame, audience)?;
                 }
-                self.answer(audience);
                 let reopens = self.reopens;
+                self.answer(audience);
+                // A change of codec opened the source again, at a new size:
+                // this frame is the old one's, and the next is the new one's.
+                if self.reopens != reopens {
+                    return Ok(());
+                }
                 self.send(&frame, None, audience)?;
                 if self.reopens == reopens {
                     self.last = Some(frame);
@@ -859,7 +869,17 @@ impl Sharer {
         };
         self.switches.changed(now);
         let was = self.encoder_name().to_string();
-        match self.switch(codec, kind) {
+        // A watchers' limit past capture's default counts only in HEVC, so
+        // under one the change of codec is also a change of size: the source
+        // opens again for it, and takes the codec from takes_hevc.
+        let options = self.source_options_in(Some(codec), self.setup.fps);
+        let changed = if options == self.options {
+            self.switch(codec, kind)
+        } else {
+            self.reopen(options, &mut |line| audience.line(line))
+                .map(|_| ())
+        };
+        match changed {
             Ok(()) => audience.line(Line::Log(format!(
                 "{was} to {} in {:.1} ms: {}",
                 self.encoder_name(),
@@ -869,6 +889,10 @@ impl Sharer {
                     Codec::Hevc => "every viewer decodes HEVC",
                 }
             ))),
+            // The source did not open again: the next frame ends the share.
+            Err(why) if self.opened.is_none() => {
+                audience.line(Line::Log(format!("{was} to {codec} at a new size: {why}")))
+            }
             Err(why) => audience.line(Line::Log(format!(
                 "{was} stays: {codec} did not open: {why}"
             ))),

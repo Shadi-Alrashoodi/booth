@@ -176,6 +176,76 @@ fn the_watchers_limit_sizes_the_share() {
     }
 }
 
+// A 4K limit that comes while the share is in H.264 waits there at 1440p.
+// When every viewer takes HEVC again, the change of codec brings the share
+// to 4K, not only a new encoder at the old size, and frames go on.
+#[test]
+fn hevc_coming_back_brings_the_4k_limit() {
+    let Some((_turn, adapter)) = gpu() else {
+        return;
+    };
+    if adapter.vendor_id != NVIDIA {
+        println!("skipped: no NVIDIA GPU, so no NVENC to share 4K in HEVC with");
+        return;
+    }
+    let setup = Setup {
+        choice: Choice::Pattern {
+            adapter: adapter.clone(),
+            width: 3840,
+            height: 2160,
+            busy: false,
+        },
+        fps: 60,
+        settings: Settings::default(),
+        encoder: None,
+        codec: None,
+        takes_hevc: false,
+        payload: PAYLOAD_LAN,
+        spread: false,
+        clock: Clock::starting(Instant::now()),
+        keep_times: false,
+    };
+    let mut said = Vec::new();
+    let mut sharer = Sharer::open(setup, |_: &[u8]| {}, &mut |line| said.push(line))
+        .unwrap_or_else(|err| panic!("{err}"));
+    let four_k = capture::Options {
+        max_width: 4096,
+        max_height: 2160,
+        max_fps: 60,
+    };
+    sharer
+        .set_limit(four_k, &mut |line| said.push(line))
+        .unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(
+        (sharer.size(), sharer.codec()),
+        ((2560, 1440), Some(Codec::H264)),
+        "{said:?}"
+    );
+    let mut watching = Watching {
+        takes_hevc: true,
+        ..Watching::default()
+    };
+    let until = Instant::now() + Duration::from_secs(10);
+    while sharer.codec() != Some(Codec::Hevc) && Instant::now() < until {
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+    }
+    assert_eq!(
+        (sharer.size(), sharer.codec()),
+        ((3840, 2160), Some(Codec::Hevc)),
+        "{:?}",
+        watching.lines
+    );
+    let before = watching.sent.len();
+    for _ in 0..10 {
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+    }
+    assert!(watching.sent.len() >= before + 10, "{:?}", watching.lines);
+}
+
 #[test]
 fn a_pattern_share_answers_the_room() {
     let Some((_turn, adapter)) = gpu() else {
