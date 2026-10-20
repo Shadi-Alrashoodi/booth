@@ -151,11 +151,14 @@ impl Client {
             && self.link.limits_read
             && self.version >= crate::peer::LIMITS_SINCE
         {
+            let cap = self.screen.watching.cap();
             self.link.queue(&Message::WatchLimits {
                 share,
                 limits: WatchLimits {
                     takes_4k: self.screen.watching.takes_4k(),
-                    ..WatchLimits::default()
+                    height: cap.height,
+                    fps: cap.fps,
+                    kbps: cap.kbps,
                 },
             });
         }

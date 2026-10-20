@@ -51,7 +51,7 @@ use crate::peer::{Clock, MEDIA_FLOWS_FOR};
 use crate::remote::{Area, Controls, Gate, Injector, Remote};
 use crate::socket::Socket;
 use crate::talk::{Cue, HOST_SLOT, OnLink, Outlet};
-use crate::view::{Numbers, Paused, RunningShare, SharingNumbers, WatchingNumbers};
+use crate::view::{Numbers, Paused, RunningShare, SharingNumbers, WatchCap, WatchingNumbers};
 
 pub(crate) use sharer::start as start_sharer;
 pub(crate) use viewer::{control_for, link_numbers, start as start_viewer};
@@ -918,8 +918,9 @@ pub struct Watching {
     hevc: Mutex<Option<bool>>,
     hevc_changed: AtomicBool,
     // It decodes HEVC at 4096x2160 too, asked at the same times; a change
-    // sets hevc_changed as well.
+    // sets hevc_changed as well, and so does a new cap.
     four_k: AtomicBool,
+    cap: Mutex<WatchCap>,
     // Whether this PC controls the share watched, as the viewer was last
     // told, and a new viewer is told at its start.
     control: Mutex<Option<share::Control>>,
@@ -1003,6 +1004,7 @@ impl Watching {
             hevc: Mutex::new((!threads || !hevc).then_some(hevc)),
             hevc_changed: AtomicBool::new(false),
             four_k: AtomicBool::new(false),
+            cap: Mutex::default(),
             control: Mutex::default(),
         })
     }
@@ -1047,7 +1049,18 @@ impl Watching {
         }
     }
 
-    // True once after what takes_hevc or takes_4k says changed.
+    pub(crate) fn cap(&self) -> WatchCap {
+        *lock(&self.cap)
+    }
+
+    pub(crate) fn set_cap(&self, cap: WatchCap) {
+        if std::mem::replace(&mut *lock(&self.cap), cap) != cap {
+            self.hevc_changed.store(true, Ordering::Release);
+            self.freshened();
+        }
+    }
+
+    // True once after what takes_hevc, takes_4k or cap says changed.
     pub(crate) fn take_hevc_changed(&self) -> bool {
         self.hevc_changed.swap(false, Ordering::AcqRel)
     }

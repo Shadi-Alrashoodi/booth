@@ -1333,9 +1333,12 @@ impl Host {
 
     // What the host's own viewer takes, as a friend's WatchLimits would say.
     fn own_limits(&self) -> WatchLimits {
+        let cap = self.screen.watching.cap();
         WatchLimits {
             takes_4k: self.screen.watching.takes_4k(),
-            ..WatchLimits::default()
+            height: cap.height,
+            fps: cap.fps,
+            kbps: cap.kbps,
         }
     }
 

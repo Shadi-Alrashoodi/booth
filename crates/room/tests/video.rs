@@ -869,6 +869,48 @@ fn four_k_goes_out_while_every_watcher_takes_it() {
     ana.wait_for(WAIT, "the viewer closed", |v| !v.share.viewer_open);
 }
 
+// A watcher's cap from its strip holds the share for everyone until it is
+// taken back.
+#[test]
+fn a_watchers_cap_holds_the_share() {
+    let _turn = turn();
+    if !ready() {
+        return;
+    }
+    let newer = invite::Version {
+        major: 1,
+        minor: 2,
+        patch: 0,
+    };
+    let config = |name| {
+        let mut config = config_with(name, pattern(None), room::DEFAULT_VIDEO_UPLOAD_KBPS);
+        config.version = newer;
+        config
+    };
+    let (host, friends) = room_of(config("Mara"), vec![config("Ana")]);
+    let ana = &friends[0];
+    let number = shares(&host, 120);
+    let shared_at = |size: (u32, u32), fps: u32, what: &str| {
+        poll(Duration::from_secs(10), what, || {
+            let sharing = host.view().numbers.sharing?;
+            ((sharing.width, sharing.height, sharing.fps) == (size.0, size.1, fps))
+                .then_some(sharing)
+        })
+    };
+    watches(ana, number);
+    shared_at((2560, 1440), 120, "the share at 2560x1440 and 120 fps");
+    ana.room().cap_watch(room::view::WatchCap {
+        height: Some(1080),
+        fps: Some(60),
+        kbps: None,
+    });
+    shared_at((1920, 1080), 60, "the share at Ana's 1080p60");
+    ana.room().cap_watch(room::view::WatchCap::default());
+    shared_at((2560, 1440), 120, "the share back at 2560x1440 and 120 fps");
+    host.room().stop_sharing();
+    ana.wait_for(WAIT, "the viewer closed", |v| !v.share.viewer_open);
+}
+
 // The target for loss, with the knob on the watcher's side: at 5 percent
 // fewer than 1 frame in 100 is lost for good, with the percentage at its
 // floor and each frame's parity from the loss. In HEVC, which the share goes

@@ -399,7 +399,16 @@ impl Room {
     /// viewer's window, on the room's own thread; closing the window is the
     /// same as Stop watching, and the share ending closes it.
     pub fn watch(&self, share: u32, on: bool) {
+        self.threads.watching().set_cap(view::WatchCap::default());
         self.threads.watch(share, on);
+    }
+
+    /// What this PC's viewer asks the share it watches to keep to, from the
+    /// viewer's strip, until it stops watching; each part brought to one
+    /// the room offers (view::WatchCap). The host folds it with every other
+    /// watcher's, and a host or sharer older than 1.2.0 never hears it.
+    pub fn cap_watch(&self, cap: view::WatchCap) {
+        self.threads.watching().set_cap(cap.offered());
     }
 
     /// Called on the viewer's thread when someone clicks the viewer's strip,

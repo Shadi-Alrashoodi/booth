@@ -618,6 +618,37 @@ pub struct SharingNumbers {
     pub upload_kbps: u32,
 }
 
+// What this PC's viewer asks the share it watches to keep to, None for
+// no cap: the picture's height, the frames a second and the bitrate. The
+// lowest any watcher asks holds for everyone. Room::cap_watch brings each
+// to one the room offers: 1080 or 1440 high, 60 fps, 8000 or 15000 kbit/s.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WatchCap {
+    pub height: Option<u16>,
+    pub fps: Option<u8>,
+    pub kbps: Option<u32>,
+}
+
+impl WatchCap {
+    // Each to the smallest offered one that holds it, or no cap past the
+    // largest: 720 high is 1080, 1200 is 1440, 2160 is none.
+    pub(crate) fn offered(self) -> WatchCap {
+        WatchCap {
+            height: self.height.and_then(|height| match height {
+                0..=1080 => Some(1080),
+                1081..=1440 => Some(1440),
+                _ => None,
+            }),
+            fps: self.fps.filter(|&fps| fps <= 60).map(|_| 60),
+            kbps: self.kbps.and_then(|kbps| match kbps {
+                0..=8_000 => Some(8_000),
+                8_001..=15_000 => Some(15_000),
+                _ => None,
+            }),
+        }
+    }
+}
+
 // The share this PC watches, once a second.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WatchingNumbers {
@@ -815,4 +846,27 @@ pub struct Spread {
     pub median_ms: f32,
     pub p99_ms: f32,
     pub count: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Whatever the strip asks, the host hears a cap it takes.
+    #[test]
+    fn a_cap_comes_to_one_the_room_offers() {
+        let cap = |height, fps, kbps| WatchCap { height, fps, kbps };
+        assert_eq!(
+            cap(Some(720), Some(30), Some(2_000)).offered(),
+            cap(Some(1080), Some(60), Some(8_000))
+        );
+        assert_eq!(
+            cap(Some(1200), Some(90), Some(12_000)).offered(),
+            cap(Some(1440), None, Some(15_000))
+        );
+        assert_eq!(
+            cap(Some(2160), Some(120), Some(50_000)).offered(),
+            WatchCap::default()
+        );
+    }
 }
