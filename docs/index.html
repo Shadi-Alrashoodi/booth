@@ -60,8 +60,10 @@
       <h2 id="features">Features</h2>
       <ul>
         <li>Voice in 5 ms Opus frames, with a jitter buffer that starts as small as it can, grows when over 1% of packets arrive late and shrinks after 5 s with none.</li>
-        <li>Screen sharing with Desktop Duplication and GPU encoding, H.264 or HEVC, up to 1440p at 120 fps. On Intel graphics Booth encodes in software for now, H.264 up to 1080p at 60 fps.</li>
+        <li>Screen sharing with Desktop Duplication and GPU encoding, H.264 or HEVC, up to 120 fps. On Intel graphics Booth encodes in software for now, H.264 up to 1080p at 60 fps.</li>
+        <li>4K sharing in HEVC when the host, the sharer and everyone watching have 1.2.0 or later and every watcher's GPU decodes it; otherwise a share goes up to 1440p.</li>
         <li>Median capture to display on my PCs: about 5 ms at 1440p120 with host and viewer on one PC, 22 to 32 ms over the internet to a laptop on Wi-Fi.</li>
+        <li>A cap on the share you watch, from the sharer's menu in the room, when the host and the sharer have 1.2.0 or later: 1080p or 1440p, 60 fps, 8 or 15 Mbit/s. The lowest cap for each part holds for everyone watching, and the strip says cap set while yours does.</li>
         <li>Ping, jitter and loss always on screen in a room.</li>
         <li>Echo cancellation where Windows has it, noise suppression (off by default, it adds 10 to 20 ms), automatic volume, and a volume for each friend.</li>
       </ul>
