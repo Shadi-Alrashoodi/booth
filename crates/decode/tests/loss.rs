@@ -112,6 +112,64 @@ fn hevc_invalidation_late() {
     invalidation(Codec::Hevc, 3);
 }
 
+// Windows' software encoder answers a loss by predicting the next frame from
+// its last IDR (encode's mf/software.rs), which a viewer that lost a frame
+// since still holds whole.
+fn software_recovery(late: u64) {
+    let _turn = common::turn();
+    let Some(gpu) = common::nvidia() else { return };
+    let Some(mut decoder) = common::decoder(&gpu, Codec::H264) else {
+        return;
+    };
+    let mut stream = Stream::software(&gpu, WIDTH, HEIGHT);
+    let mut reader = Reader::new(&gpu);
+    let reported = LOST + late;
+    let mut between = Vec::new();
+
+    for n in 0..FRAMES {
+        let unit = stream.next(false);
+        assert!(!unit.idr || n == 0, "frame {n} is an IDR");
+        if n == LOST {
+            // Dropped on the way.
+        } else if n > LOST && n <= reported {
+            between.push(format!(
+                "{n}: {}",
+                damaged(&mut decoder, &mut reader, &unit)
+            ));
+        } else {
+            clean(&mut decoder, &mut reader, &unit);
+        }
+        if n == reported {
+            assert_eq!(
+                stream.encoder.recover(LOST),
+                Recovery::Invalidated,
+                "{}",
+                stream.encoder.notes()
+            );
+        }
+    }
+    assert!(stream.encoder.invalidates(), "{}", stream.encoder.notes());
+    println!(
+        "software H.264: frame {LOST} lost, reported after {late} more frames: every frame from {} on decoded whole with its own number{}",
+        reported + 1,
+        if between.is_empty() {
+            String::new()
+        } else {
+            format!("; the ones in between: {}", between.join(", "))
+        }
+    );
+}
+
+#[test]
+fn software_recovery_at_once() {
+    software_recovery(0);
+}
+
+#[test]
+fn software_recovery_late() {
+    software_recovery(3);
+}
+
 // The loss is reported only once NVENC no longer holds a frame from before
 // it, so it answers with an IDR.
 fn idr_recovery(codec: Codec, feed_the_broken_frames: bool) {

@@ -213,7 +213,6 @@ fn a_pattern_share_answers_the_room() {
     };
     let mut sharer = Sharer::open(setup, send, &mut |line| said.push(line))
         .unwrap_or_else(|err| panic!("{err}"));
-    let nvenc = sharer.encoder_name().starts_with("NVENC");
     println!(
         "{} at {:?} and {} fps; said {said:?}",
         sharer.encoder_name(),
@@ -237,10 +236,14 @@ fn a_pattern_share_answers_the_room() {
     let facts = frames(&lan);
     assert_eq!(facts.len(), 6);
     let now = clock.micros(Instant::now());
+    // NVENC goes on after a loss by invalidation, Windows' software encoder
+    // by predicting from its last IDR; the hardware Media Foundation ones
+    // need an IDR.
+    let survives = sharer.kind() != Some(Kind::MfHardware);
     for (fact, frame) in facts.iter().zip(&sent) {
         assert_eq!((fact.number, fact.idr), (frame.number, frame.idr));
         // The flag says what the encoder does, on IDRs too.
-        assert_eq!(fact.survives_loss, nvenc, "frame {}", fact.number);
+        assert_eq!(fact.survives_loss, survives, "frame {}", fact.number);
         assert!(fact.captured <= fact.encoded && fact.encoded <= now);
     }
     // The IDR fills whole packets, bigger than a tunnel takes.
@@ -1029,19 +1032,12 @@ fn a_failed_nvenc_falls_back_to_software() {
             watching.lines
         );
         assert!(took < 1000.0, "{line}");
-        // NVENC's frames survive a loss by invalidation; the software
-        // encoder's do not, and the header says so from its first.
+        // NVENC's frames survive a loss by invalidation, and the software
+        // encoder's from its first by predicting from its last IDR.
         let count = watching.sent.iter().map(|frame| frame.packets).sum();
         let facts = frames(&wait_for(&packets, count));
         let survives: Vec<bool> = facts.iter().map(|fact| fact.survives_loss).collect();
-        assert!(
-            survives[..fails_at as usize].iter().all(|s| *s),
-            "{survives:?}"
-        );
-        assert!(
-            survives[fails_at as usize..].iter().all(|s| !s),
-            "{survives:?}"
-        );
+        assert!(survives.iter().all(|s| *s), "{survives:?}");
         if size == (2560, 1440) {
             assert_eq!((sharer.size(), sharer.fps()), ((1920, 1080), 60));
             assert!(line.contains("the new source's first picture"), "{line}");

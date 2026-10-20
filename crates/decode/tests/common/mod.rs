@@ -98,6 +98,22 @@ impl Stream {
         Stream { pattern, encoder }
     }
 
+    /// The same with Windows' software H.264 encoder, at the 60 fps it takes.
+    pub fn software(gpu: &Gpu, width: u32, height: u32) -> Stream {
+        let pattern = Pattern::new(&gpu.device, width, height, 0).unwrap_or_else(|e| panic!("{e}"));
+        let encoder = encode::open_kind_codec(
+            Kind::MfSoftware,
+            encode::Codec::H264,
+            &gpu.device,
+            width,
+            height,
+            60,
+            &Settings::default(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        Stream { pattern, encoder }
+    }
+
     pub fn next(&mut self, force_idr: bool) -> AccessUnit {
         let frame = self.pattern.next().unwrap_or_else(|e| panic!("{e}"));
         self.encoder

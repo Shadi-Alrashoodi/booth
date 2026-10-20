@@ -427,6 +427,8 @@ pub struct References {
     pps: Option<Pps>,
     // Short-term reference frames held: (frame index, frame_num).
     held: Vec<(u64, u32)>,
+    // The IDR held as long-term reference 0, when it was marked so.
+    long_term: Option<u64>,
 }
 
 impl References {
@@ -435,6 +437,7 @@ impl References {
             sps: None,
             pps: None,
             held: Vec::new(),
+            long_term: None,
         }
     }
 
@@ -465,29 +468,49 @@ impl References {
         };
 
         if nal.kind() == annexb::NAL_IDR {
-            self.held = vec![(index, header.frame_num)];
+            if header.long_term_reference {
+                self.held = Vec::new();
+                self.long_term = Some(index);
+            } else {
+                self.held = vec![(index, header.frame_num)];
+                self.long_term = None;
+            }
             return (Vec::new(), header);
         }
 
-        let mut list: Vec<(u64, u32)> = self.held.clone();
-        list.sort_by_key(|&(_, n)| std::cmp::Reverse(pic_num(n)));
+        // Short-term pictures newest first, then the long-term one: (frame
+        // index, frame_num), None for the long-term picture.
+        let mut list: Vec<(u64, Option<u32>)> =
+            self.held.iter().map(|&(i, n)| (i, Some(n))).collect();
+        list.sort_by_key(|&(_, n)| std::cmp::Reverse(n.map(pic_num)));
+        list.extend(self.long_term.map(|i| (i, None)));
         let mut predicted = current;
         for (at, change) in header.list0_changes.iter().enumerate() {
-            let no_wrap = match *change {
-                ListChange::Down(d) => (predicted - i64::from(d)).rem_euclid(max_frame_num),
-                ListChange::Up(d) => (predicted + i64::from(d)).rem_euclid(max_frame_num),
-                ListChange::LongTerm(_) => panic!("frame {index} uses a long-term reference"),
+            let from = match *change {
+                ListChange::LongTerm(0) => list
+                    .iter()
+                    .position(|&(_, n)| n.is_none())
+                    .unwrap_or_else(|| {
+                        panic!("frame {index} predicts from a long-term reference it does not hold")
+                    }),
+                ListChange::LongTerm(n) => panic!("frame {index} uses long-term reference {n}"),
+                ListChange::Down(d) | ListChange::Up(d) => {
+                    let no_wrap = if matches!(change, ListChange::Down(_)) {
+                        (predicted - i64::from(d)).rem_euclid(max_frame_num)
+                    } else {
+                        (predicted + i64::from(d)).rem_euclid(max_frame_num)
+                    };
+                    predicted = no_wrap;
+                    let wanted = if no_wrap > current {
+                        no_wrap - max_frame_num
+                    } else {
+                        no_wrap
+                    };
+                    list.iter()
+                        .position(|&(_, n)| n.is_some_and(|n| pic_num(n) == wanted))
+                        .unwrap_or_else(|| panic!("frame {index} moves a picture it does not hold"))
+                }
             };
-            predicted = no_wrap;
-            let wanted = if no_wrap > current {
-                no_wrap - max_frame_num
-            } else {
-                no_wrap
-            };
-            let from = list
-                .iter()
-                .position(|&(_, n)| pic_num(n) == wanted)
-                .unwrap_or_else(|| panic!("frame {index} moves a picture it does not hold"));
             let picture = list.remove(from);
             list.insert(at.min(list.len()), picture);
         }
@@ -497,7 +520,8 @@ impl References {
         if nal.ref_idc() != 0 {
             match &header.memory_ops {
                 None => {
-                    if self.held.len() >= sps.max_num_ref_frames as usize {
+                    let long_term = usize::from(self.long_term.is_some());
+                    if self.held.len() + long_term >= sps.max_num_ref_frames as usize {
                         let oldest = (0..self.held.len())
                             .min_by_key(|&i| pic_num(self.held[i].1))
                             .unwrap_or(0);

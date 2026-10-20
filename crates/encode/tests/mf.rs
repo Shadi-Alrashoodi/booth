@@ -3,6 +3,8 @@
 
 mod common;
 
+use std::time::{Duration, Instant};
+
 use encode::annexb::{self, NAL_IDR, NAL_PPS, NAL_SLICE, NAL_SPS, SliceType};
 use encode::{AccessUnit, Codec, EncodeError, Encoder, Frame, Kind, Preset, Recovery, Settings};
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12};
@@ -280,9 +282,62 @@ fn hardware_recover_with_idr() {
     recover_with_idr(HARDWARE);
 }
 
+// Windows' software encoder predicts the frame after a loss from its last
+// IDR, and needs an IDR only when that IDR, or a frame before it, was lost,
+// or while the last recovery frame has used more than a quarter of the
+// setting. It stays that way only while its output says it did as asked.
 #[test]
-fn software_recover_with_idr() {
-    recover_with_idr(SOFTWARE);
+fn software_recovers_from_the_last_idr() {
+    let _turn = common::turn();
+    let Some(gpu) = gpu() else {
+        return;
+    };
+    let Some(mut encoder) = open(&gpu, SOFTWARE, Preset::P1) else {
+        return;
+    };
+    let mut frames = Frames::new(&gpu, SOFTWARE.width, SOFTWARE.height);
+    for i in 0..30 {
+        encode(&mut *encoder, &mut frames, i, false);
+    }
+    assert!(encoder.invalidates(), "{}", encoder.notes());
+    assert!(!encoder.needs_idr(28) && !encoder.needs_idr(1));
+    assert!(encoder.needs_idr(0), "the IDR itself was lost");
+    assert_eq!(encoder.recover(29), Recovery::Invalidated);
+    assert_eq!(encoder.recover(12), Recovery::Invalidated);
+    let recovery = encode(&mut *encoder, &mut frames, 30, false);
+    let paid = Instant::now();
+    assert!(
+        !recovery.idr && !has_idr_slice(&recovery),
+        "an IDR for a loss after the last one"
+    );
+    assert!(!encoder.notes().contains("did not"), "{}", encoder.notes());
+    // Every frame of these is new everywhere, so the recovery frame costs
+    // what an IDR does, and the frames until it is paid for tell viewers to
+    // hold for an IDR after a loss.
+    let floor =
+        Duration::from_secs_f64(recovery.len() as f64 * 8.0 / (0.25 * f64::from(SOFTWARE.rate)));
+    assert!(floor > Duration::from_millis(500), "{floor:?}");
+    assert!(encoder.needs_idr(30) && !encoder.invalidates());
+    encode(&mut *encoder, &mut frames, 31, false);
+    assert!(encoder.needs_idr(31) && !encoder.invalidates());
+    std::thread::sleep(floor.saturating_sub(paid.elapsed()) + Duration::from_millis(20));
+    let after = encode(&mut *encoder, &mut frames, 32, false);
+    assert!(!after.idr && encoder.invalidates(), "{}", encoder.notes());
+    // A frame that told viewers to hold, reported after the wait, still gets
+    // the IDR they hold for.
+    assert!(encoder.needs_idr(31) && !encoder.needs_idr(32));
+    assert_eq!(encoder.recover(31), Recovery::Idr);
+    let idr = encode(&mut *encoder, &mut frames, 33, false);
+    assert!(
+        idr.idr && has_idr_slice(&idr),
+        "no IDR for a frame that said to hold"
+    );
+    println!(
+        "{}: the frame after a loss {} bytes, an IDR {}, the wait after it {floor:?}",
+        encoder.name(),
+        recovery.len(),
+        idr.len()
+    );
 }
 
 fn bitrate_holds_over_2_s(case: Case) {
@@ -524,18 +579,34 @@ fn decodable_stream(case: Case) {
     };
     let mut frames = Frames::new(&gpu, case.width, case.height);
     // Works out from the slice headers what each frame predicts from, as a
-    // decoder does, through a forced IDR and a recovery IDR.
+    // decoder does, through a forced IDR and a recovery: an IDR on the
+    // hardware encoder, a frame that predicts from the last IDR alone on the
+    // software one, after which nothing goes back past it.
+    let software = case.kind == Kind::MfSoftware;
     let mut refs = References::new();
     let mut sps = None;
     let mut pps = None;
     for i in 0..240u64 {
         if i == 150 {
-            assert_eq!(encoder.recover(149), Recovery::Idr);
+            let answer = if software {
+                Recovery::Invalidated
+            } else {
+                Recovery::Idr
+            };
+            assert_eq!(encoder.recover(149), answer);
         }
         let unit = encode(&mut *encoder, &mut frames, i, i == 90);
         let (usable, header) = refs.frame(i, &unit.data);
+        if software && i >= 150 {
+            assert!(
+                !usable.iter().any(|&u| u > 90 && u < 150),
+                "frame {i} predicts from a frame before the recovery: {usable:?}"
+            );
+        }
         if unit.idr {
             assert!(usable.is_empty());
+        } else if software && i == 150 {
+            assert_eq!(usable, [90], "the recovery predicts from more than the IDR");
         } else {
             assert_eq!(
                 usable.first(),
@@ -559,7 +630,11 @@ fn decodable_stream(case: Case) {
             assert_eq!(nal.kind() == NAL_IDR, unit.idr, "frame {i}");
             assert!(nal.kind() == NAL_IDR || nal.kind() == NAL_SLICE);
         }
-        assert_eq!(unit.idr, i == 0 || i == 90 || i == 150, "frame {i}");
+        assert_eq!(
+            unit.idr,
+            i == 0 || i == 90 || (i == 150 && !software),
+            "frame {i}"
+        );
     }
 }
 

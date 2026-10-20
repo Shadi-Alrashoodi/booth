@@ -487,6 +487,10 @@ pub struct SliceHeader {
     /// references go. None when the oldest goes once the buffer is full (the
     /// sliding window), and for IDRs and pictures that are not references.
     pub memory_ops: Option<Vec<MemoryOp>>,
+    /// An IDR the decoder keeps as long-term reference 0 rather than as a
+    /// short-term one (long_term_reference_flag). False for every other
+    /// picture.
+    pub long_term_reference: bool,
 }
 
 /// One step of ref_pic_list_modification: the next entry of the list is the
@@ -586,10 +590,11 @@ pub fn slice_header(nal: &Nal<'_>, sps: &Sps, pps: &Pps) -> Option<SliceHeader> 
     }
 
     let mut memory_ops = None;
+    let mut long_term_reference = false;
     if nal.ref_idc() != 0 {
         if idr {
             let _no_output_of_prior_pics = b.flag()?;
-            let _long_term_reference = b.flag()?;
+            long_term_reference = b.flag()?;
         } else if b.flag()? {
             memory_ops = Some(memory_ops_of(&mut b)?);
         }
@@ -602,6 +607,7 @@ pub fn slice_header(nal: &Nal<'_>, sps: &Sps, pps: &Pps) -> Option<SliceHeader> 
         num_ref_idx_l0_active: if slice_type.predicts() { l0 } else { 0 },
         list0_changes,
         memory_ops,
+        long_term_reference,
     })
 }
 
@@ -975,7 +981,24 @@ mod tests {
                 num_ref_idx_l0_active: 0,
                 list0_changes: Vec::new(),
                 memory_ops: None,
+                long_term_reference: false,
             })
+        );
+
+        // The same IDR kept as a long-term reference.
+        let kept = writer()
+            .ue(0)
+            .ue(7)
+            .ue(0)
+            .u(8, 0)
+            .ue(0)
+            .u(6, 0)
+            .u(1, 0)
+            .u(1, 1)
+            .nal(0x65);
+        assert!(
+            slice_header(&Nal { data: &kept }, &sps, &pps)
+                .is_some_and(|header| header.long_term_reference)
         );
 
         // A P slice that keeps the default list and the sliding window.
@@ -998,6 +1021,7 @@ mod tests {
                 num_ref_idx_l0_active: 12,
                 list0_changes: Vec::new(),
                 memory_ops: None,
+                long_term_reference: false,
             })
         );
 
@@ -1037,6 +1061,7 @@ mod tests {
                     MemoryOp::ForgetShortTerm(2),
                     MemoryOp::ForgetShortTerm(3),
                 ]),
+                long_term_reference: false,
             })
         );
 

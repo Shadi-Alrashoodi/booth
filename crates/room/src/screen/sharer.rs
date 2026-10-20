@@ -1055,8 +1055,8 @@ mod tests {
 
     // The floor between IDRs holds a viewer's ask, never the IDR for someone
     // who starts watching, from the room's answer to the encoder. Windows'
-    // software encoder answers every loss with an IDR and has the longest
-    // floor. The test pattern only; nothing of the screen is captured.
+    // software encoder makes the largest IDRs and so has the longest floor.
+    // The test pattern only; nothing of the screen is captured.
     #[test]
     fn new_watcher_idr_skips_floor() {
         let adapters = share::adapters().unwrap_or_else(|err| panic!("{err}"));

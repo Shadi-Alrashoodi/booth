@@ -431,9 +431,12 @@ impl Answers {
     // A frame only an IDR recovers waits for the floor (IDR_FLOOR_SHARE),
     // and a later one joins the IDR already waiting. The encoder says which
     // those are before it is asked (encode::Encoder::needs_idr), since
-    // asking commits it. On the Media Foundation encoders that is every
-    // frame. On NVENC it is a frame with no valid one older than it left in
-    // the reference memory: the last IDR itself, a frame reported once the
+    // asking commits it. On the hardware Media Foundation encoders that is
+    // every frame. On Windows' software encoder it is the last IDR and any
+    // frame before it, and every frame while the last frame it predicted
+    // from that IDR has used more than a quarter of the setting. On NVENC
+    // it is a frame with no valid one older than it left in the reference
+    // memory: the last IDR itself, a frame reported once the
     // one before it has slid out of that memory (11 frames later at 120 fps,
     // about 92 ms), or, for a friend's PC that reports each frame as it
     // arrives, the first report after the frames invalidated one by one have
@@ -585,7 +588,8 @@ mod tests {
             "fake"
         }
 
-        // NVENC invalidates; the Media Foundation encoders answer with an IDR.
+        // NVENC invalidates; the hardware Media Foundation encoders answer
+        // with an IDR.
         fn kind(&self) -> Kind {
             match self.answer {
                 Recovery::Invalidated => Kind::Nvenc,
@@ -1065,8 +1069,8 @@ mod tests {
     // IDR slide through that memory, an invalidated one keeps its place
     // until it slides out, and a loss is invalidated while a valid frame
     // older than it is still there, and answered with an IDR otherwise.
-    // Without, it answers every loss with an IDR, as the Media Foundation
-    // encoders do. Either way it says which before it is asked.
+    // Without, it answers every loss with an IDR, as the hardware Media
+    // Foundation encoders do. Either way it says which before it is asked.
     struct Model {
         kept: Option<usize>,
         // Oldest first, each with whether it is still one to predict from.
@@ -1280,7 +1284,7 @@ mod tests {
     }
 
     // The stream's first IDR is lost: NVENC can only answer that with an
-    // IDR, as the Media Foundation encoders answer every loss. The report
+    // IDR, as the hardware Media Foundation encoders answer every loss. The report
     // comes 50 ms in; neither encoder is asked, and the first frame after
     // the floor, 192 ms after the IDR went, is the IDR that answers it. A
     // still screen sends its last picture again for it. An IDR ask inside

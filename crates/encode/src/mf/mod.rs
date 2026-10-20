@@ -2,8 +2,9 @@
 // H.264 or HEVC encoder a GPU driver registers with Windows, which is what
 // AMD GPUs share through until Booth has AMF, and Windows' own software H.264
 // encoder, the last resort, which a share on Intel graphics starts with and
-// any share falls back to when its GPU encoder fails. Both answer every loss
-// with an IDR.
+// any share falls back to when its GPU encoder fails. The hardware ones answer
+// every loss with an IDR; the software one predicts from its last IDR instead
+// where it can (software.rs).
 
 mod codec;
 pub(crate) mod hardware;
@@ -22,9 +23,10 @@ use windows::Win32::Media::MediaFoundation::{
     MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
     MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION,
     MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX, MFMediaType_Video,
-    MFNominalRange_16_235, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES,
-    MFT_OUTPUT_STREAM_INFO, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFVideoFormat_H264,
-    MFVideoFormat_HEVC, MFVideoInterlace_Progressive, MFVideoPrimaries_BT709, MFVideoTransFunc_709,
+    MFNominalRange_16_235, MFSampleExtension_LongTermReferenceFrameInfo, MFT_OUTPUT_DATA_BUFFER,
+    MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_INFO,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFVideoFormat_H264, MFVideoFormat_HEVC,
+    MFVideoInterlace_Progressive, MFVideoPrimaries_BT709, MFVideoTransFunc_709,
     MFVideoTransferMatrix_BT709, eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_High,
     eAVEncH265VProfile_Main_420_8,
 };
@@ -273,9 +275,9 @@ fn note_own_buffer(api: &mut CodecApi, bitrate: u32) {
     ));
 }
 
-/// Every loss is answered with an IDR on these encoders, so one that cannot
-/// make an IDR on request could never recover a share and is refused at
-/// open, which lets open_codec() move on to the next encoder. `problem` is
+/// These encoders answer a loss with an IDR (the software one when it cannot
+/// predict from its last IDR), so one that cannot make an IDR on request
+/// could never recover a share and is refused at open, which lets open_codec() move on to the next encoder. `problem` is
 /// the error message it carries.
 fn check_idr_on_request(api: &mut CodecApi, problem: &'static str) -> Result<(), EncodeError> {
     if !api.supports(&CODECAPI_AVEncVideoForceKeyFrame) {
@@ -342,6 +344,10 @@ struct Output {
     // it at once.
     asynchronous: bool,
     format_changed: bool,
+    // MFSampleExtension_LongTermReferenceFrameInfo of the last sample that
+    // had it: the long-term reference the frame was marked as in the low 16
+    // bits (0xFFFF for none), the ones it predicted from in the high 16.
+    long_term: Option<u32>,
 }
 
 impl Output {
@@ -357,6 +363,7 @@ impl Output {
             own: None,
             asynchronous,
             format_changed: false,
+            long_term: None,
         })
     }
 
@@ -400,6 +407,9 @@ impl Output {
                     let Some(sample) = sample else {
                         return Ok(None);
                     };
+                    if let Some(info) = take_long_term(&sample) {
+                        self.long_term = Some(info);
+                    }
                     let bytes = sample_bytes(&sample)?;
                     if !self.provides_samples {
                         self.own = Some(sample);
@@ -443,6 +453,19 @@ fn output_sample(fns: &Functions, size: u32) -> Result<IMFSample, EncodeError> {
     // SAFETY: both are live.
     unsafe { sample.AddBuffer(&buffer) }.map_err(mf_error("create an output sample"))?;
     Ok(sample)
+}
+
+// Taken off the sample, since our own is used again for the next frame and
+// would otherwise still say this one's.
+fn take_long_term(sample: &IMFSample) -> Option<u32> {
+    // SAFETY: plain attribute calls on a live sample.
+    unsafe {
+        let info = sample
+            .GetUINT32(&MFSampleExtension_LongTermReferenceFrameInfo)
+            .ok()?;
+        let _ = sample.DeleteItem(&MFSampleExtension_LongTermReferenceFrameInfo);
+        Some(info)
+    }
 }
 
 fn sample_bytes(sample: &IMFSample) -> Result<Vec<u8>, EncodeError> {

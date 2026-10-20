@@ -4,6 +4,7 @@
 // frame is the sharer's own screen going to the sharer's own encoder, as
 // with the GPU encoders; only its bitstream leaves the PC.
 
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use windows::Win32::Graphics::Direct3D11::{
@@ -12,11 +13,13 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::MediaFoundation::{
-    CLSID_MSH264EncoderMFT, IMFMediaBuffer, IMFSample, IMFTransform, MFT_MESSAGE_COMMAND_DRAIN,
+    CLSID_MSH264EncoderMFT, CODECAPI_AVEncVideoLTRBufferControl, CODECAPI_AVEncVideoUseLTRFrame,
+    IMFMediaBuffer, IMFSample, IMFTransform, MFT_MESSAGE_COMMAND_DRAIN,
     MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
     MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFVideoFormat_NV12,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+use windows::Win32::System::Variant::VARIANT;
 use windows::core::Interface;
 
 use super::codec::CodecApi;
@@ -65,6 +68,8 @@ pub(crate) struct Software {
     width: u32,
     height: u32,
     fps: u32,
+    // In bits a second: the setting, or set_bitrate's since.
+    bitrate: u32,
     // The last frame's system memory, written again once nothing else
     // holds it: a new 3 MB buffer every frame is 3 MB of fresh pages to
     // fault in.
@@ -77,9 +82,77 @@ pub(crate) struct Software {
     // outside a test.
     #[cfg(feature = "fault")]
     fail_in: Option<u64>,
+    // None when the encoder did not take a long-term reference, or once it
+    // did not do what was asked of it.
+    long_term: Option<LongTerm>,
+    // What the last frame's header says (Encoder::invalidates), worked out
+    // once as it came out.
+    survives: bool,
     // Last, so Media Foundation stops only after the encoder is gone.
     _mf: Mf,
 }
+
+// With one long-term reference, which the encoder fills with each IDR itself,
+// the frame after a loss predicts from the last IDR alone and the frames
+// after it never go back past it, so the viewer goes on from that frame
+// without waiting for an IDR, as NVENC's invalidation lets it. Measured at
+// 1080p60, 8 Mbit/s, 10 percent loss and a 40 ms round trip: recovery frames
+// of 23 KB on the still test pattern, whose IDRs are 498 KB, and 59.5 frames
+// shown a second against 46.0.
+//
+// Only the IDR is ever predicted from. A reference marked on a later frame
+// would have to be known to have arrived: a viewer that missed it would
+// predict from the picture it held before, and nothing would show the
+// difference. A viewer that missed the IDR holds every frame until the next.
+//
+// On a picture that changed everywhere since the IDR a recovery frame costs
+// as much as an IDR, and a friend's PC that reports every frame lost would
+// ask for one each frame: 73 Mbit/s at a setting of 8. So, as for an IDR
+// (share's recovery.rs), the next one waits until the last has used at most
+// a quarter of the setting, its bits spread over the time since. Until then
+// a loss is answered with an IDR, and the frames' headers tell viewers to
+// hold for it rather than show frames that predict from the lost one. A loss
+// of one of those frames reported after the wait is answered with an IDR too,
+// since its viewer holds for one.
+//
+// The encoder says in each frame's output what it marked and what it
+// predicted from, and the first IDR or recovery frame that is not as asked
+// turns this off for the rest of the share and makes the next frame an IDR.
+struct LongTerm {
+    // The last IDR, once the encoder said it marked it.
+    anchor: Option<u64>,
+    // The next frame predicts from the anchor alone.
+    recovering: bool,
+    // The last recovery frame's size and when it came out.
+    spent: Option<(usize, Instant)>,
+    // The frames whose headers told viewers to hold for an IDR after a loss.
+    holding: VecDeque<u64>,
+}
+
+// Enough for a wait of 16 s at 60 fps: a recovery frame of 500 KB at the
+// rate control's floor of 1 Mbit/s.
+const HOLDING_KEPT: usize = 1024;
+
+impl LongTerm {
+    fn waits(&self, bitrate: u32, now: Instant) -> bool {
+        self.spent.is_some_and(|(bytes, at)| {
+            let floor = bytes as f64 * 8.0 / (RECOVERY_SHARE * f64::from(bitrate.max(1)));
+            now.saturating_duration_since(at).as_secs_f64() < floor
+        })
+    }
+}
+
+const RECOVERY_SHARE: f64 = 0.25;
+
+// LTR buffer control: one long-term reference the encoder may use until it
+// is told otherwise ("trust until", the only mode there is).
+const ONE_LONG_TERM: u32 = 1 | (1 << 16);
+// UseLTRFrame: long-term reference 0 only, and no older short-term
+// reference for the frames after this one.
+const FROM_THE_IDR: u32 = 1 | (1 << 16);
+// What the output says: the reference a frame was marked as in the low 16
+// bits, 0xFFFF for none; the ones it predicted from in the high 16.
+const NOT_MARKED: u32 = 0xFFFF;
 
 // SAFETY: as for Hardware: free-threaded Media Foundation objects, COM
 // joined at every entry point, &mut self for every call. The device context
@@ -138,6 +211,18 @@ impl Software {
             settings.preset,
             Buffer::EncodersOwn,
         );
+        let long_term = api
+            .setting(
+                "one long-term reference".to_string(),
+                &CODECAPI_AVEncVideoLTRBufferControl,
+                VARIANT::from(ONE_LONG_TERM),
+            )
+            .then_some(LongTerm {
+                anchor: None,
+                recovering: false,
+                spent: None,
+                holding: VecDeque::new(),
+            });
         let h264 = super::output_type(&fns, codec, width, height, fps, settings.bitrate)?;
         let nv12 = super::video_type(&fns, &MFVideoFormat_NV12, width, height, fps)?;
         // SAFETY: live media types, output first as encoders want it.
@@ -184,6 +269,7 @@ impl Software {
             width,
             height,
             fps,
+            bitrate: settings.bitrate,
             frame_buffer: None,
             output,
             drain_every_frame: false,
@@ -191,6 +277,8 @@ impl Software {
             last_index: None,
             #[cfg(feature = "fault")]
             fail_in: crate::fault::take_software_failure(),
+            survives: long_term.is_some(),
+            long_term,
             _mf: mf,
         })
     }
@@ -274,6 +362,15 @@ impl Software {
         Ok(has_slice(Codec::H264, &data).then_some(data))
     }
 
+    // From here on every loss is answered with an IDR, and the frames' headers
+    // say so.
+    fn long_term_failed(&mut self, what: &str) {
+        self.long_term = None;
+        self.notes.push_str(&format!(
+            ". The encoder {what}, so losses are answered with an IDR from then on"
+        ));
+    }
+
     fn drain(&mut self) -> Result<(), EncodeError> {
         // SAFETY: a plain message to a streaming encoder.
         unsafe { self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0) }
@@ -313,9 +410,25 @@ impl Encoder for Software {
             });
         }
         gpu::check_texture(&self.device, frame.texture, self.width, self.height)?;
-        if self.idr_next || frame.force_idr {
+        let mut idr_asked = self.idr_next || frame.force_idr;
+        let mut recovering = false;
+        if !idr_asked && self.long_term.as_ref().is_some_and(|l| l.recovering) {
+            recovering = self
+                .api
+                .set(
+                    &CODECAPI_AVEncVideoUseLTRFrame,
+                    &VARIANT::from(FROM_THE_IDR),
+                )
+                .is_ok();
+            if !recovering {
+                self.long_term_failed("refused to predict from its last IDR");
+                idr_asked = true;
+            }
+        }
+        if idr_asked {
             request_idr(&self.api, self.last_index.is_none())?;
         }
+        self.output.long_term = None;
 
         // The copy out of the GPU counts as encode time: every other encoder
         // reads the texture where it is.
@@ -368,6 +481,35 @@ impl Encoder for Software {
         if idr {
             self.idr_next = false;
         }
+        let said = self.output.long_term;
+        if let Some(long_term) = &mut self.long_term {
+            if idr {
+                let marked = said.is_some_and(|info| info & 0xFFFF != NOT_MARKED);
+                long_term.anchor = marked.then_some(frame.index);
+                long_term.recovering = false;
+                if !marked {
+                    self.long_term_failed("did not keep its IDR as a long-term reference");
+                }
+            } else if recovering {
+                long_term.recovering = false;
+                long_term.spent = Some((data.len(), ready));
+                if !said.is_some_and(|info| info >> 16 & 1 == 1) {
+                    self.long_term_failed("did not predict from its last IDR when asked");
+                    self.idr_next = true;
+                }
+            }
+        }
+        self.survives = match &mut self.long_term {
+            Some(long_term) if long_term.waits(self.bitrate, ready) => {
+                if long_term.holding.len() == HOLDING_KEPT {
+                    long_term.holding.pop_front();
+                }
+                long_term.holding.push_back(frame.index);
+                false
+            }
+            Some(_) => true,
+            None => false,
+        };
         Ok(AccessUnit {
             data,
             index: frame.index,
@@ -393,12 +535,34 @@ impl Encoder for Software {
         // change carries 3.75 Mbit.
         change_bitrate(&self.api, bits_per_second, None)
             .map_err(mf_error("change the software encoder's bitrate"))?;
+        self.bitrate = bits_per_second;
         Ok(())
     }
 
-    fn recover(&mut self, _lost_frame_index: u64) -> Recovery {
+    fn recover(&mut self, lost_frame_index: u64) -> Recovery {
+        if !self.needs_idr(lost_frame_index)
+            && let Some(long_term) = &mut self.long_term
+        {
+            long_term.recovering = true;
+            return Recovery::Invalidated;
+        }
         self.idr_next = true;
         Recovery::Idr
+    }
+
+    fn needs_idr(&self, lost_frame_index: u64) -> bool {
+        self.idr_next
+            || !self.long_term.as_ref().is_some_and(|long_term| {
+                long_term
+                    .anchor
+                    .is_some_and(|anchor| anchor < lost_frame_index)
+                    && !long_term.waits(self.bitrate, Instant::now())
+                    && !long_term.holding.contains(&lost_frame_index)
+            })
+    }
+
+    fn invalidates(&self) -> bool {
+        self.survives
     }
 }
 
