@@ -998,10 +998,6 @@ mod tests {
         }
     }
 
-    // A person's volume comes first in their row's menu: opened from the
-    // keyboard it takes the focus, the arrows and Page Down move it, and Esc
-    // closes the menu with the focus back on the row. A plain click opens
-    // it too.
     // Watch at from the keyboard: Tab goes down its choices and Enter picks
     // one, the menu staying open; with an older host there is nothing to
     // pick, only why.
@@ -1041,6 +1037,10 @@ mod tests {
         assert_eq!(untouched, WatchCap::default());
     }
 
+    // A person's volume comes first in their row's menu: opened from the
+    // keyboard it takes the focus, the arrows and Page Down move it, and Esc
+    // closes the menu with the focus back on the row. A plain click opens
+    // it too.
     #[test]
     fn row_menu_volume() {
         let ctx = context();

@@ -872,7 +872,7 @@ pub struct Spread {
 mod tests {
     use super::*;
 
-    // Whatever the strip asks, the host hears a cap it takes.
+    // Whatever the menu asks, the host hears a cap it takes.
     #[test]
     fn a_cap_comes_to_one_the_room_offers() {
         let cap = |height, fps, kbps| WatchCap { height, fps, kbps };

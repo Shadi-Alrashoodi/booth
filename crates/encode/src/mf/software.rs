@@ -117,7 +117,8 @@ pub(crate) struct Software {
 //
 // The encoder says in each frame's output what it marked and what it
 // predicted from, and the first IDR or recovery frame that is not as asked
-// turns this off for the rest of the share and makes the next frame an IDR.
+// turns this off for the rest of the share; after such a recovery frame the
+// next frame is an IDR.
 struct LongTerm {
     // The last IDR, once the encoder said it marked it.
     anchor: Option<u64>,

@@ -424,9 +424,9 @@ impl Answers {
     //
     // A report that names a frame not sent yet is left alone too. No viewer
     // can have lost one, and NVENC answers a frame it never made with an
-    // IDR, as the Media Foundation encoders answer everything: a friend's PC
-    // naming a new future frame each time would get one of about 90 KB per
-    // request.
+    // IDR, as the hardware Media Foundation encoders answer everything: a
+    // friend's PC naming a new future frame each time would get one of about
+    // 90 KB per request.
     //
     // A frame only an IDR recovers waits for the floor (IDR_FLOOR_SHARE),
     // and a later one joins the IDR already waiting. The encoder says which

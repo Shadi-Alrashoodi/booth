@@ -96,8 +96,9 @@ const WATCHER_IDR: u8 = 1 << 2;
 // Watch's one flag: this watcher decodes HEVC.
 const TAKES_HEVC: u8 = 1 << 0;
 
-// The caps a viewer's strip offers, and the boxes and frame rates the host
-// folds them into. WatchLimits and ShareLimits refuse anything else.
+// The caps a watcher picks from the sharer's row menu, and the boxes and
+// frame rates the host folds them into. WatchLimits and ShareLimits refuse
+// anything else.
 const CAP_HEIGHTS: [u16; 2] = [1080, 1440];
 const CAP_FPS: [u8; 1] = [60];
 const CAP_KBPS: [u32; 2] = [8_000, 15_000];
@@ -256,7 +257,8 @@ pub(crate) enum Message {
         paused: bool,
     },
     // A watcher to the host, with Watch and whenever it changes: whether its
-    // viewer decodes HEVC at 4096x2160, and the cap chosen in its strip.
+    // viewer decodes HEVC at 4096x2160, and the cap chosen in the sharer's
+    // row menu.
     WatchLimits {
         share: u32,
         limits: WatchLimits,
@@ -954,7 +956,7 @@ impl Message {
     }
 }
 
-// Zero is no cap; anything else has to be one the strip offers.
+// Zero is no cap; anything else has to be one the menu offers.
 fn offered<T: Copy + Default + PartialEq>(value: T, caps: &[T]) -> Option<Option<T>> {
     if value == T::default() {
         Some(None)
@@ -2861,7 +2863,7 @@ mod limits_tests {
         );
     }
 
-    // Each field out of what the strip offers or the host folds into, one
+    // Each field out of what the menu offers or the host folds into, one
     // at a time, and a byte too many or too few.
     #[test]
     fn bent_limits_refused() {

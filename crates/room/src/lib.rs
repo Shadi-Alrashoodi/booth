@@ -404,9 +404,10 @@ impl Room {
     }
 
     /// What this PC's viewer asks the share it watches to keep to, from the
-    /// viewer's strip, until it stops watching; each part brought to one
-    /// the room offers (view::WatchCap). The host folds it with every other
-    /// watcher's, and a host or sharer older than 1.2.0 never hears it.
+    /// sharer's row menu in the panel, until it stops watching; each part
+    /// brought to one the room offers (view::WatchCap). The host folds it with
+    /// every other watcher's, and a host or sharer older than 1.2.0 never
+    /// hears it.
     pub fn cap_watch(&self, cap: view::WatchCap) {
         self.threads.watching().set_cap(cap.offered());
     }

@@ -869,8 +869,8 @@ fn four_k_goes_out_while_every_watcher_takes_it() {
     ana.wait_for(WAIT, "the viewer closed", |v| !v.share.viewer_open);
 }
 
-// A watcher's cap from its strip holds the share for everyone until it is
-// taken back.
+// A watcher's cap from the sharer's row menu holds the share for everyone
+// until it is taken back.
 #[test]
 fn a_watchers_cap_holds_the_share() {
     let _turn = turn();

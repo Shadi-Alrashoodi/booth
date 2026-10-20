@@ -243,7 +243,8 @@ pub const FAST_CLIMB: f64 = 1.15;
 // its tail, and the picture never came back; stepped down it held 60 fps.
 // Not on the first backoff (LAN_CUTS): a light share cut once for a moment's
 // loss goes to 0.8 of the little it sends, under 8 at once. It steps back up
-// once the rate is back at the rate allowed, after the same clean seconds.
+// once the rate is back at 10 or at the rate allowed, after the same clean
+// seconds.
 pub const STEP_DOWN_BELOW_KBPS: u32 = 8_000;
 pub const LAN_CUTS: u32 = 2;
 pub const STEP_UP_FROM_KBPS: u32 = 10_000;
@@ -543,7 +544,8 @@ pub struct Rate {
     last_backoff: Option<Instant>,
     // Clean seconds in a row: no sign of a queue, or one ignored.
     clean: u32,
-    // Backoffs since the link last held clean for STEP_UP_CLEAN_SECONDS.
+    // Backoffs since the link last held clean for STEP_UP_CLEAN_SECONDS,
+    // and lossy seconds at the rate floor, where no backoff is left.
     cuts: u32,
     // Seconds in a row the round trip has risen, and of those the ones past
     // AT_ONCE_MARGINS times the margin, and how far it was over the floor in
