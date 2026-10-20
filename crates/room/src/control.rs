@@ -54,6 +54,10 @@ const CONTROL_PAUSED: u8 = 23;
 // The Hello from 0.1.0 on. This number and the Hello's fields up to the
 // name stay as they are in every later protocol.
 const HELLO: u8 = 24;
+// From 1.2.0 on: what a watcher takes, and the limits the host folds from
+// every watcher's for the sharer.
+const WATCH_LIMITS: u8 = 25;
+const SHARE_LIMITS: u8 = 26;
 
 const IS_HOST: u8 = 1 << 0;
 const JOINED_BY_INVITE: u8 = 1 << 1;
@@ -91,6 +95,14 @@ const WATCHER_IDR: u8 = 1 << 2;
 
 // Watch's one flag: this watcher decodes HEVC.
 const TAKES_HEVC: u8 = 1 << 0;
+
+// The caps a viewer's strip offers, and the boxes and frame rates the host
+// folds them into. WatchLimits and ShareLimits refuse anything else.
+const CAP_HEIGHTS: [u16; 2] = [1080, 1440];
+const CAP_FPS: [u8; 1] = [60];
+const CAP_KBPS: [u32; 2] = [8_000, 15_000];
+const SHARE_BOXES: [(u16, u16); 4] = [(1920, 1080), (2560, 1440), (4096, 1440), (4096, 2160)];
+const SHARE_FPS: [u8; 2] = [60, 120];
 
 // VideoLoss before anything was measured.
 const NO_LOSS_YET: u16 = u16::MAX;
@@ -243,6 +255,38 @@ pub(crate) enum Message {
         number: u32,
         paused: bool,
     },
+    // A watcher to the host, with Watch and whenever it changes: whether its
+    // viewer decodes HEVC at 4096x2160, and the cap chosen in its strip.
+    WatchLimits {
+        share: u32,
+        limits: WatchLimits,
+    },
+    // The host to the sharer whenever they change: what every watcher of the
+    // share takes, folded. None to the watchers of a sharer too old to read
+    // them, which keeps to its own.
+    ShareLimits {
+        share: u32,
+        limits: Option<ShareLimits>,
+    },
+}
+
+// None is automatic, no cap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WatchLimits {
+    pub takes_4k: bool,
+    pub height: Option<u16>,
+    pub fps: Option<u8>,
+    pub kbps: Option<u32>,
+}
+
+// A picture no wider or taller than the box, at no more frames a second,
+// and no more than kbps when there is a cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ShareLimits {
+    pub width: u16,
+    pub height: u16,
+    pub fps: u8,
+    pub kbps: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -580,6 +624,28 @@ impl Message {
                 out.extend_from_slice(&number.to_le_bytes());
                 out.push(u8::from(*paused));
             }
+            Message::WatchLimits { share, limits } => {
+                out.push(WATCH_LIMITS);
+                out.extend_from_slice(&share.to_le_bytes());
+                out.push(u8::from(limits.takes_4k));
+                out.extend_from_slice(&limits.height.unwrap_or(0).to_le_bytes());
+                out.push(limits.fps.unwrap_or(0));
+                out.extend_from_slice(&limits.kbps.unwrap_or(0).to_le_bytes());
+            }
+            Message::ShareLimits { share, limits } => {
+                out.push(SHARE_LIMITS);
+                out.extend_from_slice(&share.to_le_bytes());
+                match limits {
+                    Some(limits) => {
+                        out.push(1);
+                        out.extend_from_slice(&limits.width.to_le_bytes());
+                        out.extend_from_slice(&limits.height.to_le_bytes());
+                        out.push(limits.fps);
+                        out.extend_from_slice(&limits.kbps.unwrap_or(0).to_le_bytes());
+                    }
+                    None => out.extend_from_slice(&[0; 10]),
+                }
+            }
         }
         out
     }
@@ -849,9 +915,51 @@ impl Message {
                 number: r.number()?,
                 paused: r.yes_no()?,
             },
+            WATCH_LIMITS => Message::WatchLimits {
+                share: r.share()?,
+                limits: WatchLimits {
+                    takes_4k: r.yes_no()?,
+                    height: offered(u16::from_le_bytes(r.array()?), &CAP_HEIGHTS)?,
+                    fps: offered(r.u8()?, &CAP_FPS)?,
+                    kbps: offered(u32::from_le_bytes(r.array()?), &CAP_KBPS)?,
+                },
+            },
+            SHARE_LIMITS => {
+                let share = r.share()?;
+                let supported = r.yes_no()?;
+                let width = u16::from_le_bytes(r.array()?);
+                let height = u16::from_le_bytes(r.array()?);
+                let fps = r.u8()?;
+                let kbps = u32::from_le_bytes(r.array()?);
+                let limits = if supported {
+                    if !SHARE_BOXES.contains(&(width, height)) || !SHARE_FPS.contains(&fps) {
+                        return None;
+                    }
+                    Some(ShareLimits {
+                        width,
+                        height,
+                        fps,
+                        kbps: offered(kbps, &CAP_KBPS)?,
+                    })
+                } else if (width, height, fps, kbps) == (0, 0, 0, 0) {
+                    None
+                } else {
+                    return None;
+                };
+                Message::ShareLimits { share, limits }
+            }
             _ => return None,
         };
         r.0.is_empty().then_some(message)
+    }
+}
+
+// Zero is no cap; anything else has to be one the strip offers.
+fn offered<T: Copy + Default + PartialEq>(value: T, caps: &[T]) -> Option<Option<T>> {
+    if value == T::default() {
+        Some(None)
+    } else {
+        caps.contains(&value).then_some(Some(value))
     }
 }
 
@@ -981,6 +1089,16 @@ impl fmt::Debug for Message {
                 .field("share", share)
                 .field("number", number)
                 .field("paused", paused)
+                .finish(),
+            Message::WatchLimits { share, limits } => f
+                .debug_struct("WatchLimits")
+                .field("share", share)
+                .field("limits", limits)
+                .finish(),
+            Message::ShareLimits { share, limits } => f
+                .debug_struct("ShareLimits")
+                .field("share", share)
+                .field("limits", limits)
                 .finish(),
         }
     }
@@ -2688,6 +2806,147 @@ mod control_tests {
             let mut bytes = vec![kind];
             bytes.extend(body);
             check(&bytes);
+        }
+    }
+}
+
+#[cfg(test)]
+mod limits_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn bytes(message: &Message) -> Vec<u8> {
+        message.encode().to_vec()
+    }
+
+    fn watch(takes_4k: bool, height: Option<u16>, fps: Option<u8>, kbps: Option<u32>) -> Message {
+        Message::WatchLimits {
+            share: 7,
+            limits: WatchLimits {
+                takes_4k,
+                height,
+                fps,
+                kbps,
+            },
+        }
+    }
+
+    fn share(limits: Option<ShareLimits>) -> Message {
+        Message::ShareLimits { share: 7, limits }
+    }
+
+    #[test]
+    fn limits_bytes() {
+        assert_eq!(
+            bytes(&watch(true, Some(1440), Some(60), Some(8_000))),
+            [25, 7, 0, 0, 0, 1, 0xA0, 0x05, 60, 0x40, 0x1F, 0, 0]
+        );
+        assert_eq!(
+            bytes(&watch(false, None, None, None)),
+            [25, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        let four_k = ShareLimits {
+            width: 4096,
+            height: 2160,
+            fps: 120,
+            kbps: None,
+        };
+        assert_eq!(
+            bytes(&share(Some(four_k))),
+            [26, 7, 0, 0, 0, 1, 0x00, 0x10, 0x70, 0x08, 120, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            bytes(&share(None)),
+            [26, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    // Each field out of what the strip offers or the host folds into, one
+    // at a time, and a byte too many or too few.
+    #[test]
+    fn bent_limits_refused() {
+        let good = bytes(&watch(true, Some(1080), Some(60), Some(15_000)));
+        let watch_bent: [(usize, &[u8]); 6] = [
+            (1, &[0, 0, 0, 0]),
+            (5, &[2]),
+            (6, &[0xD0, 0x02]),
+            (8, &[30]),
+            (9, &[0x88, 0x13, 0, 0]),
+            (9, &[0x40, 0x1F, 0, 1]),
+        ];
+        let four_k = bytes(&share(Some(ShareLimits {
+            width: 4096,
+            height: 2160,
+            fps: 60,
+            kbps: Some(8_000),
+        })));
+        let share_bent: [(usize, &[u8]); 5] = [
+            (5, &[2]),
+            (6, &[0x00, 0x0F]),
+            (8, &[0x00, 0x05]),
+            (10, &[90]),
+            (11, &[1, 0, 0, 0]),
+        ];
+        for (good, bent) in [(&good, &watch_bent[..]), (&four_k, &share_bent[..])] {
+            assert!(Message::decode(good).is_some());
+            for &(at, with) in bent {
+                let mut changed = good.clone();
+                changed[at..at + with.len()].copy_from_slice(with);
+                assert!(Message::decode(&changed).is_none(), "{changed:?}");
+            }
+            let mut long = good.clone();
+            long.push(0);
+            assert!(Message::decode(&long).is_none());
+            assert!(Message::decode(&good[..good.len() - 1]).is_none());
+        }
+        // Not honored, and so nothing to say.
+        let mut none = bytes(&share(None));
+        none[10] = 60;
+        assert!(Message::decode(&none).is_none());
+    }
+
+    fn any_cap<T: Copy + std::fmt::Debug + 'static>(
+        caps: &'static [T],
+    ) -> impl Strategy<Value = Option<T>> {
+        prop::option::of(prop::sample::select(caps))
+    }
+
+    proptest! {
+        #[test]
+        fn any_limits_round_trip(
+            takes_4k in any::<bool>(),
+            height in any_cap(&CAP_HEIGHTS),
+            fps in any_cap(&CAP_FPS),
+            kbps in any_cap(&CAP_KBPS),
+            (width, box_height) in prop::sample::select(&SHARE_BOXES[..]),
+            share_fps in prop::sample::select(&SHARE_FPS[..]),
+            supported in any::<bool>(),
+        ) {
+            let sent = watch(takes_4k, height, fps, kbps);
+            let back = Message::decode(&bytes(&sent)).expect("decodes");
+            prop_assert_eq!(bytes(&back), bytes(&sent));
+            let limits = supported.then_some(ShareLimits {
+                width,
+                height: box_height,
+                fps: share_fps,
+                kbps,
+            });
+            let sent = share(limits);
+            let back = Message::decode(&bytes(&sent)).expect("decodes");
+            prop_assert_eq!(bytes(&back), bytes(&sent));
+        }
+
+        // Whatever gets through encodes back to the same bytes.
+        #[test]
+        fn any_limits_bytes_parse_or_refused(
+            kind in WATCH_LIMITS..=SHARE_LIMITS,
+            body in prop::collection::vec(any::<u8>(), 0..20),
+        ) {
+            let mut sent = vec![kind];
+            sent.extend(body);
+            if let Some(message) = Message::decode(&sent) {
+                prop_assert_eq!(bytes(&message), sent);
+            }
         }
     }
 }
