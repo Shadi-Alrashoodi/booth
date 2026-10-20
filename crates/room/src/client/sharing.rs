@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::Client;
-use crate::control::{Entry, EntryShare, Message, Roster, ShareAnswer};
+use crate::control::{Entry, EntryShare, Message, Roster, ShareAnswer, WatchLimits};
 use crate::log::log;
 use crate::remote::ControlEnd;
 use crate::screen::wire::{self, PREFIX, RELAYED};
@@ -136,9 +136,29 @@ impl Client {
             on: true,
             hevc: self.screen.watching.takes_hevc(),
         });
+        self.send_watch_limits();
         self.flush(now, socket);
         self.share_step();
         true
+    }
+
+    // What this PC's viewer takes, after each Watch, to a host whose copy
+    // reads it (peer::LIMITS_SINCE): once its Hello says so, too, since a
+    // new session sends Watch before it. None from a room standing for an
+    // older copy (Config::version).
+    pub(super) fn send_watch_limits(&mut self) {
+        if let Some(share) = self.screen.watched
+            && self.link.limits_read
+            && self.version >= crate::peer::LIMITS_SINCE
+        {
+            self.link.queue(&Message::WatchLimits {
+                share,
+                limits: WatchLimits {
+                    takes_4k: self.screen.watching.takes_4k(),
+                    ..WatchLimits::default()
+                },
+            });
+        }
     }
 
     // What the two hooks left for the timer thread: a shape from this PC's
@@ -171,6 +191,7 @@ impl Client {
                 on: true,
                 hevc,
             });
+            self.send_watch_limits();
         }
         self.own_shape(now);
         for back in self.screen.watching.take_backs() {

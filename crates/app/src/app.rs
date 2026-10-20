@@ -1425,6 +1425,7 @@ pub fn load(args: &Args, backlog: &mut Backlog) -> Result<Setup, NotStarted> {
                 }),
                 ..VideoConfig::default()
             },
+            version: invite::VERSION,
         },
     };
     if let Some(knob) = setup.config.video.loss {
@@ -1463,6 +1464,7 @@ mod tests {
                 voice: VoiceConfig::default(),
                 video_upload_kbps: room::DEFAULT_VIDEO_UPLOAD_KBPS,
                 video: VideoConfig::default(),
+                version: invite::VERSION,
             },
         }
     }

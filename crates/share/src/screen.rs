@@ -31,6 +31,9 @@ const STRIP_EVERY: Duration = Duration::from_millis(250);
 const SECOND: Duration = Duration::from_secs(1);
 // A wait between two frames shown that anyone sees as the picture stopping.
 const STALL: Duration = Duration::from_millis(100);
+// The largest picture a share sends: in HEVC, to watchers that all take it
+// (Screen::takes_4k). Every other share fits capture's default.
+const FOUR_K: (u32, u32) = (4096, 2160);
 
 // The first decode failure is shown, since without a log it would be lost;
 // the next few go to the log word for word, and after that only the count.
@@ -235,6 +238,8 @@ pub struct Screen {
     // The GPU's driver says it decodes HEVC at the largest picture a share
     // sends, and no HEVC stream was refused since.
     takes_hevc: bool,
+    // And at 4096x2160.
+    takes_4k: bool,
     // Frames in a codec the decoder is not for, said once in the log.
     codec_said: bool,
     // The decoder in use has given a picture: one that replaces it is a
@@ -431,6 +436,8 @@ impl Screen {
         } else {
             Err(String::from("it was told not to"))
         };
+        let four_k =
+            hevc.is_ok() && decode::probe(viewer.device(), Codec::Hevc, FOUR_K.0, FOUR_K.1).is_ok();
         say(Line::Say(format!(
             "viewer on {}, tearing {}, {}",
             viewer.adapter(),
@@ -440,7 +447,8 @@ impl Screen {
                 "not allowed"
             },
             match &hevc {
-                Ok(()) => String::from("takes HEVC"),
+                Ok(()) if four_k => String::from("takes HEVC up to 4096x2160"),
+                Ok(()) => String::from("takes HEVC up to 4096x1440"),
                 Err(why) => format!("does not take HEVC: {why}"),
             }
         )));
@@ -452,6 +460,7 @@ impl Screen {
             decoder,
             viewer,
             takes_hevc: hevc.is_ok(),
+            takes_4k: four_k,
             codec_said: false,
             decoder_used: false,
             new_decoders: NewDecoders::default(),
@@ -484,6 +493,12 @@ impl Screen {
     // watcher, has to decode for the share to go in it.
     pub fn takes_hevc(&self) -> bool {
         self.takes_hevc
+    }
+
+    // And at 4096x2160, for a share all of whose watchers do. A stream of
+    // HEVC refused since takes this away with takes_hevc.
+    pub fn takes_4k(&self) -> bool {
+        self.takes_hevc && self.takes_4k
     }
 
     // Until the inbox is stopped or the window closed. An error is one the
@@ -1075,10 +1090,21 @@ fn share_codec(codec: Codec) -> ShareCodec {
 // Whether a viewer on this PC would take HEVC, asked before any viewer
 // opens: the driver's answer on the GPU that drives the primary monitor,
 // where a viewer's window opens unless the pointer is on another GPU's
-// monitor, at the largest picture a share sends, so it holds whatever the
-// share's size. The viewer asks again on its own device when it opens
-// (Screen::takes_hevc). Makes a Direct3D device for it and lets it go.
+// monitor, at the largest picture a share sends to a watcher that does not
+// take 4K, so it holds whatever the share's size. The viewer asks again on
+// its own device when it opens (Screen::takes_hevc). Makes a Direct3D device
+// for it and lets it go.
 pub fn primary_takes_hevc() -> Result<(), String> {
+    let largest = capture::Options::default();
+    primary_probe(largest.max_width, largest.max_height)
+}
+
+// The same at 4096x2160 (Screen::takes_4k).
+pub fn primary_takes_4k() -> Result<(), String> {
+    primary_probe(FOUR_K.0, FOUR_K.1)
+}
+
+fn primary_probe(width: u32, height: u32) -> Result<(), String> {
     let monitors = capture::monitors().map_err(|err| err.to_string())?;
     let adapter = match monitors.iter().find(|m| m.primary).or(monitors.first()) {
         Some(monitor) => monitor.adapter.clone(),
@@ -1089,9 +1115,7 @@ pub fn primary_takes_hevc() -> Result<(), String> {
             .ok_or("this PC has no graphics card to show a share on")?,
     };
     let device = capture::device_on(&adapter).map_err(|err| err.to_string())?;
-    let largest = capture::Options::default();
-    decode::probe(&device, Codec::Hevc, largest.max_width, largest.max_height)
-        .map_err(|err| err.to_string())
+    decode::probe(&device, Codec::Hevc, width, height).map_err(|err| err.to_string())
 }
 
 // The stream itself refused, by the GPU's decoder or by the guard in front of

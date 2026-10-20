@@ -99,6 +99,8 @@ pub(crate) struct ClientSetup<'a> {
     pub port: u16,
     pub has_ipv6: bool,
     pub lookup: Lookup,
+    // What its Hello says (Config::version).
+    pub version: invite::Version,
     pub joined: Instant,
     // Read from hosts.bin when the room opened.
     pub hosts: HostBook,
@@ -289,6 +291,7 @@ fn usable_here(addrs: impl Iterator<Item = SocketAddr>, has_ipv6: bool) -> Vec<S
 pub(crate) struct Client {
     identity: Arc<Identity>,
     name: String,
+    version: invite::Version,
     host_key: [u8; 32],
     // None on a rejoin, which has the per-peer secret from the start.
     invite: Option<InviteUse>,
@@ -484,6 +487,7 @@ impl Client {
             setup.joined,
         );
         Client {
+            version: setup.version,
             identity: setup.identity,
             name: control::clean(&setup.name, control::PERSON_FALLBACK),
             host_key: start.host_key,
@@ -1814,7 +1818,7 @@ impl Client {
         self.host_hello = false;
         self.last_heard = now;
         self.link.queue(&Message::Hello {
-            version: invite::VERSION,
+            version: self.version,
             name: self.name.clone(),
             reached: Some(from),
         });
@@ -2255,6 +2259,7 @@ impl Client {
                         self.host_hello = true;
                         self.link.feedback_read = version >= peer::FEEDBACK_SINCE;
                         self.link.limits_read = version >= peer::LIMITS_SINCE;
+                        self.send_watch_limits();
                         if version != invite::VERSION {
                             log!(
                                 self.log,
@@ -2718,6 +2723,7 @@ mod tests {
                 port: socket.local_port(),
                 has_ipv6: socket.has_ipv6(),
                 lookup: Lookup::default(),
+                version: invite::VERSION,
                 joined: start,
                 hosts: HostBook::new(Vec::new(), true),
                 list_problem: None,
@@ -3354,6 +3360,7 @@ mod tests {
                 port: socket.local_port(),
                 has_ipv6: socket.has_ipv6(),
                 lookup: Lookup::default(),
+                version: invite::VERSION,
                 joined: start,
                 hosts: HostBook::new(Vec::new(), true),
                 list_problem: None,
@@ -4169,6 +4176,7 @@ mod tests {
             port: socket.local_port(),
             has_ipv6: socket.has_ipv6(),
             lookup: Lookup::default(),
+            version: invite::VERSION,
             joined: start,
             hosts: HostBook::new(vec![known.clone()], true),
             list_problem: None,

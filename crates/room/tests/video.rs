@@ -806,6 +806,69 @@ fn software_switch_in_time() {
     assert!(gaps.iter().all(|&ms| ms < 1000.0), "{gaps:?}");
 }
 
+// A 4K screen goes out at its own size, in HEVC, while every watcher's copy
+// takes 4K, at 2560x1440 while an older copy watches too, and back at 4K
+// once it stops.
+#[test]
+fn four_k_goes_out_while_every_watcher_takes_it() {
+    let _turn = turn();
+    if !ready() || !takes_hevc() {
+        return;
+    }
+    if let Err(why) = share::primary_takes_4k() {
+        println!("skipped: this PC's GPU does not decode HEVC at 4096x2160: {why}");
+        return;
+    }
+    let newer = invite::Version {
+        major: 1,
+        minor: 2,
+        patch: 0,
+    };
+    let older = invite::Version {
+        major: 1,
+        minor: 1,
+        patch: 0,
+    };
+    let config = |name, version| {
+        let video = VideoConfig {
+            source: VideoSource::Pattern {
+                width: 3840,
+                height: 2160,
+                busy: false,
+            },
+            ..pattern(None)
+        };
+        let mut config = config_with(name, video, room::DEFAULT_VIDEO_UPLOAD_KBPS);
+        config.version = version;
+        config
+    };
+    let (host, friends) = room_of(
+        config("Mara", newer),
+        vec![config("Ana", newer), config("Bo", older)],
+    );
+    let (ana, bo) = (&friends[0], &friends[1]);
+    let number = shares(&host, 60);
+    let shared_at = |size: (u32, u32), what: &str| {
+        poll(Duration::from_secs(10), what, || {
+            let sharing = host.view().numbers.sharing?;
+            ((sharing.width, sharing.height) == size).then_some(sharing)
+        })
+    };
+    watches(ana, number);
+    let sharing = shared_at((3840, 2160), "the share at 3840x2160");
+    print_shared(&sharing);
+    poll(WAIT, "Ana's frames in HEVC", || {
+        let numbers = ana.view().numbers.watching?;
+        (numbers.codec == Some(Codec::Hevc) && numbers.fps > 0).then_some(numbers)
+    });
+    watches(bo, number);
+    shared_at((2560, 1440), "the share at 2560x1440 with Bo watching");
+    bo.room().watch(number, false);
+    shared_at((3840, 2160), "the share at 3840x2160 again");
+    host.room().stop_sharing();
+    ana.wait_for(WAIT, "the viewer closed", |v| !v.share.viewer_open);
+}
+
 // The target for loss, with the knob on the watcher's side: at 5 percent
 // fewer than 1 frame in 100 is lost for good, with the percentage at its
 // floor and each frame's parity from the loss. In HEVC, which the share goes

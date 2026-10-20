@@ -317,6 +317,7 @@ impl Host {
             name: self.name_of(&sharer),
         });
         self.own_watcher.hevc = self.screen.watching.takes_hevc();
+        self.own_watcher.limits = Some(self.own_limits());
         self.started_watching(By::Host, now, socket);
         true
     }
@@ -339,6 +340,7 @@ impl Host {
         // watching.
         if self.screen.watching.take_hevc_changed() && self.screen.watched.is_some() {
             self.own_watcher.hevc = self.screen.watching.takes_hevc();
+            self.own_watcher.limits = Some(self.own_limits());
             log!(
                 self.log,
                 "this host's viewer decodes hevc: {}",
@@ -1329,9 +1331,21 @@ impl Host {
         true
     }
 
+    // What the host's own viewer takes, as a friend's WatchLimits would say.
+    fn own_limits(&self) -> WatchLimits {
+        WatchLimits {
+            takes_4k: self.screen.watching.takes_4k(),
+            ..WatchLimits::default()
+        }
+    }
+
     // What every watcher takes, folded, to the sharer when it changed and its
-    // copy reads it (peer::LIMITS_SINCE). An older sharer keeps to its own.
+    // copy reads it (peer::LIMITS_SINCE). An older sharer keeps to its own,
+    // and so does every share in a room standing for an older copy.
     fn tell_limits(&mut self, now: Instant, socket: &Socket) {
+        if self.version < crate::peer::LIMITS_SINCE {
+            return;
+        }
         let Some(live) = self.live.as_ref() else {
             return;
         };

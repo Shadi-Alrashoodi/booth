@@ -84,6 +84,16 @@ fn run(watching: &Watching, video: &VideoConfig, out: &Arc<dyn ControlOut>, log:
             ),
         }
         watching.set_takes_hevc(answer.is_ok());
+        if answer.is_ok() {
+            let four_k = share::primary_takes_4k();
+            if let Err(why) = &four_k {
+                log!(
+                    log,
+                    "watch: this pc's viewer takes hevc up to 4096x1440: {why}"
+                );
+            }
+            watching.set_takes_4k(four_k.is_ok());
+        }
     }
     while let Some(start) = next_watch(watching, log) {
         let (share, name) = (start.share, start.name.clone());
@@ -196,6 +206,7 @@ fn watch(
     // The viewer's own GPU has the last word, which the room passes on to
     // the host when it differs from what the Watch said.
     watching.set_takes_hevc(screen.takes_hevc());
+    watching.set_takes_4k(screen.takes_4k());
     watching.set_showing(true);
     let mut tally = Tally::new(watching.knob());
     let mut seconds = 0u64;

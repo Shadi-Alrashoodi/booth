@@ -1039,6 +1039,7 @@ fn hosted_room_maps_and_unmaps() {
             local: LOCALHOST,
         }),
         punch_loopback: false,
+        version: invite::VERSION,
         address_name: None,
         lookup: crate::config::Lookup::default(),
         devices: DeviceBook::new(KnownDevices::default(), true),

@@ -352,6 +352,8 @@ pub(crate) struct HostSetup {
     // the carrier-grade NAT check looks at.
     pub router: Option<Gateway>,
     pub punch_loopback: bool,
+    // What its Hello says (Config::version).
+    pub version: invite::Version,
     // Already checked with invite::check_hostname.
     pub address_name: Option<String>,
     pub lookup: Lookup,
@@ -430,6 +432,7 @@ pub(crate) struct Host {
     // Reply codes pasted back: where the punches go and for which key.
     punches: Punches,
     punch_loopback: bool,
+    version: invite::Version,
     // What came of the last paste, and the key it named.
     last_paste: Option<([u8; 32], PasteState)>,
     // The dynamic DNS name every invite carries, looked up once when the
@@ -578,6 +581,7 @@ impl Host {
             other_versions: Vec::new(),
             punches: Punches::default(),
             punch_loopback: setup.punch_loopback,
+            version: setup.version,
             last_paste: None,
             address_name: setup.address_name.map(|name| {
                 let mut name = AddressName::new(name, setup.lookup);
@@ -2534,7 +2538,7 @@ impl Host {
             // it: a client takes anything else first for a build from before
             // version numbers.
             self.peers[i].link.queue(&Message::Hello {
-                version: invite::VERSION,
+                version: self.version,
                 name: self.name.clone(),
                 reached: None,
             });
@@ -3445,6 +3449,7 @@ mod tests {
                     local: Ipv4Addr::LOCALHOST,
                 }),
                 punch_loopback: true,
+                version: invite::VERSION,
                 address_name: None,
                 lookup: Lookup::default(),
                 devices,
@@ -6588,6 +6593,7 @@ mod tests {
         for (version, reads) in [(older, false), (peer::LIMITS_SINCE, true)] {
             let start = Instant::now();
             let mut rig = Rig::new(start);
+            rig.host.version = peer::LIMITS_SINCE;
             let mut ana = Guest::new();
             ana.join_as(&mut rig, "Ana", version, None, start);
             let mut bo = Guest::new();

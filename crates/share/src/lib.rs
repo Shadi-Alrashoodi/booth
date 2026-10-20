@@ -29,7 +29,9 @@ pub use numbers::{
 };
 pub use recovery::Back;
 pub use resolution::{FineTimer, fine_timers_held};
-pub use screen::{LinkNumbers, Report, Screen, Second, Watch, Window, primary_takes_hevc};
+pub use screen::{
+    LinkNumbers, Report, Screen, Second, Watch, Window, primary_takes_4k, primary_takes_hevc,
+};
 pub use sharer::{
     Audience, SOFTWARE_DID_NOT_START, SOFTWARE_FAILED_TOO, SWITCH_GAP, Sent, Setup, Sharer,
     Software,

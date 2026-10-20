@@ -40,6 +40,9 @@ pub struct Config {
     pub video_upload_kbps: u32,
     // Where this PC's share comes from and how its viewer opens.
     pub video: VideoConfig,
+    // What this room's Hello says it is: invite::VERSION, except in tests
+    // that stand for an older or a newer copy.
+    pub version: invite::Version,
 }
 
 pub const DEFAULT_VIDEO_UPLOAD_KBPS: u32 = 15_000;

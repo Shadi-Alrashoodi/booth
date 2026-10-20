@@ -81,6 +81,7 @@ pub fn config_in(name: &str, timers: Timers, data_dir: PathBuf) -> Config {
             show: Show::NoActivate,
             ..VideoConfig::default()
         },
+        version: invite::VERSION,
     }
 }
 

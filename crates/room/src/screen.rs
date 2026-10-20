@@ -917,6 +917,9 @@ pub struct Watching {
     // while this PC may be watching, so Watch goes again.
     hevc: Mutex<Option<bool>>,
     hevc_changed: AtomicBool,
+    // It decodes HEVC at 4096x2160 too, asked at the same times; a change
+    // sets hevc_changed as well.
+    four_k: AtomicBool,
     // Whether this PC controls the share watched, as the viewer was last
     // told, and a new viewer is told at its start.
     control: Mutex<Option<share::Control>>,
@@ -999,6 +1002,7 @@ impl Watching {
             showing: AtomicBool::new(false),
             hevc: Mutex::new((!threads || !hevc).then_some(hevc)),
             hevc_changed: AtomicBool::new(false),
+            four_k: AtomicBool::new(false),
             control: Mutex::default(),
         })
     }
@@ -1032,7 +1036,18 @@ impl Watching {
         }
     }
 
-    // True once after what takes_hevc says changed.
+    pub(crate) fn takes_4k(&self) -> bool {
+        self.four_k.load(Ordering::Acquire)
+    }
+
+    fn set_takes_4k(&self, takes: bool) {
+        if self.four_k.swap(takes, Ordering::AcqRel) != takes {
+            self.hevc_changed.store(true, Ordering::Release);
+            self.freshened();
+        }
+    }
+
+    // True once after what takes_hevc or takes_4k says changed.
     pub(crate) fn take_hevc_changed(&self) -> bool {
         self.hevc_changed.swap(false, Ordering::AcqRel)
     }
