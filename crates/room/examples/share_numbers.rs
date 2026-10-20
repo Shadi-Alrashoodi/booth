@@ -8,9 +8,10 @@
 //
 // Each case is a room of its own: 5 s from the first frame shown to settle,
 // then 30 s measured, 60 s for the bursts and the narrowest link. Loopback is
-// a LAN path to the room, so the share sends LAN-sized packets and never
-// steps down for a low rate, as it would over the internet. A stall is a wait
-// of more than 100 ms between two frames shown.
+// a LAN path to the room, so the share sends LAN-sized packets and steps down
+// for a low rate only after backoffs, not for the rate allowed as it would
+// over the internet. A stall is a wait of more than 100 ms between two frames
+// shown.
 //
 // The pattern is made on the GPU and nothing of the screen is captured. The
 // desktop cases capture the primary monitor while viewer_pattern moves on all
@@ -228,7 +229,9 @@ struct Second {
     sharing: Option<SharingNumbers>,
 }
 
-fn measure(pair: &Pair, secs: u64) -> Vec<Second> {
+// The seconds read, and when the reading ended: a viewer that stops, or a
+// picture that stops changing, adds no seconds but still counts in the time.
+fn measure(pair: &Pair, secs: u64) -> (Vec<Second>, Instant) {
     let read = || {
         let view = pair.friend.view();
         view.numbers.watching.map(|watching| Second {
@@ -251,16 +254,17 @@ fn measure(pair: &Pair, secs: u64) -> Vec<Second> {
             seconds.push(now);
         }
     }
-    seconds
+    (seconds, Instant::now())
 }
 
-fn print_case(case: &Case, seconds: &[Second]) {
+fn print_case(case: &Case, seconds: &[Second], until: Instant) {
     let (Some(first), Some(last)) = (seconds.first(), seconds.last()) else {
         println!("  {}: the friend watched nothing", case.link);
         return;
     };
     let (a, b) = (&first.watching, &last.watching);
-    let took = last.at.duration_since(first.at).as_secs_f64();
+    let took = until.duration_since(first.at).as_secs_f64();
+    let dark = b.fps == 0 || until.duration_since(last.at) >= Duration::from_secs(1);
     let fps = if took > 0.0 {
         (b.shown - a.shown) as f64 / took
     } else {
@@ -301,7 +305,7 @@ fn print_case(case: &Case, seconds: &[Second]) {
         "  {}: {fps:.1} fps shown in {took:.0} s, capture to display {latency} (median/p95, worst 10 s), slowest {slowest:.1} ms, {} stalls, longest wait {longest:.0} ms{}, lost for good {}, not decoded {}, repaired {}; {kbps} kbit/s, {idrs} IDRs, {backoffs} backoffs, rate at the end {} kbit/s",
         case.link,
         b.stalls - a.stalls,
-        if b.fps == 0 { ", ended dark" } else { "" },
+        if dark { ", ended dark" } else { "" },
         b.dropped - a.dropped,
         b.decode_failed - a.decode_failed,
         b.repaired - a.repaired,
@@ -348,9 +352,9 @@ fn run(case: &Case) {
     }
     pair.link.shape(case.shape, case.shape);
     let before = pair.link.tallies();
-    let seconds = measure(&pair, case.secs);
+    let (seconds, until) = measure(&pair, case.secs);
     let after = pair.link.tallies();
-    print_case(case, &seconds);
+    print_case(case, &seconds, until);
     if case.link != "clean" {
         println!(
             "    the link lost {:.1}% toward the friend, {:.1}% toward the host",
