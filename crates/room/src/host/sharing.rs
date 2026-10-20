@@ -70,8 +70,11 @@ pub(super) struct Live {
     told: Option<Facts>,
     told_at: Option<Instant>,
     facts_due: Option<Instant>,
-    // The limits the sharer was last told, when it reads them.
+    // The limits the sharer was last told, when it reads them, when the last
+    // LIMITS_PER_GAP of them went, and when limits that changed since may go.
     told_limits: Option<ShareLimits>,
+    limits_told_at: VecDeque<Instant>,
+    limits_due: Option<Instant>,
     shape: Option<ShapeUnderWay>,
     // Remote control of this share, asked for or allowed: it ends with it.
     pub control: Option<Grant>,
@@ -669,18 +672,10 @@ impl Host {
                 false
             }
             Message::Watch { share, on, hevc } => self.took_watch(i, share, on, hevc, now, socket),
-            // Held to the watches' limit: each change can open the sharer's
-            // capture again.
+            // Kept past any limit; what it changes for the sharer goes at
+            // most LIMITS_PER_GAP times a gap.
             Message::WatchLimits { share, limits } => {
-                let peer = &mut self.peers[i];
-                let allowed = peer.share.limits.watches.take(
-                    now,
-                    screen::WATCHES_PER_SECOND,
-                    screen::WATCH_BURST,
-                );
-                if !allowed {
-                    self.screen.dropped += 1;
-                } else if peer.share.watching == Some(share) && self.is_live(share) {
+                if self.peers[i].share.watching == Some(share) && self.is_live(share) {
                     self.peers[i].share.watcher.limits = Some(limits);
                     self.tell_limits(now, socket);
                 }
@@ -969,6 +964,8 @@ impl Host {
             told_at: None,
             facts_due: None,
             told_limits: None,
+            limits_told_at: VecDeque::with_capacity(screen::LIMITS_PER_GAP),
+            limits_due: None,
             shape: None,
             control: None,
         });
@@ -1371,8 +1368,24 @@ impl Host {
             return;
         };
         if live.told_limits == Some(limits) {
+            live.limits_due = None;
             return;
         }
+        if live.limits_told_at.len() == screen::LIMITS_PER_GAP
+            && let Some(due) = live
+                .limits_told_at
+                .front()
+                .map(|&at| at + share::SWITCH_GAP)
+                .filter(|due| now < *due)
+        {
+            live.limits_due = Some(due);
+            return;
+        }
+        live.limits_due = None;
+        if live.limits_told_at.len() == screen::LIMITS_PER_GAP {
+            live.limits_told_at.pop_front();
+        }
+        live.limits_told_at.push_back(now);
         let sharer = live.sharer;
         if sharer == *self.identity.public() {
             live.told_limits = Some(limits);
@@ -1489,6 +1502,7 @@ impl Host {
         let own = (number.is_some() && self.screen.watched == number).then_some(&self.own_watcher);
         [
             self.live.as_ref().and_then(|live| live.facts_due),
+            self.live.as_ref().and_then(|live| live.limits_due),
             self.screen.shape_due(),
         ]
         .into_iter()

@@ -138,6 +138,14 @@ pub(crate) const IDR_ASK_EVERY: Duration = Duration::from_millis(500);
 // sharer, which changes its encoder's rate, goes at most this often; the
 // first change in a while goes at once.
 pub(crate) const FACTS_EVERY: Duration = Duration::from_millis(250);
+// A watcher's limits past the watches' limit still take effect, so the host
+// and the watcher never disagree about a cap. What they tell the sharer opens
+// its capture again, a new size and a new decoder for every viewer, and a
+// viewer holds a share that makes more than three in a share::SWITCH_GAP. The
+// sharer's own change of codec can be one of them, so at most this many
+// changes of limits go in a gap: a new watcher's two (the first fold, then
+// its own limits) at once, a third later.
+pub(crate) const LIMITS_PER_GAP: usize = 2;
 
 // What reaches Watching's inbox and waits there for the viewer's thread, as
 // a socket's receive buffer would hold it: about 4.8 MB, half a second at

@@ -6637,6 +6637,74 @@ mod tests {
         }
     }
 
+    // A watcher picking caps as fast as it can: the sharer is told at most
+    // LIMITS_PER_GAP changes in a SWITCH_GAP, a new watcher's first two at
+    // once, and the last pick still reaches it once the gap allows, past any
+    // limit on the watcher's messages.
+    #[test]
+    fn caps_picked_fast_reach_the_sharer_paced() {
+        let start = Instant::now();
+        let mut rig = Rig::new(start);
+        rig.host.version = peer::LIMITS_SINCE;
+        let mut ana = Guest::new();
+        ana.join_as(&mut rig, "Ana", peer::LIMITS_SINCE, None, start);
+        let mut bo = Guest::new();
+        bo.join_as(&mut rig, "Bo", peer::LIMITS_SINCE, None, start);
+        let share = granted(&mut rig, &mut ana, start);
+        let told = |messages: Vec<Message>| -> Vec<control::ShareLimits> {
+            messages
+                .into_iter()
+                .filter_map(|message| match message {
+                    Message::ShareLimits {
+                        limits: Some(limits),
+                        ..
+                    } => Some(limits),
+                    _ => None,
+                })
+                .collect()
+        };
+        ana.heard(start);
+        bo.say(
+            &mut rig,
+            &Message::Watch {
+                share,
+                on: true,
+                hevc: true,
+            },
+            start,
+        );
+        let mut at = start;
+        let mut last = None;
+        for n in 0..20u16 {
+            at += Duration::from_millis(50);
+            let height = if n % 2 == 0 { 1080 } else { 1440 };
+            let limits = control::WatchLimits {
+                takes_4k: true,
+                height: Some(height),
+                ..control::WatchLimits::default()
+            };
+            bo.say(&mut rig, &Message::WatchLimits { share, limits }, at);
+            last = Some(height);
+        }
+        // The share's start told the first fold already, so of Bo's picks
+        // only the first goes in this gap.
+        let first = told(ana.heard(at));
+        assert_eq!(
+            first.iter().map(|limits| limits.height).collect::<Vec<_>>(),
+            [1080]
+        );
+        rig.tick(start + share::SWITCH_GAP - Duration::from_millis(1));
+        assert!(told(ana.heard(at)).is_empty());
+        let after = start + share::SWITCH_GAP;
+        rig.tick(after);
+        let later = told(ana.heard(after));
+        assert_eq!(
+            later.iter().map(|limits| limits.height).collect::<Vec<_>>(),
+            [last.unwrap()]
+        );
+        assert_eq!(rig.host.drops.bad, 0);
+    }
+
     // A watcher whose copy reads limits hears once that the sharer's does
     // not, so its menu can say why a cap does nothing.
     #[test]
