@@ -1237,8 +1237,9 @@ impl eframe::App for App {
                     ui.scope_builder(UiBuilder::new().max_rect(bottom), |ui| {
                         ui.set_clip_rect(bottom);
                         let shown = view.as_ref().map(|view| &view.strip);
+                        let cap_set = view.as_ref().is_some_and(|view| view.share.cap_set());
                         strip_clicked =
-                            strip::show(ui, shown, &self.sweep, self.scrolling).clicked();
+                            strip::show(ui, shown, cap_set, &self.sweep, self.scrolling).clicked();
                     });
                 }
             });

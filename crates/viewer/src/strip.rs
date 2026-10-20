@@ -55,6 +55,9 @@ pub struct Strip {
     // The shared PC has an administrator window in front, which drops
     // everything sent to it, so control is paused.
     pub control_paused: bool,
+    // This PC asks the share to keep to a cap: "cap set" after the path
+    // word.
+    pub cap_set: bool,
 }
 
 impl Default for Strip {
@@ -77,6 +80,7 @@ impl Default for Strip {
             end_to_end_level: Level::Good,
             controlling: None,
             control_paused: false,
+            cap_set: false,
         }
     }
 }
@@ -186,6 +190,7 @@ enum Part {
     Jitter,
     Loss,
     Path,
+    Cap,
     Control,
     Paused,
     Encode,
@@ -217,7 +222,7 @@ impl Part {
             Part::Loss => &["10.0%"],
             Part::Encode | Part::Decode => &["99.9 ms"],
             Part::Path => &["relayed"],
-            Part::State | Part::Control | Part::Paused | Part::Present => &[],
+            Part::State | Part::Cap | Part::Control | Part::Paused | Part::Present => &[],
         }
     }
 }
@@ -227,8 +232,10 @@ impl Part {
 // the strip is the one place state shows, "relayed" is the reason a link is
 // slow, the control words say this PC's keys go to another, and "composed"
 // is the reason a windowed viewer is a frame behind. When they still do not
-// fit, the control words take their short forms.
-const DROP_ORDER: [Part; 6] = [
+// fit, the control words take their short forms. "cap set" is a reminder of
+// this PC's own choice, and goes first.
+const DROP_ORDER: [Part; 7] = [
+    Part::Cap,
     Part::Jitter,
     Part::Loss,
     Part::Encode,
@@ -322,6 +329,9 @@ fn words(strip: &Strip, present: Option<PresentPath>) -> Vec<Word> {
         };
         // A word, not a reading: colour in the strip is for the numbers.
         push(Part::Path, word.to_string(), ASH, true);
+    }
+    if strip.cap_set {
+        push(Part::Cap, String::from("cap set"), ASH, false);
     }
     control_words(strip, &mut words);
     let mut push = |part, text: String, colour, slot| {
@@ -900,6 +910,25 @@ mod tests {
             controlling: Some(key.to_string()),
             ..live()
         }
+    }
+
+    // This PC's cap, in ash after the path word, is the first word to go
+    // when the strip is too narrow.
+    #[test]
+    fn cap_set_follows_the_path_word() {
+        let strip = Strip {
+            cap_set: true,
+            ..live()
+        };
+        let words = words(&strip, None);
+        let texts: Vec<&str> = words.iter().map(|word| word.text.as_str()).collect();
+        assert_eq!(texts[3..5], ["LAN", "cap set"]);
+        assert_eq!(words[4].colour, ASH);
+        let widths: Vec<(Part, f32)> = words.iter().map(|word| (word.part, 50.0)).collect();
+        let all = widths.len() as f32 * (50.0 + GAP);
+        assert!(fit(&widths, all).contains(&Part::Cap));
+        assert!(!fit(&widths, all - 60.0).contains(&Part::Cap));
+        assert!(fit(&widths, all - 60.0).contains(&Part::Jitter));
     }
 
     #[test]

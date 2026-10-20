@@ -48,7 +48,14 @@ fn appended(old: &[TracePoint], new: &[TracePoint]) -> usize {
     new.len()
 }
 
-pub fn show(ui: &mut Ui, strip: Option<&Strip>, sweep: &Sweep, scrolling: bool) -> Response {
+// `cap_set`: this PC watches with a cap (room::view::ShareView::cap_set).
+pub fn show(
+    ui: &mut Ui,
+    strip: Option<&Strip>,
+    cap_set: bool,
+    sweep: &Sweep,
+    scrolling: bool,
+) -> Response {
     // With nobody connected a click still opens the stats, but the strip is
     // not a Tab stop: a focus ring around nothing reads as broken.
     let sense = match strip.map(|strip| strip.state) {
@@ -73,7 +80,7 @@ pub fn show(ui: &mut Ui, strip: Option<&Strip>, sweep: &Sweep, scrolling: bool) 
         controls::ring_within(&painter, rect, rect);
     }
 
-    let words = words(strip);
+    let words = words(strip, cap_set);
     let widths: Vec<(Part, f32)> = words
         .iter()
         .map(|word| (word.part, slot_width(&painter, word)))
@@ -138,6 +145,7 @@ enum Part {
     Jitter,
     Loss,
     Path,
+    Cap,
 }
 
 impl Part {
@@ -152,7 +160,7 @@ impl Part {
             Part::Jitter => &["\u{b1}99"],
             Part::Loss => &["10.0%"],
             Part::Path => &["relayed"],
-            Part::State => &[],
+            Part::State | Part::Cap => &[],
         }
     }
 }
@@ -160,7 +168,7 @@ impl Part {
 // What goes first when the strip is too narrow for everything. The state
 // word and the path word always stay: the strip is the one place state
 // shows, and "relayed" is the reason a link is slow.
-const DROP_ORDER: [Part; 3] = [Part::Jitter, Part::Loss, Part::RoundTrip];
+const DROP_ORDER: [Part; 4] = [Part::Cap, Part::Jitter, Part::Loss, Part::RoundTrip];
 
 struct Word {
     part: Part,
@@ -208,7 +216,7 @@ fn fit(widths: &[(Part, f32)], room: f32) -> Vec<Part> {
     kept
 }
 
-fn words(strip: &Strip) -> Vec<Word> {
+fn words(strip: &Strip, cap_set: bool) -> Vec<Word> {
     let mut words = Vec::new();
     let mut push = |part, text: String, color, slot| {
         words.push(Word {
@@ -273,6 +281,10 @@ fn words(strip: &Strip) -> Vec<Word> {
     // sage word beside them gives them nothing to stand out against.
     if let Some(path) = strip.path {
         push(Part::Path, path_word(path).to_owned(), ASH, true);
+    }
+    // This PC's own choice, so a word in ash like the path's.
+    if cap_set {
+        push(Part::Cap, String::from("cap set"), ASH, false);
     }
     words
 }
@@ -427,6 +439,33 @@ mod tests {
 
     fn rtts(values: &[f32]) -> Vec<TracePoint> {
         values.iter().map(|&ms| TracePoint::Rtt(ms)).collect()
+    }
+
+    // This PC's cap, in ash after the path word, is the first word to go
+    // when the strip is too narrow.
+    #[test]
+    fn cap_set_follows_the_path_word() {
+        let strip = Strip {
+            state: LinkState::Live,
+            rtt_ms: Some(9.0),
+            path: Some(PathWord::Direct),
+            ..Strip::default()
+        };
+        let texts = |cap_set| -> Vec<String> {
+            words(&strip, cap_set)
+                .into_iter()
+                .map(|word| word.text)
+                .collect()
+        };
+        assert_eq!(texts(false), ["9 ms", "direct"]);
+        assert_eq!(texts(true), ["9 ms", "direct", "cap set"]);
+        let widths = [
+            (Part::RoundTrip, 50.0),
+            (Part::Path, 50.0),
+            (Part::Cap, 50.0),
+        ];
+        assert_eq!(fit(&widths, 200.0).len(), 3);
+        assert_eq!(fit(&widths, 120.0), [Part::RoundTrip, Part::Path]);
     }
 
     #[test]

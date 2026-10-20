@@ -460,6 +460,7 @@ pub(crate) fn link_numbers(view: &View) -> LinkNumbers {
             })
             .collect(),
         one_way_ms: one_way_ms(view),
+        cap_set: view.share.cap_set(),
     }
 }
 

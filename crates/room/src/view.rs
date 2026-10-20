@@ -74,6 +74,14 @@ pub struct ShareView {
     pub cap_unheard: Option<Unheard>,
 }
 
+impl ShareView {
+    // This PC watches with a cap the host and the sharer hear: the strip
+    // says "cap set".
+    pub fn cap_set(&self) -> bool {
+        self.watching && self.cap != WatchCap::default() && self.cap_unheard.is_none()
+    }
+}
+
 // Who runs a Booth older than 1.2.0, which takes no cap from a watcher.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unheard {

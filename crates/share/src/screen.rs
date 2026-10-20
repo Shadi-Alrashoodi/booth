@@ -107,6 +107,8 @@ pub struct LinkNumbers {
     // capture to display's thresholds are that much later. None on LAN and
     // in the loopback.
     pub one_way_ms: Option<f32>,
+    // This PC asks the share to keep to a cap (the room's WatchCap).
+    pub cap_set: bool,
 }
 
 impl Default for LinkNumbers {
@@ -122,6 +124,7 @@ impl Default for LinkNumbers {
             path: None,
             trace: Vec::new(),
             one_way_ms: None,
+            cap_set: false,
         }
     }
 }
@@ -1070,6 +1073,7 @@ fn show_link(strip: &mut Strip, link: LinkNumbers) -> bool {
     strip.jitter_level = link.jitter_level;
     strip.path = link.path;
     strip.trace = link.trace;
+    strip.cap_set = link.cap_set;
     match link.loss_pct {
         Some(pct) => {
             strip.loss_pct = Some(pct);
