@@ -4,7 +4,7 @@
 
 <p align="center">Voice, text chat and screen sharing for a few friends on Windows, built for low delay.</p>
 
-<p align="center"><a href="https://github.com/Shadi-Alrashoodi/booth/releases/download/v1.1.0/booth-1.1.0-setup.exe"><b>Download the installer</b></a> &nbsp; or &nbsp; <a href="https://github.com/Shadi-Alrashoodi/booth/releases/download/v1.1.0/booth-1.1.0-windows-x64.zip">the zip</a></p>
+<p align="center"><a href="https://github.com/Shadi-Alrashoodi/booth/releases/download/v1.2.0/booth-1.2.0-setup.exe"><b>Download the installer</b></a> &nbsp; or &nbsp; <a href="https://github.com/Shadi-Alrashoodi/booth/releases/download/v1.2.0/booth-1.2.0-windows-x64.zip">the zip</a></p>
 
 <p align="center"><a href="https://github.com/Shadi-Alrashoodi/booth/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/Shadi-Alrashoodi/booth?label=release&color=E8912F"></a> <a href="https://github.com/Shadi-Alrashoodi/booth/actions"><img alt="Build" src="https://img.shields.io/github/check-runs/Shadi-Alrashoodi/booth/main?nameFilter=windows&label=build"></a> <a href="#license"><img alt="License: MIT or Apache-2.0" src="https://img.shields.io/badge/license-MIT%20or%20Apache--2.0-555"></a></p>
 
