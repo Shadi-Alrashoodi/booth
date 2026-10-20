@@ -101,7 +101,7 @@ const TAKES_HEVC: u8 = 1 << 0;
 const CAP_HEIGHTS: [u16; 2] = [1080, 1440];
 const CAP_FPS: [u8; 1] = [60];
 const CAP_KBPS: [u32; 2] = [8_000, 15_000];
-const SHARE_BOXES: [(u16, u16); 4] = [(1920, 1080), (2560, 1440), (4096, 1440), (4096, 2160)];
+const SHARE_BOXES: [(u16, u16); 3] = [(4096, 1080), (4096, 1440), (4096, 2160)];
 const SHARE_FPS: [u8; 2] = [60, 120];
 
 // VideoLoss before anything was measured.

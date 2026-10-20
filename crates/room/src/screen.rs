@@ -45,7 +45,7 @@ use share::{Knob, MonitorId};
 use stats::{STREAM_WINDOW, StreamLoss, StreamStats};
 
 use crate::config::LossKnob;
-use crate::control::{Facts, MAX_RECOVER_SPAN, PERMILLE};
+use crate::control::{Facts, MAX_RECOVER_SPAN, PERMILLE, ShareLimits};
 use crate::limit::Bucket;
 use crate::peer::{Clock, MEDIA_FLOWS_FOR};
 use crate::remote::{Area, Controls, Gate, Injector, Remote};
@@ -327,6 +327,10 @@ struct Own {
 struct Told {
     facts: Option<ShareFacts>,
     answers: Vec<Answer>,
+    // The host's cap from its last facts, and what every watcher takes:
+    // both bring the facts' rate down.
+    host_cap_kbps: Option<u32>,
+    limits: Option<ShareLimits>,
 }
 
 const NO_FRAME: u64 = u64::MAX;
@@ -555,9 +559,9 @@ impl Sharing {
     // with no internet watcher. A new watcher's IDR ask in them goes in with
     // them, under the same lock.
     pub(crate) fn set_facts(&self, facts: &Facts) {
-        let cap_kbps = (facts.cap_kbps > 0).then_some(facts.cap_kbps);
-        let rate_kbps = cap_kbps.map_or(self.upload_kbps, |cap| cap.min(self.upload_kbps));
         let mut told = lock(&self.told);
+        told.host_cap_kbps = (facts.cap_kbps > 0).then_some(facts.cap_kbps);
+        let rate_kbps = self.rate_for(&told);
         told.facts = Some(ShareFacts {
             watchers: facts.watchers,
             internet: facts.internet,
@@ -571,6 +575,31 @@ impl Sharing {
         }
         drop(told);
         self.wake.set();
+    }
+
+    // From the host's ShareLimits: the largest picture, the frame rate and
+    // the bitrate every watcher takes.
+    pub(crate) fn set_limits(&self, limits: ShareLimits) {
+        let mut told = lock(&self.told);
+        told.limits = Some(limits);
+        let rate_kbps = self.rate_for(&told);
+        if let Some(facts) = told.facts.as_mut() {
+            facts.rate_kbps = rate_kbps;
+        }
+        drop(told);
+        self.wake.set();
+    }
+
+    pub(crate) fn limits(&self) -> Option<ShareLimits> {
+        lock(&self.told).limits
+    }
+
+    fn rate_for(&self, told: &Told) -> u32 {
+        let watchers = told.limits.and_then(|limits| limits.kbps);
+        [told.host_cap_kbps, watchers]
+            .into_iter()
+            .flatten()
+            .fold(self.upload_kbps, u32::min)
     }
 
     pub(crate) fn answer(&self, answer: Answer) {

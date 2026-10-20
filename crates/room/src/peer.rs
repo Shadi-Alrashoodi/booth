@@ -32,6 +32,15 @@ pub(crate) const FEEDBACK_SINCE: invite::Version = invite::Version {
     patch: 2,
 };
 
+// Watch and share limits (control::WatchLimits and ShareLimits) go only to
+// a peer whose Hello says LIMITS_SINCE or later: an older one counts them as
+// bad, and shares and watches as it always did.
+pub(crate) const LIMITS_SINCE: invite::Version = invite::Version {
+    major: 1,
+    minor: 2,
+    patch: 0,
+};
+
 // Feedback waiting on its stream, in flight or queued, past which new
 // feedback is held and merged until it drains: recover requests into one
 // span, and the newest IDR ask and loss report. A request that waits behind
@@ -351,6 +360,8 @@ pub(crate) struct Link {
     // its Hello says (FEEDBACK_SINCE). Feedback held while it is backed up.
     pub feedback: Reliable,
     pub feedback_read: bool,
+    // The other side reads watch and share limits (LIMITS_SINCE).
+    pub limits_read: bool,
     held: Held,
     pub stats: LinkStats,
     pub offset: OffsetEstimator,
@@ -421,6 +432,7 @@ impl Link {
             chat: Reliable::new(),
             feedback: Reliable::new(),
             feedback_read: false,
+            limits_read: false,
             held: Held::default(),
             stats: LinkStats::new(),
             offset: OffsetEstimator::new(),

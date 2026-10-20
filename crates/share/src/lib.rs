@@ -39,8 +39,8 @@ pub use source::Choice;
 // The other crates' types this crate's own take and give, so a caller such
 // as the room needs no dependency on capture, encode or viewer for them.
 pub use capture::{
-    Adapter, CursorKind, CursorShape, CursorUpdate, Monitor, MonitorId, PauseReason, adapters,
-    make_process_dpi_aware, monitors,
+    Adapter, CursorKind, CursorShape, CursorUpdate, Monitor, MonitorId, Options as CaptureOptions,
+    PauseReason, adapters, make_process_dpi_aware, monitors,
 };
 pub use encode::{Codec, Kind, Preset, Settings};
 pub use viewer::{

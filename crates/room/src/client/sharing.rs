@@ -386,6 +386,12 @@ impl Client {
             Message::ShareFacts(facts) if own_share == Some(facts.share) => {
                 self.screen.sharing.set_facts(&facts);
             }
+            Message::ShareLimits {
+                share,
+                limits: Some(limits),
+            } if own_share == Some(share) => {
+                self.screen.sharing.set_limits(limits);
+            }
             Message::SharerClock {
                 share,
                 offset_us,
@@ -407,7 +413,8 @@ impl Client {
             Message::Recover { .. }
             | Message::Idr { .. }
             | Message::VideoLoss { .. }
-            | Message::ShareFacts(_) => {}
+            | Message::ShareFacts(_)
+            | Message::ShareLimits { .. } => {}
             // Only a client sends these.
             _ => {
                 self.drops.bad(now);

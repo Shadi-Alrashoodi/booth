@@ -3007,6 +3007,7 @@ impl Host {
                     greeted |= first;
                     self.peers[i].hello = true;
                     self.peers[i].link.feedback_read = version >= peer::FEEDBACK_SINCE;
+                    self.peers[i].link.limits_read = version >= peer::LIMITS_SINCE;
                     let peer = &self.peers[i];
                     if first
                         && version != invite::VERSION
@@ -3079,6 +3080,7 @@ impl Host {
                     message @ (Message::ShareStart { .. }
                     | Message::ShareStop
                     | Message::Watch { .. }
+                    | Message::WatchLimits { .. }
                     | Message::Recover { .. }
                     | Message::Idr { .. }
                     | Message::VideoLoss { .. }
@@ -6572,6 +6574,61 @@ mod tests {
             out.extend(Message::decode(&bytes));
         }
         out
+    }
+
+    // Limits go to a sharer whose Hello says LIMITS_SINCE or later, never to
+    // an older one, and a watcher's 4K and caps fold into them.
+    #[test]
+    fn limits_go_only_to_a_sharer_that_reads_them() {
+        let older = Version {
+            major: 1,
+            minor: 1,
+            patch: 0,
+        };
+        for (version, reads) in [(older, false), (peer::LIMITS_SINCE, true)] {
+            let start = Instant::now();
+            let mut rig = Rig::new(start);
+            let mut ana = Guest::new();
+            ana.join_as(&mut rig, "Ana", version, None, start);
+            let mut bo = Guest::new();
+            bo.join_as(&mut rig, "Bo", peer::LIMITS_SINCE, None, start);
+            let share = granted(&mut rig, &mut ana, start);
+            bo.say(
+                &mut rig,
+                &Message::Watch {
+                    share,
+                    on: true,
+                    hevc: true,
+                },
+                start,
+            );
+            let limits = control::WatchLimits {
+                takes_4k: true,
+                fps: Some(60),
+                ..control::WatchLimits::default()
+            };
+            bo.say(&mut rig, &Message::WatchLimits { share, limits }, start);
+            ana.read(start);
+            let told: Vec<_> = messages(&mut ana.reliable)
+                .into_iter()
+                .filter_map(|message| match message {
+                    Message::ShareLimits { limits, .. } => Some(limits),
+                    _ => None,
+                })
+                .collect();
+            let four_k = control::ShareLimits {
+                width: 4096,
+                height: 2160,
+                fps: 60,
+                kbps: None,
+            };
+            if reads {
+                assert_eq!(told.last(), Some(&Some(four_k)), "{version}");
+            } else {
+                assert!(told.is_empty(), "{version}: {told:?}");
+            }
+            assert_eq!(rig.host.drops.bad, 0, "{version}");
+        }
     }
 
     // A sharer whose Hello is older than FEEDBACK_SINCE reads recover

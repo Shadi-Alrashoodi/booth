@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 use net::pace::Timer;
 use share::rate::{Lost, Rate, Second, Step};
 use share::{
-    Audience, Back, Choice, CursorShape, CursorUpdate, FineTimer, Kind, Line, MonitorId,
-    PauseReason, Preset, Sent, Settings, Setup, Sharer, SharerNumbers, Software, spread,
+    Audience, Back, CaptureOptions, Choice, CursorShape, CursorUpdate, FineTimer, Kind, Line,
+    MonitorId, PauseReason, Preset, Sent, Settings, Setup, Sharer, SharerNumbers, Software, spread,
 };
 
 use super::wire::{Shape, ShapeKind};
@@ -194,6 +194,7 @@ fn share(
     let mut watchers = Watchers::new(sharing, log, number);
     let mut rate = Rate::new(allowed);
     let mut applied = facts;
+    let mut applied_limits = None;
     let mut asked_fps = start.fps;
     let mut tally = Tally::new(sharing.upload_bytes());
     let mut next_second = Instant::now() + Duration::from_secs(1);
@@ -223,6 +224,28 @@ fn share(
                 }
             }
             _ => break,
+        }
+        // Not while capture is paused either: a new box or rate opens the
+        // source again.
+        let limits = sharing.limits();
+        if limits != applied_limits && !sharer.paused() {
+            applied_limits = limits;
+            if let Some(limits) = limits {
+                let limit = CaptureOptions {
+                    max_width: u32::from(limits.width),
+                    max_height: u32::from(limits.height),
+                    max_fps: u32::from(limits.fps),
+                };
+                if sharer.set_limit(limit, &mut say).map_err(ran)? {
+                    let (width, height) = sharer.size();
+                    log!(
+                        log,
+                        "share {number}: running at {width}x{height} and {} fps for what the watchers take",
+                        sharer.fps()
+                    );
+                    announce_fps(sharing, number, &sharer);
+                }
+            }
         }
         let facts = sharing.facts();
         if facts != applied {

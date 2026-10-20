@@ -2254,6 +2254,7 @@ impl Client {
                     Some(Message::Hello { version, .. }) => {
                         self.host_hello = true;
                         self.link.feedback_read = version >= peer::FEEDBACK_SINCE;
+                        self.link.limits_read = version >= peer::LIMITS_SINCE;
                         if version != invite::VERSION {
                             log!(
                                 self.log,
@@ -2305,6 +2306,7 @@ impl Client {
                     | Message::Idr { .. }
                     | Message::VideoLoss { .. }
                     | Message::ShareFacts(_)
+                    | Message::ShareLimits { .. }
                     | Message::SharerClock { .. }
                     | Message::Shape(_)),
                 ) => self.on_share_message(message, now),

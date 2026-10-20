@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use super::remote::{Grant, PeerControl};
 use super::{Host, Peer, who};
-use crate::control::{Facts, Message, ShareAnswer};
+use crate::control::{Facts, Message, ShareAnswer, ShareLimits, WatchLimits};
 use crate::limit::Bucket;
 use crate::log::log;
 use crate::remote::ControlEnd;
@@ -70,6 +70,8 @@ pub(super) struct Live {
     told: Option<Facts>,
     told_at: Option<Instant>,
     facts_due: Option<Instant>,
+    // The limits the sharer was last told, when it reads them.
+    told_limits: Option<ShareLimits>,
     shape: Option<ShapeUnderWay>,
     // Remote control of this share, asked for or allowed: it ends with it.
     pub control: Option<Grant>,
@@ -82,6 +84,36 @@ struct ShapeUnderWay {
     next: u16,
     // It fit the limit and goes on.
     pass: bool,
+}
+
+// The limits a share keeps to, from each watcher's HEVC and WatchLimits:
+// 2160 high only when every watcher decodes HEVC and its viewer took 4K, so
+// one older copy watching keeps everyone at 1440; each cap the lowest any
+// watcher chose.
+pub(super) fn fold_limits(watchers: &[(bool, Option<WatchLimits>)]) -> ShareLimits {
+    fn lowest<T: Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+    let mut four_k = !watchers.is_empty();
+    let mut height = None;
+    let mut fps = None;
+    let mut kbps = None;
+    for &(hevc, limits) in watchers {
+        let limits = limits.unwrap_or_default();
+        four_k &= hevc && limits.takes_4k;
+        height = lowest(height, limits.height);
+        fps = lowest(fps, limits.fps);
+        kbps = lowest(kbps, limits.kbps);
+    }
+    ShareLimits {
+        width: 4096,
+        height: height.unwrap_or(if four_k { 2160 } else { 1440 }),
+        fps: fps.unwrap_or(120),
+        kbps,
+    }
 }
 
 // What the host keeps about one watcher: a friend, or the host itself.
@@ -100,6 +132,8 @@ pub(super) struct Watcher {
     told_clock: Option<(i64, bool)>,
     // Its viewer decodes HEVC, as its Watch said.
     hevc: bool,
+    // What its WatchLimits said; None from a copy too old to send them.
+    limits: Option<WatchLimits>,
 }
 
 // A friend's side of sharing, on the host.
@@ -166,6 +200,7 @@ impl Watcher {
         self.loss = None;
         self.told_clock = None;
         self.join_idr_waits = false;
+        self.limits = None;
     }
 
     // True when an IDR ask for this watcher may go now.
@@ -628,6 +663,23 @@ impl Host {
                 false
             }
             Message::Watch { share, on, hevc } => self.took_watch(i, share, on, hevc, now, socket),
+            // Held to the watches' limit: each change can open the sharer's
+            // capture again.
+            Message::WatchLimits { share, limits } => {
+                let peer = &mut self.peers[i];
+                let allowed = peer.share.limits.watches.take(
+                    now,
+                    screen::WATCHES_PER_SECOND,
+                    screen::WATCH_BURST,
+                );
+                if !allowed {
+                    self.screen.dropped += 1;
+                } else if peer.share.watching == Some(share) && self.is_live(share) {
+                    self.peers[i].share.watcher.limits = Some(limits);
+                    self.tell_limits(now, socket);
+                }
+                false
+            }
             Message::Recover { share, first, last } => {
                 let peer = &mut self.peers[i];
                 let allowed = peer.share.limits.recovers.take(
@@ -910,6 +962,7 @@ impl Host {
             told: None,
             told_at: None,
             facts_due: None,
+            told_limits: None,
             shape: None,
             control: None,
         });
@@ -1196,6 +1249,7 @@ impl Host {
     // `idr` puts a new watcher's IDR ask in the facts if they go now. True
     // when they went.
     fn tell_facts_with(&mut self, idr: bool, now: Instant, socket: &Socket) -> bool {
+        self.tell_limits(now, socket);
         let Some(live) = self.live.as_ref() else {
             return false;
         };
@@ -1273,6 +1327,59 @@ impl Host {
         );
         self.tell_sharer_facts(Facts { idr, ..facts }, now, socket);
         true
+    }
+
+    // What every watcher takes, folded, to the sharer when it changed and its
+    // copy reads it (peer::LIMITS_SINCE). An older sharer keeps to its own.
+    fn tell_limits(&mut self, now: Instant, socket: &Socket) {
+        let Some(live) = self.live.as_ref() else {
+            return;
+        };
+        let number = live.number;
+        let mut watchers: Vec<(bool, Option<WatchLimits>)> = self
+            .peers
+            .iter()
+            .filter(|peer| peer.share.watching == Some(number))
+            .map(|peer| (peer.share.watcher.hevc, peer.share.watcher.limits))
+            .collect();
+        if self.screen.watched == Some(number) {
+            watchers.push((self.own_watcher.hevc, self.own_watcher.limits));
+        }
+        let limits = fold_limits(&watchers);
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if live.told_limits == Some(limits) {
+            return;
+        }
+        let sharer = live.sharer;
+        if sharer == *self.identity.public() {
+            live.told_limits = Some(limits);
+            self.screen.sharing.set_limits(limits);
+        } else if let Some(peer) = self
+            .peers
+            .iter_mut()
+            .find(|peer| peer.key == sharer && peer.link.limits_read)
+        {
+            live.told_limits = Some(limits);
+            peer.link.queue(&Message::ShareLimits {
+                share: number,
+                limits: Some(limits),
+            });
+            peer.flush(socket, now);
+        } else {
+            return;
+        }
+        log!(
+            self.log,
+            "share {number}: the watchers take up to {}x{} at {} fps{}",
+            limits.width,
+            limits.height,
+            limits.fps,
+            limits
+                .kbps
+                .map_or_else(String::new, |kbps| format!(", {kbps} kbit/s"))
+        );
     }
 
     fn tell_sharer_facts(&mut self, facts: Facts, now: Instant, socket: &Socket) {
@@ -1477,5 +1584,60 @@ impl Host {
             mine: false,
             kind: LineKind::Problem,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caps(
+        takes_4k: bool,
+        height: Option<u16>,
+        fps: Option<u8>,
+        kbps: Option<u32>,
+    ) -> WatchLimits {
+        WatchLimits {
+            takes_4k,
+            height,
+            fps,
+            kbps,
+        }
+    }
+
+    fn limits(height: u16, fps: u8, kbps: Option<u32>) -> ShareLimits {
+        ShareLimits {
+            width: 4096,
+            height,
+            fps,
+            kbps,
+        }
+    }
+
+    // 4K only when every watcher takes it; an older copy, one without HEVC
+    // or nobody watching keeps the share at 1440; each cap the lowest.
+    #[test]
+    fn the_lowest_limit_of_every_watcher() {
+        let four_k = Some(caps(true, None, None, None));
+        assert_eq!(fold_limits(&[]), limits(1440, 120, None));
+        assert_eq!(fold_limits(&[(true, four_k)]), limits(2160, 120, None));
+        assert_eq!(
+            fold_limits(&[(true, four_k), (true, None)]),
+            limits(1440, 120, None)
+        );
+        assert_eq!(
+            fold_limits(&[(true, four_k), (false, four_k)]),
+            limits(1440, 120, None)
+        );
+        let capped = Some(caps(true, Some(1080), Some(60), Some(15_000)));
+        let lower = Some(caps(true, Some(1440), None, Some(8_000)));
+        assert_eq!(
+            fold_limits(&[(true, four_k), (true, capped), (true, lower)]),
+            limits(1080, 60, Some(8_000))
+        );
+        assert_eq!(
+            fold_limits(&[(true, None), (true, lower)]),
+            limits(1440, 120, Some(8_000))
+        );
     }
 }
