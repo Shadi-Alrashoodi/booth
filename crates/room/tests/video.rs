@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 use common::voiced::heard_cues;
 use common::{Member, code_to_invite, config, fresh_log, loopback, poll, read_log, timers};
-use room::view::{Codec, LineKind, LinkState, OwnShare, SharingNumbers, View, WatchingNumbers};
+use room::view::{
+    Codec, LineKind, LinkState, OwnShare, ShareState, SharingNumbers, View, WatchingNumbers,
+};
 use room::{Config, Devices, LossKnob, Show, VideoConfig, VideoSource};
 use voice::audio::fake::Fake;
 
@@ -1161,4 +1163,68 @@ fn a_paused_share_sends_nothing_until_it_resumes() {
         assert_eq!(watched.decode_failed, 0, "{who}");
         assert_eq!(watched.before_first_idr, 0, "{who}");
     }
+}
+
+// Watchers whose copies read it hear that a share is paused, and that it is
+// live again; one standing for 1.2.0 never hears it. Both ways a state
+// travels: the host's own share to its watchers, and a friend's through the
+// host to the host's own viewer. Everyone stands for 1.3.0 but Bo, since
+// the state goes only between copies that read it.
+#[test]
+fn watchers_hear_that_the_share_is_paused() {
+    let _turn = turn();
+    if !ready() {
+        return;
+    }
+    let reads = invite::Version {
+        major: 1,
+        minor: 3,
+        patch: 0,
+    };
+    let older = invite::Version {
+        major: 1,
+        minor: 2,
+        patch: 0,
+    };
+    let config = |name, version| {
+        let mut config = config_with(name, pattern(None), room::DEFAULT_VIDEO_UPLOAD_KBPS);
+        config.version = version;
+        config
+    };
+    let (host, friends) = room_of(
+        config("Mara", reads),
+        vec![config("Ana", reads), config("Bo", older)],
+    );
+    let (ana, bo) = (&friends[0], &friends[1]);
+    let state = |member: &Member| member.view().share.watched_state;
+    let number = shares(&host, 60);
+    watches(ana, number);
+    watches(bo, number);
+    host.room().pause_share(true);
+    ana.wait_for(WAIT, "Ana hearing the share is paused", |v| {
+        v.share.watched_state == ShareState::Paused
+    });
+    // Told at the same moment as Ana, if it were told at all.
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        state(bo),
+        ShareState::Live,
+        "a copy standing for 1.2.0 told"
+    );
+    host.room().pause_share(false);
+    ana.wait_for(WAIT, "Ana hearing it is live again", |v| {
+        v.share.watched_state == ShareState::Live
+    });
+    host.room().stop_sharing();
+    ana.wait_for(WAIT, "the viewer closed", |v| !v.share.viewer_open);
+    let number = shares(ana, 60);
+    watches(&host, number);
+    ana.room().pause_share(true);
+    host.wait_for(WAIT, "the host hearing Ana's share is paused", |v| {
+        v.share.watched_state == ShareState::Paused
+    });
+    ana.room().pause_share(false);
+    host.wait_for(WAIT, "the host hearing it is live again", |v| {
+        v.share.watched_state == ShareState::Live
+    });
 }

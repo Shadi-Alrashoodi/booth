@@ -21,7 +21,7 @@ use crate::screen::{
 };
 use crate::socket::Socket;
 use crate::talk::{Outlet, Sent};
-use crate::view::{ChatLine, CurrentShare, LineKind, ShareView, Unheard};
+use crate::view::{ChatLine, CurrentShare, LineKind, ShareState, ShareView, Unheard};
 
 // A watcher's loss report counts for this long, as a listener's voice
 // report does.
@@ -78,6 +78,8 @@ pub(super) struct Live {
     shape: Option<ShapeUnderWay>,
     // Remote control of this share, asked for or allowed: it ends with it.
     pub control: Option<Grant>,
+    // As its sharer last said.
+    state: ShareState,
 }
 
 // The shape the sharer is sending, as its first chunk gave it.
@@ -410,6 +412,12 @@ impl Host {
                     self.problem_line(String::from(screen::paused_sentence(paused)));
                 }
             }
+            ShareNews::State { share, state } => {
+                if self.live.as_ref().is_some_and(|live| ours(live, share)) {
+                    self.share_state(state, now, socket);
+                }
+                return false;
+            }
         }
         true
     }
@@ -678,6 +686,21 @@ impl Host {
                 if self.peers[i].share.watching == Some(share) && self.is_live(share) {
                     self.peers[i].share.watcher.limits = Some(limits);
                     self.tell_limits(now, socket);
+                }
+                false
+            }
+            // From the live share's sharer only; one from a share of theirs
+            // that ended was on its way.
+            Message::ShareState { share, state } => {
+                let key = self.peers[i].key;
+                match self.live.as_ref() {
+                    Some(live) if live.sharer == key && live.number == share => {
+                        self.share_state(state, now, socket);
+                    }
+                    Some(live) if live.sharer == key => {}
+                    _ => {
+                        self.drops.bad(now);
+                    }
                 }
                 false
             }
@@ -968,6 +991,7 @@ impl Host {
             limits_due: None,
             shape: None,
             control: None,
+            state: ShareState::Live,
         });
         log!(
             self.log,
@@ -1076,6 +1100,62 @@ impl Host {
         let asks = self.idr_goes(by, None, now).is_some();
         if !self.tell_facts_with(asks, now, socket) && asks {
             self.ask_idr(None, now, socket);
+        }
+        // A new watcher of a share that is not live hears so at once: a
+        // paused picture and a still one look alike.
+        let Some(live) = self.live.as_ref() else {
+            return;
+        };
+        let (number, state) = (live.number, live.state);
+        if state == ShareState::Live || self.version < crate::peer::SHARE_STATE_SINCE {
+            return;
+        }
+        match by {
+            By::Peer(i) if self.peers[i].link.state_read => {
+                let peer = &mut self.peers[i];
+                peer.link.queue(&Message::ShareState {
+                    share: number,
+                    state,
+                });
+                peer.flush(socket, now);
+            }
+            By::Peer(_) => {}
+            By::Host => self.screen.watching.set_share_state(state),
+        }
+    }
+
+    // How the live share stands, from its sharer: to every watcher whose
+    // copy reads it (peer::SHARE_STATE_SINCE) and to this host's viewer.
+    // A room standing for an older copy passes nothing on.
+    fn share_state(&mut self, state: ShareState, now: Instant, socket: &Socket) {
+        if self.version < crate::peer::SHARE_STATE_SINCE {
+            return;
+        }
+        let Some(live) = self.live.as_mut().filter(|live| live.state != state) else {
+            return;
+        };
+        live.state = state;
+        let number = live.number;
+        log!(
+            self.log,
+            "share {number}: {}",
+            match state {
+                ShareState::Live => "live again",
+                ShareState::Paused => "paused by the sharer",
+                ShareState::Away => "away while Windows has the sharer's screen",
+            }
+        );
+        if self.screen.watched == Some(number) {
+            self.screen.watching.set_share_state(state);
+        }
+        for peer in &mut self.peers {
+            if peer.share.watching == Some(number) && peer.link.state_read {
+                peer.link.queue(&Message::ShareState {
+                    share: number,
+                    state,
+                });
+                peer.flush(socket, now);
+            }
         }
     }
 
@@ -1616,6 +1696,7 @@ impl Host {
             control: self.control_view(),
             cap: self.screen.watching.cap(),
             cap_unheard: self.cap_unheard(),
+            watched_state: self.screen.watching.share_state(),
         }
     }
 

@@ -72,6 +72,9 @@ pub struct ShareView {
     // (Room::cap_watch), and who cannot honor that, if anyone.
     pub cap: WatchCap,
     pub cap_unheard: Option<Unheard>,
+    // While this PC watches: the share as its sharer says it is, Live when
+    // the sharer or the host is older than 1.3.0.
+    pub watched_state: ShareState,
 }
 
 impl ShareView {

@@ -2262,6 +2262,7 @@ impl Client {
                         self.host_hello = true;
                         self.link.feedback_read = version >= peer::FEEDBACK_SINCE;
                         self.link.limits_read = version >= peer::LIMITS_SINCE;
+                        self.link.state_read = version >= peer::SHARE_STATE_SINCE;
                         self.send_watch_limits();
                         if version != invite::VERSION {
                             log!(
@@ -2315,6 +2316,7 @@ impl Client {
                     | Message::VideoLoss { .. }
                     | Message::ShareFacts(_)
                     | Message::ShareLimits { .. }
+                    | Message::ShareState { .. }
                     | Message::SharerClock { .. }
                     | Message::Shape(_)),
                 ) => self.on_share_message(message, now),

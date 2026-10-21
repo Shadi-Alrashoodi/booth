@@ -41,6 +41,14 @@ pub(crate) const LIMITS_SINCE: invite::Version = invite::Version {
     patch: 0,
 };
 
+// A share's state (control::Message::ShareState) goes only to a peer whose
+// Hello says SHARE_STATE_SINCE or later, for the same reason.
+pub(crate) const SHARE_STATE_SINCE: invite::Version = invite::Version {
+    major: 1,
+    minor: 3,
+    patch: 0,
+};
+
 // Feedback waiting on its stream, in flight or queued, past which new
 // feedback is held and merged until it drains: recover requests into one
 // span, and the newest IDR ask and loss report. A request that waits behind
@@ -362,6 +370,8 @@ pub(crate) struct Link {
     pub feedback_read: bool,
     // The other side reads watch and share limits (LIMITS_SINCE).
     pub limits_read: bool,
+    // And a share's state (SHARE_STATE_SINCE).
+    pub state_read: bool,
     held: Held,
     pub stats: LinkStats,
     pub offset: OffsetEstimator,
@@ -433,6 +443,7 @@ impl Link {
             feedback: Reliable::new(),
             feedback_read: false,
             limits_read: false,
+            state_read: false,
             held: Held::default(),
             stats: LinkStats::new(),
             offset: OffsetEstimator::new(),

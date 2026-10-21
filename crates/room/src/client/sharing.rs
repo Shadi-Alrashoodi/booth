@@ -264,6 +264,19 @@ impl Client {
                 }
                 self.problem_line(String::from(screen::paused_sentence(paused)));
             }
+            // For the watchers, through a host whose copy reads it
+            // (peer::SHARE_STATE_SINCE); none from a room standing for an
+            // older copy.
+            ShareNews::State { share, state } => {
+                if ours(share)
+                    && self.link.state_read
+                    && self.version >= crate::peer::SHARE_STATE_SINCE
+                {
+                    self.link.queue(&Message::ShareState { share, state });
+                    self.flush(now, socket);
+                }
+                return false;
+            }
         }
         true
     }
@@ -421,6 +434,12 @@ impl Client {
                 limits: None,
             } if self.screen.watched == Some(share) => {
                 self.sharer_unread = Some(share);
+            }
+            // One for a share no longer watched was on its way.
+            Message::ShareState { share, state } => {
+                if self.screen.watched == Some(share) {
+                    self.screen.watching.set_share_state(state);
+                }
             }
             Message::SharerClock {
                 share,
@@ -649,6 +668,7 @@ impl Client {
             control: self.control_view(),
             cap: self.screen.watching.cap(),
             cap_unheard: self.cap_unheard(),
+            watched_state: self.screen.watching.share_state(),
         }
     }
 

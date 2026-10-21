@@ -51,7 +51,9 @@ use crate::peer::{Clock, MEDIA_FLOWS_FOR};
 use crate::remote::{Area, Controls, Gate, Injector, Remote};
 use crate::socket::Socket;
 use crate::talk::{Cue, HOST_SLOT, OnLink, Outlet};
-use crate::view::{Numbers, Paused, RunningShare, SharingNumbers, WatchCap, WatchingNumbers};
+use crate::view::{
+    Numbers, Paused, RunningShare, ShareState, SharingNumbers, WatchCap, WatchingNumbers,
+};
 
 pub(crate) use sharer::start as start_sharer;
 pub(crate) use viewer::{control_for, link_numbers, start as start_viewer};
@@ -359,6 +361,8 @@ pub(crate) enum ShareNews {
     // that the panel shows.
     Software { share: u32, sentence: &'static str },
     Paused { share: u32, paused: Paused },
+    // Live, paused by hand or away, whenever that changes, for the watchers.
+    State { share: u32, state: ShareState },
 }
 
 impl Sharing {
@@ -945,6 +949,9 @@ pub struct Watching {
     // sets hevc_changed as well, and so does a new cap.
     four_k: AtomicBool,
     cap: Mutex<WatchCap>,
+    // The share watched, as its sharer last said; Live for an older one,
+    // and again with each Watch.
+    share_state: Mutex<ShareState>,
     // Whether this PC controls the share watched, as the viewer was last
     // told, and a new viewer is told at its start.
     control: Mutex<Option<share::Control>>,
@@ -1029,6 +1036,7 @@ impl Watching {
             hevc_changed: AtomicBool::new(false),
             four_k: AtomicBool::new(false),
             cap: Mutex::default(),
+            share_state: Mutex::default(),
             control: Mutex::default(),
         })
     }
@@ -1080,6 +1088,16 @@ impl Watching {
     pub(crate) fn set_cap(&self, cap: WatchCap) {
         if std::mem::replace(&mut *lock(&self.cap), cap) != cap {
             self.hevc_changed.store(true, Ordering::Release);
+            self.freshened();
+        }
+    }
+
+    pub(crate) fn share_state(&self) -> ShareState {
+        *lock(&self.share_state)
+    }
+
+    pub(crate) fn set_share_state(&self, state: ShareState) {
+        if std::mem::replace(&mut *lock(&self.share_state), state) != state {
             self.freshened();
         }
     }

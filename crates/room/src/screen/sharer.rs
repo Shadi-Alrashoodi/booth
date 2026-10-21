@@ -27,7 +27,7 @@ use super::{Answer, Outbox, OwnShare, SOFTWARE_ENCODER, ShareFacts, ShareNews, S
 use crate::config::VideoSource;
 use crate::log::{Log, log};
 use crate::remote::Area;
-use crate::view::{Latency, Level, Paused, RunningShare, SharingNumbers, SteppedDown};
+use crate::view::{Latency, Level, Paused, RunningShare, ShareState, SharingNumbers, SteppedDown};
 
 // Seconds of IDR and invalidation counts the stats panel adds up.
 const MINUTE: usize = 60;
@@ -202,6 +202,7 @@ fn share(
     let mut seconds = 0u64;
     let mut lost_here_before = 0u64;
     let mut rest = Rest::new(log, number);
+    let mut told_state = ShareState::Live;
     loop {
         if sharing.closing() {
             break;
@@ -308,6 +309,22 @@ fn share(
                 software = Some(why.sentence());
                 on_software(sharing, number, &sharer, why.sentence());
             }
+        }
+
+        // The watchers hear why no frames come, from the frame it changed on.
+        let state = if sharer.held() {
+            ShareState::Paused
+        } else if sharer.paused() {
+            ShareState::Away
+        } else {
+            ShareState::Live
+        };
+        if state != told_state {
+            told_state = state;
+            sharing.tell(ShareNews::State {
+                share: number,
+                state,
+            });
         }
 
         let now = Instant::now();

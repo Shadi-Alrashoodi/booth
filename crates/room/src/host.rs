@@ -3012,6 +3012,7 @@ impl Host {
                     self.peers[i].hello = true;
                     self.peers[i].link.feedback_read = version >= peer::FEEDBACK_SINCE;
                     self.peers[i].link.limits_read = version >= peer::LIMITS_SINCE;
+                    self.peers[i].link.state_read = version >= peer::SHARE_STATE_SINCE;
                     let peer = &self.peers[i];
                     if first
                         && version != invite::VERSION
@@ -3085,6 +3086,7 @@ impl Host {
                     | Message::ShareStop
                     | Message::Watch { .. }
                     | Message::WatchLimits { .. }
+                    | Message::ShareState { .. }
                     | Message::Recover { .. }
                     | Message::Idr { .. }
                     | Message::VideoLoss { .. }
@@ -6637,6 +6639,75 @@ mod tests {
         }
     }
 
+    fn states(guest: &mut Guest, share: u32, at: Instant) -> Vec<crate::view::ShareState> {
+        guest.read(at);
+        messages(&mut guest.reliable)
+            .into_iter()
+            .filter_map(|message| match message {
+                Message::ShareState { share: of, state } if of == share => Some(state),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // A share's state goes from its sharer to each watcher whose Hello says
+    // SHARE_STATE_SINCE or later, never to an older one, and to a new
+    // watcher of a paused share at once; a room standing for an older copy
+    // passes none on, and one from someone who does not share is bad.
+    #[test]
+    fn share_state_goes_only_to_watchers_that_read_it() {
+        use crate::view::ShareState::{Live, Paused};
+        let older = Version {
+            major: 1,
+            minor: 2,
+            patch: 0,
+        };
+        for host in [older, peer::SHARE_STATE_SINCE] {
+            let passes = host >= peer::SHARE_STATE_SINCE;
+            let start = Instant::now();
+            let mut rig = Rig::new(start);
+            rig.host.version = host;
+            let mut ana = Guest::new();
+            ana.join_as(&mut rig, "Ana", peer::SHARE_STATE_SINCE, None, start);
+            let mut bo = Guest::new();
+            bo.join_as(&mut rig, "Bo", older, None, start);
+            let mut cy = Guest::new();
+            cy.join_as(&mut rig, "Cy", peer::SHARE_STATE_SINCE, None, start);
+            let share = granted(&mut rig, &mut ana, start);
+            let watch = Message::Watch {
+                share,
+                on: true,
+                hevc: true,
+            };
+            bo.say(&mut rig, &watch, start);
+            cy.say(&mut rig, &watch, start);
+            let paused = Message::ShareState {
+                share,
+                state: Paused,
+            };
+            ana.say(&mut rig, &paused, start);
+            assert!(states(&mut bo, share, start).is_empty(), "{host}");
+            let told = states(&mut cy, share, start);
+            assert_eq!(told, if passes { vec![Paused] } else { vec![] }, "{host}");
+            // Said again, it is no news.
+            ana.say(&mut rig, &paused, start);
+            assert!(states(&mut cy, share, start).is_empty(), "{host}");
+            let mut dan = Guest::new();
+            dan.join_as(&mut rig, "Dan", peer::SHARE_STATE_SINCE, None, start);
+            dan.say(&mut rig, &watch, start);
+            let told = states(&mut dan, share, start);
+            assert_eq!(told, if passes { vec![Paused] } else { vec![] }, "{host}");
+            ana.say(&mut rig, &Message::ShareState { share, state: Live }, start);
+            for guest in [&mut cy, &mut dan] {
+                let told = states(guest, share, start);
+                assert_eq!(told, if passes { vec![Live] } else { vec![] }, "{host}");
+            }
+            assert_eq!(rig.host.drops.bad, 0, "{host}");
+            cy.say(&mut rig, &paused, start);
+            assert_eq!(rig.host.drops.bad, 1, "{host}");
+            assert!(states(&mut dan, share, start).is_empty(), "{host}");
+        }
+    }
     // A watcher picking caps as fast as it can: the sharer is told at most
     // LIMITS_PER_GAP changes in a SWITCH_GAP, a new watcher's first two at
     // once, and the last pick still reaches it once the gap allows, past any
