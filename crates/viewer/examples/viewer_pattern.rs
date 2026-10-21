@@ -6,9 +6,10 @@
 // word there means Windows has not said. Once a second it prints what the
 // viewer measured, with "not known" for no word. --fullscreen starts it
 // fullscreen, as room's share_numbers does to give a desktop share the
-// whole monitor moving.
+// whole monitor moving. --left-out leaves the window out of screen captures,
+// as Booth's own viewers are, to see that the path stays the same.
 //
-//   cargo run --release -p viewer --example viewer_pattern -- [--vsync] [--fps N] [--fullscreen]
+//   cargo run --release -p viewer --example viewer_pattern -- [--vsync] [--fps N] [--fullscreen] [--left-out]
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -27,6 +28,7 @@ struct Args {
     vsync: bool,
     fps: u32,
     fullscreen: bool,
+    left_out: bool,
 }
 
 fn parse() -> Result<Args, String> {
@@ -34,12 +36,14 @@ fn parse() -> Result<Args, String> {
         vsync: false,
         fps: 120,
         fullscreen: false,
+        left_out: false,
     };
     let mut words = std::env::args().skip(1);
     while let Some(word) = words.next() {
         match word.as_str() {
             "--vsync" => args.vsync = true,
             "--fullscreen" => args.fullscreen = true,
+            "--left-out" => args.left_out = true,
             "--fps" => {
                 let fps = words.next().ok_or("--fps needs a number")?;
                 args.fps = fps
@@ -50,7 +54,7 @@ fn parse() -> Result<Args, String> {
             }
             other => {
                 return Err(format!(
-                    "{other} is not an option; try --vsync, --fps N or --fullscreen"
+                    "{other} is not an option; try --vsync, --fps N, --fullscreen or --left-out"
                 ));
             }
         }
@@ -100,7 +104,11 @@ fn word(path: Option<PresentPath>) -> &'static str {
 fn run(args: &Args) -> Result<(), String> {
     let mut options = Options::new("Booth viewer pattern", WIDTH, HEIGHT);
     options.vsync = args.vsync;
+    viewer::leave_out_of_captures(args.left_out);
     let mut viewer = Viewer::open(&options).map_err(|err| err.to_string())?;
+    if let Some(note) = viewer.capture_note() {
+        println!("{note}");
+    }
     if args.fullscreen {
         viewer.set_fullscreen(true);
     }

@@ -38,14 +38,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostQuitMessage, RegisterClassExW, SC_KEYMENU, SIZE_MINIMIZED, SM_CXICON, SM_CXSMICON,
     SPI_GETCLIENTAREAANIMATION, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetCursor, SetWindowLongPtrW,
-    SetWindowPlacement, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage,
-    WA_INACTIVE, WINDOW_EX_STYLE, WINDOW_STYLE, WINDOWPLACEMENT, WM_ACTIVATE, WM_ACTIVATEAPP,
-    WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
-    WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_WINDOWPOSCHANGED, WM_XBUTTONDOWN,
-    WM_XBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetCursor, SetWindowDisplayAffinity,
+    SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, ShowWindow, SystemParametersInfoW,
+    TranslateMessage, WA_INACTIVE, WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WINDOWPLACEMENT, WM_ACTIVATE, WM_ACTIVATEAPP, WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND,
+    WM_WINDOWPOSCHANGED, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 use windows::core::{BOOL, HSTRING, PCWSTR, w};
 
@@ -128,6 +129,8 @@ pub(crate) struct Shared {
     opened: Instant,
     moved: AtomicU64,
     strip_hidden: AtomicBool,
+    // Set once, when Windows would not leave the window out of captures.
+    capture_note: OnceLock<String>,
     wake: Option<Wake>,
     // Remote control (control.rs). `out` is where the controller's input
     // goes, fixed at open. The present thread sets the mode; the window
@@ -165,6 +168,7 @@ impl Shared {
             opened: Instant::now(),
             moved: AtomicU64::new(NEVER),
             strip_hidden: AtomicBool::new(false),
+            capture_note: OnceLock::new(),
             wake,
             out,
             mode: AtomicU8::new(NO_MODE),
@@ -174,6 +178,10 @@ impl Shared {
             local_moved: AtomicBool::new(false),
             has_shape: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn capture_note(&self) -> Option<&str> {
+        self.capture_note.get().map(String::as_str)
     }
 
     pub(crate) fn mode(&self) -> Option<MouseMode> {
@@ -735,6 +743,15 @@ fn create(
     // SAFETY: a live window.
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
     show_icons(hwnd, dpi);
+    // Before it is ever shown, so no capture has a picture of it.
+    if crate::left_out_of_captures() {
+        // SAFETY: a live top-level window of this process.
+        if let Err(err) = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } {
+            let _ = shared.capture_note.set(format!(
+                "Windows would not leave the viewer window out of screen captures: {err}"
+            ));
+        }
+    }
     shared.dpi.store(dpi, Ordering::Release);
     record_size(hwnd, shared);
     // SAFETY: a live window. The answer is whether it was visible before.

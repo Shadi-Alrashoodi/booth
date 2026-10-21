@@ -81,6 +81,7 @@ fn main() -> ExitCode {
         win::error_box(&problem);
         return ExitCode::FAILURE;
     }
+    viewer::leave_out_of_captures(winver::leaves_out_of_captures());
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     #[cfg(feature = "memstats")]
     let args = memstats::take_flags(args);

@@ -47,6 +47,14 @@ pub fn cancels_echo() -> bool {
     *CAN.get_or_init(|| this_pc().is_some_and(|version| version.build >= ECHO_CANCELLATION_BUILD))
 }
 
+// Windows 10 2004, the first that can leave a window out of screen
+// captures rather than show it black in them.
+const LEAVE_OUT_BUILD: u32 = 19041;
+
+pub fn leaves_out_of_captures() -> bool {
+    this_pc().is_some_and(|version| version.build >= LEAVE_OUT_BUILD)
+}
+
 // None if Windows would not say, and then Booth goes on and finds out.
 pub fn this_pc() -> Option<WindowsVersion> {
     real(shared_page(), reported())

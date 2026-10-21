@@ -70,6 +70,21 @@ pub fn hide_strip_in_fullscreen(on: bool) {
     HIDE_STRIP.store(on, Ordering::Relaxed);
 }
 
+// Viewers opened while this is on are left out of screen captures, so a
+// viewer on a monitor that is being shared never shows the share inside
+// itself. The app turns it on where Windows can, from build 19041; before
+// it the same call shows the window black in captures instead. Off for the
+// tests and the benchmark, whose captures want the window.
+static LEFT_OUT: AtomicBool = AtomicBool::new(false);
+
+pub fn leave_out_of_captures(on: bool) {
+    LEFT_OUT.store(on, Ordering::Relaxed);
+}
+
+pub(crate) fn left_out_of_captures() -> bool {
+    LEFT_OUT.load(Ordering::Relaxed)
+}
+
 #[derive(Clone)]
 pub struct Options {
     pub title: String,
@@ -244,6 +259,12 @@ impl Viewer {
 
     pub fn window(&self) -> HWND {
         self.window.hwnd()
+    }
+
+    // Why Windows shows this window in screen captures after all, while
+    // viewers are left out of them.
+    pub fn capture_note(&self) -> Option<&str> {
+        self.window.shared().capture_note()
     }
 
     // The swap chain's buffers, which follow the client area at each present.
@@ -595,7 +616,9 @@ mod tests {
 
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::Graphics::Dxgi::DXGI_FRAME_PRESENTATION_MODE_OVERLAY;
-    use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_DISPLAYCHANGE};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowDisplayAffinity, SendMessageW, WDA_EXCLUDEFROMCAPTURE, WM_DISPLAYCHANGE,
+    };
 
     use super::*;
 
@@ -620,6 +643,37 @@ mod tests {
             }
             Err(err) => panic!("{err}"),
         }
+    }
+
+    // A viewer opened while viewers are left out of captures is left out,
+    // and one opened after that is turned off again is not.
+    #[test]
+    fn a_viewer_can_be_left_out_of_captures() {
+        let _screen = one_at_a_time();
+        leave_out_of_captures(true);
+        let left_out = hidden("Booth viewer capture test");
+        leave_out_of_captures(false);
+        let Some(left_out) = left_out else {
+            return;
+        };
+        let affinity = |viewer: &Viewer| {
+            let mut affinity = 0;
+            // SAFETY: a live window of this process and a live out parameter.
+            unsafe { GetWindowDisplayAffinity(viewer.window(), &mut affinity) }
+                .unwrap_or_else(|err| panic!("{err}"));
+            affinity
+        };
+        assert_eq!(
+            affinity(&left_out),
+            WDA_EXCLUDEFROMCAPTURE.0,
+            "{:?}",
+            left_out.capture_note()
+        );
+        drop(left_out);
+        let Some(shown) = hidden("Booth viewer capture test") else {
+            return;
+        };
+        assert_eq!(affinity(&shown), 0);
     }
 
     // What the window's thread records reaches the present path word: new

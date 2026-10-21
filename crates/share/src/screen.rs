@@ -426,6 +426,9 @@ impl Screen {
             control: out.clone(),
         })
         .map_err(|err| err.to_string())?;
+        if let Some(note) = viewer.capture_note() {
+            say(Line::Log(note.to_string()));
+        }
         let decoder = Decoder::new(viewer.device(), Codec::H264).map_err(|err| err.to_string())?;
         let largest = capture::Options::default();
         let hevc = if watch.hevc {
