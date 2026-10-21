@@ -176,6 +176,77 @@ fn the_watchers_limit_sizes_the_share() {
     }
 }
 
+// A 4K limit for a share 1440 high keeps its source and encoder, so nobody
+// watching gets an IDR for it, and so does going back to the 1440 box; a
+// cap that changes the picture still opens them again.
+#[test]
+fn a_4k_limit_keeps_a_1440p_share_as_it_is() {
+    let Some((_turn, adapter)) = gpu() else {
+        return;
+    };
+    if adapter.vendor_id != NVIDIA {
+        println!("skipped: no NVIDIA GPU, so no NVENC to share 4K in HEVC with");
+        return;
+    }
+    let setup = Setup {
+        choice: Choice::Pattern {
+            adapter,
+            width: 2560,
+            height: 1440,
+            busy: false,
+        },
+        fps: 120,
+        settings: Settings::default(),
+        encoder: None,
+        codec: Some(Codec::Hevc),
+        takes_hevc: true,
+        payload: PAYLOAD_LAN,
+        spread: false,
+        clock: Clock::starting(Instant::now()),
+        keep_times: false,
+    };
+    let mut said = Vec::new();
+    let mut sharer = Sharer::open(setup, |_: &[u8]| {}, &mut |line| said.push(line))
+        .unwrap_or_else(|err| panic!("{err}"));
+    let mut watching = Watching::default();
+    let send = |sharer: &mut Sharer, watching: &mut Watching| {
+        for _ in 0..5 {
+            sharer.next(watching).unwrap_or_else(|err| panic!("{err}"));
+        }
+    };
+    send(&mut sharer, &mut watching);
+    let four_k = capture::Options {
+        max_width: 4096,
+        max_height: 2160,
+        max_fps: 120,
+    };
+    for limit in [four_k, capture::Options::default()] {
+        let reopened = sharer
+            .set_limit(limit, &mut |line| said.push(line))
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert!(!reopened, "{limit:?}: {said:?}");
+        assert_eq!(sharer.size(), (2560, 1440));
+        send(&mut sharer, &mut watching);
+    }
+    let idrs: Vec<u32> = watching
+        .sent
+        .iter()
+        .filter(|sent| sent.idr)
+        .map(|sent| sent.number)
+        .collect();
+    assert_eq!(idrs, [0], "{:?}", watching.lines);
+    let capped = capture::Options {
+        max_width: 1920,
+        max_height: 1080,
+        max_fps: 60,
+    };
+    let reopened = sharer
+        .set_limit(capped, &mut |line| said.push(line))
+        .unwrap_or_else(|err| panic!("{err}"));
+    assert!(reopened, "{said:?}");
+    assert_eq!((sharer.size(), sharer.fps()), ((1920, 1080), 60));
+}
+
 // A 4K limit that comes while the share is in H.264 waits there at 1440p.
 // When every viewer takes HEVC again, the change of codec brings the share
 // to 4K, not only a new encoder at the old size, and frames go on.

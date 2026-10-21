@@ -579,15 +579,17 @@ impl Sharer {
         )
     }
 
-    // True when the source opened again, which it does only for options
-    // other than the ones it has: on the software encoder a step or a new
-    // rate can come to what it runs at already.
+    // True when the source opened again, which it does only for a picture
+    // or a rate other than the one it has: on the software encoder a step or
+    // a new rate can come to what it runs at already, and a 4K box changes
+    // nothing for a monitor 1440 high but the next mode change.
     fn reopen(
         &mut self,
         options: capture::Options,
         say: &mut dyn FnMut(Line),
     ) -> Result<bool, String> {
-        if options == self.options && self.opened.is_some() {
+        if self.keeps(options) {
+            self.take_options(options);
             return Ok(false);
         }
         // Windows allows one duplication of a monitor per process, so the
@@ -616,6 +618,23 @@ impl Sharer {
         self.opened = Some(opened);
         self.encoder_bitrate = self.setup.settings.bitrate;
         Ok(true)
+    }
+
+    // Whether the source in use gives the same picture at the same rate
+    // under `options`.
+    fn keeps(&self, options: capture::Options) -> bool {
+        self.opened
+            .as_ref()
+            .is_some_and(|opened| same_picture(opened.source.plan(), self.options.max_fps, options))
+    }
+
+    // `options` for the source in use, which keeps its picture under them.
+    fn take_options(&mut self, options: capture::Options) {
+        if let Some(opened) = &mut self.opened {
+            opened.source.set_limits(options);
+            opened.options = options;
+        }
+        self.options = options;
     }
 
     // The encoder a new one is asked of: the one the share was set up for,
@@ -870,11 +889,13 @@ impl Sharer {
         self.switches.changed(now);
         let was = self.encoder_name().to_string();
         // A watchers' limit past capture's default counts only in HEVC, so
-        // under one the change of codec is also a change of size: the source
-        // opens again for it, and takes the codec from takes_hevc.
+        // under one the change of codec can also be a change of size: the
+        // source then opens again for it, and takes the codec from
+        // takes_hevc.
         let options = self.source_options_in(Some(codec), self.setup.fps);
-        let changed = if options == self.options {
+        let changed = if self.keeps(options) {
             self.switch(codec, kind)
+                .map(|()| self.take_options(options))
         } else {
             self.reopen(options, &mut |line| audience.line(line))
                 .map(|_| ())
@@ -1355,6 +1376,19 @@ fn options_for(
     }
 }
 
+// Whether capture asked for `options` makes the picture `plan` describes
+// at the rate `fps`, from the same source.
+fn same_picture(plan: capture::Plan, fps: u32, options: capture::Options) -> bool {
+    let fitted = capture::Plan::new(
+        plan.source_width,
+        plan.source_height,
+        plan.rotation,
+        options.max_width,
+        options.max_height,
+    );
+    options.max_fps == fps && fitted == plan
+}
+
 // A limit with its box brought down to capture's default, which is all
 // H.264 is sent at.
 fn within_default(limit: capture::Options) -> capture::Options {
@@ -1401,6 +1435,49 @@ mod tests {
         assert_eq!(within_default(four_k), options(4096, 1440, 120));
         assert_eq!(within_default(capped), capped);
         assert_eq!(within_default(default), default);
+    }
+
+    // A 4K box leaves a 1440p monitor's picture as it is and brings a 4K
+    // one to its own size; a new rate or a smaller box is a new picture.
+    #[test]
+    fn a_new_box_is_a_new_picture_only_when_the_picture_changes() {
+        let default = capture::Options::default();
+        let four_k = capture::Options {
+            max_width: 4096,
+            max_height: 2160,
+            max_fps: 120,
+        };
+        let plan = |width, height, rotation| {
+            capture::Plan::new(
+                width,
+                height,
+                rotation,
+                default.max_width,
+                default.max_height,
+            )
+        };
+        let monitor_1440 = plan(2560, 1440, capture::Rotation::Identity);
+        assert!(same_picture(monitor_1440, 120, default));
+        assert!(same_picture(monitor_1440, 120, four_k));
+        assert!(!same_picture(monitor_1440, 60, four_k));
+        assert!(!same_picture(
+            monitor_1440,
+            120,
+            capture::Options {
+                max_width: 1920,
+                max_height: 1080,
+                max_fps: 120,
+            }
+        ));
+        let monitor_4k = plan(3840, 2160, capture::Rotation::Identity);
+        assert_eq!((monitor_4k.width, monitor_4k.height), (2560, 1440));
+        assert!(same_picture(monitor_4k, 120, default));
+        assert!(!same_picture(monitor_4k, 120, four_k));
+        // Turned on its side, 1440 wide and 2560 high, it is scaled down
+        // in either box.
+        let portrait = plan(2560, 1440, capture::Rotation::Rotate90);
+        assert_eq!((portrait.width, portrait.height), (810, 1440));
+        assert!(!same_picture(portrait, 120, four_k));
     }
 
     // A viewer without HEVC comes and goes: H.264 at once, HEVC a gap after

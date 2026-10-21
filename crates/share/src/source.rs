@@ -165,13 +165,24 @@ impl Source {
         })
     }
 
-    pub(crate) fn size(&self) -> (u32, u32) {
-        let plan = match self {
+    pub(crate) fn plan(&self) -> capture::Plan {
+        match self {
             Source::Screen(capture) => capture.plan(),
             Source::Pattern(pattern) => pattern.plan(),
             Source::Busy(busy) => busy.pattern.plan(),
-        };
+        }
+    }
+
+    pub(crate) fn size(&self) -> (u32, u32) {
+        let plan = self.plan();
         (plan.width, plan.height)
+    }
+
+    // A pattern's picture keeps its size, so only a screen needs them.
+    pub(crate) fn set_limits(&mut self, options: capture::Options) {
+        if let Source::Screen(capture) = self {
+            capture.set_limits(options.max_width, options.max_height);
+        }
     }
 
     pub(crate) fn next(&mut self) -> Result<Next, String> {

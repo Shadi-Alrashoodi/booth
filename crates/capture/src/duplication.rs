@@ -206,6 +206,12 @@ impl Capture {
         self.layout.plan
     }
 
+    // From the next picture on, and for every mode change after it.
+    pub fn set_limits(&mut self, max_width: u32, max_height: u32) {
+        self.options.max_width = max_width;
+        self.options.max_height = max_height;
+    }
+
     pub fn compile_time(&self) -> Duration {
         self.converter.compile_time()
     }
