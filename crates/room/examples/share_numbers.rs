@@ -25,7 +25,10 @@
 //
 // With no words it runs every clean case, then the hard links at 1440p and
 // 120 fps on the pattern and on the desktop. pattern or desktop keeps to one
-// source, clean or links to one half.
+// source, clean or links to one half. region shares regions of the desktop
+// instead, in the middle of the primary monitor: 1920x1080 and 2560x1440 at
+// their own size, and all of the monitor as a region, which set beside the
+// desktop case is what the crop itself costs; its links at 2560x1440.
 
 #[path = "../tests/common/mod.rs"]
 mod common;
@@ -53,6 +56,8 @@ const LOOK: Duration = Duration::from_millis(50);
 enum Source {
     Pattern(u32, u32),
     Desktop,
+    // A region of the desktop this size, or all of it as a region.
+    Region(Option<(u32, u32)>),
 }
 
 impl Source {
@@ -60,6 +65,8 @@ impl Source {
         match self {
             Source::Pattern(width, height) => format!("pattern {width}x{height}"),
             Source::Desktop => String::from("desktop"),
+            Source::Region(Some((width, height))) => format!("desktop region {width}x{height}"),
+            Source::Region(None) => String::from("desktop region of all of it"),
         }
     }
 }
@@ -112,6 +119,14 @@ fn cases(sources: &[&str], halves: &[&str]) -> Vec<Case> {
     if wants(sources, "desktop") {
         all.push(Source::Desktop);
     }
+    // Only when asked for: they stand beside the desktop's own numbers.
+    if sources.contains(&"region") {
+        all.extend([
+            Source::Region(Some((1920, 1080))),
+            Source::Region(Some((2560, 1440))),
+            Source::Region(None),
+        ]);
+    }
     if wants(halves, "clean") {
         for &source in &all {
             for fps in [60, 120] {
@@ -126,10 +141,12 @@ fn cases(sources: &[&str], halves: &[&str]) -> Vec<Case> {
         }
     }
     if wants(halves, "links") {
-        for source in all
-            .into_iter()
-            .filter(|&s| matches!(s, Source::Pattern(_, 1440) | Source::Desktop))
-        {
+        for source in all.into_iter().filter(|&s| {
+            matches!(
+                s,
+                Source::Pattern(_, 1440) | Source::Desktop | Source::Region(Some((_, 1440)))
+            )
+        }) {
             for (link, shape, secs) in links() {
                 picked.push(Case {
                     source,
@@ -167,6 +184,24 @@ fn drawing() -> Result<Child, String> {
         })
 }
 
+// The primary monitor, and the region of it in its middle, or all of it.
+fn middle(size: Option<(u32, u32)>) -> (share::MonitorId, share::Region) {
+    let monitors = share::monitors().expect("the monitors");
+    let monitor = monitors
+        .iter()
+        .find(|monitor| monitor.primary)
+        .or(monitors.first())
+        .expect("a monitor");
+    let (width, height) = size.unwrap_or((monitor.width, monitor.height));
+    let region = share::Region {
+        left: monitor.width.saturating_sub(width) / 2,
+        top: monitor.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    (monitor.id.clone(), region)
+}
+
 struct Pair {
     // Field order is drop order: the friend leaves before the host.
     friend: Member,
@@ -182,7 +217,7 @@ fn open(source: Source, fps: u8) -> Pair {
                 height,
                 busy: false,
             },
-            Source::Desktop => VideoSource::Screen,
+            Source::Desktop | Source::Region(_) => VideoSource::Screen,
         },
         show,
         ..VideoConfig::default()
@@ -196,7 +231,7 @@ fn open(source: Source, fps: u8) -> Pair {
     let mut friend_config = config("Ana", timers);
     friend_config.video = video(match source {
         Source::Pattern(..) => Show::NoActivate,
-        Source::Desktop => Show::Hidden,
+        Source::Desktop | Source::Region(_) => Show::Hidden,
     });
     let friend = Member::join_with(
         friend_config,
@@ -206,7 +241,13 @@ fn open(source: Source, fps: u8) -> Pair {
     friend.wait_for(WAIT, "the friend in the room", |v| {
         v.strip.state == LinkState::Live
     });
-    host.room().share(fps, None);
+    match source {
+        Source::Region(size) => {
+            let (monitor, region) = middle(size);
+            host.room().share_region(fps, monitor, region);
+        }
+        _ => host.room().share(fps, None),
+    }
     let share = own_share(&host.wait_for(WAIT, "the share running", |v| {
         own_share(v).is_some() && v.share.running.is_some()
     }))
@@ -316,7 +357,8 @@ fn print_case(case: &Case, seconds: &[Second], until: Instant) {
 fn run(case: &Case) {
     let what = format!("{} at {} fps", case.source.name(), case.fps);
     let mut pattern = None;
-    if case.source == Source::Desktop {
+    let desktop = matches!(case.source, Source::Desktop | Source::Region(_));
+    if desktop {
         match drawing() {
             Ok(child) => pattern = Some(child),
             Err(err) => {
@@ -343,11 +385,7 @@ fn run(case: &Case) {
                 Some(PresentPath::Composed) => "composed",
                 None => "not known",
             },
-            if case.source == Source::Desktop {
-                " to a hidden viewer"
-            } else {
-                ""
-            },
+            if desktop { " to a hidden viewer" } else { "" },
         );
     }
     pair.link.shape(case.shape, case.shape);
@@ -375,10 +413,10 @@ fn main() -> ExitCode {
     let mut halves = Vec::new();
     for word in &words {
         match word.as_str() {
-            "pattern" | "desktop" => sources.push(word.as_str()),
+            "pattern" | "desktop" | "region" => sources.push(word.as_str()),
             "clean" | "links" => halves.push(word.as_str()),
             _ => {
-                eprintln!("{word:?} is none of pattern, desktop, clean or links");
+                eprintln!("{word:?} is none of pattern, desktop, region, clean or links");
                 return ExitCode::from(2);
             }
         }
