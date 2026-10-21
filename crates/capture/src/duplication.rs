@@ -35,7 +35,7 @@ use crate::{CursorKind, CursorShape, CursorUpdate, Frame, Next, Options, PauseRe
 // it tries to get the desktop back while paused; a monitor that left the
 // desktop is looked for only once a second (missing.rs). Either is how long
 // a share thread may take to notice it was told to stop.
-const IDLE_WAIT: Duration = Duration::from_millis(100);
+pub(crate) const IDLE_WAIT: Duration = Duration::from_millis(100);
 const RETRY: Duration = Duration::from_millis(100);
 
 // DuplicateOutput1 works only for a process that is per-monitor DPI aware
@@ -735,7 +735,7 @@ impl Capture {
     }
 }
 
-fn qpc() -> i64 {
+pub(crate) fn qpc() -> i64 {
     let mut counter = 0;
     // SAFETY: fills one live i64; it cannot fail on Windows XP and later.
     let _ = unsafe { QueryPerformanceCounter(&mut counter) };
@@ -747,7 +747,7 @@ fn qpc() -> i64 {
 // over as its age when the frame was acquired. The counter is read just
 // after `acquired`, so a thread switch between the two reads can only make
 // the age look longer, never put the present time after `acquired`.
-fn present_instant(
+pub(crate) fn present_instant(
     acquired: Instant,
     acquired_qpc: i64,
     present_qpc: i64,

@@ -182,6 +182,8 @@ pub enum Paused {
     // The shared monitor is off or unplugged; the share stops if it is not
     // back within about 30 s.
     Missing,
+    // The shared window is minimized.
+    Minimized,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

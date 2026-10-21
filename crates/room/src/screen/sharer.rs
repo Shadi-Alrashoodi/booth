@@ -875,6 +875,7 @@ impl Audience for Watchers<'_> {
             PauseReason::Disconnected => Paused::Disconnected,
             PauseReason::Changing(_) => Paused::Changing,
             PauseReason::Missing => Paused::Missing,
+            PauseReason::Minimized => Paused::Minimized,
         };
         self.sharing.tell(ShareNews::Paused {
             share: self.number,

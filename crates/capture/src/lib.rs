@@ -12,6 +12,7 @@ mod monitors;
 mod pattern;
 pub mod reference;
 mod timer;
+mod window;
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -25,6 +26,7 @@ pub use error::{CaptureError, ErrorKind};
 pub use monitors::{Adapter, Monitor, MonitorId, Rotation, adapters, monitors};
 pub use pattern::{Pattern, pattern_image, read_frame_number};
 pub use reference::Nv12Image;
+pub use window::WindowCapture;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
@@ -146,6 +148,8 @@ pub enum PauseReason {
     // The monitor is not on the desktop: turned off, asleep with the PC, or
     // unplugged. Sharing stops if it is not back within about 30 s.
     Missing,
+    // The shared window is minimized; it goes on when it is restored.
+    Minimized,
 }
 
 impl fmt::Display for PauseReason {
@@ -161,6 +165,9 @@ impl fmt::Display for PauseReason {
                 "this Windows session is disconnected. Sharing goes on when it is back",
             ),
             PauseReason::Changing(what) => write!(f, "{what}. Sharing goes on when Windows lets go"),
+            PauseReason::Minimized => f.write_str(
+                "the shared window is minimized. Sharing goes on when it is restored",
+            ),
             PauseReason::Missing => write!(
                 f,
                 "the monitor left the desktop: it was turned off, went to sleep or was unplugged. Sharing goes on if it is back within {} s",
