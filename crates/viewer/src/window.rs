@@ -31,13 +31,15 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_F11};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, GWL_EXSTYLE,
-    GWL_STYLE, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowPlacement,
-    HICON, HTCLIENT, HWND_TOP, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_HAND, IMAGE_ICON,
-    IsWindowVisible, LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MINMAXINFO, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SC_KEYMENU, SIZE_MINIMIZED, SM_CXICON, SM_CXSMICON,
-    SPI_GETCLIENTAREAANIMATION, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+    AppendMenuW, CheckMenuItem, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow,
+    DispatchMessageW, GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetCursorPos, GetMessageW,
+    GetSystemMenu, GetWindowLongPtrW, GetWindowPlacement, HICON, HTCLIENT, HWND_NOTOPMOST,
+    HWND_TOP, HWND_TOPMOST, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_HAND, IMAGE_ICON, IsIconic,
+    IsWindowVisible, IsZoomed, LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MF_BYCOMMAND, MF_CHECKED,
+    MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MINMAXINFO, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SC_KEYMENU, SIZE_MINIMIZED, SM_CXICON, SM_CXSMICON,
+    SPI_GETCLIENTAREAANIMATION, SW_HIDE, SW_RESTORE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetCursor, SetWindowDisplayAffinity,
     SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, ShowWindow, SystemParametersInfoW,
     TranslateMessage, WA_INACTIVE, WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE, WINDOW_STYLE,
@@ -68,6 +70,12 @@ const WM_CONTROL: u32 = WM_APP + 3;
 const WM_PRETEND_FRONT: u32 = WM_APP + 4;
 // In UI::Controls, which has nothing else this crate needs.
 const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_SMALL: u32 = WM_APP + 5;
+// The system menu's "Small on top". A window's own system commands sit
+// below 0xF000 with the low four bits clear, which Windows keeps for itself.
+const SMALL_ON_TOP: usize = 0x0010;
+// How far small on top keeps from the work area's edges, at 100 percent.
+const SMALL_MARGIN: i32 = 16;
 
 // Shared::mode and Shared::capturing, as one byte each.
 const NO_MODE: u8 = 0;
@@ -131,6 +139,7 @@ pub(crate) struct Shared {
     strip_hidden: AtomicBool,
     // Set once, when Windows would not leave the window out of captures.
     capture_note: OnceLock<String>,
+    small: AtomicBool,
     wake: Option<Wake>,
     // Remote control (control.rs). `out` is where the controller's input
     // goes, fixed at open. The present thread sets the mode; the window
@@ -169,6 +178,7 @@ impl Shared {
             moved: AtomicU64::new(NEVER),
             strip_hidden: AtomicBool::new(false),
             capture_note: OnceLock::new(),
+            small: AtomicBool::new(false),
             wake,
             out,
             mode: AtomicU8::new(NO_MODE),
@@ -182,6 +192,10 @@ impl Shared {
 
     pub(crate) fn capture_note(&self) -> Option<&str> {
         self.capture_note.get().map(String::as_str)
+    }
+
+    pub(crate) fn small(&self) -> bool {
+        self.small.load(Ordering::Acquire)
     }
 
     pub(crate) fn mode(&self) -> Option<MouseMode> {
@@ -451,6 +465,19 @@ impl Window {
         let _ = unsafe { PostMessageW(Some(self.hwnd()), WM_FULLSCREEN, WPARAM(code), LPARAM(0)) };
     }
 
+    pub(crate) fn small(&self, on: bool) {
+        // SAFETY: posting to a window this struct keeps alive. A failed post
+        // (the queue is full) drops the change, which the caller can repeat.
+        let _ = unsafe {
+            PostMessageW(
+                Some(self.hwnd()),
+                WM_SMALL,
+                WPARAM(usize::from(on)),
+                LPARAM(0),
+            )
+        };
+    }
+
     // After Shared::set_mode: the window thread switches capture to match.
     pub(crate) fn follow_control(&self) {
         // SAFETY: posting to a window this struct keeps alive. A failed post
@@ -484,6 +511,8 @@ thread_local! {
     static SHARED: OnceCell<Arc<Shared>> = const { OnceCell::new() };
     // Where the window was before F11, to go back to.
     static SAVED: Cell<Option<Saved>> = const { Cell::new(None) };
+    // And before small on top.
+    static SMALL: Cell<Option<Saved>> = const { Cell::new(None) };
     // Where the last WM_MOUSEMOVE put the pointer. Windows sends the message
     // again with the pointer standing still, when something under it changes.
     static POINTER: Cell<Option<(i16, i16)>> = const { Cell::new(None) };
@@ -740,6 +769,13 @@ fn create(
         )
     };
     caption_colours(hwnd);
+    // SAFETY: the live window's own copy of the system menu, which lives as
+    // long as the window does. Without the item the window is as before.
+    unsafe {
+        let menu = GetSystemMenu(hwnd, false);
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING, SMALL_ON_TOP, w!("Small on top"));
+    }
     // SAFETY: a live window.
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
     show_icons(hwnd, dpi);
@@ -790,6 +826,15 @@ pub(crate) fn opening_client(
 pub(crate) fn min_client(dpi: u32) -> (i32, i32) {
     let dpi = dpi.max(96) as i32;
     (MIN_CLIENT.0 * dpi / 96, MIN_CLIENT.1 * dpi / 96)
+}
+
+// The client size small on top takes: the least width the window allows,
+// and the height that keeps the picture's aspect above the strip.
+pub(crate) fn small_client(source: (u32, u32), band: u32, dpi: u32) -> (i32, i32) {
+    let (width, least) = min_client(dpi);
+    let picture =
+        (f64::from(width) * f64::from(source.1.max(1)) / f64::from(source.0.max(1))).round() as i32;
+    (width, (picture + band as i32).max(least))
 }
 
 fn pointer_monitor() -> HMONITOR {
@@ -869,6 +914,7 @@ fn set_fullscreen(hwnd: HWND, shared: &Shared, on: bool) {
         return;
     }
     if on {
+        set_small(hwnd, shared, false);
         enter_fullscreen(hwnd, shared);
     } else {
         leave_fullscreen(hwnd, shared);
@@ -933,14 +979,7 @@ fn leave_fullscreen(hwnd: HWND, shared: &Shared) {
         return;
     };
     shared.fullscreen.store(false, Ordering::Release);
-    // SetWindowPlacement shows the window with the saved command, which
-    // would show a hidden one and activate one that is not active.
-    // SAFETY: a live window.
-    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
-        saved.placement.showCmd = SW_HIDE.0 as u32;
-    } else if saved.placement.showCmd == SW_SHOWNORMAL.0 as u32 {
-        saved.placement.showCmd = SW_SHOWNOACTIVATE.0 as u32;
-    }
+    quietly(hwnd, &mut saved.placement);
     // SAFETY: a live window, its own earlier style and placement.
     unsafe {
         SetWindowLongPtrW(hwnd, GWL_STYLE, saved.style);
@@ -959,6 +998,130 @@ fn leave_fullscreen(hwnd: HWND, shared: &Shared) {
                 | SWP_FRAMECHANGED
                 | SWP_NOACTIVATE,
         );
+    }
+}
+
+// SetWindowPlacement shows the window with the saved command, which would
+// show a hidden one and activate one that is not active.
+fn quietly(hwnd: HWND, placement: &mut WINDOWPLACEMENT) {
+    // SAFETY: a live window.
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        placement.showCmd = SW_HIDE.0 as u32;
+    } else if placement.showCmd == SW_SHOWNORMAL.0 as u32 {
+        placement.showCmd = SW_SHOWNOACTIVATE.0 as u32;
+    }
+}
+
+fn set_small(hwnd: HWND, shared: &Shared, on: bool) {
+    if on == shared.small() {
+        return;
+    }
+    if on {
+        set_fullscreen(hwnd, shared, false);
+        enter_small(hwnd, shared);
+    } else {
+        leave_small(hwnd, shared);
+    }
+    let check = if shared.small() {
+        MF_CHECKED
+    } else {
+        MF_UNCHECKED
+    };
+    // SAFETY: the live window's own system menu.
+    unsafe {
+        let menu = GetSystemMenu(hwnd, false);
+        CheckMenuItem(menu, SMALL_ON_TOP as u32, (MF_BYCOMMAND | check).0);
+    }
+    shared.mark_changed();
+}
+
+// The window's least size with the picture's aspect, above every other
+// window, at the bottom right of its monitor's work area: for keeping an
+// eye on a share over a game. Not activated, as for fullscreen.
+fn enter_small(hwnd: HWND, shared: &Shared) {
+    // SAFETY: a plain lookup on a live window.
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let Some((_, work)) = monitor_rects(monitor) else {
+        return;
+    };
+    let mut placement = WINDOWPLACEMENT {
+        length: size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: a live window and a WINDOWPLACEMENT with its length set.
+    if unsafe { GetWindowPlacement(hwnd, &mut placement) }.is_err() {
+        return;
+    }
+    // SAFETY: getters on a live window.
+    let (style, ex_style, dpi) = unsafe {
+        (
+            GetWindowLongPtrW(hwnd, GWL_STYLE),
+            GetWindowLongPtrW(hwnd, GWL_EXSTYLE),
+            GetDpiForWindow(hwnd).max(96),
+        )
+    };
+    SMALL.with(|small| small.set(Some(Saved { placement, style })));
+    shared.small.store(true, Ordering::Release);
+    // Before the first present the picture's size is not known yet.
+    let source = shared.placed().map_or((16, 9), |placed| placed.source);
+    let (width, height) = small_client(source, strip::band_height(dpi), dpi);
+    let mut frame = RECT {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+    };
+    // SAFETY: a live RECT; on failure the frame is left out, which only
+    // makes the window a little smaller.
+    let _ = unsafe {
+        AdjustWindowRectExForDpi(
+            &mut frame,
+            WINDOW_STYLE(style as u32),
+            false,
+            WINDOW_EX_STYLE(ex_style as u32),
+            dpi,
+        )
+    };
+    let (outer_w, outer_h) = (frame.right - frame.left, frame.bottom - frame.top);
+    let margin = SMALL_MARGIN * dpi as i32 / 96;
+    let x = (work.right - outer_w - margin).max(work.left);
+    let y = (work.bottom - outer_h - margin).max(work.top);
+    // SAFETY: a live window. Only SW_RESTORE brings a maximized or minimized
+    // one back to a plain window that SetWindowPos can size.
+    unsafe {
+        if IsZoomed(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            x,
+            y,
+            outer_w,
+            outer_h,
+            SWP_NOOWNERZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+fn leave_small(hwnd: HWND, shared: &Shared) {
+    let Some(mut saved) = SMALL.with(|small| small.take()) else {
+        return;
+    };
+    shared.small.store(false, Ordering::Release);
+    quietly(hwnd, &mut saved.placement);
+    // SAFETY: a live window and its own earlier placement.
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_NOTOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER | SWP_NOACTIVATE,
+        );
+        let _ = SetWindowPlacement(hwnd, &saved.placement);
     }
 }
 
@@ -1020,6 +1183,14 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             if (wparam.0 & 0xfff0) as u32 == SC_KEYMENU
                 && control::menu_key_is_the_sharers(shared.mode(), lparam.0) =>
         {
+            LRESULT(0)
+        }
+        WM_SYSCOMMAND if wparam.0 & 0xfff0 == SMALL_ON_TOP => {
+            set_small(hwnd, &shared, !shared.small());
+            LRESULT(0)
+        }
+        WM_SMALL => {
+            set_small(hwnd, &shared, wparam.0 != 0);
             LRESULT(0)
         }
         WM_DPICHANGED => {
@@ -1346,6 +1517,17 @@ mod tests {
     fn never_opens_smaller_than_the_minimum() {
         assert_eq!(opening_client((64, 64), (3840, 2088), 24, 96), (620, 204));
         assert_eq!(opening_client((64, 64), (3840, 2088), 36, 144), (930, 306));
+    }
+
+    // Small on top is as narrow as the window goes, with the picture's own
+    // aspect above the strip, and never shorter than the window goes.
+    #[test]
+    fn small_on_top_keeps_the_pictures_aspect() {
+        assert_eq!(small_client((2560, 1440), 24, 96), (620, 373));
+        assert_eq!(small_client((3840, 2160), 36, 144), (930, 559));
+        assert_eq!(small_client((1440, 2560), 24, 96), (620, 1126));
+        assert_eq!(small_client((5120, 1440), 24, 96), (620, 198));
+        assert_eq!(small_client((8000, 1440), 24, 96), (620, 180));
     }
 
     #[test]

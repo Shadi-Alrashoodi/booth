@@ -18,10 +18,13 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowRect, PostMessageW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SendMessageW,
-    SetWindowPos, WM_CLOSE, WM_NULL,
+    GWL_EXSTYLE, GetMenuState, GetSystemMenu, GetWindowLongPtrW, GetWindowRect, MF_BYCOMMAND,
+    MF_CHECKED, PostMessageW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SendMessageW, SetWindowPos,
+    WM_CLOSE, WM_NULL, WM_SYSCOMMAND, WS_EX_TOPMOST,
 };
 
+// The viewer's system menu item for small on top.
+const SMALL_ON_TOP: usize = 0x0010;
 const FRAMES: usize = 240;
 const RESIZE_AT: usize = 120;
 
@@ -114,7 +117,7 @@ fn window_rect(viewer: &Viewer) -> RECT {
     rect
 }
 
-fn monitor_rect(viewer: &Viewer) -> RECT {
+fn monitor_info(viewer: &Viewer) -> MONITORINFO {
     let mut info = MONITORINFO {
         cbSize: size_of::<MONITORINFO>() as u32,
         ..Default::default()
@@ -124,7 +127,15 @@ fn monitor_rect(viewer: &Viewer) -> RECT {
         let monitor = MonitorFromWindow(viewer.window(), MONITOR_DEFAULTTONEAREST);
         assert!(GetMonitorInfoW(monitor, &mut info).as_bool());
     }
-    info.rcMonitor
+    info
+}
+
+fn monitor_rect(viewer: &Viewer) -> RECT {
+    monitor_info(viewer).rcMonitor
+}
+
+fn work_rect(viewer: &Viewer) -> RECT {
+    monitor_info(viewer).rcWork
 }
 
 fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
@@ -302,6 +313,85 @@ fn fullscreen_covers_the_monitor_exactly_and_comes_back() {
     viewer.toggle_fullscreen();
     wait_for("the window's old place", || {
         !viewer.fullscreen() && window_rect(&viewer) == windowed
+    });
+}
+
+// Small on top: narrower than the window was, above other windows, in the
+// bottom right corner of the work area; F11 takes it back to a plain window
+// first and its own place after; off again, the window is where it was.
+// Never shown, as above.
+#[test]
+fn small_on_top_tucks_into_a_corner_and_comes_back() {
+    let _screen = one_at_a_time();
+    let Some(viewer) = open(Show::Hidden, 1280, 720) else {
+        return;
+    };
+    let topmost = |viewer: &Viewer| {
+        // SAFETY: a getter on the viewer's live window.
+        let ex_style = unsafe { GetWindowLongPtrW(viewer.window(), GWL_EXSTYLE) };
+        ex_style & WS_EX_TOPMOST.0 as isize != 0
+    };
+    // The item's state in the window's system menu: None when it is not there.
+    let checked = |viewer: &Viewer| {
+        // SAFETY: lookups on the viewer's live window and its own menu.
+        let state = unsafe {
+            GetMenuState(
+                GetSystemMenu(viewer.window(), false),
+                SMALL_ON_TOP as u32,
+                MF_BYCOMMAND,
+            )
+        };
+        (state != u32::MAX).then_some(state & MF_CHECKED.0 != 0)
+    };
+    let windowed = window_rect(&viewer);
+    assert_eq!(checked(&viewer), Some(false));
+    viewer.set_small(true);
+    wait_for("small on top", || {
+        viewer.small() && window_rect(&viewer) != windowed
+    });
+    let small = window_rect(&viewer);
+    let work = work_rect(&viewer);
+    println!("small on top: {small:?} in the work area {work:?}, windowed {windowed:?}");
+    assert!(topmost(&viewer));
+    assert_eq!(checked(&viewer), Some(true));
+    assert!(small.right - small.left < windowed.right - windowed.left);
+    assert!(small.right <= work.right && small.bottom <= work.bottom);
+    assert!(small.right > work.right - 64 && small.bottom > work.bottom - 64);
+    viewer.set_fullscreen(true);
+    wait_for("fullscreen from small on top", || {
+        viewer.fullscreen() && !viewer.small() && window_rect(&viewer) == monitor_rect(&viewer)
+    });
+    assert!(!topmost(&viewer));
+    viewer.set_fullscreen(false);
+    wait_for("the window's old place after fullscreen", || {
+        !viewer.fullscreen() && window_rect(&viewer) == windowed
+    });
+    viewer.set_small(true);
+    wait_for("small on top again", || window_rect(&viewer) == small);
+    viewer.set_small(false);
+    wait_for("the window's old place", || {
+        !viewer.small() && window_rect(&viewer) == windowed
+    });
+    assert!(!topmost(&viewer));
+    // The system menu's item, as a click on it sends it.
+    let menu_item = || {
+        // SAFETY: the viewer's live window; the answer is not needed.
+        unsafe {
+            SendMessageW(
+                viewer.window(),
+                WM_SYSCOMMAND,
+                Some(WPARAM(SMALL_ON_TOP)),
+                Some(LPARAM(0)),
+            )
+        };
+    };
+    menu_item();
+    wait_for("small on top from the menu", || {
+        window_rect(&viewer) == small
+    });
+    menu_item();
+    wait_for("the window's old place from the menu", || {
+        !viewer.small() && window_rect(&viewer) == windowed
     });
 }
 

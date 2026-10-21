@@ -341,6 +341,18 @@ impl Viewer {
         self.window.fullscreen(Fullscreen::Toggle);
     }
 
+    pub fn small(&self) -> bool {
+        self.window.shared().small()
+    }
+
+    // Small on top, as the window's system menu has it: the window at its
+    // least size above every other, in a corner of its monitor, and back
+    // where it was. It leaves fullscreen, and F11 leaves it. Like
+    // set_fullscreen, a moment later on the window's thread.
+    pub fn set_small(&self, on: bool) {
+        self.window.small(on);
+    }
+
     pub fn gauge(&self) {
         self.scene.gauge();
     }
