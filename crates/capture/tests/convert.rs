@@ -3,8 +3,10 @@
 
 use std::time::Instant;
 
-use capture::reference::to_nv12;
-use capture::{Nv12Image, Options, Pattern, Plan, Rotation, pattern_image, read_frame_number};
+use capture::reference::{region_to_nv12, to_nv12};
+use capture::{
+    Nv12Image, Options, Pattern, Plan, Region, Rotation, pattern_image, read_frame_number,
+};
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 
 fn device() -> Option<ID3D11Device> {
@@ -625,4 +627,128 @@ fn a_pattern_refuses_to_read_back_a_frame_it_did_not_make() {
         "{err}"
     );
     mine.next().unwrap();
+}
+
+// A region is cut to the picture where it reaches past it and its sides come
+// down to even, never up, so nothing outside it goes out; one with less than
+// two pixels each way on the picture is none. Turned, the region is in the
+// upright picture's pixels.
+#[test]
+fn a_region_keeps_inside_what_was_asked() {
+    let region = |left, top, width, height| Region {
+        left,
+        top,
+        width,
+        height,
+    };
+    let plan = |rotation, asked| Plan::region(1920, 1080, rotation, asked, 4096, 1440);
+    let fitted = |rotation, asked| {
+        plan(rotation, asked).map(|plan| (plan.crop, plan.upright_width, plan.upright_height))
+    };
+    let identity = Rotation::Identity;
+    assert_eq!(
+        fitted(identity, region(101, 37, 641, 361)),
+        Some(((101, 37), 640, 360))
+    );
+    assert_eq!(
+        fitted(identity, region(1800, 1000, 500, 500)),
+        Some(((1800, 1000), 120, 80))
+    );
+    assert_eq!(fitted(identity, region(1919, 0, 10, 10)), None);
+    assert_eq!(fitted(identity, region(2000, 0, 10, 10)), None);
+    assert_eq!(
+        fitted(Rotation::Rotate90, region(0, 1000, 1080, 920)),
+        Some(((0, 1000), 1080, 920))
+    );
+    assert_eq!(fitted(Rotation::Rotate90, region(0, 1921, 100, 100)), None);
+    let whole = plan(identity, region(0, 0, 1920, 1080)).unwrap();
+    assert_eq!(whole, Plan::new(1920, 1080, identity, 4096, 1440));
+    let scaled = Plan::region(3840, 2160, identity, region(0, 0, 3840, 2160), 4096, 1440).unwrap();
+    assert_eq!((scaled.width, scaled.height), (2560, 1440));
+}
+
+// Regions upright and turned, kept and scaled: the GPU converts exactly
+// what the CPU reference does. And a kept region at an even corner is the
+// whole picture's own pixels there, chroma included, which holds the crop
+// to the picture itself and not only to the reference.
+#[test]
+fn a_region_matches_the_cpu_reference() {
+    let Some(device) = device() else { return };
+    let (width, height) = (960, 540);
+    let bgra = pattern_image(7, width, height);
+    let region = |left, top, width, height| Region {
+        left,
+        top,
+        width,
+        height,
+    };
+    let cases = [
+        (
+            Rotation::Identity,
+            region(101, 37, 641, 361),
+            unpaced(),
+            (640, 360),
+        ),
+        (
+            Rotation::Identity,
+            region(0, 0, 960, 540),
+            under(640, 360),
+            (640, 360),
+        ),
+        (
+            Rotation::Identity,
+            region(300, 100, 600, 400),
+            under(300, 200),
+            (300, 200),
+        ),
+        (
+            Rotation::Rotate90,
+            region(20, 100, 300, 500),
+            unpaced(),
+            (300, 500),
+        ),
+        (
+            Rotation::Rotate270,
+            region(41, 300, 400, 600),
+            under(200, 300),
+            (200, 300),
+        ),
+    ];
+    for (rotation, asked, options, size) in cases {
+        let mut pattern =
+            Pattern::with_region(&device, width, height, rotation, asked, options).unwrap();
+        let frame = pattern.convert(&bgra).unwrap();
+        let got = pattern.read_back(&frame).unwrap();
+        assert_eq!((got.width, got.height), size, "{asked:?} {rotation:?}");
+        let want = region_to_nv12(&bgra, width, height, rotation, asked, options);
+        assert_matches_reference(&got, &want, &format!("{asked:?} {rotation:?}"));
+    }
+    let whole = convert(&device, &bgra, width, height, Rotation::Identity, unpaced());
+    let (left, top) = (100, 36);
+    let mut pattern = Pattern::with_region(
+        &device,
+        width,
+        height,
+        Rotation::Identity,
+        region(left, top, 640, 360),
+        unpaced(),
+    )
+    .unwrap();
+    let frame = pattern.convert(&bgra).unwrap();
+    let part = pattern.read_back(&frame).unwrap();
+    for y in 0..part.height {
+        for x in 0..part.width {
+            assert_eq!(
+                part.luma(x, y),
+                whole.luma(left + x, top + y),
+                "Y at {x},{y}"
+            );
+        }
+    }
+    for y in 0..part.height / 2 {
+        for x in 0..part.width / 2 {
+            let there = whole.chroma(left / 2 + x, top / 2 + y);
+            assert_eq!(part.chroma(x, y), there, "UV at {x},{y}");
+        }
+    }
 }

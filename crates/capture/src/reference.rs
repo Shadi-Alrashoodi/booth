@@ -3,7 +3,7 @@
 // Only ever fed test pictures.
 
 use crate::Options;
-use crate::convert::Plan;
+use crate::convert::{Plan, Region};
 use crate::monitors::Rotation;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,6 +45,32 @@ pub fn to_nv12(
         options.max_width,
         options.max_height,
     );
+    convert(bgra, &plan)
+}
+
+// The same for a region of the picture (Plan::region); one off the picture
+// is a test's mistake.
+pub fn region_to_nv12(
+    bgra: &[u8],
+    source_width: u32,
+    source_height: u32,
+    rotation: Rotation,
+    region: Region,
+    options: Options,
+) -> Nv12Image {
+    let plan = Plan::region(
+        source_width,
+        source_height,
+        rotation,
+        region,
+        options.max_width,
+        options.max_height,
+    )
+    .unwrap_or_else(|| panic!("{region:?} is not on the picture"));
+    convert(bgra, &plan)
+}
+
+fn convert(bgra: &[u8], plan: &Plan) -> Nv12Image {
     assert_eq!(
         bgra.len(),
         (plan.source_width * plan.source_height * 4) as usize,
@@ -55,7 +81,7 @@ pub fn to_nv12(
     let mut y = vec![0; (plan.width * plan.height) as usize];
     by_rows(&mut y, plan.width, |row, out| {
         for (column, luma) in (0..).zip(out.iter_mut()) {
-            let rgb = area_average(bgra, &plan, column, row, plan.footprint);
+            let rgb = area_average(bgra, plan, column, row, plan.footprint);
             *luma = code(16.0 + 219.0 * dot(rgb));
         }
     });
@@ -63,7 +89,7 @@ pub fn to_nv12(
     let mut uv = vec![0; (plan.width * plan.height / 2) as usize];
     by_rows(&mut uv, plan.width, |row, out| {
         for (column, [u, v]) in (0..).zip(out.as_chunks_mut::<2>().0) {
-            let rgb = area_average(bgra, &plan, column, row, double);
+            let rgb = area_average(bgra, plan, column, row, double);
             let luma = dot(rgb);
             *u = code(128.0 + 224.0 * (rgb[2] - luma) / 1.8556);
             *v = code(128.0 + 224.0 * (rgb[0] - luma) / 1.5748);
@@ -135,8 +161,8 @@ fn area_average(
 }
 
 fn load_upright(bgra: &[u8], plan: &Plan, x: i64, y: i64) -> [f64; 3] {
-    let x = x.clamp(0, plan.upright_width as i64 - 1);
-    let y = y.clamp(0, plan.upright_height as i64 - 1);
+    let x = x.clamp(0, plan.upright_width as i64 - 1) + plan.crop.0 as i64;
+    let y = y.clamp(0, plan.upright_height as i64 - 1) + plan.crop.1 as i64;
     let last_x = plan.source_width as i64 - 1;
     let last_y = plan.source_height as i64 - 1;
     let (sx, sy) = match plan.rotation {

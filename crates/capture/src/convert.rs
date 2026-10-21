@@ -26,6 +26,16 @@ use crate::monitors::Rotation;
 
 const SHADER: &str = include_str!("convert.hlsl");
 
+// A rectangle of a monitor's picture as it shows on the desktop, upright,
+// in its pixels from its top left corner: what a region share sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Region {
+    pub left: u32,
+    pub top: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 // Sizes and scale for one source size, rotation and size limit. Pure, so
 // the CPU reference uses exactly the numbers the GPU gets.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -33,8 +43,11 @@ pub struct Plan {
     pub source_width: u32,
     pub source_height: u32,
     pub rotation: Rotation,
+    // The upright picture that goes out, before any scaling: the whole
+    // source turned upright, or a region of it starting at `crop`.
     pub upright_width: u32,
     pub upright_height: u32,
+    pub crop: (u32, u32),
     pub width: u32,
     pub height: u32,
     // Upright source pixels under one output pixel, per axis: 1 when the
@@ -53,13 +66,54 @@ impl Plan {
         max_width: u32,
         max_height: u32,
     ) -> Plan {
-        let source_width = source_width.max(1);
-        let source_height = source_height.max(1);
-        let (upright_width, upright_height) = if rotation.swaps_sides() {
-            (source_height, source_width)
-        } else {
-            (source_width, source_height)
-        };
+        let whole = upright(source_width, source_height, rotation);
+        Plan::fit(
+            (source_width, source_height),
+            rotation,
+            (0, 0),
+            whole,
+            max_width,
+            max_height,
+        )
+    }
+
+    // Only `region` of the upright picture, cut to the picture where it
+    // reaches past it and its sides brought down to even, which NV12 needs,
+    // so a region share never sends a pixel more than was asked for. None
+    // when less than two pixels each way of it are on the picture.
+    pub fn region(
+        source_width: u32,
+        source_height: u32,
+        rotation: Rotation,
+        region: Region,
+        max_width: u32,
+        max_height: u32,
+    ) -> Option<Plan> {
+        let (whole_width, whole_height) = upright(source_width, source_height, rotation);
+        let right = region.left.saturating_add(region.width).min(whole_width);
+        let bottom = region.top.saturating_add(region.height).min(whole_height);
+        let width = right.saturating_sub(region.left) & !1;
+        let height = bottom.saturating_sub(region.top) & !1;
+        (width >= 2 && height >= 2).then(|| {
+            Plan::fit(
+                (source_width, source_height),
+                rotation,
+                (region.left, region.top),
+                (width, height),
+                max_width,
+                max_height,
+            )
+        })
+    }
+
+    fn fit(
+        (source_width, source_height): (u32, u32),
+        rotation: Rotation,
+        crop: (u32, u32),
+        (upright_width, upright_height): (u32, u32),
+        max_width: u32,
+        max_height: u32,
+    ) -> Plan {
         let max_width = limit(max_width);
         let max_height = limit(max_height);
         let kept = upright_width <= max_width && upright_height <= max_height;
@@ -81,17 +135,17 @@ impl Plan {
             )
         };
         Plan {
-            source_width,
-            source_height,
+            source_width: source_width.max(1),
+            source_height: source_height.max(1),
             rotation,
             upright_width,
             upright_height,
+            crop,
             width,
             height,
             footprint,
         }
     }
-
     // How many output pixels one desktop pixel becomes, for the cursor.
     pub fn scale(&self) -> (f32, f32) {
         (1.0 / self.footprint.0, 1.0 / self.footprint.1)
@@ -104,6 +158,16 @@ impl Plan {
 fn limit(max: u32) -> u32 {
     let max = if max == 0 { u32::MAX } else { max };
     (max & !1).max(2)
+}
+
+// The source's size turned upright, never 0 a side.
+fn upright(source_width: u32, source_height: u32, rotation: Rotation) -> (u32, u32) {
+    let (width, height) = (source_width.max(1), source_height.max(1));
+    if rotation.swaps_sides() {
+        (height, width)
+    } else {
+        (width, height)
+    }
 }
 
 fn even_up(side: u32) -> u32 {
@@ -147,6 +211,9 @@ struct PlaneConstants {
     footprint: [f32; 2],
     quarter_turns: u32,
     unused: u32,
+    crop_origin: [u32; 2],
+    // Constant buffers come in whole 16-byte registers.
+    padding: [u32; 2],
 }
 
 // A Plan with its constant buffers on the device.
@@ -249,6 +316,8 @@ impl Converter {
             footprint: [footprint.0, footprint.1],
             quarter_turns: plan.rotation.degrees() / 90,
             unused: 0,
+            crop_origin: [plan.crop.0, plan.crop.1],
+            padding: [0, 0],
         };
         let luma = self.constant_buffer(constants(plan.footprint))?;
         let chroma =

@@ -18,13 +18,18 @@ cbuffer Plane : register(b0)
 {
     // The duplication image as Windows hands it, before rotation.
     uint2 source_size;
-    // The same image turned upright.
+    // The upright picture that goes out: the same image turned upright, or
+    // a region of it.
     uint2 upright_size;
     // Upright source pixels under one pixel of this plane, per axis.
     float2 footprint;
     // Quarter turns clockwise from the duplication image to upright.
     uint quarter_turns;
     uint unused;
+    // Where the upright picture that goes out starts in the whole upright
+    // image: 0, 0 but for a region of it.
+    uint2 crop_origin;
+    uint2 padding;
 };
 
 Texture2D<float4> source : register(t0);
@@ -38,8 +43,9 @@ float4 vs_main(uint id : SV_VertexID) : SV_Position
 
 float3 load_upright(int2 upright)
 {
-    // Past the edge (an odd size padded to even) repeats the edge pixel.
-    upright = clamp(upright, int2(0, 0), int2(upright_size) - 1);
+    // Past the edge (an odd size padded to even) repeats the edge pixel,
+    // and a region never reads past its own edges.
+    upright = clamp(upright, int2(0, 0), int2(upright_size) - 1) + int2(crop_origin);
     int2 last = int2(source_size) - 1;
     int2 at = upright;
     if (quarter_turns == 1)

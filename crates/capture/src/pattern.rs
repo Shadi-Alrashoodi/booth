@@ -18,7 +18,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::core::Interface;
 
-use crate::convert::{Converter, Layout, Plan, Target};
+use crate::convert::{Converter, Layout, Plan, Region, Target};
 use crate::error::CaptureError;
 use crate::monitors::{Rotation, wide_to_string};
 use crate::reference::Nv12Image;
@@ -70,11 +70,6 @@ impl Pattern {
         rotation: Rotation,
         options: Options,
     ) -> Result<Pattern, CaptureError> {
-        let gpu = adapter_name(device);
-        // SAFETY: GetImmediateContext hands back an owned reference.
-        let context = unsafe { device.GetImmediateContext() }
-            .map_err(|err| CaptureError::windows(format!("start Direct3D 11 on {gpu}"), &err))?;
-        let converter = Converter::new(device, &gpu)?;
         let plan = Plan::new(
             source_width,
             source_height,
@@ -82,6 +77,44 @@ impl Pattern {
             options.max_width,
             options.max_height,
         );
+        Pattern::with_plan(device, plan, options)
+    }
+
+    // The same with only `region` of the upright picture going out.
+    pub fn with_region(
+        device: &ID3D11Device,
+        source_width: u32,
+        source_height: u32,
+        rotation: Rotation,
+        region: Region,
+        options: Options,
+    ) -> Result<Pattern, CaptureError> {
+        let plan = Plan::region(
+            source_width,
+            source_height,
+            rotation,
+            region,
+            options.max_width,
+            options.max_height,
+        )
+        .ok_or_else(|| {
+            CaptureError::other(format!(
+                "could not make the test pattern: {region:?} is not on a {source_width}x{source_height} picture"
+            ))
+        })?;
+        Pattern::with_plan(device, plan, options)
+    }
+
+    fn with_plan(
+        device: &ID3D11Device,
+        plan: Plan,
+        options: Options,
+    ) -> Result<Pattern, CaptureError> {
+        let gpu = adapter_name(device);
+        // SAFETY: GetImmediateContext hands back an owned reference.
+        let context = unsafe { device.GetImmediateContext() }
+            .map_err(|err| CaptureError::windows(format!("start Direct3D 11 on {gpu}"), &err))?;
+        let converter = Converter::new(device, &gpu)?;
         let layout = converter.layout(plan)?;
         let picture = background(plan.source_width, plan.source_height);
         let background = bgra_texture(device, plan.source_width, plan.source_height, &picture)?;
