@@ -298,6 +298,8 @@ pub struct Sharing {
     // The monitor Room::share asked for, which the share's thread opens.
     // None is the primary one.
     monitor: Mutex<Option<MonitorId>>,
+    // Room::share_region's region of that monitor, or None for all of it.
+    region: Mutex<Option<share::Region>>,
     // The room is closing: the share's thread ends.
     closing: AtomicBool,
     // Room::pause_share, for the share under way.
@@ -391,6 +393,7 @@ impl Sharing {
             newest_frame: AtomicU64::new(NO_FRAME),
             work: OnceLock::new(),
             monitor: Mutex::default(),
+            region: Mutex::default(),
             closing: AtomicBool::new(false),
             held: AtomicBool::new(false),
             news: Mutex::default(),
@@ -663,8 +666,9 @@ impl Sharing {
         self.generation.fetch_add(1, Ordering::Release);
     }
 
-    pub(crate) fn set_monitor(&self, monitor: Option<MonitorId>) {
+    pub(crate) fn set_monitor(&self, monitor: Option<MonitorId>, region: Option<share::Region>) {
         *lock(&self.monitor) = monitor;
+        *lock(&self.region) = region;
     }
 
     // The share's thread ends at its next frame, or within 100 ms on a
@@ -694,6 +698,10 @@ impl Sharing {
 
     fn monitor(&self) -> Option<MonitorId> {
         lock(&self.monitor).clone()
+    }
+
+    fn region(&self) -> Option<share::Region> {
+        *lock(&self.region)
     }
 
     fn closing(&self) -> bool {

@@ -673,9 +673,14 @@ impl Threads {
         lock(&self.shared.view).clone()
     }
 
-    pub(crate) fn share(&self, fps: u8, monitor: Option<share::MonitorId>) {
+    pub(crate) fn share(
+        &self,
+        fps: u8,
+        monitor: Option<share::MonitorId>,
+        region: Option<share::Region>,
+    ) {
         if self.sharing.number().is_none() {
-            self.sharing.set_monitor(monitor);
+            self.sharing.set_monitor(monitor, region);
         }
         self.with_side(|side, now, socket| side.share(fps, now, socket));
     }

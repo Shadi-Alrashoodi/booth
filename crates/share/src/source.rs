@@ -24,9 +24,19 @@ macro_rules! device {
     };
 }
 
+// A region share's region is at least this many pixels each way: smaller is
+// no picture to watch, and under the floors some encoders and decoders have.
+pub const SMALLEST_REGION: u32 = 256;
+
 #[derive(Clone)]
 pub enum Choice {
     Screen(Monitor),
+    // Only this part of the monitor's picture, for as long as the monitor
+    // keeps its resolution and rotation (Capture::open_region).
+    Region {
+        monitor: Monitor,
+        region: capture::Region,
+    },
     // A monitor of this size, made up: one past 4096 wide or 1440 high is
     // scaled down to fit the way a capture would be. Nothing of the screen
     // is captured. Busy turns it to noise (Busy below).
@@ -42,7 +52,7 @@ impl Choice {
     // The GPU the share is captured, converted and encoded on.
     pub fn adapter(&self) -> &Adapter {
         match self {
-            Choice::Screen(monitor) => &monitor.adapter,
+            Choice::Screen(monitor) | Choice::Region { monitor, .. } => &monitor.adapter,
             Choice::Pattern { adapter, .. } => adapter,
         }
     }
@@ -146,6 +156,9 @@ impl Source {
             Choice::Screen(monitor) => {
                 Source::Screen(Box::new(Capture::open(monitor, options).map_err(text)?))
             }
+            Choice::Region { monitor, region } => Source::Screen(Box::new(
+                Capture::open_region(monitor, *region, options).map_err(text)?,
+            )),
             Choice::Pattern {
                 adapter,
                 width,

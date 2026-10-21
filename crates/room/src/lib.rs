@@ -384,7 +384,17 @@ impl Room {
     /// Asked again while sharing, it changes the frame rate; the monitor is
     /// the one it started with.
     pub fn share(&self, fps: u8, monitor: Option<MonitorId>) {
-        self.threads.share(fps.clamp(1, control::MAX_FPS), monitor);
+        self.threads
+            .share(fps.clamp(1, control::MAX_FPS), monitor, None);
+    }
+
+    /// As share, with only `region` of the monitor going out, in its
+    /// upright pixels: at least share::SMALLEST_REGION each way, and only
+    /// while the monitor keeps the resolution and rotation it has now. A
+    /// share that runs already keeps what it shows.
+    pub fn share_region(&self, fps: u8, monitor: MonitorId, region: share::Region) {
+        self.threads
+            .share(fps.clamp(1, control::MAX_FPS), Some(monitor), Some(region));
     }
 
     /// Needs no answer: the share is over for everyone at once, and its

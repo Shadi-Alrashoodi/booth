@@ -24,7 +24,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::core::Interface;
 
 use crate::cap::{Decision, FpsCap};
-use crate::convert::{Converter, Layout, Plan, Target};
+use crate::convert::{Converter, Layout, Plan, Region, Target};
 use crate::device;
 use crate::error::{CaptureError, ErrorKind, is_device_lost, meaning};
 use crate::missing::{Missed, Missing};
@@ -93,6 +93,12 @@ pub struct Capture {
     missing: Missing,
     number: u64,
     pointer: (i32, i32, bool),
+    // The hotspot of the pointer shape read last, which says whether a
+    // region shows the pointer.
+    hotspot: (i32, i32),
+    // A region share's region, with the upright size of the monitor it was
+    // drawn on: it holds for that mode only.
+    region: Option<(Region, (u32, u32))>,
     qpc_frequency: i64,
     // Tests make Windows refuse the desktop with this, since only the user
     // can bring up the secure desktop, and count the tries.
@@ -142,6 +148,28 @@ impl Drop for HeldFrame<'_> {
 
 impl Capture {
     pub fn open(monitor: &Monitor, options: Options) -> Result<Capture, CaptureError> {
+        Capture::open_in(monitor, None, options)
+    }
+
+    // Only `region` of the monitor's picture goes out, as long as the
+    // monitor keeps the resolution and rotation it has now.
+    pub fn open_region(
+        monitor: &Monitor,
+        region: Region,
+        options: Options,
+    ) -> Result<Capture, CaptureError> {
+        Capture::open_in(
+            monitor,
+            Some((region, (monitor.width, monitor.height))),
+            options,
+        )
+    }
+
+    fn open_in(
+        monitor: &Monitor,
+        region: Option<(Region, (u32, u32))>,
+        options: Options,
+    ) -> Result<Capture, CaptureError> {
         let name = &monitor.name;
         if !is_per_monitor_v2() {
             return Err(CaptureError::other(format!(
@@ -152,10 +180,11 @@ impl Capture {
         let gpu = &monitor.adapter.description;
         let (device, context) = device::create(&adapter, gpu)?;
         let converter = Converter::new(&device, gpu)?;
-        let (duplication, plan) =
-            duplicate(&device, &output, monitor, options).map_err(|refused| match refused {
+        let (duplication, plan) = duplicate(&device, &output, monitor, options, region).map_err(
+            |refused| match refused {
                 Refused::Paused(_, err) | Refused::Failed(err) => err,
-            })?;
+            },
+        )?;
         let layout = converter.layout(plan)?;
         let targets = [
             converter.target(plan.width, plan.height)?,
@@ -184,6 +213,8 @@ impl Capture {
             missing: Missing::default(),
             number: 0,
             pointer: (0, 0, false),
+            hotspot: (0, 0),
+            region,
             qpc_frequency: qpc_frequency.max(1),
             #[cfg(test)]
             refuse: None,
@@ -344,13 +375,13 @@ impl Capture {
         // The texture's own size is the one that counts; the mode Windows
         // reported can be the rotated one.
         let before = self.layout.plan;
-        self.rebuild(Plan::new(
-            desc.Width,
-            desc.Height,
+        self.rebuild(fitted(
+            (desc.Width, desc.Height),
             self.rotation,
-            self.options.max_width,
-            self.options.max_height,
-        ))?;
+            self.options,
+            self.region,
+            &self.monitor.name,
+        )?)?;
         // Scaled with the plan this frame is made in, while it is still held.
         let resized = self.layout.plan != before;
         let cursor = self.cursor_update(&info, &duplication, resized)?;
@@ -561,15 +592,26 @@ impl Capture {
         } else {
             None
         };
+        if let Some(shape) = &shape {
+            self.hotspot = (shape.hotspot_x, shape.hotspot_y);
+        }
         if !moved && shape.is_none() && !resized {
             return Ok(None);
         }
-        let (scale_x, scale_y) = self.layout.plan.scale();
+        let plan = self.layout.plan;
+        let (scale_x, scale_y) = plan.scale();
         let (x, y, visible) = self.pointer;
+        let (x, y) = (x - plan.crop.0 as i32, y - plan.crop.1 as i32);
+        // A region shows the pointer only while it points inside it.
+        let inside = self.region.is_none() || {
+            let (hotspot_x, hotspot_y) = (x + self.hotspot.0, y + self.hotspot.1);
+            (0..plan.upright_width as i32).contains(&hotspot_x)
+                && (0..plan.upright_height as i32).contains(&hotspot_y)
+        };
         Ok(Some(CursorUpdate {
             x: (x as f32 * scale_x).round() as i32,
             y: (y as f32 * scale_y).round() as i32,
-            visible,
+            visible: visible && inside,
             scale: scale_x,
             shape,
         }))
@@ -644,7 +686,13 @@ impl Capture {
             Err(err) => return Err(err),
         };
         self.missing.found();
-        match duplicate(&self.device, &output, &self.monitor, self.options) {
+        match duplicate(
+            &self.device,
+            &output,
+            &self.monitor,
+            self.options,
+            self.region,
+        ) {
             Ok((duplication, plan)) => {
                 self.rebuild(plan)?;
                 self.duplication = Some(duplication);
@@ -723,6 +771,7 @@ fn duplicate(
     output: &IDXGIOutput,
     monitor: &Monitor,
     options: Options,
+    region: Option<(Region, (u32, u32))>,
 ) -> Result<(IDXGIOutputDuplication, Plan), Refused> {
     let name = &monitor.name;
     let output: IDXGIOutput5 = output.cast().map_err(|_| {
@@ -769,14 +818,57 @@ fn duplicate(
         )));
     }
     let rotation = Rotation::from_dxgi(desc.Rotation);
-    let plan = Plan::new(
-        desc.ModeDesc.Width,
-        desc.ModeDesc.Height,
+    let plan = fitted(
+        (desc.ModeDesc.Width, desc.ModeDesc.Height),
         rotation,
-        options.max_width,
-        options.max_height,
-    );
+        options,
+        region,
+        name,
+    )
+    .map_err(Refused::Failed)?;
     Ok((duplication, plan))
+}
+
+// The plan for a picture of this size and rotation: all of it, or a region
+// share's region, which holds only on the mode it was drawn on.
+fn fitted(
+    (width, height): (u32, u32),
+    rotation: Rotation,
+    options: Options,
+    region: Option<(Region, (u32, u32))>,
+    name: &str,
+) -> Result<Plan, CaptureError> {
+    let Some((region, drawn_on)) = region else {
+        return Ok(Plan::new(
+            width,
+            height,
+            rotation,
+            options.max_width,
+            options.max_height,
+        ));
+    };
+    let upright = if rotation.swaps_sides() {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    (upright == drawn_on)
+        .then(|| {
+            Plan::region(
+                width,
+                height,
+                rotation,
+                region,
+                options.max_width,
+                options.max_height,
+            )
+        })
+        .flatten()
+        .ok_or_else(|| {
+            CaptureError::other(format!(
+                "{name} changed resolution or rotation, so the region drawn on it no longer matches. Share the region again"
+            ))
+        })
 }
 
 #[cfg(test)]
@@ -1014,6 +1106,87 @@ mod tests {
         assert!(update.visible && update.shape.is_none());
     }
 
+    // A region share's pictures are the region's size, its pointer is in
+    // the region's own pixels and hidden while it points outside, and a mode
+    // other than the one the region was drawn on ends it.
+    #[test]
+    fn a_region_has_its_own_size_and_pointer() {
+        let _turn = desktop_turn();
+        make_process_dpi_aware().unwrap();
+        let monitors = crate::monitors().unwrap();
+        let Some(monitor) = monitors.iter().find(|m| m.primary).or(monitors.first()) else {
+            println!("skipped: no monitor is attached to the desktop");
+            return;
+        };
+        let region = Region {
+            left: 200,
+            top: 100,
+            width: 641,
+            height: 360,
+        };
+        let mut capture = Capture::open_region(monitor, region, Options::default()).unwrap();
+        let plan = capture.plan();
+        assert_eq!((plan.width, plan.height, plan.crop), (640, 360, (200, 100)));
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(1) {
+            if let Next::Frame(frame) = capture.next().unwrap() {
+                assert_eq!((frame.width, frame.height), (640, 360));
+                break;
+            }
+        }
+        let duplication = capture.duplication.clone().unwrap();
+        let still = DXGI_OUTDUPL_FRAME_INFO::default();
+        capture.hotspot = (4, 4);
+        for (at, seen) in [
+            ((300, 150), Some((100, 50))),
+            ((196, 150), Some((-4, 50))),
+            ((195, 150), None),
+            ((835, 455), Some((635, 355))),
+            ((836, 150), None),
+        ] {
+            capture.pointer = (at.0, at.1, true);
+            let update = capture
+                .cursor_update(&still, &duplication, true)
+                .unwrap()
+                .unwrap();
+            match seen {
+                Some(seen) => {
+                    assert!(update.visible, "{at:?}");
+                    assert_eq!((update.x, update.y), seen, "{at:?}");
+                }
+                None => assert!(!update.visible, "{at:?}"),
+            }
+        }
+        let options = Options::default();
+        let (width, height) = (monitor.width, monitor.height);
+        let name = "the monitor";
+        assert!(
+            fitted(
+                (width, height),
+                Rotation::Identity,
+                options,
+                capture.region,
+                name
+            )
+            .is_ok()
+        );
+        let other = fitted(
+            (width / 2, height / 2),
+            Rotation::Identity,
+            options,
+            capture.region,
+            name,
+        );
+        assert!(other.is_err_and(|err| err.to_string().contains("Share the region again")));
+        let turned = fitted(
+            (height, width),
+            Rotation::Rotate90,
+            options,
+            capture.region,
+            name,
+        );
+        assert!(turned.is_ok(), "the same upright size, turned");
+    }
     #[test]
     fn while_paused_each_call_waits_then_tries_once() {
         let _turn = desktop_turn();

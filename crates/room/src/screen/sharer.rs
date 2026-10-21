@@ -19,7 +19,8 @@ use net::pace::Timer;
 use share::rate::{Lost, Rate, Second, Step};
 use share::{
     Audience, Back, CaptureOptions, Choice, CursorShape, CursorUpdate, FineTimer, Kind, Line,
-    MonitorId, PauseReason, Preset, Sent, Settings, Setup, Sharer, SharerNumbers, Software, spread,
+    MonitorId, PauseReason, Preset, Region, SMALLEST_REGION, Sent, Settings, Setup, Sharer,
+    SharerNumbers, Software, spread,
 };
 
 use super::wire::{Shape, ShapeKind};
@@ -127,7 +128,8 @@ fn share(
             None
         }
     };
-    let choice = choose(source, sharing.monitor(), log, number).map_err(did_not_start)?;
+    let choice =
+        choose(source, sharing.monitor(), sharing.region(), log, number).map_err(did_not_start)?;
     // Capture turns a rotated monitor upright and scales the whole of it
     // into the picture, so the picture is exactly this rectangle.
     sharing.set_area(match &choice {
@@ -428,9 +430,18 @@ fn share(
 fn choose(
     source: &VideoSource,
     monitor: Option<MonitorId>,
+    region: Option<Region>,
     log: &Log,
     number: u32,
 ) -> Result<Choice, String> {
+    if let Some(region) = region
+        && (region.width < SMALLEST_REGION || region.height < SMALLEST_REGION)
+    {
+        return Err(format!(
+            "the region is {}x{}, smaller than {SMALLEST_REGION} by {SMALLEST_REGION} pixels. Draw a bigger one",
+            region.width, region.height
+        ));
+    }
     if let VideoSource::Pattern { width, height, .. } = source
         && (*width == 0 || *height == 0)
     {
@@ -444,7 +455,10 @@ fn choose(
                 .iter()
                 .find(|monitor| monitor.id == id)
                 .cloned()
-                .map(Choice::Screen)
+                .map(|monitor| match region {
+                    Some(region) => Choice::Region { monitor, region },
+                    None => Choice::Screen(monitor),
+                })
                 .ok_or_else(|| {
                     log!(
                         log,
@@ -1033,7 +1047,7 @@ mod tests {
             device_name: String::from(r"\\.\NOT-A-MONITOR"),
             adapter_luid: 0,
         };
-        let Err(why) = choose(&VideoSource::Screen, Some(nowhere), &log, 4) else {
+        let Err(why) = choose(&VideoSource::Screen, Some(nowhere), None, &log, 4) else {
             panic!("a monitor that does not exist was chosen");
         };
         assert_eq!(
@@ -1050,8 +1064,28 @@ mod tests {
             busy: false,
         };
         assert_eq!(
-            choose(&pattern, None, &log, 5).err().as_deref(),
+            choose(&pattern, None, None, &log, 5).err().as_deref(),
             Some("the test pattern cannot be 0x1440")
+        );
+    }
+
+    // A region smaller than SMALLEST_REGION either way is refused before any
+    // monitor is looked at.
+    #[test]
+    fn small_region_sentence() {
+        let (log, _) = Log::capture(8);
+        let small = Region {
+            left: 0,
+            top: 0,
+            width: 255,
+            height: 1080,
+        };
+        let Err(why) = choose(&VideoSource::Screen, None, Some(small), &log, 6) else {
+            panic!("a region too small was shared");
+        };
+        assert_eq!(
+            crate::screen::share_failed(&why, false),
+            "Could not start sharing: the region is 255x1080, smaller than 256 by 256 pixels. Draw a bigger one."
         );
     }
 

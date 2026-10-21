@@ -397,6 +397,10 @@ fn choose(source: Source, busy: bool, monitors: &[Monitor]) -> Result<Choice, St
 fn describe(options: &Options, setup: &Setup) -> String {
     let source = match &setup.share.choice {
         Choice::Screen(monitor) => format!("the screen of {}", monitor.name),
+        Choice::Region { monitor, region } => format!(
+            "a {}x{} region of {} at {},{}",
+            region.width, region.height, monitor.name, region.left, region.top
+        ),
         Choice::Pattern {
             width,
             height,
