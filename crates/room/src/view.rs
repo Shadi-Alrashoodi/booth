@@ -138,6 +138,9 @@ pub struct RunningShare {
     // Windows took the desktop away; the share goes on by itself when it
     // gives it back.
     pub paused: Option<Paused>,
+    // Paused by hand (Room::pause_share): nothing of the screen is read or
+    // sent until it resumes.
+    pub held: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

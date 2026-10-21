@@ -2184,6 +2184,7 @@ mod tests {
             Some(RunningShare {
                 software: false,
                 paused,
+                held: false,
             })
         };
         let sharing = OwnShare::Sharing { number: 1, fps: 60 };

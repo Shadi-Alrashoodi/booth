@@ -298,6 +298,8 @@ pub struct Sharing {
     monitor: Mutex<Option<MonitorId>>,
     // The room is closing: the share's thread ends.
     closing: AtomicBool,
+    // Room::pause_share, for the share under way.
+    held: AtomicBool,
     // What the share's thread has for the room, taken on the timer thread.
     news: Mutex<Vec<ShareNews>>,
     running: Mutex<Option<RunningShare>>,
@@ -386,6 +388,7 @@ impl Sharing {
             work: OnceLock::new(),
             monitor: Mutex::default(),
             closing: AtomicBool::new(false),
+            held: AtomicBool::new(false),
             news: Mutex::default(),
             running: Mutex::default(),
             numbers: Mutex::default(),
@@ -510,11 +513,24 @@ impl Sharing {
         if ended || new_share {
             *lock(&self.told) = Told::default();
             self.newest_frame.store(NO_FRAME, Ordering::Relaxed);
+            self.held.store(false, Ordering::Relaxed);
         }
         if ended {
             *lock(&self.shape) = None;
         }
         self.wake.set();
+    }
+
+    // While it holds, the share's thread has let go of capture and the
+    // encoder and sends nothing, not even to someone who starts watching.
+    // A new share starts unheld.
+    pub(crate) fn set_held(&self, held: bool) {
+        self.held.store(held, Ordering::Relaxed);
+        self.wake.set();
+    }
+
+    pub(crate) fn held(&self) -> bool {
+        self.held.load(Ordering::Relaxed)
     }
 
     pub(crate) fn number(&self) -> Option<u32> {
@@ -2306,6 +2322,7 @@ mod tests {
         let running = || RunningShare {
             software: false,
             paused: None,
+            held: false,
         };
         let take = || std::mem::take(&mut *lock(&played));
         let sharing_as = |number| OwnShare::Sharing { number, fps: 60 };

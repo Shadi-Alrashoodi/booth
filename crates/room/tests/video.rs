@@ -1104,3 +1104,61 @@ fn share_that_cannot_start_says_why() {
         ana.wait_for(WAIT, "no share in the room", |v| v.share.current.is_none());
     }
 }
+
+// Paused by hand, the share lets go of the pattern and sends nothing: the
+// frames a watcher has shown stop, and a friend who starts watching
+// meanwhile gets no picture at all. Resumed, both get frames again, every
+// one decoding, the first an IDR.
+#[test]
+fn a_paused_share_sends_nothing_until_it_resumes() {
+    let _turn = turn();
+    if !ready() {
+        return;
+    }
+    let (host, friends) = room_of(
+        config_with("Mara", pattern(None), room::DEFAULT_VIDEO_UPLOAD_KBPS),
+        vec![
+            config_with("Ana", pattern(None), room::DEFAULT_VIDEO_UPLOAD_KBPS),
+            config_with("Bo", pattern(None), room::DEFAULT_VIDEO_UPLOAD_KBPS),
+        ],
+    );
+    let (ana, bo) = (&friends[0], &friends[1]);
+    let number = shares(&host, 60);
+    watches(ana, number);
+    poll(WAIT, "Ana's first frames", || {
+        ana.view().numbers.watching.filter(|w| w.shown > 0)
+    });
+    host.room().pause_share(true);
+    host.wait_for(WAIT, "the share paused", |v| {
+        v.share.running.as_ref().is_some_and(|running| running.held)
+    });
+    // The numbers are the last second's, and a frame already on its way when
+    // the share let go may still land: the count settles within a second.
+    let numbers_settle = Duration::from_millis(1500);
+    thread::sleep(numbers_settle);
+    let shown = || ana.view().numbers.watching.map_or(0, |w| w.shown);
+    let paused_at = shown();
+    watches(bo, number);
+    thread::sleep(numbers_settle);
+    assert_eq!(shown(), paused_at, "frames shown while paused");
+    let bo_shown = bo.view().numbers.watching.map_or(0, |w| w.shown);
+    assert_eq!(bo_shown, 0, "a picture for a new watcher while paused");
+    host.room().pause_share(false);
+    host.wait_for(WAIT, "the share resumed", |v| {
+        v.share
+            .running
+            .as_ref()
+            .is_some_and(|running| !running.held)
+    });
+    for (who, member, before) in [("Ana", ana, paused_at), ("Bo", bo, 0)] {
+        let watched = poll(WAIT, "frames after the pause", || {
+            member
+                .view()
+                .numbers
+                .watching
+                .filter(|w| w.shown >= before + 10)
+        });
+        assert_eq!(watched.decode_failed, 0, "{who}");
+        assert_eq!(watched.before_first_idr, 0, "{who}");
+    }
+}

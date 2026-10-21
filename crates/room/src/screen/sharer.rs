@@ -186,6 +186,7 @@ fn share(
         RunningShare {
             software: software.is_some(),
             paused: None,
+            held: false,
         },
     );
     announce_fps(sharing, number, &sharer);
@@ -209,7 +210,7 @@ fn share(
             OwnShare::Sharing { number: now, fps } if now == number => {
                 // Not while capture is paused: a new frame rate opens the
                 // source again. It is applied once a picture comes back.
-                if fps != asked_fps && !sharer.paused() {
+                if fps != asked_fps && !sharer.paused() && !sharer.held() {
                     asked_fps = fps;
                     sharer.set_fps(u32::from(fps), &mut say).map_err(ran)?;
                     log!(
@@ -225,10 +226,34 @@ fn share(
             }
             _ => break,
         }
+        // Paused by hand: the screen is let go before anything more of it is
+        // read, and taken up again when the pause ends.
+        if sharing.held() != sharer.held() {
+            if sharing.held() {
+                watchers.hide_pointer();
+                sharer.pause();
+                log!(
+                    log,
+                    "share {number}: paused, nothing of the screen is read until it resumes"
+                );
+            } else {
+                sharer.resume(&mut say).map_err(ran)?;
+                let (width, height) = sharer.size();
+                log!(
+                    log,
+                    "share {number}: resumed at {width}x{height} and {} fps",
+                    sharer.fps()
+                );
+            }
+            sharing.set_running(sharing.running().map(|running| RunningShare {
+                held: sharer.held(),
+                ..running
+            }));
+        }
         // Not while capture is paused either: a new box or rate opens the
         // source again.
         let limits = sharing.limits();
-        if limits != applied_limits && !sharer.paused() {
+        if limits != applied_limits && !sharer.paused() && !sharer.held() {
             applied_limits = limits;
             if let Some(limits) = limits {
                 let limit = CaptureOptions {
@@ -269,7 +294,9 @@ fn share(
         // the video, and the GPU next to a game. The facts say so only once
         // the host has told them. A new watcher's IDR ask ends the rest at
         // once, since the host can hold the facts back for FACTS_EVERY.
-        if applied.is_some_and(|facts| facts.watchers == 0) && !sharing.answers_waiting() {
+        if sharer.held()
+            || (applied.is_some_and(|facts| facts.watchers == 0) && !sharing.answers_waiting())
+        {
             rest.until(sharing, next_second);
         } else {
             sharer.next(&mut watchers).map_err(ran)?;
@@ -317,7 +344,7 @@ fn share(
             // While capture is paused nothing goes out to judge the link by,
             // and a step opens the source again, which a monitor that left
             // the desktop would not survive.
-            let decision = (!sharer.paused()).then(|| rate.second(now, &second));
+            let decision = (!sharer.paused() && !sharer.held()).then(|| rate.second(now, &second));
             if let Some(decision) = &decision {
                 if let Some(line) = rate.line(decision) {
                     log!(log, "share {number}: {line}");
@@ -721,6 +748,15 @@ impl<'a> Watchers<'a> {
         if let (Some((x, y, visible)), Some((id, _))) = (self.pointer, &self.shape) {
             self.outbox.pointer(x, y, visible, *id);
         }
+    }
+
+    // For a pause: the pointer the watchers last saw would stay on their
+    // picture otherwise.
+    fn hide_pointer(&mut self) {
+        let (x, y) = self.pointer.map_or((0, 0), |(x, y, _)| (x, y));
+        self.pointer = Some((x, y, false));
+        let id = self.shape.as_ref().map_or(0, |(id, _)| *id);
+        self.outbox.pointer(x, y, false, id);
     }
 }
 

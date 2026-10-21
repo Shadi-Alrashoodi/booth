@@ -1751,6 +1751,7 @@ fn opened(member: &Member, share: u32) {
         RunningShare {
             software: false,
             paused: None,
+            held: false,
         },
     );
 }
