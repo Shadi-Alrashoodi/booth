@@ -247,6 +247,72 @@ fn a_4k_limit_keeps_a_1440p_share_as_it_is() {
     assert_eq!((sharer.size(), sharer.fps()), ((1920, 1080), 60));
 }
 
+// Paused by hand, a share has no encoder; resumed, it opens again at the
+// same size and its first frame is an IDR, the frame numbers going on.
+#[test]
+fn a_paused_share_comes_back_with_an_idr() {
+    let Some((_turn, adapter)) = gpu() else {
+        return;
+    };
+    let setup = Setup {
+        choice: Choice::Pattern {
+            adapter,
+            width: 1280,
+            height: 720,
+            busy: false,
+        },
+        fps: 60,
+        settings: Settings::default(),
+        encoder: None,
+        codec: None,
+        takes_hevc: false,
+        payload: PAYLOAD_LAN,
+        spread: false,
+        clock: Clock::starting(Instant::now()),
+        keep_times: false,
+    };
+    let mut said = Vec::new();
+    let mut sharer = Sharer::open(setup, |_: &[u8]| {}, &mut |line| said.push(line))
+        .unwrap_or_else(|err| panic!("{err}"));
+    let mut watching = Watching::default();
+    for _ in 0..5 {
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+    }
+    let before = watching.sent.len();
+    let size = sharer.size();
+    sharer.pause();
+    assert!(sharer.held());
+    assert_eq!(sharer.codec(), None);
+    let resumed = sharer
+        .resume(&mut |line| said.push(line))
+        .unwrap_or_else(|err| panic!("{err}"));
+    assert!(resumed, "{said:?}");
+    assert!(!sharer.held());
+    assert_eq!(sharer.size(), size);
+    for _ in 0..5 {
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+    }
+    let after = &watching.sent[before..];
+    assert!(after.first().is_some_and(|sent| sent.idr), "{after:?}");
+    assert!(
+        after.iter().skip(1).all(|sent| !sent.idr),
+        "{after:?} {:?}",
+        watching.lines
+    );
+    assert_eq!(
+        after.first().map(|sent| sent.number),
+        watching.sent.get(before - 1).map(|sent| sent.number + 1)
+    );
+    let again = sharer
+        .resume(&mut |line| said.push(line))
+        .unwrap_or_else(|err| panic!("{err}"));
+    assert!(!again);
+}
+
 // A 4K limit that comes while the share is in H.264 waits there at 1440p.
 // When every viewer takes HEVC again, the change of codec brings the share
 // to 4K, not only a new encoder at the old size, and frames go on.

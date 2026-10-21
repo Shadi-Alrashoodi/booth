@@ -248,6 +248,8 @@ pub struct Sharer {
     // A software encoder that took over from a failed GPU encoder, until
     // its first frame is out or it fails on it.
     fallback: Option<Fallback>,
+    // Paused by hand (pause), until resume.
+    held: bool,
 }
 
 // The change from a failed GPU encoder to the software one, timed for the
@@ -392,6 +394,7 @@ impl Sharer {
             limit: None,
             reopens: 0,
             fallback: None,
+            held: false,
         })
     }
 
@@ -409,7 +412,8 @@ impl Sharer {
             .map_or("no encoder", |opened| opened.encoder.name())
     }
 
-    // None only after a failed reopen, when the share is over.
+    // None while paused by hand, and after a failed reopen, when the share
+    // is over.
     pub fn codec(&self) -> Option<Codec> {
         self.opened.as_ref().map(|opened| opened.encoder.codec())
     }
@@ -480,6 +484,32 @@ impl Sharer {
         self.answers.force_idr();
     }
 
+    // Lets go of the source and the encoder, for someone who paused their
+    // share: nothing of the screen is read until resume(), and the last
+    // picture goes with them, so whoever starts watching meanwhile gets
+    // nothing from before the pause. next() is not called while it holds.
+    pub fn pause(&mut self) {
+        self.last = None;
+        self.opened = None;
+        self.held = true;
+    }
+
+    // The same source again, at what it ran at before the pause, its first
+    // frame an IDR; frame numbers go on. False when it was not paused. An
+    // error ends the share.
+    pub fn resume(&mut self, say: &mut dyn FnMut(Line)) -> Result<bool, String> {
+        if !std::mem::take(&mut self.held) {
+            return Ok(false);
+        }
+        self.reopen(self.options, say)?;
+        self.answers.force_idr();
+        Ok(true)
+    }
+
+    pub fn held(&self) -> bool {
+        self.held
+    }
+
     // Under 8 Mbit/s a viewer, 1440p120 is not worth its frames, and an
     // encoder that cannot keep up needs fewer pixels. The source and the
     // encoder open again at 1080p60's size and rate, the shape kept as for
@@ -546,7 +576,8 @@ impl Sharer {
         self.small.is_some()
     }
 
-    // None only after a failed reopen, when the share is over.
+    // None while paused by hand, and after a failed reopen, when the share
+    // is over.
     pub fn kind(&self) -> Option<Kind> {
         self.opened.as_ref().map(|opened| opened.encoder.kind())
     }
