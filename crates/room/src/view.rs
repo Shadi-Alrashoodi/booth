@@ -83,6 +83,16 @@ impl ShareView {
     pub fn cap_set(&self) -> bool {
         self.watching && self.cap != WatchCap::default() && self.cap_unheard.is_none()
     }
+
+    // The share watched as its sharer says it is, for the strips' word; Live
+    // when this PC watches nothing, whatever the last share said.
+    pub fn watched(&self) -> ShareState {
+        if self.watching {
+            self.watched_state
+        } else {
+            ShareState::Live
+        }
+    }
 }
 
 // Who runs a Booth older than 1.2.0, which takes no cap from a watcher.

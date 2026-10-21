@@ -13,7 +13,7 @@ use input::{Action, Chord, Event};
 use invite::Invite;
 use keys::Identity;
 use net::firewall::FirewallState;
-use room::view::Role;
+use room::view::{Role, ShareState};
 use room::{
     Candidates, Config, DamagedList, Devices, Injector, KnownDevices, KnownError, List,
     ListProblem, Lookup, LossKnob, Manual, Notify, Room, TalkMode, Timers, VideoConfig,
@@ -1238,8 +1238,12 @@ impl eframe::App for App {
                         ui.set_clip_rect(bottom);
                         let shown = view.as_ref().map(|view| &view.strip);
                         let cap_set = view.as_ref().is_some_and(|view| view.share.cap_set());
+                        let watched = view
+                            .as_ref()
+                            .map_or(ShareState::Live, |view| view.share.watched());
                         strip_clicked =
-                            strip::show(ui, shown, cap_set, &self.sweep, self.scrolling).clicked();
+                            strip::show(ui, shown, cap_set, watched, &self.sweep, self.scrolling)
+                                .clicked();
                     });
                 }
             });

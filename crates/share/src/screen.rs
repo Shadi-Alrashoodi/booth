@@ -14,8 +14,8 @@ use encode::Codec as ShareCodec;
 use net::Timer;
 use stats::{Level, Thresholds, TraceSample};
 use viewer::{
-    ControlOut, Cursor, ErrorKind, LinkState, MouseMode, Options, PathWord, Show, Strip, Video,
-    Viewer,
+    ControlOut, Cursor, ErrorKind, LinkState, MouseMode, Options, PathWord, ShareState, Show,
+    Strip, Video, Viewer,
 };
 
 use crate::cursor::pointer;
@@ -109,6 +109,8 @@ pub struct LinkNumbers {
     pub one_way_ms: Option<f32>,
     // This PC asks the share to keep to a cap (the room's WatchCap).
     pub cap_set: bool,
+    // The share as its sharer says it is (the room's ShareState).
+    pub share_state: ShareState,
 }
 
 impl Default for LinkNumbers {
@@ -125,6 +127,7 @@ impl Default for LinkNumbers {
             trace: Vec::new(),
             one_way_ms: None,
             cap_set: false,
+            share_state: ShareState::Live,
         }
     }
 }
@@ -1077,6 +1080,7 @@ fn show_link(strip: &mut Strip, link: LinkNumbers) -> bool {
     strip.path = link.path;
     strip.trace = link.trace;
     strip.cap_set = link.cap_set;
+    strip.share_state = link.share_state;
     match link.loss_pct {
         Some(pct) => {
             strip.loss_pct = Some(pct);

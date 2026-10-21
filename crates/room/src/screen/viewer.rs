@@ -461,6 +461,11 @@ pub(crate) fn link_numbers(view: &View) -> LinkNumbers {
             .collect(),
         one_way_ms: one_way_ms(view),
         cap_set: view.share.cap_set(),
+        share_state: match view.share.watched() {
+            view::ShareState::Live => share::ShareState::Live,
+            view::ShareState::Paused => share::ShareState::Paused,
+            view::ShareState::Away => share::ShareState::Away,
+        },
     }
 }
 

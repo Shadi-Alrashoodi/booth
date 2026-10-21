@@ -3,7 +3,7 @@ use eframe::egui::{
     Color32, CursorIcon, Mesh, Painter, Rect, Response, Sense, Ui, WidgetInfo, WidgetType, pos2,
     vec2,
 };
-use room::view::{LinkState, PathWord, Strip, TracePoint};
+use room::view::{LinkState, PathWord, ShareState, Strip, TracePoint};
 use stats::Thresholds;
 
 use crate::controls;
@@ -49,10 +49,13 @@ fn appended(old: &[TracePoint], new: &[TracePoint]) -> usize {
 }
 
 // `cap_set`: this PC watches with a cap (room::view::ShareView::cap_set).
+// `watched`: the share it watches, as its sharer says it is
+// (ShareView::watched).
 pub fn show(
     ui: &mut Ui,
     strip: Option<&Strip>,
     cap_set: bool,
+    watched: ShareState,
     sweep: &Sweep,
     scrolling: bool,
 ) -> Response {
@@ -80,7 +83,7 @@ pub fn show(
         controls::ring_within(&painter, rect, rect);
     }
 
-    let words = words(strip, cap_set);
+    let words = words(strip, cap_set, watched);
     let widths: Vec<(Part, f32)> = words
         .iter()
         .map(|word| (word.part, slot_width(&painter, word)))
@@ -145,6 +148,7 @@ enum Part {
     Jitter,
     Loss,
     Path,
+    Share,
     Cap,
 }
 
@@ -160,14 +164,15 @@ impl Part {
             Part::Jitter => &["\u{b1}99"],
             Part::Loss => &["10.0%"],
             Part::Path => &["relayed"],
-            Part::State | Part::Cap => &[],
+            Part::State | Part::Share | Part::Cap => &[],
         }
     }
 }
 
 // What goes first when the strip is too narrow for everything. The state
-// word and the path word always stay: the strip is the one place state
-// shows, and "relayed" is the reason a link is slow.
+// word, the path word and the share's state always stay: the strip is the
+// one place state shows, "relayed" is the reason a link is slow, and a
+// paused share and a still screen look alike without the word.
 const DROP_ORDER: [Part; 4] = [Part::Cap, Part::Jitter, Part::Loss, Part::RoundTrip];
 
 struct Word {
@@ -216,7 +221,7 @@ fn fit(widths: &[(Part, f32)], room: f32) -> Vec<Part> {
     kept
 }
 
-fn words(strip: &Strip, cap_set: bool) -> Vec<Word> {
+fn words(strip: &Strip, cap_set: bool, watched: ShareState) -> Vec<Word> {
     let mut words = Vec::new();
     let mut push = |part, text: String, color, slot| {
         words.push(Word {
@@ -281,6 +286,12 @@ fn words(strip: &Strip, cap_set: bool) -> Vec<Word> {
     // sage word beside them gives them nothing to stand out against.
     if let Some(path) = strip.path {
         push(Part::Path, path_word(path).to_owned(), ASH, true);
+    }
+    // The sharer's, in ash too: the reason the picture stands still.
+    match watched {
+        ShareState::Live => {}
+        ShareState::Paused => push(Part::Share, String::from("paused"), ASH, false),
+        ShareState::Away => push(Part::Share, String::from("paused by Windows"), ASH, false),
     }
     // This PC's own choice, so a word in ash like the path's.
     if cap_set {
@@ -452,7 +463,7 @@ mod tests {
             ..Strip::default()
         };
         let texts = |cap_set| -> Vec<String> {
-            words(&strip, cap_set)
+            words(&strip, cap_set, ShareState::Live)
                 .into_iter()
                 .map(|word| word.text)
                 .collect()
@@ -572,6 +583,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    // The share's state after the path word, before the cap, and never
+    // dropped.
+    #[test]
+    fn share_state_follows_the_path_word() {
+        let strip = Strip {
+            state: LinkState::Live,
+            rtt_ms: Some(9.0),
+            path: Some(PathWord::Direct),
+            ..Strip::default()
+        };
+        let texts = |watched| -> Vec<String> {
+            words(&strip, true, watched)
+                .into_iter()
+                .map(|word| word.text)
+                .collect()
+        };
+        assert_eq!(texts(ShareState::Live), ["9 ms", "direct", "cap set"]);
+        assert_eq!(
+            texts(ShareState::Paused),
+            ["9 ms", "direct", "paused", "cap set"]
+        );
+        assert_eq!(
+            texts(ShareState::Away),
+            ["9 ms", "direct", "paused by Windows", "cap set"]
+        );
+        let widths = [
+            (Part::RoundTrip, 50.0),
+            (Part::Path, 50.0),
+            (Part::Share, 50.0),
+            (Part::Cap, 50.0),
+        ];
+        assert_eq!(fit(&widths, 100.0), [Part::Path, Part::Share]);
     }
 
     #[test]

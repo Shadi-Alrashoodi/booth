@@ -58,6 +58,9 @@ pub struct Strip {
     // This PC asks the share to keep to a cap: "cap set" after the path
     // word.
     pub cap_set: bool,
+    // While this PC watches: the sharer paused the share, or Windows has
+    // their screen. The reason no frames come.
+    pub share_state: ShareState,
 }
 
 impl Default for Strip {
@@ -81,6 +84,7 @@ impl Default for Strip {
             controlling: None,
             control_paused: false,
             cap_set: false,
+            share_state: ShareState::Live,
         }
     }
 }
@@ -100,6 +104,15 @@ pub enum LinkState {
     Reconnecting,
     Lost,
     Closed,
+}
+
+// room::view::ShareState, one to one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShareState {
+    #[default]
+    Live,
+    Paused,
+    Away,
 }
 
 // room::view::PathWord, plus the word for booth.exe --loopback, where the
@@ -190,6 +203,7 @@ enum Part {
     Jitter,
     Loss,
     Path,
+    Share,
     Cap,
     Control,
     Paused,
@@ -222,14 +236,20 @@ impl Part {
             Part::Loss => &["10.0%"],
             Part::Encode | Part::Decode => &["99.9 ms"],
             Part::Path => &["relayed"],
-            Part::State | Part::Cap | Part::Control | Part::Paused | Part::Present => &[],
+            Part::State
+            | Part::Share
+            | Part::Cap
+            | Part::Control
+            | Part::Paused
+            | Part::Present => &[],
         }
     }
 }
 
 // What goes first when the strip is too narrow for everything. The state
-// word, the path word, the control words and the present path always stay:
-// the strip is the one place state shows, "relayed" is the reason a link is
+// word, the path word, the share's state, the control words and the present
+// path always stay: the strip is the one place state shows, a paused share
+// and a still screen look alike without the word, "relayed" is the reason a link is
 // slow, the control words say this PC's keys go to another, and "composed"
 // is the reason a windowed viewer is a frame behind. When they still do not
 // fit, the control words take their short forms. "cap set" is a reminder of
@@ -329,6 +349,11 @@ fn words(strip: &Strip, present: Option<PresentPath>) -> Vec<Word> {
         };
         // A word, not a reading: colour in the strip is for the numbers.
         push(Part::Path, word.to_string(), ASH, true);
+    }
+    match strip.share_state {
+        ShareState::Live => {}
+        ShareState::Paused => push(Part::Share, String::from("paused"), ASH, false),
+        ShareState::Away => push(Part::Share, String::from("paused by Windows"), ASH, false),
     }
     if strip.cap_set {
         push(Part::Cap, String::from("cap set"), ASH, false);
@@ -929,6 +954,32 @@ mod tests {
         assert!(fit(&widths, all).contains(&Part::Cap));
         assert!(!fit(&widths, all - 60.0).contains(&Part::Cap));
         assert!(fit(&widths, all - 60.0).contains(&Part::Jitter));
+    }
+
+    // The share's state after the path word, which never drops out.
+    #[test]
+    fn share_state_follows_the_path_word() {
+        for (state, word) in [
+            (ShareState::Paused, "paused"),
+            (ShareState::Away, "paused by Windows"),
+        ] {
+            let strip = Strip {
+                share_state: state,
+                cap_set: true,
+                ..live()
+            };
+            let words = words(&strip, None);
+            let texts: Vec<&str> = words.iter().map(|word| word.text.as_str()).collect();
+            assert_eq!(texts[3..6], ["LAN", word, "cap set"]);
+            assert_eq!(words[4].colour, ASH);
+            let widths: Vec<(Part, f32)> = words.iter().map(|word| (word.part, 50.0)).collect();
+            assert!(fit(&widths, 300.0).contains(&Part::Share));
+        }
+        assert!(
+            !words(&live(), None)
+                .iter()
+                .any(|word| word.part == Part::Share)
+        );
     }
 
     #[test]

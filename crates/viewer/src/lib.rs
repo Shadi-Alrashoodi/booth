@@ -48,7 +48,7 @@ use crate::window::{Fullscreen, Window};
 pub use crate::control::{Capturing, ControlOut, MouseButton, MouseMode, Pointing};
 pub use crate::cursor::{Cursor, CursorKind, CursorShape};
 pub use crate::error::{ErrorKind, ViewerError};
-pub use crate::strip::{LinkState, PathWord, PresentPath, Strip};
+pub use crate::strip::{LinkState, PathWord, PresentPath, ShareState, Strip};
 
 // Two buffers: one on screen, one being drawn. Flip discard needs at least
 // two, and a third would only be a frame waiting in line.
