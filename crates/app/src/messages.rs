@@ -507,6 +507,7 @@ pub fn stun_refused(line: usize) -> String {
     STUN_REFUSED.replace("{n}", &line.to_string())
 }
 
+pub const SHARE_PAUSED: &str = "Sharing is paused. Nothing of your screen is sent until you resume.";
 pub const HOTKEYS_PAUSED: &str = "Hotkeys paused while an administrator window has focus.";
 pub const PRESS_NEW_KEY: &str = "Press the new key, or Esc to keep the old one.";
 
@@ -516,6 +517,7 @@ pub fn hotkey_label(action: Action) -> &'static str {
         Action::Mute => "Mute",
         Action::Deafen => "Deafen",
         Action::Share => "Share (press twice) or stop sharing",
+        Action::PauseShare => "Pause sharing, resume (press twice)",
         Action::Panic => "Panic key",
         Action::ShowPanel => "Show or hide the panel",
         Action::StatsPanel => "Stats panel",

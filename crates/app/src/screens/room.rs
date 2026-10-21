@@ -234,6 +234,17 @@ impl InRoom {
                 self.monitors = None;
             }
         }
+        if view
+            .share
+            .running
+            .as_ref()
+            .is_some_and(|running| running.held)
+        {
+            block = true;
+            if paused_block(ui) {
+                self.room.pause_share(false);
+            }
+        }
         block |= self.request(ui, view);
         if stats_open {
             self.periods.ask(ui.ctx(), &self.devices);
@@ -872,6 +883,17 @@ fn monitor_row(ui: &mut Ui, picks: &[Pick]) -> Option<usize> {
         });
     });
     pressed
+}
+
+// While this PC's share is paused by hand, under the title row as the
+// monitor list is. Resume is secondary: Stop sharing stays the room's one
+// primary.
+fn paused_block(ui: &mut Ui) -> bool {
+    controls::region(ui, |ui| {
+        controls::text(ui, messages::SHARE_PAUSED, theme::body(), CHALK);
+        ui.add_space(STEP);
+        controls::buttons(ui, &[Button::new("Resume")], CONTROL_HEIGHT).is_some()
+    })
 }
 
 // 8 px of window tone between a block in panel tone and the first row, as
@@ -2197,7 +2219,16 @@ mod tests {
             // Granted, before the capture and the encoder are open.
             (sharing.clone(), None, true),
             (sharing.clone(), capture(None), true),
-            (sharing, capture(Some(Paused::SecureDesktop)), true),
+            (sharing.clone(), capture(Some(Paused::SecureDesktop)), true),
+            // Paused by hand: resuming would show them in its first picture.
+            (
+                sharing,
+                capture(None).map(|running| RunningShare {
+                    held: true,
+                    ..running
+                }),
+                true,
+            ),
             // Stop sharing pressed, and the thread still holds the screen.
             (OwnShare::Off, capture(None), true),
             (OwnShare::Refused(Refusal::TooSoon), None, false),

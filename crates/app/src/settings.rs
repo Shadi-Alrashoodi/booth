@@ -35,6 +35,7 @@ const HOTKEY_PUSH_TO_TALK: &str = "hotkey_push_to_talk";
 const HOTKEY_MUTE: &str = "hotkey_mute";
 const HOTKEY_DEAFEN: &str = "hotkey_deafen";
 const HOTKEY_SHARE: &str = "hotkey_share";
+const HOTKEY_PAUSE_SHARE: &str = "hotkey_pause_share";
 const HOTKEY_PANIC: &str = "hotkey_panic";
 const HOTKEY_SHOW_PANEL: &str = "hotkey_show_panel";
 const HOTKEY_STATS_PANEL: &str = "hotkey_stats_panel";
@@ -48,7 +49,7 @@ const SHARE_MONITOR: &str = "share_monitor";
 // address. Only on is saved.
 const CHECK_FOR_NEW_VERSIONS: &str = "check_for_new_versions";
 // Every key this version knows, in the order a save adds the missing ones.
-const KEYS: [&str; 24] = [
+const KEYS: [&str; 25] = [
     NAME,
     PORT,
     STUN_SERVERS,
@@ -57,6 +58,7 @@ const KEYS: [&str; 24] = [
     HOTKEY_MUTE,
     HOTKEY_DEAFEN,
     HOTKEY_SHARE,
+    HOTKEY_PAUSE_SHARE,
     HOTKEY_PANIC,
     HOTKEY_SHOW_PANEL,
     HOTKEY_STATS_PANEL,
@@ -559,6 +561,7 @@ fn hotkey_action(key: &str) -> Option<Action> {
         HOTKEY_MUTE => Action::Mute,
         HOTKEY_DEAFEN => Action::Deafen,
         HOTKEY_SHARE => Action::Share,
+        HOTKEY_PAUSE_SHARE => Action::PauseShare,
         HOTKEY_PANIC => Action::Panic,
         HOTKEY_SHOW_PANEL => Action::ShowPanel,
         HOTKEY_STATS_PANEL => Action::StatsPanel,

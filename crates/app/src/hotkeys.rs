@@ -29,6 +29,7 @@ struct Aim {
     room: Option<Arc<Room>>,
     key: bool,
     button: bool,
+    pause: PauseKey,
 }
 
 impl Target {
@@ -37,6 +38,7 @@ impl Target {
             room: Some(room),
             key: false,
             button: false,
+            pause: PauseKey::default(),
         };
     }
 
@@ -68,6 +70,25 @@ impl Target {
     pub fn toggle_deafen(&self) {
         if let Some(room) = &self.lock().room {
             room.deafen(!room.view().voice.deafened);
+        }
+    }
+
+    // Here on the hotkey thread rather than in the panel, as for push to
+    // talk: someone about to show what they should not cannot wait for a
+    // minimized panel to look. Only while this PC shares.
+    pub fn pause_key(&self, at: Instant) {
+        let mut aim = self.lock();
+        let Some(room) = aim.room.clone() else {
+            return;
+        };
+        if room.view().share.running.is_none() {
+            aim.pause = PauseKey::default();
+            return;
+        }
+        match aim.pause.press(at, room.share_paused()) {
+            Some(PauseStep::Pause) => room.pause_share(true),
+            Some(PauseStep::Resume) => room.pause_share(false),
+            None => {}
         }
     }
 
@@ -163,6 +184,39 @@ impl ShareKey {
     }
 }
 
+// The pause key as it counts presses: pausing takes one, at once, and
+// resuming a second one within SECOND_PRESS_WITHIN of the first, as starting
+// a share does, so a stray press never shows the screen again.
+#[derive(Debug, Default)]
+struct PauseKey {
+    first: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PauseStep {
+    Pause,
+    Resume,
+}
+
+impl PauseKey {
+    // `paused` is whether this PC's share is paused now.
+    fn press(&mut self, at: Instant, paused: bool) -> Option<PauseStep> {
+        if !paused {
+            self.first = None;
+            return Some(PauseStep::Pause);
+        }
+        match self.first.take() {
+            Some(first) if at.saturating_duration_since(first) <= SECOND_PRESS_WITHIN => {
+                Some(PauseStep::Resume)
+            }
+            _ => {
+                self.first = Some(at);
+                None
+            }
+        }
+    }
+}
+
 pub struct Hotkeys {
     running: Option<input::Hotkeys>,
     // Each with when the hotkey thread heard it: while the panel is
@@ -193,6 +247,7 @@ impl Hotkeys {
                 Event::Pressed(Action::Mute) => target.toggle_mute(),
                 Event::Pressed(Action::Deafen) => target.toggle_deafen(),
                 Event::Pressed(Action::Panic) => target.panic_key(),
+                Event::Pressed(Action::PauseShare) => target.pause_key(at),
                 _ => {}
             }
             let _ = tell.send((event, at));
@@ -430,7 +485,7 @@ mod tests {
     fn the_bindings_line_lists_every_action() {
         assert_eq!(
             bindings_line(&Bindings::default()),
-            "hotkeys: push to talk Right Ctrl, mute Ctrl+Shift+M, deafen Ctrl+Shift+D, share (press twice) or stop sharing Ctrl+Shift+S, panic key Ctrl+Shift+End, show or hide the panel Ctrl+Shift+Space, stats panel Ctrl+Shift+I"
+            "hotkeys: push to talk Right Ctrl, mute Ctrl+Shift+M, deafen Ctrl+Shift+D, share (press twice) or stop sharing Ctrl+Shift+S, pause sharing, resume (press twice) Ctrl+Shift+F9, panic key Ctrl+Shift+End, show or hide the panel Ctrl+Shift+Space, stats panel Ctrl+Shift+I"
         );
     }
 
@@ -462,6 +517,24 @@ mod tests {
         assert_eq!(key.press(after(t, 5_000), false), None);
         // The late one counts as a first press.
         assert_eq!(key.press(after(t, 5_600), false), Some(ShareStep::Start));
+    }
+
+    // Pausing takes one press; resuming takes two within a second, and a
+    // press after the pause ended is a pause again.
+    #[test]
+    fn one_press_pauses_and_two_resume() {
+        let t = Instant::now();
+        let mut key = PauseKey::default();
+        assert_eq!(key.press(t, false), Some(PauseStep::Pause));
+        assert_eq!(key.press(after(t, 300), true), None);
+        assert_eq!(key.press(after(t, 1_500), true), None);
+        assert_eq!(key.press(after(t, 2_000), true), Some(PauseStep::Resume));
+        assert_eq!(key.press(after(t, 2_100), false), Some(PauseStep::Pause));
+        // A first press left over when the panel resumed the share counts
+        // for nothing once it is paused again.
+        assert_eq!(key.press(after(t, 2_500), true), None);
+        assert_eq!(key.press(after(t, 2_600), false), Some(PauseStep::Pause));
+        assert_eq!(key.press(after(t, 2_700), true), None);
     }
 
     // Stopping takes one press, and that press is no first one.

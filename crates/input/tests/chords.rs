@@ -20,6 +20,7 @@ fn default_chords_as_text() {
             "Ctrl+Shift+M",
             "Ctrl+Shift+D",
             "Ctrl+Shift+S",
+            "Ctrl+Shift+F9",
             "Ctrl+Shift+End",
             "Ctrl+Shift+Space",
             "Ctrl+Shift+I"

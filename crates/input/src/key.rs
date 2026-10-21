@@ -25,6 +25,7 @@ impl Key {
     pub const S: Key = Key(0x1F);
     pub const SPACE: Key = Key(0x39);
     pub const F4: Key = Key(0x3E);
+    pub const F9: Key = Key(0x43);
     pub const F11: Key = Key(0x57);
     pub const END: Key = Key(E0 | 0x4F);
     pub const LEFT_CTRL: Key = Key(0x1D);

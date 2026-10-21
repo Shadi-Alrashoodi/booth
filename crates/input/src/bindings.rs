@@ -6,6 +6,9 @@ pub enum Action {
     Mute,
     Deafen,
     Share,
+    // Lets go of the screen while sharing, at once; resuming takes a second
+    // press, as starting a share does (the app counts them).
+    PauseShare,
     // Cuts remote control on the PC being controlled, and lets go of it on
     // the controller's. Only a physical keyboard presses it (tracker.rs).
     Panic,
@@ -15,11 +18,12 @@ pub enum Action {
 
 impl Action {
     // In the order settings lists them.
-    pub const ALL: [Action; 7] = [
+    pub const ALL: [Action; 8] = [
         Action::PushToTalk,
         Action::Mute,
         Action::Deafen,
         Action::Share,
+        Action::PauseShare,
         Action::Panic,
         Action::ShowPanel,
         Action::StatsPanel,
@@ -45,6 +49,7 @@ impl Action {
             Action::Mute => "mute",
             Action::Deafen => "deafen",
             Action::Share => "share (press twice) or stop sharing",
+            Action::PauseShare => "pause sharing, resume (press twice)",
             Action::Panic => "panic key",
             Action::ShowPanel => "show or hide the panel",
             Action::StatsPanel => "stats panel",
@@ -58,6 +63,7 @@ impl Action {
             Action::Mute => Chord::new(ctrl_shift, Key::M),
             Action::Deafen => Chord::new(ctrl_shift, Key::D),
             Action::Share => Chord::new(ctrl_shift, Key::S),
+            Action::PauseShare => Chord::new(ctrl_shift, Key::F9),
             Action::Panic => Chord::new(ctrl_shift, Key::END),
             Action::ShowPanel => Chord::new(ctrl_shift, Key::SPACE),
             Action::StatsPanel => Chord::new(ctrl_shift, Key::I),
@@ -80,9 +86,10 @@ impl Action {
             Action::Mute => 1,
             Action::Deafen => 2,
             Action::Share => 3,
-            Action::Panic => 4,
-            Action::ShowPanel => 5,
-            Action::StatsPanel => 6,
+            Action::PauseShare => 4,
+            Action::Panic => 5,
+            Action::ShowPanel => 6,
+            Action::StatsPanel => 7,
         }
     }
 }
