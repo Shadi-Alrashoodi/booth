@@ -62,7 +62,8 @@ pub const RING_GAP: f32 = 2.0;
 
 pub const ICON_SIZE: f32 = 16.0;
 
-const SANS_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/IBMPlexSans-Regular.ttf");
+pub(crate) const SANS_REGULAR: &[u8] =
+    include_bytes!("../../../assets/fonts/IBMPlexSans-Regular.ttf");
 const SANS_MEDIUM: &[u8] = include_bytes!("../../../assets/fonts/IBMPlexSans-Medium.ttf");
 const MONO_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/IBMPlexMono-Regular.ttf");
 // IBM Plex Sans Arabic 1.1.0, the TTFs of github.com/IBM/plex at commit

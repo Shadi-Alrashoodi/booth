@@ -11,6 +11,7 @@ mod loopback;
 mod memstats;
 mod messages;
 mod monitors;
+mod region;
 mod remote;
 mod running;
 mod screens;

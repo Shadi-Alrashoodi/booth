@@ -674,7 +674,7 @@ impl App {
                 self.backlog.add(line);
             }
             match event {
-                Event::Pressed(Action::Share) => self.share_key(at),
+                Event::Pressed(Action::Share) => self.share_key(at, ctx),
                 Event::Pressed(Action::ShowPanel) => self.show_or_hide(ctx),
                 Event::Pressed(Action::StatsPanel) => self.stats_key(ctx),
                 Event::Chord(chord) => self.chord(chord),
@@ -728,7 +728,7 @@ impl App {
     // start one on the monitor picked last in Share's list.
     // While someone else shares the room refuses the second press with its
     // one line, "Ines is sharing. One share at a time."
-    fn share_key(&mut self, at: Instant) {
+    fn share_key(&mut self, at: Instant, ctx: &Context) {
         let (Ok(setup), Screen::Room(in_room)) = (&self.setup, &mut self.screen) else {
             return;
         };
@@ -740,6 +740,13 @@ impl App {
                 return;
             }
             None => return,
+        }
+        // After a region share the key opens the list instead, so a press never
+        // shows more than the person last chose.
+        if in_room.region_last() {
+            in_room.open_share_list();
+            self.show_panel(ctx);
+            return;
         }
         in_room.close_monitors();
         let (fps, monitor) = match monitors::list() {
@@ -1301,6 +1308,7 @@ impl eframe::App for App {
                 }
             }
             Some(Step::Remember(device)) => self.remember_monitor(&device),
+            Some(Step::Log(line)) => self.backlog.add(line),
             None => {}
         }
         // Change or Save pressed on this frame starts or ends a wait.

@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Instant;
 
 use eframe::egui::emath::GuiRounding;
 use eframe::egui::{
-    Align, Color32, Key, Layout, Modifiers, Rect, Response, ScrollArea, Sense, Stroke, Ui, vec2,
+    Align, Color32, Context, Key, Layout, Modifiers, Rect, Response, ScrollArea, Sense, Stroke, Ui,
+    vec2,
 };
 use invite::ReplyCode;
 use room::view::{
@@ -18,6 +20,7 @@ use crate::controls::{self, Button, Lead};
 use crate::hotkeys::{self, Target};
 use crate::messages;
 use crate::monitors::{self, Pick};
+use crate::region::{self, Picked};
 use crate::screens::chat::{Chat, Composer};
 use crate::screens::control::{self, AllowWait, Answer, Decline, MenuItem, PanicKey, RowMenu};
 use crate::screens::stats;
@@ -63,6 +66,11 @@ pub struct InRoom {
     // The monitors Share offered, while the list under the title row is
     // open.
     monitors: Option<Vec<Pick>>,
+    // The region picker's answer, while it is open.
+    region_pick: Option<Receiver<Result<Option<Picked>, String>>>,
+    // The share started last from the panel was a region: the share key
+    // then opens the list rather than show a whole monitor.
+    region_last: bool,
     panic: PanicKey,
     allow_wait: AllowWait,
     decline: Decline,
@@ -123,6 +131,8 @@ pub enum Step {
     // A monitor was picked from the list, and its Windows name goes in the
     // settings for the share key.
     Remember(String),
+    // For the log, which the panel has no line for.
+    Log(String),
 }
 
 impl InRoom {
@@ -154,6 +164,8 @@ impl InRoom {
             keys: hotkeys::State::default(),
             control_offered: false,
             monitors: None,
+            region_pick: None,
+            region_last: false,
             panic,
             allow_wait: AllowWait::default(),
             decline: Decline::default(),
@@ -175,6 +187,19 @@ impl InRoom {
     // offer a choice that no longer applies.
     pub fn close_monitors(&mut self) {
         self.monitors = None;
+    }
+
+    pub fn region_last(&self) -> bool {
+        self.region_last
+    }
+
+    // For the share key after a region share: the list, as Share opens it.
+    pub fn open_share_list(&mut self) {
+        if let Ok(list) = monitors::list()
+            && !list.is_empty()
+        {
+            self.monitors = Some(monitors::picks(&list));
+        }
     }
 
     pub fn show(
@@ -227,11 +252,35 @@ impl InRoom {
         let mut block = false;
         if let Some(picks) = &self.monitors {
             block = true;
-            if let Some(i) = monitor_row(ui, picks) {
-                let pick = &picks[i];
-                self.room.share(pick.fps, Some(pick.id.clone()));
-                step = Some(Step::Remember(pick.id.device_name.clone()));
-                self.monitors = None;
+            match monitor_row(ui, picks) {
+                Some(RowPick::Monitor(i)) => {
+                    let pick = &picks[i];
+                    self.room.share(pick.fps, Some(pick.id.clone()));
+                    step = Some(Step::Remember(pick.id.device_name.clone()));
+                    self.monitors = None;
+                    self.region_last = false;
+                }
+                Some(RowPick::Region) => {
+                    self.monitors = None;
+                    step = self.pick_region(ui.ctx());
+                }
+                None => {}
+            }
+        }
+        if let Some(answer) = &self.region_pick {
+            match answer.try_recv() {
+                Ok(Ok(Some(picked))) => {
+                    let fps = monitors::fps(picked.refresh_hz);
+                    self.room.share_region(fps, picked.monitor, picked.region);
+                    self.region_last = true;
+                    self.region_pick = None;
+                }
+                Ok(Err(why)) => {
+                    step = Some(Step::Log(why));
+                    self.region_pick = None;
+                }
+                Ok(Ok(None)) | Err(TryRecvError::Disconnected) => self.region_pick = None,
+                Err(TryRecvError::Empty) => {}
             }
         }
         if view
@@ -287,21 +336,17 @@ impl InRoom {
         step
     }
 
-    // Share on a PC with one monitor starts on it at once; with more, the
-    // list opens, and Share again closes it. Stop sharing needs no answer.
+    // Share opens the list of monitors and Region under the title row, one
+    // monitor or more, and Share again closes it. Stop sharing needs no
+    // answer.
     fn share_pressed(&mut self, verb: Option<&ShareVerb>) {
         match verb {
             Some(ShareVerb::Share) if self.monitors.is_some() => self.monitors = None,
             Some(ShareVerb::Share) => match monitors::list() {
-                Ok(list) if list.len() > 1 => self.monitors = Some(monitors::picks(&list)),
-                Ok(list) => {
-                    let only = list.first();
-                    let fps = only.map_or(monitors::MOST_FPS, |m| monitors::fps(m.refresh_hz));
-                    self.room.share(fps, only.map(|m| m.id.clone()));
-                }
+                Ok(list) if !list.is_empty() => self.monitors = Some(monitors::picks(&list)),
                 // The room tries the primary monitor, and when that cannot
                 // open either, its problem line in the chat says why.
-                Err(_) => self.room.share(monitors::MOST_FPS, None),
+                Ok(_) | Err(_) => self.room.share(monitors::MOST_FPS, None),
             },
             Some(ShareVerb::StopSharing) => self.room.stop_sharing(),
             Some(ShareVerb::StopControl) => self.room.stop_control(),
@@ -863,10 +908,16 @@ pub fn addresses_hidden(share: &ShareView) -> bool {
     own_share_on(&share.own) || share.running.is_some()
 }
 
-// On a PC with more than one monitor, Share opens a one-line list of them by
-// size and position under the title row, and one click starts the share. At
-// the narrowest window three of them wrap onto a second line.
-fn monitor_row(ui: &mut Ui, picks: &[Pick]) -> Option<usize> {
+#[derive(Debug, PartialEq, Eq)]
+enum RowPick {
+    Monitor(usize),
+    Region,
+}
+
+// Share opens a one-line list of the monitors by size and position under the
+// title row, with Region last, and one click starts the share or the region
+// picker. At the narrowest window three monitors wrap onto a second line.
+fn monitor_row(ui: &mut Ui, picks: &[Pick]) -> Option<RowPick> {
     let mut pressed = None;
     controls::region(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -877,12 +928,36 @@ fn monitor_row(ui: &mut Ui, picks: &[Pick]) -> Option<usize> {
                     .show(ui)
                     .clicked()
                 {
-                    pressed = Some(i);
+                    pressed = Some(RowPick::Monitor(i));
                 }
+            }
+            let region = Button::new("Region").label("Share a region of a monitor");
+            if region.show(ui).clicked() {
+                pressed = Some(RowPick::Region);
             }
         });
     });
     pressed
+}
+
+impl InRoom {
+    // The picker over every monitor; body takes its answer when it comes.
+    fn pick_region(&mut self, ctx: &Context) -> Option<Step> {
+        let list = match monitors::list() {
+            Ok(list) => list,
+            Err(why) => return Some(Step::Log(why)),
+        };
+        let ctx = ctx.clone();
+        match region::pick(list, move || ctx.request_repaint()) {
+            Ok(answer) => {
+                self.region_pick = Some(answer);
+                None
+            }
+            Err(err) => Some(Step::Log(format!(
+                "could not open the region picker: {err}"
+            ))),
+        }
+    }
 }
 
 // While this PC's share is paused by hand, under the title row as the
@@ -2280,6 +2355,7 @@ mod tests {
             .collect()
     }
 
+    // Region, after the monitors, opens the picker.
     #[test]
     fn one_click_in_the_monitor_list_picks_that_monitor() {
         use crate::controls::tests::{frame, press, release};
@@ -2295,10 +2371,14 @@ mod tests {
         });
         frame(&ctx, press(second), |ui| monitor_row(ui, &picks));
         let (pressed, _) = frame(&ctx, release(second), |ui| monitor_row(ui, &picks));
-        assert_eq!(pressed, Some(1));
+        assert_eq!(pressed, Some(RowPick::Monitor(1)));
         let first = pos2(SIDE + 10.0, SIDE + CONTROL_HEIGHT / 2.0);
         frame(&ctx, press(first), |ui| monitor_row(ui, &picks));
         let (pressed, _) = frame(&ctx, release(first), |ui| monitor_row(ui, &picks));
-        assert_eq!(pressed, Some(0));
+        assert_eq!(pressed, Some(RowPick::Monitor(0)));
+        // Alone in the row, so it is where the first monitor was.
+        frame(&ctx, press(first), |ui| monitor_row(ui, &[]));
+        let (pressed, _) = frame(&ctx, release(first), |ui| monitor_row(ui, &[]));
+        assert_eq!(pressed, Some(RowPick::Region));
     }
 }
