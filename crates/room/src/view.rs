@@ -143,6 +143,19 @@ pub struct RunningShare {
     pub held: bool,
 }
 
+// Why no frames come from a share, as its sharer says it (from 1.3.0): a
+// still screen sends none either, and only this tells the two apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShareState {
+    #[default]
+    Live,
+    // Paused by hand: nothing comes until the sharer resumes.
+    Paused,
+    // A UAC prompt, the lock screen, the monitor off: it comes back by
+    // itself.
+    Away,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Paused {
     // A UAC prompt, the lock screen or Ctrl+Alt+Del.

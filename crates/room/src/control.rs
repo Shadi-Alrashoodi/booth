@@ -12,6 +12,7 @@ use zeroize::Zeroizing;
 use crate::known;
 use crate::remote::ControlEnd;
 use crate::screen::wire::ShapeChunk;
+use crate::view::ShareState;
 
 pub(crate) const MAX_NAME_CHARS: usize = 32;
 // A 32-character name can be 128 bytes of UTF-8, and nine of those do not fit
@@ -58,6 +59,9 @@ const HELLO: u8 = 24;
 // every watcher's for the sharer.
 const WATCH_LIMITS: u8 = 25;
 const SHARE_LIMITS: u8 = 26;
+// From 1.3.0 on: whether the share under way is live, paused by the sharer,
+// or away while Windows has taken the sharer's screen.
+const SHARE_STATE: u8 = 27;
 
 const IS_HOST: u8 = 1 << 0;
 const JOINED_BY_INVITE: u8 = 1 << 1;
@@ -269,6 +273,12 @@ pub(crate) enum Message {
     ShareLimits {
         share: u32,
         limits: Option<ShareLimits>,
+    },
+    // The sharer to the host whenever it changes, and the host to each
+    // watcher then and when one starts watching a share that is not live.
+    ShareState {
+        share: u32,
+        state: ShareState,
     },
 }
 
@@ -648,6 +658,15 @@ impl Message {
                     None => out.extend_from_slice(&[0; 10]),
                 }
             }
+            Message::ShareState { share, state } => {
+                out.push(SHARE_STATE);
+                out.extend_from_slice(&share.to_le_bytes());
+                out.push(match state {
+                    ShareState::Live => 0,
+                    ShareState::Paused => 1,
+                    ShareState::Away => 2,
+                });
+            }
         }
         out
     }
@@ -950,6 +969,15 @@ impl Message {
                 };
                 Message::ShareLimits { share, limits }
             }
+            SHARE_STATE => Message::ShareState {
+                share: r.share()?,
+                state: match r.u8()? {
+                    0 => ShareState::Live,
+                    1 => ShareState::Paused,
+                    2 => ShareState::Away,
+                    _ => return None,
+                },
+            },
             _ => return None,
         };
         r.0.is_empty().then_some(message)
@@ -1101,6 +1129,11 @@ impl fmt::Debug for Message {
                 .debug_struct("ShareLimits")
                 .field("share", share)
                 .field("limits", limits)
+                .finish(),
+            Message::ShareState { share, state } => f
+                .debug_struct("ShareState")
+                .field("share", share)
+                .field("state", state)
                 .finish(),
         }
     }
@@ -2949,6 +2982,45 @@ mod limits_tests {
             if let Some(message) = Message::decode(&sent) {
                 prop_assert_eq!(bytes(&message), sent);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod share_state_tests {
+    use super::*;
+
+    fn state(state: ShareState) -> Message {
+        Message::ShareState { share: 7, state }
+    }
+
+    #[test]
+    fn share_state_bytes() {
+        for (shared, byte) in [
+            (ShareState::Live, 0),
+            (ShareState::Paused, 1),
+            (ShareState::Away, 2),
+        ] {
+            let sent = state(shared);
+            let bytes = sent.encode().to_vec();
+            assert_eq!(bytes, [27, 7, 0, 0, 0, byte]);
+            let back = Message::decode(&bytes).expect("decodes");
+            assert_eq!(back.encode().to_vec(), bytes);
+        }
+    }
+
+    // A state this version does not know, share 0, and a byte too many or
+    // too few.
+    #[test]
+    fn bent_share_state_refused() {
+        let good = state(ShareState::Paused).encode().to_vec();
+        for bent in [
+            vec![27, 7, 0, 0, 0, 3],
+            vec![27, 0, 0, 0, 0, 1],
+            [&good[..], &[0]].concat(),
+            good[..good.len() - 1].to_vec(),
+        ] {
+            assert!(Message::decode(&bent).is_none(), "{bent:?}");
         }
     }
 }
