@@ -3013,6 +3013,7 @@ impl Host {
                     self.peers[i].link.feedback_read = version >= peer::FEEDBACK_SINCE;
                     self.peers[i].link.limits_read = version >= peer::LIMITS_SINCE;
                     self.peers[i].link.state_read = version >= peer::SHARE_STATE_SINCE;
+                    self.peers[i].link.sound_read = version >= peer::PC_SOUND_SINCE;
                     let peer = &self.peers[i];
                     if first
                         && version != invite::VERSION
@@ -3935,6 +3936,47 @@ mod tests {
             addresses_in(&ana.heard(later)),
             [(vec![lan, public(MOVED), public(bound(MOVED))], name)]
         );
+    }
+
+    // Whether a friend's copy reads PC sound is its latest Hello's version,
+    // and a link starts out without it.
+    #[test]
+    fn pc_sound_goes_by_each_hello() {
+        let start = Instant::now();
+        let mut rig = Rig::new(start);
+        let mut ana = Guest::new();
+        ana.join(&mut rig, "Ana", start);
+        let mut now = start + Duration::from_secs(1);
+        rig.tick(now);
+        for (version, reads) in [
+            (
+                invite::Version {
+                    major: 1,
+                    minor: 2,
+                    patch: 0,
+                },
+                false,
+            ),
+            (peer::PC_SOUND_SINCE, true),
+            (
+                invite::Version {
+                    major: 1,
+                    minor: 2,
+                    patch: 9,
+                },
+                false,
+            ),
+        ] {
+            now += Duration::from_millis(10);
+            let hello = Message::Hello {
+                version,
+                name: String::from("Ana"),
+                reached: None,
+            };
+            ana.say(&mut rig, &hello, now);
+            rig.tick(now);
+            assert_eq!(rig.host.peers[0].link.sound_read, reads, "{version}");
+        }
     }
 
     #[test]

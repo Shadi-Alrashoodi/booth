@@ -2263,6 +2263,7 @@ impl Client {
                         self.link.feedback_read = version >= peer::FEEDBACK_SINCE;
                         self.link.limits_read = version >= peer::LIMITS_SINCE;
                         self.link.state_read = version >= peer::SHARE_STATE_SINCE;
+                        self.link.sound_read = version >= peer::PC_SOUND_SINCE;
                         self.send_watch_limits();
                         if version != invite::VERSION {
                             log!(

@@ -46,7 +46,7 @@ fn empty_packet_is_an_error() {
 
 #[test]
 fn unknown_channel_is_an_error() {
-    for byte in 8..=255u8 {
+    for byte in 9..=255u8 {
         assert_eq!(
             unframe(&[byte, 1, 2, 3]),
             Err(FrameError::UnknownChannel(byte))

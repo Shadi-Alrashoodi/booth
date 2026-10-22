@@ -12,6 +12,9 @@ pub enum Channel {
     Ping = 6,
     // Video feedback, a reliable stream of its own beside Control.
     Feedback = 7,
+    // PC sound, from Booth 1.3.0: copies before it count the byte as
+    // unknown, so nothing goes out on it to them.
+    Sound = 8,
 }
 
 impl TryFrom<u8> for Channel {
@@ -27,6 +30,7 @@ impl TryFrom<u8> for Channel {
             5 => Channel::Input,
             6 => Channel::Ping,
             7 => Channel::Feedback,
+            8 => Channel::Sound,
             other => return Err(FrameError::UnknownChannel(other)),
         })
     }

@@ -49,6 +49,14 @@ pub(crate) const SHARE_STATE_SINCE: invite::Version = invite::Version {
     patch: 0,
 };
 
+// PC sound (Channel::Sound and control::Message::ShareSound) goes only to a
+// peer whose Hello says PC_SOUND_SINCE or later.
+pub(crate) const PC_SOUND_SINCE: invite::Version = invite::Version {
+    major: 1,
+    minor: 3,
+    patch: 0,
+};
+
 // Feedback waiting on its stream, in flight or queued, past which new
 // feedback is held and merged until it drains: recover requests into one
 // span, and the newest IDR ask and loss report. A request that waits behind
@@ -355,6 +363,8 @@ pub(crate) fn read_plain(plain: &[u8]) -> Option<Plain<'_>> {
         (Channel::Video, payload) => Some(Plain::Video(payload)),
         (Channel::Cursor, payload) => Some(Plain::Cursor(payload)),
         (Channel::Input, payload) => Some(Plain::Input(payload)),
+        // Not read yet: counted bad, as by a copy before 1.3.0.
+        (Channel::Sound, _) => None,
     }
 }
 
@@ -372,6 +382,8 @@ pub(crate) struct Link {
     pub limits_read: bool,
     // And a share's state (SHARE_STATE_SINCE).
     pub state_read: bool,
+    // And PC sound (PC_SOUND_SINCE).
+    pub sound_read: bool,
     held: Held,
     pub stats: LinkStats,
     pub offset: OffsetEstimator,
@@ -444,6 +456,7 @@ impl Link {
             feedback_read: false,
             limits_read: false,
             state_read: false,
+            sound_read: false,
             held: Held::default(),
             stats: LinkStats::new(),
             offset: OffsetEstimator::new(),
