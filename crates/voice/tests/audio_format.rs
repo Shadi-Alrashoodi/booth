@@ -1,4 +1,6 @@
-use voice::audio::{Format, FormatError, Sample, from_mono, interleaved, plan, to_mono};
+use voice::audio::{
+    Format, FormatError, Sample, from_mono, from_stereo, interleaved, plan, to_mono,
+};
 
 // WAVEFORMATEX, then for the extensible form: valid bits, channel mask and
 // the sub-format GUID.
@@ -166,6 +168,100 @@ fn stereo_becomes_mono_by_averaging() {
     let mut mono = Vec::new();
     to_mono(&data[..data.len() - 1], &format, &mut mono);
     assert_eq!(mono.len(), 3);
+}
+
+const LAYOUTS: [(u16, u32); 11] = [
+    (1, 0),
+    (2, 0),
+    (4, 0),
+    (6, 0),
+    (8, 0),
+    (2, 0x3),
+    // Quad, 5.1 with back speakers, 5.1 with side speakers, 7.1.
+    (4, 0x33),
+    (6, 0x3F),
+    (6, 0x60F),
+    (8, 0x63F),
+    // A mask with fewer speakers than channels.
+    (6, 0x3),
+];
+
+// A voice through the stereo path, the same on both sides, comes out byte
+// for byte as through the mono one, so a listener who never gets PC sound
+// hears exactly what they did.
+#[test]
+fn the_same_on_both_sides_is_what_mono_writes() {
+    let mut seed = 0x2545_f491u32;
+    let mut random = || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (seed >> 8) as f32 / (1u32 << 24) as f32 * 3.0 - 1.5
+    };
+    let mut mono = vec![
+        0.0,
+        -0.0,
+        0.5,
+        -0.5,
+        1.0,
+        -1.0,
+        2.0,
+        -2.0,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+        f32::from_bits(1),
+        f32::MAX,
+    ];
+    mono.extend((0..500).map(|_| random()));
+    let stereo: Vec<f32> = mono.iter().flat_map(|&m| [m, m]).collect();
+    for sample in [Sample::F32, Sample::I16, Sample::I24, Sample::I32] {
+        for (channels, channel_mask) in LAYOUTS {
+            let format = Format {
+                rate: 48_000,
+                channels,
+                sample,
+                channel_mask,
+            };
+            let mut through_mono = vec![0u8; mono.len() * format.frame_bytes()];
+            let mut through_stereo = vec![1u8; mono.len() * format.frame_bytes()];
+            from_mono(&mono, &format, &mut through_mono);
+            from_stereo(&stereo, &format, &mut through_stereo);
+            assert_eq!(through_mono, through_stereo, "{format:?}");
+        }
+    }
+}
+
+#[test]
+fn each_speaker_gets_its_side_of_the_mix() {
+    let (left, right) = (0.5, -0.25);
+    let middle = (left + right) * 0.5;
+    for ((channels, channel_mask), expected) in [
+        ((1, 0), vec![middle]),
+        ((2, 0), vec![left, right]),
+        ((4, 0), vec![left, right, middle, middle]),
+        ((2, 0x3), vec![left, right]),
+        ((4, 0x33), vec![left, right, left, right]),
+        // Front left and right, centre, LFE, back left and right.
+        ((6, 0x3F), vec![left, right, middle, middle, left, right]),
+        // The same with side speakers.
+        ((6, 0x60F), vec![left, right, middle, middle, left, right]),
+        (
+            (8, 0x63F),
+            vec![left, right, middle, middle, left, right, left, right],
+        ),
+        ((6, 0x3), vec![left, right, middle, middle, middle, middle]),
+    ] {
+        let format = Format {
+            rate: 48_000,
+            channels,
+            sample: Sample::F32,
+            channel_mask,
+        };
+        let mut out = vec![0u8; format.frame_bytes()];
+        from_stereo(&[left, right], &format, &mut out);
+        let (samples, _) = out.as_chunks::<4>();
+        let got: Vec<f32> = samples.iter().map(|b| f32::from_le_bytes(*b)).collect();
+        assert_eq!(got, expected, "{channels} channels, mask {channel_mask:#x}");
+    }
 }
 
 #[test]

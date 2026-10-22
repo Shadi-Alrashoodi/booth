@@ -284,6 +284,85 @@ pub fn from_mono(mono: &[f32], format: &Format, out: &mut [u8]) {
     }
 }
 
+// A stereo mix to every channel of a frame: the speakers on the left get the
+// left channel, those on the right the right, and the centre, the LFE and
+// the rest the middle of the two, as a voice played through from_mono comes
+// out of every speaker. Channels follow the mask's bits from the lowest up;
+// one past them, or any with no mask beyond the first two, gets the middle.
+// With both channels the same it writes exactly what from_mono does. `out`
+// holds exactly `stereo.len() / 2` frames.
+pub fn from_stereo(stereo: &[f32], format: &Format, out: &mut [u8]) {
+    let frame_bytes = format.frame_bytes();
+    let size = format.sample.bytes();
+    debug_assert_eq!(out.len(), stereo.len() / 2 * frame_bytes);
+    let mut sides = [Side::Middle; MAX_CHANNELS as usize];
+    for (channel, side) in sides
+        .iter_mut()
+        .enumerate()
+        .take(usize::from(format.channels))
+    {
+        *side = side_of(format, channel);
+    }
+    let (pairs, _) = stereo.as_chunks::<2>();
+    for (frame, [left, right]) in out.chunks_exact_mut(frame_bytes).zip(pairs) {
+        let (left, right) = (safe(*left), safe(*right));
+        let mut bytes = [[0u8; 4]; 3];
+        write(left, format.sample, &mut bytes[0]);
+        write(right, format.sample, &mut bytes[1]);
+        write((left + right) * 0.5, format.sample, &mut bytes[2]);
+        for (slot, side) in frame.chunks_exact_mut(size).zip(sides) {
+            slot.copy_from_slice(&bytes[side as usize][..size]);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Side {
+    Left = 0,
+    Right = 1,
+    Middle = 2,
+}
+
+// Speaker bits from WAVEFORMATEXTENSIBLE: the front, back, side and top
+// speakers on each side, and front left and right of centre.
+const LEFT_SPEAKERS: u32 = 0x1 | 0x10 | 0x40 | 0x200 | 0x1000 | 0x8000;
+const RIGHT_SPEAKERS: u32 = 0x2 | 0x20 | 0x80 | 0x400 | 0x4000 | 0x2_0000;
+
+fn side_of(format: &Format, channel: usize) -> Side {
+    if format.channel_mask == 0 {
+        return match (format.channels, channel) {
+            (1, _) => Side::Middle,
+            (_, 0) => Side::Left,
+            (_, 1) => Side::Right,
+            _ => Side::Middle,
+        };
+    }
+    let Some(bit) = (0..32)
+        .map(|bit| 1u32 << bit)
+        .filter(|bit| format.channel_mask & bit != 0)
+        .nth(channel)
+    else {
+        return Side::Middle;
+    };
+    if bit & LEFT_SPEAKERS != 0 {
+        Side::Left
+    } else if bit & RIGHT_SPEAKERS != 0 {
+        Side::Right
+    } else {
+        Side::Middle
+    }
+}
+
+// What from_mono writes for a sample: a NaN from a bad mix would reach the
+// speaker as whatever the driver makes of it, so silence.
+fn safe(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 fn read(bytes: &[u8], sample: Sample) -> f32 {
     match sample {
         Sample::F32 => f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
