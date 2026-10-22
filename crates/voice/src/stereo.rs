@@ -4,6 +4,8 @@
 // whose frames, repair data and checks are shaped for speech. Every frame
 // from the network goes through FrameInfo::read before libopus sees it.
 
+pub mod buffer;
+
 use std::fmt;
 
 pub const SAMPLE_RATE: u32 = 48_000;
