@@ -32,6 +32,9 @@ use crate::view::{Latency, Level, Paused, RunningShare, ShareState, SharingNumbe
 
 // Seconds of IDR and invalidation counts the stats panel adds up.
 const MINUTE: usize = 60;
+// Watched this long with no picture from a shared window, the sharer is told
+// why that may be (ShareNews::NoPicture).
+const NO_PICTURE_AFTER: Duration = Duration::from_secs(1);
 // The log has the stats panel's numbers this often, for a test with a
 // friend read back later.
 const LOG_EVERY_SECONDS: u64 = 10;
@@ -208,6 +211,7 @@ fn share(
     let mut lost_here_before = 0u64;
     let mut rest = Rest::new(log, number);
     let mut told_state = ShareState::Live;
+    let mut first_picture = FirstPicture::default();
     loop {
         if sharing.closing() {
             break;
@@ -310,7 +314,24 @@ fn share(
                 return Err(ran(String::from(WINDOW_CLOSED)));
             }
         } else {
+            let asked = Instant::now();
             sharer.next(&mut watchers).map_err(ran)?;
+            // Only while someone watches: a share at rest reads nothing.
+            if let Some(window) = window
+                && applied.is_some_and(|facts| facts.watchers > 0)
+                && first_picture.after(
+                    asked.elapsed(),
+                    sharer.numbers().captured > 0,
+                    window.minimized(),
+                )
+            {
+                log!(
+                    log,
+                    "share {number}: no picture from the window in its first {} s of being watched",
+                    NO_PICTURE_AFTER.as_secs()
+                );
+                sharing.tell(ShareNews::NoPicture { share: number });
+            }
             // The GPU encoder failed on that frame and the software encoder
             // took the share over, at 60 fps from now on if it ran faster.
             if software.is_none()
@@ -575,6 +596,31 @@ fn apply(
         crate::log::yes_no(facts.hevc)
     );
     Ok(())
+}
+
+// How long a window share has waited for its first picture while it was
+// watched and not minimized, until a picture comes or the sharer is told.
+#[derive(Default)]
+struct FirstPicture {
+    waited: Duration,
+    done: bool,
+}
+
+impl FirstPicture {
+    // True once, when NO_PICTURE_AFTER of such waiting passed with no
+    // picture.
+    fn after(&mut self, took: Duration, pictured: bool, minimized: bool) -> bool {
+        if self.done || minimized {
+            return false;
+        }
+        if pictured {
+            self.done = true;
+            return false;
+        }
+        self.waited += took;
+        self.done = self.waited >= NO_PICTURE_AFTER;
+        self.done
+    }
 }
 
 // While nobody watches, the share's thread waits for the room's signal,
@@ -1136,6 +1182,27 @@ mod tests {
             captured.lines(),
             ["share 7: the window asked for, 0x5150, is not open"]
         );
+    }
+
+    // Told once, after a second of waiting that was neither minimized nor
+    // ended by a picture, in words the chat can show as they are.
+    #[test]
+    fn no_picture_rule() {
+        let tick = Duration::from_millis(100);
+        let mut first = FirstPicture::default();
+        for _ in 0..9 {
+            assert!(!first.after(tick, false, false));
+        }
+        for _ in 0..20 {
+            assert!(!first.after(tick, false, true), "minimized time counted");
+        }
+        assert!(first.after(tick, false, false));
+        assert!(!first.after(tick, false, false), "told twice");
+        let mut pictured = FirstPicture::default();
+        assert!(!pictured.after(tick, true, false));
+        assert!(!pictured.after(Duration::from_secs(5), false, false));
+        let text = crate::screen::NO_PICTURE;
+        assert!(text.is_ascii() && !text.contains('!') && text.ends_with('.'));
     }
 
     // A region smaller than SMALLEST_REGION either way is refused before any

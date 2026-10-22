@@ -264,6 +264,12 @@ impl Client {
                 }
                 self.problem_line(String::from(screen::paused_sentence(paused)));
             }
+            ShareNews::NoPicture { share } => {
+                if !ours(share) {
+                    return false;
+                }
+                self.problem_line(String::from(screen::NO_PICTURE));
+            }
             // For the watchers, through a host whose copy reads it
             // (peer::SHARE_STATE_SINCE); none from a room standing for an
             // older copy.

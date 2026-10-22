@@ -412,6 +412,11 @@ impl Host {
                     self.problem_line(String::from(screen::paused_sentence(paused)));
                 }
             }
+            ShareNews::NoPicture { share } => {
+                if self.live.as_ref().is_some_and(|live| ours(live, share)) {
+                    self.problem_line(String::from(screen::NO_PICTURE));
+                }
+            }
             ShareNews::State { share, state } => {
                 if self.live.as_ref().is_some_and(|live| ours(live, share)) {
                     self.share_state(state, now, socket);

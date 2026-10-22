@@ -374,6 +374,9 @@ pub(crate) enum ShareNews {
     // that the panel shows.
     Software { share: u32, sentence: &'static str },
     Paused { share: u32, paused: Paused },
+    // A shared window gave no picture in its first second of being watched,
+    // as a game in exclusive fullscreen does. The share goes on waiting.
+    NoPicture { share: u32 },
     // Live, paused by hand or away, whenever that changes, for the watchers.
     State { share: u32, state: ShareState },
 }
@@ -1915,6 +1918,8 @@ pub(crate) fn watch_failed(name: &str, why: &str) -> String {
 
 pub(crate) const SOFTWARE_ENCODER: &str =
     "No GPU encoder on this PC would open. Sharing will use the software encoder at up to 1080p60.";
+
+pub(crate) const NO_PICTURE: &str = "No picture from this window. If it is a game in fullscreen, set it to borderless or windowed, or share the monitor.";
 
 pub(crate) fn paused_sentence(paused: Paused) -> &'static str {
     match paused {
