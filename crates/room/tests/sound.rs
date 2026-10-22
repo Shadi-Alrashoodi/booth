@@ -720,6 +720,40 @@ fn a_packet_without_a_stamp_after_a_gap_sends_nothing_after_the_press() {
     assert!(back.len() >= 25 && back[0].first, "{:?}", flags(&back));
 }
 
+// Mara's share rests with Share sound on, since nobody watches, and her PC
+// goes to the lock screen meanwhile, which a share at rest does not see. Ana
+// starts watching: no PC sound comes before the share's capture has looked,
+// nor once it finds the secure desktop, which lets the capture go. With the
+// picture back it comes, from a FIRST. The share's thread is played by hand.
+#[test]
+fn a_new_watcher_hears_nothing_until_the_share_has_seen_the_desktop() {
+    let _alone = alone();
+    let fake = pc_sound(left_and_right, Duration::ZERO);
+    let (host, code, to_host) = hosting(sharer("Mara", PC_SOUND_SINCE, silence, &fake));
+    let mut ana = hand_watcher(&code, to_host);
+    let share = shares(&host);
+    let sharing = host.room().sharing();
+    sharing.set_unseen(share, true);
+    host.room().share_sound(true);
+    captures_open(&fake, 1, 1);
+    ana.say(&watch(share));
+    watched_by(&host, 1);
+    let (unseen, told) = listen(&mut ana, Duration::from_millis(400));
+    assert!(unseen.is_empty(), "{:?}", flags(&unseen));
+    assert_eq!(told, [(share, true)]);
+    sharing.set_away(true);
+    captures_open(&fake, 1, 0);
+    let (locked, _) = listen(&mut ana, Duration::from_millis(300));
+    assert!(locked.is_empty(), "{:?}", flags(&locked));
+    // The first picture after the secure desktop, and so the capture's
+    // first answer since the rest.
+    sharing.set_away(false);
+    sharing.set_unseen(share, false);
+    let (back, told) = listen(&mut ana, Duration::from_millis(400));
+    assert!(back.len() >= 25 && back[0].first, "{:?}", flags(&back));
+    assert!(told.is_empty(), "{told:?}");
+}
+
 // Share after share with a tone playing: Share sound is off at the start of
 // each, and no packet ever names a share whose switch was off when it was
 // captured.

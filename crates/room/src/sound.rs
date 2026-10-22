@@ -254,9 +254,10 @@ impl Sound {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Gate {
     share: u32,
-    // The switch going on, or the share going on after a pause.
+    // The switch going on, or the share going on after a pause or a rest.
     since: Instant,
-    // A pause by hand, the secure desktop, or the switch going off.
+    // A pause by hand, the secure desktop, the switch going off, or the
+    // share resting with nobody watching.
     stop: Option<Instant>,
 }
 
@@ -268,19 +269,29 @@ struct Gates {
     held: bool,
     away: bool,
     off: bool,
+    // The share rested with nobody watching, and its capture has not
+    // answered since: nothing looked at the desktop meanwhile, and it can be
+    // the secure one by now. The capture runs on, as it does while nobody
+    // can hear.
+    unseen: bool,
 }
 
 impl Gates {
+    // The capture is let go.
     fn paused(&self) -> bool {
         self.held || self.away || self.off
+    }
+
+    fn shut(&self) -> bool {
+        self.paused() || self.unseen
     }
 
     // Shut at the first of them, open again from the press that ends the
     // last.
     fn follow(&mut self, press: Instant) {
-        let paused = self.paused();
+        let shut = self.shut();
         if let Some(gate) = self.gate.as_mut() {
-            match (gate.stop, paused) {
+            match (gate.stop, shut) {
                 (None, true) => gate.stop = Some(press),
                 (Some(_), false) => {
                     gate.since = press;
@@ -378,7 +389,7 @@ impl Outgoing {
         gates.gate = Some(Gate {
             share,
             since: press,
-            stop: gates.paused().then_some(press),
+            stop: gates.shut().then_some(press),
         });
     }
 
@@ -426,6 +437,19 @@ impl Outgoing {
         };
         if gated {
             self.wake_room();
+        }
+    }
+
+    // Share `share` rested with nobody watching, or its capture answered
+    // after the rest, unpaused. Nothing looks at the desktop while it rests,
+    // so a friend who starts watching while the PC is on the lock screen
+    // hears nothing before the capture has looked and reported it. Named,
+    // since the share's thread can still be on a share the room has ended.
+    pub(crate) fn set_unseen(&self, share: u32, unseen: bool, at: Instant) {
+        let mut gates = lock(&self.gates);
+        if self.live.load(Ordering::Acquire) == share {
+            gates.unseen = unseen;
+            gates.follow(at);
         }
     }
 

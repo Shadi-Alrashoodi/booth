@@ -212,6 +212,9 @@ fn share(
     let mut rest = Rest::new(log, number);
     let mut told_state = ShareState::Live;
     let mut first_picture = FirstPicture::default();
+    // The share rested with nobody watching, and its capture has not
+    // answered since.
+    let mut unseen = false;
     loop {
         if sharing.closing() {
             break;
@@ -304,9 +307,15 @@ fn share(
         // the video, and the GPU next to a game. The facts say so only once
         // the host has told them. A new watcher's IDR ask ends the rest at
         // once, since the host can hold the facts back for FACTS_EVERY.
-        if sharer.held()
-            || (applied.is_some_and(|facts| facts.watchers == 0) && !sharing.answers_waiting())
-        {
+        let nobody = applied.is_some_and(|facts| facts.watchers == 0);
+        if sharer.held() || (nobody && !sharing.answers_waiting()) {
+            // Nothing looks at the desktop while the share rests, and the
+            // lock screen can come up meanwhile: the PC sound waits until
+            // the capture has looked again. A window's capture never
+            // reports the secure desktop, so it is not waited for.
+            if nobody && window.is_none() && !std::mem::replace(&mut unseen, true) {
+                sharing.set_unseen(number, true);
+            }
             rest.until(sharing, next_second);
             // Nothing reads the window while the share rests, so its closing
             // is looked for here: the share ends as it would have.
@@ -315,7 +324,17 @@ fn share(
             }
         } else {
             let asked = Instant::now();
+            let late = sharer.numbers().held;
             sharer.next(&mut watchers).map_err(ran)?;
+            // A capture that is not paused saw the desktop as it is now: a
+            // monitor's loses its duplication when the secure desktop comes
+            // up, so even a still screen's answer says it is the sharer's. A
+            // picture the fps cap held says nothing: it can be from before
+            // the rest.
+            if unseen && !sharer.paused() && sharer.numbers().held == late {
+                unseen = false;
+                sharing.set_unseen(number, false);
+            }
             // Only while someone watches: a share at rest reads nothing.
             if let Some(window) = window
                 && applied.is_some_and(|facts| facts.watchers > 0)
@@ -943,7 +962,7 @@ impl Audience for Watchers<'_> {
     }
 
     fn resumed(&mut self) {
-        self.sharing.sound().set_away(false, Instant::now());
+        self.sharing.set_away(false);
         log!(self.log, "share {}: capture back", self.number);
         self.sharing
             .set_running(self.sharing.running().map(|running| RunningShare {
@@ -956,12 +975,16 @@ impl Audience for Watchers<'_> {
         // Locked, on a UAC prompt or disconnected, the PC may be left alone,
         // and what it plays then is not the sharer's to send: the PC sound
         // stops as for a pause by hand, before anything says paused. A
-        // minimized window, a monitor taken, changing or gone keep it.
-        let away = matches!(
+        // minimized window, a monitor taken, changing or gone keep it, and
+        // keep it stopped once it is: a monitor asleep on the lock screen
+        // can leave the desktop, and only a picture says it is the sharer's
+        // again.
+        if matches!(
             reason,
             PauseReason::SecureDesktop | PauseReason::Disconnected
-        );
-        self.sharing.sound().set_away(away, Instant::now());
+        ) {
+            self.sharing.set_away(true);
+        }
         log!(self.log, "share {}: capture paused: {reason}", self.number);
         let paused = match reason {
             PauseReason::SecureDesktop => Paused::SecureDesktop,
@@ -1245,7 +1268,8 @@ mod tests {
 
     // The lock screen, a UAC prompt and a disconnected session stop the
     // share's PC sound as a pause by hand does, and it comes back with the
-    // picture. A minimized window and the monitor's own pauses keep it.
+    // picture, not with another pause. A minimized window and the monitor's
+    // own pauses keep it.
     #[test]
     fn the_secure_desktop_and_a_lost_session_stop_pc_sound() {
         let wake = net::pace::Signal::new().expect("create an event");
@@ -1266,6 +1290,12 @@ mod tests {
             watchers.resumed();
             assert!(!sound.paused(), "{reason}");
         }
+        // The monitor asleep on the lock screen leaves the desktop.
+        watchers.paused(&PauseReason::SecureDesktop);
+        watchers.paused(&PauseReason::Missing);
+        assert!(sound.paused());
+        watchers.resumed();
+        assert!(!sound.paused());
         // Paused by hand as well, it stays paused when the picture is back.
         watchers.paused(&PauseReason::SecureDesktop);
         sharing.set_held(true);

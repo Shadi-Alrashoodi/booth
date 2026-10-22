@@ -618,6 +618,20 @@ impl Sharing {
         *lock(&self.area)
     }
 
+    // The share's thread, or a test that plays it by hand: share `share`
+    // rests with nobody watching (true), or its capture answered after the
+    // rest without a pause (false). Its PC sound waits for that answer.
+    pub fn set_unseen(&self, share: u32, unseen: bool) {
+        self.sound.set_unseen(share, unseen, Instant::now());
+    }
+
+    // The share's thread, or a test that plays it by hand: the capture
+    // paused on the secure desktop or a disconnected session (true), or gave
+    // a picture again (false). Its PC sound stops meanwhile.
+    pub fn set_away(&self, away: bool) {
+        self.sound.set_away(away, Instant::now());
+    }
+
     // From the host's Facts. Its cap is the host's share of the rule, zero
     // with no internet watcher. A new watcher's IDR ask in them goes in with
     // them, under the same lock.

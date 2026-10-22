@@ -444,4 +444,32 @@ mod tests {
         assert_eq!(back.len(), 2);
         assert!(back[0].2 && !back[1].2);
     }
+
+    // After a rest nothing goes out, though the capture runs on, until the
+    // share's own capture answers: then a spell of its own, from the answer.
+    // A share that is over says nothing about the next.
+    #[test]
+    fn a_rest_holds_the_sound_until_the_capture_answers() {
+        let start = Instant::now();
+        let mut bench = Bench::new(start, start);
+        bench.out.set_unseen(SHARE, true, start);
+        assert!(!bench.out.paused(), "the capture was let go");
+        bench.feed.hear(&tone(FRAME * 3, 0), start, true);
+        assert!(bench.sent().is_empty());
+        let other = start + frames_to_time(FRAME * 3);
+        bench.out.set_unseen(SHARE + 1, false, other);
+        bench.feed.hear(&tone(FRAME * 3, 0), other, false);
+        assert!(bench.sent().is_empty(), "another share's answer opened it");
+        let next = other + frames_to_time(FRAME * 3);
+        let seen = next + FRAME_TIME;
+        bench.out.set_unseen(SHARE, false, seen);
+        bench.feed.hear(&tone(FRAME * 4, 0), next, false);
+        let back = bench.sent();
+        assert_eq!(back.len(), 3, "{back:?}");
+        assert!(back[0].2 && !back[1].2, "{back:?}");
+        assert!(
+            back[0].1.abs_diff(bench.clock.micros(seen)) <= 1,
+            "{back:?}"
+        );
+    }
 }
