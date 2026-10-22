@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use eframe::egui::emath::GuiRounding;
 use eframe::egui::{
-    Align, Color32, Context, Key, Layout, Modifiers, Rect, Response, ScrollArea, Sense, Stroke, Ui,
-    vec2,
+    Align, Color32, Context, CursorIcon, Key, Layout, Modifiers, Rect, Response, ScrollArea, Sense,
+    Stroke, Ui, WidgetInfo, WidgetType, vec2,
 };
 use invite::ReplyCode;
 use room::view::{
@@ -64,13 +64,14 @@ pub struct InRoom {
     // Whether the panel offers remote control at all (control.rs).
     control_offered: bool,
     // The monitors Share offered, while the list under the title row is
-    // open.
+    // open, and the windows under them.
     monitors: Option<Vec<Pick>>,
+    windows: Vec<WindowPick>,
     // The region picker's answer, while it is open.
     region_pick: Option<Receiver<Result<Option<Picked>, String>>>,
-    // The share started last from the panel was a region: the share key
-    // then opens the list rather than show a whole monitor.
-    region_last: bool,
+    // The share started last from the panel was a region or a window: the
+    // share key then opens the list rather than show a whole monitor.
+    list_next: bool,
     panic: PanicKey,
     allow_wait: AllowWait,
     decline: Decline,
@@ -165,7 +166,8 @@ impl InRoom {
             control_offered: false,
             monitors: None,
             region_pick: None,
-            region_last: false,
+            windows: Vec::new(),
+            list_next: false,
             panic,
             allow_wait: AllowWait::default(),
             decline: Decline::default(),
@@ -189,16 +191,18 @@ impl InRoom {
         self.monitors = None;
     }
 
-    pub fn region_last(&self) -> bool {
-        self.region_last
+    pub fn list_next(&self) -> bool {
+        self.list_next
     }
 
-    // For the share key after a region share: the list, as Share opens it.
+    // For the share key after a region or window share: the list, as Share
+    // opens it.
     pub fn open_share_list(&mut self) {
         if let Ok(list) = monitors::list()
             && !list.is_empty()
         {
             self.monitors = Some(monitors::picks(&list));
+            self.windows = window_picks();
         }
     }
 
@@ -252,17 +256,32 @@ impl InRoom {
         let mut block = false;
         if let Some(picks) = &self.monitors {
             block = true;
-            match monitor_row(ui, picks) {
+            match share_list(ui, picks, &self.windows) {
                 Some(RowPick::Monitor(i)) => {
                     let pick = &picks[i];
                     self.room.share(pick.fps, Some(pick.id.clone()));
                     step = Some(Step::Remember(pick.id.device_name.clone()));
                     self.monitors = None;
-                    self.region_last = false;
+                    self.list_next = false;
                 }
                 Some(RowPick::Region) => {
                     self.monitors = None;
                     step = self.pick_region(ui.ctx());
+                }
+                Some(RowPick::Window(i)) => {
+                    let id = self.windows[i].id;
+                    if id.exists() {
+                        let fps = room::window_monitor(id).map_or(monitors::MOST_FPS, |monitor| {
+                            monitors::fps(monitor.refresh_hz)
+                        });
+                        self.room.share_window(fps, id);
+                        self.monitors = None;
+                        self.list_next = true;
+                    } else {
+                        // Closed since the list was taken: a list as it is
+                        // now, rather than a share that cannot start.
+                        self.windows = window_picks();
+                    }
                 }
                 None => {}
             }
@@ -272,7 +291,7 @@ impl InRoom {
                 Ok(Ok(Some(picked))) => {
                     let fps = monitors::fps(picked.refresh_hz);
                     self.room.share_region(fps, picked.monitor, picked.region);
-                    self.region_last = true;
+                    self.list_next = true;
                     self.region_pick = None;
                 }
                 Ok(Err(why)) => {
@@ -336,14 +355,17 @@ impl InRoom {
         step
     }
 
-    // Share opens the list of monitors and Region under the title row, one
-    // monitor or more, and Share again closes it. Stop sharing needs no
-    // answer.
+    // Share opens the list of monitors, Region and the windows under the
+    // title row, one monitor or more, and Share again closes it. Stop
+    // sharing needs no answer.
     fn share_pressed(&mut self, verb: Option<&ShareVerb>) {
         match verb {
             Some(ShareVerb::Share) if self.monitors.is_some() => self.monitors = None,
             Some(ShareVerb::Share) => match monitors::list() {
-                Ok(list) if !list.is_empty() => self.monitors = Some(monitors::picks(&list)),
+                Ok(list) if !list.is_empty() => {
+                    self.monitors = Some(monitors::picks(&list));
+                    self.windows = window_picks();
+                }
                 // The room tries the primary monitor, and when that cannot
                 // open either, its problem line in the chat says why.
                 Ok(_) | Err(_) => self.room.share(monitors::MOST_FPS, None),
@@ -912,12 +934,54 @@ pub fn addresses_hidden(share: &ShareView) -> bool {
 enum RowPick {
     Monitor(usize),
     Region,
+    Window(usize),
+}
+
+// A window Share offers, as its row shows it and a screen reader names it.
+// The title stays in the panel: it never goes into a message, the log or the
+// settings, so no Debug either.
+struct WindowPick {
+    id: room::WindowId,
+    title: String,
+    // The program's name and whether the window is minimized, quiet after
+    // the title.
+    quiet: String,
+    spoken: String,
+}
+
+// The windows as they are now; none when they cannot be listed.
+fn window_picks() -> Vec<WindowPick> {
+    let windows = room::top_windows().unwrap_or_default();
+    windows
+        .into_iter()
+        .map(|window| {
+            let quiet = match (&window.program, window.minimized) {
+                (Some(program), true) => format!("{program}, minimized"),
+                (Some(program), false) => program.clone(),
+                (None, true) => String::from("minimized"),
+                (None, false) => String::new(),
+            };
+            let spoken = format!(
+                "Share the window {}{}",
+                messages::isolated(&window.title),
+                if window.minimized { ", minimized" } else { "" }
+            );
+            WindowPick {
+                id: window.id,
+                title: window.title,
+                quiet,
+                spoken,
+            }
+        })
+        .collect()
 }
 
 // Share opens a one-line list of the monitors by size and position under the
-// title row, with Region last, and one click starts the share or the region
-// picker. At the narrowest window three monitors wrap onto a second line.
-fn monitor_row(ui: &mut Ui, picks: &[Pick]) -> Option<RowPick> {
+// title row, with Region last, and the windows under it, one row each, and
+// one click starts the share or the region picker. At the narrowest window
+// three monitors wrap onto a second line. The windows scroll on their own
+// once they would take more than half the panel.
+fn share_list(ui: &mut Ui, picks: &[Pick], windows: &[WindowPick]) -> Option<RowPick> {
     let mut pressed = None;
     controls::region(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -936,8 +1000,55 @@ fn monitor_row(ui: &mut Ui, picks: &[Pick]) -> Option<RowPick> {
                 pressed = Some(RowPick::Region);
             }
         });
+        if windows.is_empty() {
+            return;
+        }
+        let most = (ui.available_height() / 2.0).max(2.0 * ROW_HEIGHT);
+        let scroll = ScrollArea::vertical()
+            .id_salt("windows")
+            .max_height(most)
+            .auto_shrink([false, true]);
+        scroll.show(ui, |ui| {
+            for (i, window) in windows.iter().enumerate() {
+                if window_row(ui, window) {
+                    pressed = Some(RowPick::Window(i));
+                }
+            }
+        });
     });
     pressed
+}
+
+// One window: its title cut on one line, its program and whether it is
+// minimized quiet at the right. The whole row is the button, as a known
+// host's is on the start screen.
+fn window_row(ui: &mut Ui, window: &WindowPick) -> bool {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::hover());
+    let row = ui.interact(
+        rect,
+        ui.id().with(("window", window.id.hwnd)),
+        Sense::click(),
+    );
+    row.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &window.spoken));
+    let quiet = theme::caption();
+    let right = controls::text_width(ui, &window.quiet, quiet.clone());
+    controls::split_row(
+        ui,
+        rect,
+        right,
+        |ui| {
+            controls::one_line(ui, &window.title, theme::body(), CHALK);
+        },
+        |ui| {
+            controls::one_line(ui, &window.quiet, quiet, ASH);
+        },
+    );
+    let focused = row.has_focus();
+    if focused && controls::keyboard_focus(ui) {
+        controls::ring(ui, rect);
+    }
+    let entered = focused && ui.input(|input| input.key_pressed(Key::Enter));
+    row.on_hover_cursor(CursorIcon::PointingHand).clicked() || entered
 }
 
 impl InRoom {
@@ -2364,21 +2475,45 @@ mod tests {
         theme::apply(&ctx);
         let picks = picks();
         let (second, _) = frame(&ctx, Vec::new(), |ui| {
-            assert_eq!(monitor_row(ui, &picks), None);
+            assert_eq!(share_list(ui, &picks, &[]), None);
             let first = Button::new(&picks[0].text).width(ui);
             let gap = ui.spacing().item_spacing.x;
             pos2(SIDE + first + gap + 10.0, SIDE + CONTROL_HEIGHT / 2.0)
         });
-        frame(&ctx, press(second), |ui| monitor_row(ui, &picks));
-        let (pressed, _) = frame(&ctx, release(second), |ui| monitor_row(ui, &picks));
+        frame(&ctx, press(second), |ui| share_list(ui, &picks, &[]));
+        let (pressed, _) = frame(&ctx, release(second), |ui| share_list(ui, &picks, &[]));
         assert_eq!(pressed, Some(RowPick::Monitor(1)));
         let first = pos2(SIDE + 10.0, SIDE + CONTROL_HEIGHT / 2.0);
-        frame(&ctx, press(first), |ui| monitor_row(ui, &picks));
-        let (pressed, _) = frame(&ctx, release(first), |ui| monitor_row(ui, &picks));
+        frame(&ctx, press(first), |ui| share_list(ui, &picks, &[]));
+        let (pressed, _) = frame(&ctx, release(first), |ui| share_list(ui, &picks, &[]));
         assert_eq!(pressed, Some(RowPick::Monitor(0)));
         // Alone in the row, so it is where the first monitor was.
-        frame(&ctx, press(first), |ui| monitor_row(ui, &[]));
-        let (pressed, _) = frame(&ctx, release(first), |ui| monitor_row(ui, &[]));
+        frame(&ctx, press(first), |ui| share_list(ui, &[], &[]));
+        let (pressed, _) = frame(&ctx, release(first), |ui| share_list(ui, &[], &[]));
         assert_eq!(pressed, Some(RowPick::Region));
+    }
+
+    // A window's row, under the monitors, shares that window in one click.
+    #[test]
+    fn one_click_on_a_window_row_picks_that_window() {
+        use crate::controls::tests::{frame, press, release};
+        use eframe::egui::{Context, pos2};
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        let window = |hwnd, title: &str| WindowPick {
+            id: room::WindowId { hwnd, process: 1 },
+            title: title.to_string(),
+            quiet: String::from("notepad"),
+            spoken: format!("Share the window {title}"),
+        };
+        let windows = [window(1, "Notes"), window(2, "Game")];
+        let (second, _) = frame(&ctx, Vec::new(), |ui| {
+            assert_eq!(share_list(ui, &[], &windows), None);
+            let below = SIDE + CONTROL_HEIGHT + ui.spacing().item_spacing.y;
+            pos2(SIDE + 10.0, below + ROW_HEIGHT * 1.5)
+        });
+        frame(&ctx, press(second), |ui| share_list(ui, &[], &windows));
+        let (pressed, _) = frame(&ctx, release(second), |ui| share_list(ui, &[], &windows));
+        assert_eq!(pressed, Some(RowPick::Window(1)));
     }
 }

@@ -743,7 +743,7 @@ impl App {
         }
         // After a region share the key opens the list instead, so a press never
         // shows more than the person last chose.
-        if in_room.region_last() {
+        if in_room.list_next() {
             in_room.open_share_list();
             self.show_panel(ctx);
             return;
