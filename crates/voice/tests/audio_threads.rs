@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::RecvTimeoutError;
 use voice::audio::fake::{Fake, Setup};
 use voice::audio::{
-    AudioError, Capture, Choice, Event, LOOK_AGAIN, REOPEN_AFTER, Render, StreamInfo,
+    AudioError, Capture, Choice, Event, LOOK_AGAIN, PcSound, REOPEN_AFTER, Render, StreamInfo,
 };
 
 const PERIOD: u32 = 128;
@@ -657,4 +657,170 @@ fn render_fills_what_the_device_asks_for() {
     let expected = PERIOD_TIME + Duration::from_micros(1500) + PERIOD_TIME;
     assert!(latency.abs_diff(expected) < PERIOD_TIME, "{latency:?}");
     assert!(underruns <= 2, "{underruns}");
+}
+
+// PC sound: one packet of stereo f32 with its capture time and whether it
+// comes after a gap, as Windows' loopback will give them.
+type Heard = Arc<Mutex<Vec<(Vec<f32>, Instant, bool)>>>;
+
+fn pc_sound(fake: &Fake) -> (PcSound, Heard, Arc<AtomicU64>, Receiver<(Instant, Event)>) {
+    let heard: Heard = Arc::new(Mutex::new(Vec::new()));
+    let frames = Arc::new(AtomicU64::new(0));
+    let (seen, counted) = (Arc::clone(&heard), Arc::clone(&frames));
+    let (on_event, rx) = events();
+    let sound = PcSound::start_with(
+        fake.device(),
+        move |samples: &[f32], time, gap| {
+            seen.lock().unwrap().push((samples.to_vec(), time, gap));
+            counted.fetch_add(samples.len() as u64 / 2, Ordering::Relaxed);
+        },
+        on_event,
+    )
+    .unwrap();
+    (sound, heard, frames, rx)
+}
+
+fn one_output(setup: Setup) -> Fake {
+    Fake::new(setup, &[("out", "Fake speakers")], Some("out"))
+}
+
+fn assert_spaced(packets: &[(Vec<f32>, Instant, bool)]) {
+    for pair in packets.windows(2) {
+        let step = pair[1].1 - pair[0].1;
+        let off = step.abs_diff(PERIOD_TIME);
+        assert!(off < Duration::from_micros(2), "{step:?}");
+    }
+}
+
+#[test]
+fn pc_sound_keeps_both_channels_and_marks_only_its_first_packet() {
+    let fake = one_output(Setup {
+        signal: |_, channel| if channel == 0 { 0.25 } else { -0.5 },
+        open_time: Duration::from_millis(30),
+        ..Setup::default()
+    });
+    let (sound, heard, frames, rx) = pc_sound(&fake);
+    let (_, info) = opened(&rx);
+    wait_for(&frames, 4_800);
+    let (event_reads, quiet_reads) = sound.reads();
+    sound.stop();
+    println!(
+        "opened in {:.1} ms, {event_reads} reads on the event, {quiet_reads} after a quiet wait",
+        info.opened_in.as_secs_f64() * 1000.0
+    );
+    assert!(info.opened_in >= Duration::from_millis(30), "{info:?}");
+    assert!(event_reads > 0);
+    let heard = heard.lock().unwrap();
+    for (samples, _, _) in heard.iter() {
+        assert_eq!(samples.len(), PERIOD as usize * 2);
+        for [left, right] in samples.as_chunks::<2>().0 {
+            assert_eq!((*left, *right), (0.25, -0.5));
+        }
+    }
+    let gaps: Vec<bool> = heard.iter().map(|(_, _, gap)| *gap).collect();
+    assert!(gaps[0]);
+    assert!(gaps[1..].iter().all(|gap| !gap), "{gaps:?}");
+    assert_spaced(&heard);
+}
+
+// Windows may keep a loopback stream's packets coming with no event while
+// nothing plays: they are still read, on every 20 ms wait, as one stretch.
+#[test]
+fn pc_sound_is_read_when_windows_sets_no_event() {
+    let fake = one_output(Setup::default());
+    let (sound, heard, frames, rx) = pc_sound(&fake);
+    opened(&rx);
+    wait_for(&frames, 1_280);
+    fake.quiet(true);
+    let now = frames.load(Ordering::Relaxed);
+    wait_for(&frames, now + 9_600);
+    let (event_reads, quiet_reads) = sound.reads();
+    sound.stop();
+    println!("{event_reads} reads on the event, {quiet_reads} after a quiet wait");
+    assert!(quiet_reads >= 5, "{quiet_reads}");
+    let heard = heard.lock().unwrap();
+    assert!(heard[1..].iter().all(|(_, _, gap)| !gap));
+    assert_spaced(&heard);
+}
+
+// Packets with no timestamp follow the one before, so they are no gap.
+#[test]
+fn pc_sound_without_stamps_runs_on_from_the_last_packet() {
+    let fake = one_output(Setup::default());
+    let (sound, heard, frames, rx) = pc_sound(&fake);
+    opened(&rx);
+    wait_for(&frames, 1_280);
+    fake.unstamped(true);
+    let now = frames.load(Ordering::Relaxed);
+    wait_for(&frames, now + 4_800);
+    sound.stop();
+    let heard = heard.lock().unwrap();
+    assert!(heard[1..].iter().all(|(_, _, gap)| !gap));
+    assert_spaced(&heard);
+}
+
+#[test]
+fn pc_sound_marks_lost_sound_as_a_gap_and_counts_it() {
+    let fake = one_output(Setup::default());
+    let (sound, heard, frames, rx) = pc_sound(&fake);
+    opened(&rx);
+    wait_for(&frames, 1_280);
+    assert_eq!(sound.glitches(), 0);
+    fake.glitch();
+    let now = frames.load(Ordering::Relaxed);
+    wait_for(&frames, now + 1_280);
+    assert_eq!(sound.glitches(), 1);
+    sound.stop();
+    let gaps = heard
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, _, gap)| *gap)
+        .count();
+    assert_eq!(gaps, 2);
+}
+
+// Gone while it ran, it opens again after REOPEN_AFTER, and the first packet
+// of the new stream starts after a gap.
+#[test]
+fn pc_sound_lost_opens_again_after_a_second() {
+    let fake = one_output(Setup::default());
+    let (sound, heard, frames, rx) = pc_sound(&fake);
+    opened(&rx);
+    wait_for(&frames, 1_280);
+    fake.unplug("out");
+    let lost_at = match next(&rx) {
+        (at, Event::Lost(_)) => at,
+        (_, other) => panic!("expected Lost, got {other:?}"),
+    };
+    let before = heard.lock().unwrap().len();
+    fake.plug("out", "Fake speakers");
+    let (opened_at, _) = opened(&rx);
+    assert!(opened_at - lost_at >= REOPEN_AFTER);
+    let now = frames.load(Ordering::Relaxed);
+    wait_for(&frames, now + 1_280);
+    sound.stop();
+    let heard = heard.lock().unwrap();
+    assert!(
+        heard[before].2,
+        "the first packet after the reopen is no gap"
+    );
+    assert!(heard[before + 1..].iter().all(|(_, _, gap)| !gap));
+}
+
+#[test]
+fn pc_sound_takes_only_stereo() {
+    let fake = one_output(Setup {
+        channels: 6,
+        ..Setup::default()
+    });
+    let (sound, _, _, rx) = pc_sound(&fake);
+    match next(&rx) {
+        (_, Event::Failed(err)) => assert_eq!(
+            err.to_string(),
+            "could not start PC sound: Windows gave it as 6 channels where Booth asked for 2. Try again, and restart Windows if it keeps happening"
+        ),
+        (_, other) => panic!("expected Failed, got {other:?}"),
+    }
+    sound.stop();
 }

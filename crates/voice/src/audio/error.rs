@@ -55,11 +55,22 @@ pub enum AudioError {
         direction: Direction,
         default: bool,
     },
+    // PC sound, the sound of every other program on this PC. `lost` when it
+    // may come back by itself, as after the Windows Audio service restarts;
+    // `code` 0 when Windows gave none.
+    PcSound {
+        code: u32,
+        text: String,
+        lost: bool,
+    },
 }
 
 impl AudioError {
     pub fn is_lost(&self) -> bool {
-        matches!(self, AudioError::Lost { .. })
+        matches!(
+            self,
+            AudioError::Lost { .. } | AudioError::PcSound { lost: true, .. }
+        )
     }
 
     // Not there to open: unplugged or turned off before the open, or gone
@@ -82,7 +93,7 @@ impl AudioError {
             | AudioError::Format { direction, .. }
             | AudioError::Rate { direction, .. }
             | AudioError::StillClosing { direction, .. } => Some(*direction),
-            AudioError::Windows { .. } | AudioError::Thread(_) => None,
+            AudioError::Windows { .. } | AudioError::Thread(_) | AudioError::PcSound { .. } => None,
         }
     }
 }
@@ -166,6 +177,21 @@ impl fmt::Display for AudioError {
                     f.write_str(way_out)?;
                 }
                 Ok(())
+            }
+            AudioError::PcSound { code, text, lost } => {
+                let code = if *code == 0 {
+                    String::new()
+                } else {
+                    format!(" ({code:#010x})")
+                };
+                if *lost {
+                    write!(f, "PC sound stopped: {text}{code}. Booth tries again every second")
+                } else {
+                    write!(
+                        f,
+                        "could not start PC sound: {text}{code}. Try again, and restart Windows if it keeps happening"
+                    )
+                }
             }
         }
     }

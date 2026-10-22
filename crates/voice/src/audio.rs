@@ -26,13 +26,13 @@ mod watch;
 pub use devices::{Choice, DeviceList, Direction, Endpoint, ListedDevice, Lists, Resolved};
 pub use echo::{Echo, Effects};
 pub use error::AudioError;
-pub use format::{Format, FormatError, Plan, RATE, Sample, from_mono, plan, to_mono};
+pub use format::{Format, FormatError, Plan, RATE, Sample, from_mono, interleaved, plan, to_mono};
 pub(crate) use level::Meter;
 pub use level::{Level, Reading};
 pub use microphone::{Microphone, hands_free};
 pub use stream::{
-    Capture, Device, DeviceStream, Event, LOOK_AGAIN, Packet, REOPEN_AFTER, Refused, Render,
-    StreamInfo, StreamThread, Wake,
+    Capture, Device, DeviceStream, Event, LOOK_AGAIN, Packet, PcSound, REOPEN_AFTER, Refused,
+    Render, StreamInfo, StreamThread, Wake,
 };
 pub use wasapi::{EnginePeriods, Probe};
 pub use watch::Watch;

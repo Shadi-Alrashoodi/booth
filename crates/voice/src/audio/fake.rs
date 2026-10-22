@@ -61,6 +61,12 @@ struct State {
     wakes: Mutex<Vec<Wake>>,
     // Every device stops sending events, as a hung driver would.
     stalled: AtomicBool,
+    // Every device stops sending events while its frames keep coming, as
+    // Windows' loopback may while nothing plays.
+    quiet: AtomicBool,
+    // Captured packets come with no timestamp, as when Windows marks it
+    // wrong.
+    unstamped: AtomicBool,
     // The next packet captured comes after lost sound.
     glitch: AtomicBool,
     record: Mutex<Record>,
@@ -114,6 +120,8 @@ impl Fake {
                 default: Mutex::new(default.map(str::to_owned)),
                 wakes: Mutex::new(Vec::new()),
                 stalled: AtomicBool::new(false),
+                quiet: AtomicBool::new(false),
+                unstamped: AtomicBool::new(false),
                 glitch: AtomicBool::new(false),
                 record: Mutex::new(Record::default()),
                 recording,
@@ -155,6 +163,14 @@ impl Fake {
 
     pub fn stall(&self, stalled: bool) {
         self.state.stalled.store(stalled, Ordering::Relaxed);
+    }
+
+    pub fn quiet(&self, quiet: bool) {
+        self.state.quiet.store(quiet, Ordering::Relaxed);
+    }
+
+    pub fn unstamped(&self, unstamped: bool) {
+        self.state.unstamped.store(unstamped, Ordering::Relaxed);
     }
 
     // The next packet captured is marked as coming after lost sound.
@@ -258,6 +274,7 @@ impl FakeDevice {
                 refused: None,
                 effects: Effects::default(),
                 echo: Echo::NotAsked,
+                opened_in: Duration::ZERO,
             },
             started: None,
             ticks_seen: 0,
@@ -330,7 +347,10 @@ impl DeviceStream for FakeStream {
             thread::sleep(timeout);
             return Ok(false);
         };
-        if self.state.stalled.load(Ordering::Relaxed) || !self.plugged_in() {
+        if self.state.stalled.load(Ordering::Relaxed)
+            || self.state.quiet.load(Ordering::Relaxed)
+            || !self.plugged_in()
+        {
             thread::sleep(timeout);
             return Ok(false);
         }
@@ -357,7 +377,12 @@ impl DeviceStream for FakeStream {
         let setup = self.state.setup;
         let period = u64::from(setup.period_frames);
         let started = self.started.unwrap_or_else(Instant::now);
-        while self.frames_out + period <= self.ticks_seen * period {
+        let ready = if self.state.quiet.load(Ordering::Relaxed) {
+            self.ticks_now()
+        } else {
+            self.ticks_seen
+        };
+        while self.frames_out + period <= ready * period {
             let first = self.frames_out;
             let mut data = Vec::with_capacity(self.info.format.frame_bytes() * period as usize);
             for frame in first..first + period {
@@ -369,10 +394,11 @@ impl DeviceStream for FakeStream {
             // Windows may mark the first packet after a start as coming
             // after lost sound; the fake always does.
             let glitch = first == 0 || self.state.glitch.swap(false, Ordering::Relaxed);
+            let stamped = !self.state.unstamped.load(Ordering::Relaxed);
             packet(Packet {
                 data: &data,
                 frames: setup.period_frames,
-                time: Some(time),
+                time: stamped.then_some(time),
                 silent: false,
                 glitch,
             });

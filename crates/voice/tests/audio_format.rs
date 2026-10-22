@@ -1,4 +1,4 @@
-use voice::audio::{Format, FormatError, Sample, from_mono, plan, to_mono};
+use voice::audio::{Format, FormatError, Sample, from_mono, interleaved, plan, to_mono};
 
 // WAVEFORMATEX, then for the extensible form: valid bits, channel mask and
 // the sub-format GUID.
@@ -166,6 +166,31 @@ fn stereo_becomes_mono_by_averaging() {
     let mut mono = Vec::new();
     to_mono(&data[..data.len() - 1], &format, &mut mono);
     assert_eq!(mono.len(), 3);
+}
+
+#[test]
+fn stereo_stays_as_it_is_and_bad_samples_go_silent() {
+    let format = Format::float_48k(2, 0b11);
+    let data = f32_frames(&[&[0.5, -0.5], &[f32::NAN, 1.0], &[-0.25, f32::INFINITY]]);
+    let mut stereo = vec![9.0];
+    interleaved(&data, &format, &mut stereo);
+    assert_eq!(stereo, [9.0, 0.5, -0.5, 0.0, 1.0, -0.25, 0.0]);
+    // A frame cut short at the end is left out, its first channel too.
+    let mut stereo = Vec::new();
+    interleaved(&data[..data.len() - 1], &format, &mut stereo);
+    assert_eq!(stereo.len(), 4);
+
+    let i16_format = Format {
+        sample: Sample::I16,
+        ..format
+    };
+    let data: Vec<u8> = [i16::MIN, 16_384, 0, -16_384]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let mut stereo = Vec::new();
+    interleaved(&data, &i16_format, &mut stereo);
+    assert_eq!(stereo, [-1.0, 0.5, 0.0, -0.5]);
 }
 
 #[test]

@@ -397,6 +397,7 @@ impl Session {
                 refused,
                 effects,
                 echo: Echo::NotAsked,
+                opened_in: Duration::ZERO,
             },
             io,
             client,

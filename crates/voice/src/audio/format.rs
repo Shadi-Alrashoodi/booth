@@ -248,6 +248,20 @@ pub fn to_mono(data: &[u8], format: &Format, out: &mut Vec<f32>) {
     }
 }
 
+// Appends every sample of each frame as it is, channel after channel. A
+// sample that is not a number comes out as silence. Anything after the last
+// whole frame is left out.
+pub fn interleaved(data: &[u8], format: &Format, out: &mut Vec<f32>) {
+    let frame_bytes = format.frame_bytes();
+    let whole = data.len() / frame_bytes * frame_bytes;
+    let size = format.sample.bytes();
+    out.reserve(whole / size);
+    for bytes in data[..whole].chunks_exact(size) {
+        let value = read(bytes, format.sample);
+        out.push(if value.is_finite() { value } else { 0.0 });
+    }
+}
+
 // Each mono sample to every channel of a frame. `out` holds exactly
 // `mono.len()` frames.
 pub fn from_mono(mono: &[f32], format: &Format, out: &mut [u8]) {

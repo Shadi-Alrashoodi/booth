@@ -14,7 +14,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use super::devices::{Choice, Direction};
 use super::echo::{Echo, Effects};
 use super::error::AudioError;
-use super::format::{Format, RATE, from_mono, to_mono};
+use super::format::{Format, RATE, from_mono, interleaved, to_mono};
 use super::level::{Level, Meter, Reading};
 use super::wasapi;
 
@@ -32,6 +32,12 @@ pub const REOPEN_AFTER: Duration = Duration::from_secs(1);
 pub const LOOK_AGAIN: Duration = Duration::from_secs(2);
 // The queued average follows the last 16 or so writes.
 const QUEUED_SHIFT: u32 = 4;
+// A stereo packet stamped this much after the last one ended comes after a
+// stretch with nothing: Windows sent no packets while nothing played.
+const GAP: Duration = Duration::from_millis(5);
+// A packet with no stamp is taken to follow the one before, unless that puts
+// it further than this from when it can have been captured.
+const DRIFT: Duration = Duration::from_millis(20);
 
 // What the thread asks of a device. Windows implements it in wasapi.rs.
 pub trait Device {
@@ -100,6 +106,9 @@ pub struct StreamInfo {
     // What Windows does to a microphone's sound before Booth gets it.
     pub effects: Effects,
     pub echo: Echo,
+    // How long the open took, a Bluetooth headset's change of profile or
+    // process loopback's activation included.
+    pub opened_in: Duration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,6 +189,10 @@ struct Shared {
     underruns: AtomicU64,
     // Captured packets that came after lost sound.
     glitches: AtomicU64,
+    // Stereo only: reads after Windows set the event, and after a wait it
+    // did not.
+    event_reads: AtomicU64,
+    quiet_reads: AtomicU64,
 }
 
 impl Shared {
@@ -273,6 +286,7 @@ impl StreamThread {
 }
 
 type AudioIn = Box<dyn FnMut(&[f32], Instant) + Send>;
+type StereoIn = Box<dyn FnMut(&[f32], Instant, bool) + Send>;
 type AudioOut = Box<dyn FnMut(&mut [f32]) + Send>;
 type Events = Box<dyn FnMut(Event) + Send>;
 
@@ -321,7 +335,8 @@ impl Capture {
             mono: Vec::new(),
             first: true,
         };
-        spawn(Direction::Input, make, choice, work, Box::new(events)).map(Capture)
+        let name = format!("audio {}", Direction::Input);
+        spawn(name, Direction::Input, make, choice, work, Box::new(events)).map(Capture)
     }
 
     pub fn info(&self) -> Option<StreamInfo> {
@@ -380,7 +395,16 @@ impl Render {
             fill: Box::new(fill),
             mono: Vec::new(),
         };
-        spawn(Direction::Output, make, choice, work, Box::new(events)).map(Render)
+        let name = format!("audio {}", Direction::Output);
+        spawn(
+            name,
+            Direction::Output,
+            make,
+            choice,
+            work,
+            Box::new(events),
+        )
+        .map(Render)
     }
 
     pub fn info(&self) -> Option<StreamInfo> {
@@ -420,6 +444,105 @@ impl Render {
     }
 }
 
+// PC sound: what the other programs on this PC play, as interleaved stereo
+// f32 at 48 kHz, with the time the first frame of each packet was captured
+// and whether the packet comes after a gap: the first after an open, sound
+// Windows lost, or a stretch with nothing. Stops when dropped.
+pub struct PcSound(Handle);
+
+impl PcSound {
+    // `make` runs on the new thread, as for Capture::start_with. The device
+    // has to give two channels.
+    pub fn start_with<D, F>(
+        make: F,
+        audio: impl FnMut(&[f32], Instant, bool) + Send + 'static,
+        events: impl FnMut(Event) + Send + 'static,
+    ) -> Result<PcSound, AudioError>
+    where
+        D: Device,
+        F: FnOnce(Direction, Wake) -> Result<D, AudioError> + Send + 'static,
+    {
+        let work = Work::Stereo {
+            audio: Box::new(audio),
+            meter: Meter::default(),
+            stereo: Vec::new(),
+            mid: Vec::new(),
+            first: true,
+            end: None,
+        };
+        let name = String::from("audio pc sound");
+        spawn(
+            name,
+            Direction::Input,
+            make,
+            Choice::Default,
+            work,
+            Box::new(events),
+        )
+        .map(PcSound)
+    }
+
+    pub fn info(&self) -> Option<StreamInfo> {
+        self.0.shared.info()
+    }
+
+    // Of both channels together.
+    pub fn level(&self) -> Reading {
+        self.0.shared.level.read()
+    }
+
+    pub fn glitches(&self) -> u64 {
+        self.0.shared.glitches.load(Ordering::Relaxed)
+    }
+
+    // Reads after Windows set the stream's event, and reads after a wait it
+    // did not, over every stream this has opened.
+    pub fn reads(&self) -> (u64, u64) {
+        (
+            self.0.shared.event_reads.load(Ordering::Relaxed),
+            self.0.shared.quiet_reads.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn thread(&self) -> StreamThread {
+        self.0.outside()
+    }
+
+    pub fn stop(mut self) {
+        self.0.stop();
+    }
+
+    // As Capture's.
+    pub fn let_go(self) -> StreamThread {
+        self.0.let_go()
+    }
+}
+
+// When a stereo packet's first frame was captured: its stamp, or with none,
+// where the packet before ended, unless that is more than DRIFT from now less
+// the packet's length, the latest it can have been captured.
+fn packet_time(
+    stamp: Option<Instant>,
+    end: Option<Instant>,
+    now: Instant,
+    length: Duration,
+) -> Instant {
+    if let Some(stamp) = stamp {
+        return stamp;
+    }
+    let latest = now.checked_sub(length).unwrap_or(now);
+    match end {
+        Some(end) if end.duration_since(latest).max(latest.duration_since(end)) <= DRIFT => end,
+        _ => latest,
+    }
+}
+
+// Only a packet that starts late is after a gap: one stamped early is
+// Windows' clock and the packet clock disagreeing by a little.
+fn after_gap(time: Instant, end: Option<Instant>) -> bool {
+    end.is_some_and(|end| time > end + GAP)
+}
+
 enum Work {
     Capture {
         audio: AudioIn,
@@ -433,12 +556,32 @@ enum Work {
         fill: AudioOut,
         mono: Vec<f32>,
     },
+    Stereo {
+        audio: StereoIn,
+        meter: Meter,
+        stereo: Vec<f32>,
+        // Both channels' average, for the meter.
+        mid: Vec<f32>,
+        first: bool,
+        // Where the last packet ended, on its own clock.
+        end: Option<Instant>,
+    },
 }
 
 impl Work {
+    // Process loopback can have packets ready while its event stays quiet,
+    // so it is read on every wait; the other streams are only checked.
+    fn reads_unwoken(&self) -> bool {
+        matches!(self, Work::Stereo { .. })
+    }
+
     fn start(&mut self, stream: &mut dyn DeviceStream) -> Result<(), AudioError> {
         match self {
             Work::Capture { first, .. } => *first = true,
+            Work::Stereo { first, end, .. } => {
+                *first = true;
+                *end = None;
+            }
             Work::Render { .. } => {
                 // Silence first, so the device has something to play until
                 // the first wake.
@@ -453,6 +596,10 @@ impl Work {
         match self {
             Work::Capture { mono, .. } => stats::gauge!("voice.capture.mono", *mono),
             Work::Render { mono, .. } => stats::gauge!("voice.render.mono", *mono),
+            Work::Stereo { stereo, mid, .. } => {
+                stats::gauge!("voice.pc_sound.stereo", *stereo);
+                stats::gauge!("voice.pc_sound.mid", *mid);
+            }
         }
     }
 
@@ -499,6 +646,33 @@ impl Work {
                 shared.note_queued(queued);
                 Ok(())
             }
+            Work::Stereo {
+                audio,
+                meter,
+                stereo,
+                mid,
+                first,
+                end,
+            } => stream.read(&mut |packet| {
+                if packet.glitch && !*first {
+                    shared.glitches.fetch_add(1, Ordering::Relaxed);
+                }
+                stereo.clear();
+                if packet.silent {
+                    stereo.resize(packet.frames as usize * 2, 0.0);
+                } else {
+                    interleaved(packet.data, &format, stereo);
+                }
+                mid.clear();
+                mid.extend(stereo.chunks_exact(2).map(|pair| (pair[0] + pair[1]) * 0.5));
+                meter.push(mid, &shared.level);
+                let length = frames_to_time(packet.frames);
+                let time = packet_time(packet.time, *end, Instant::now(), length);
+                let gap = *first || packet.glitch || after_gap(time, *end);
+                *first = false;
+                *end = Some(time + length);
+                audio(stereo, time, gap);
+            }),
         }
     }
 }
@@ -508,6 +682,7 @@ fn frames_to_time(frames: u32) -> Duration {
 }
 
 fn spawn<D, F>(
+    name: String,
     direction: Direction,
     make: F,
     choice: Choice,
@@ -524,7 +699,7 @@ where
     let shared = Arc::new(Shared::default());
     let thread_shared = Arc::clone(&shared);
     let thread = thread::Builder::new()
-        .name(format!("audio {direction}"))
+        .name(name)
         .spawn(move || {
             let raised = wasapi::raise_thread();
             match make(direction, wake) {
@@ -580,6 +755,7 @@ impl Run<'_> {
         let mut away = false;
         loop {
             let seen = self.notices.get();
+            let opening = Instant::now();
             let mut stream = match device.open(self.choice) {
                 Ok(stream) => stream,
                 // A default that vanished while it was being opened, as a
@@ -616,6 +792,7 @@ impl Run<'_> {
             };
             let mut info = stream.info().clone();
             info.pro_audio = self.pro_audio;
+            info.opened_in = opening.elapsed();
             // Opening a Bluetooth headset can take a second while it changes
             // profile, and the owner may have asked to stop meanwhile. The
             // stream then ends here, before it starts.
@@ -629,6 +806,17 @@ impl Run<'_> {
                     direction: info.direction,
                     name: info.device.clone(),
                     rate: info.format.rate,
+                }));
+                return;
+            }
+            if work.reads_unwoken() && info.format.channels != 2 {
+                events(Event::Failed(AudioError::PcSound {
+                    code: 0,
+                    text: format!(
+                        "Windows gave it as {} channels where Booth asked for 2",
+                        info.format.channels
+                    ),
+                    lost: false,
                 }));
                 return;
             }
@@ -687,9 +875,17 @@ impl Run<'_> {
             if let Some(end) = self.controls(id) {
                 return end;
             }
+            if work.reads_unwoken() {
+                let reads = if signalled {
+                    &self.shared.event_reads
+                } else {
+                    &self.shared.quiet_reads
+                };
+                reads.fetch_add(1, Ordering::Relaxed);
+            }
             // The Windows default also has the default-changed notice when
             // it goes; a device chosen in settings has only this.
-            let result = if signalled {
+            let result = if signalled || work.reads_unwoken() {
                 work.serve(stream, self.shared)
             } else {
                 stream.check()
@@ -764,5 +960,50 @@ impl Run<'_> {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEN_MS: Duration = Duration::from_millis(10);
+
+    #[test]
+    fn a_stamp_is_kept_and_a_missing_one_follows_the_last_packet() {
+        let now = Instant::now() + Duration::from_secs(10);
+        let stamp = now - Duration::from_millis(37);
+        assert_eq!(packet_time(Some(stamp), None, now, TEN_MS), stamp);
+        assert_eq!(packet_time(Some(stamp), Some(now), now, TEN_MS), stamp);
+        // No stamp: where the last one ended, within DRIFT either way of now
+        // less the packet's length.
+        let latest = now - TEN_MS;
+        for off in [Duration::ZERO, DRIFT] {
+            assert_eq!(
+                packet_time(None, Some(latest - off), now, TEN_MS),
+                latest - off
+            );
+            assert_eq!(
+                packet_time(None, Some(latest + off), now, TEN_MS),
+                latest + off
+            );
+        }
+        // Further than that, as after seconds with no packets, or with none
+        // before it: now less the packet's length.
+        let long_ago = latest - DRIFT - Duration::from_micros(1);
+        assert_eq!(packet_time(None, Some(long_ago), now, TEN_MS), latest);
+        assert_eq!(packet_time(None, Some(now + DRIFT), now, TEN_MS), latest);
+        assert_eq!(packet_time(None, None, now, TEN_MS), latest);
+    }
+
+    #[test]
+    fn only_a_late_packet_comes_after_a_gap() {
+        let end = Instant::now() + Duration::from_secs(10);
+        assert!(!after_gap(end, None));
+        assert!(!after_gap(end, Some(end)));
+        assert!(!after_gap(end + GAP, Some(end)));
+        assert!(after_gap(end + GAP + Duration::from_micros(1), Some(end)));
+        // Early is the two clocks disagreeing, never a gap.
+        assert!(!after_gap(end - Duration::from_millis(50), Some(end)));
     }
 }
