@@ -30,6 +30,27 @@ pub trait FrameSource {
     fn set_period(&mut self, _samples: usize) {}
 }
 
+// A stream of stereo frames, as PC sound is: like FrameSource, with each
+// frame interleaved, left first.
+pub trait StereoSource {
+    // Writes the next frame into `out`, which has room for MAX_FRAME frames
+    // of two samples, and returns its length in frames. None while silent.
+    fn next_frame(&mut self, out: &mut [f32]) -> Option<usize>;
+
+    fn pause(&mut self) {}
+
+    fn set_period(&mut self, _frames: usize) {}
+}
+
+// The streams of a mixer that takes none.
+pub enum NoStreams {}
+
+impl StereoSource for NoStreams {
+    fn next_frame(&mut self, _: &mut [f32]) -> Option<usize> {
+        match *self {}
+    }
+}
+
 impl FrameSource for JitterBuffer {
     fn next_frame(&mut self, out: &mut [f32]) -> Option<usize> {
         self.pull(out).map(|pulled| pulled.samples)
@@ -107,26 +128,88 @@ impl<K, S: FrameSource> Voice<K, S> {
     }
 }
 
+// A stereo stream in the mix, as a Voice is, with its frames two samples
+// wide.
+struct Stream<K, T> {
+    key: K,
+    source: T,
+    held: [f32; 2 * MAX_FRAME],
+    // In frames.
+    start: usize,
+    len: usize,
+    gain: f32,
+    wanted: f32,
+    played: bool,
+}
+
+impl<K, T: StereoSource> Stream<K, T> {
+    // As Voice::add_into, into interleaved stereo. False when it had nothing,
+    // so nothing was added, not even zeros.
+    fn add_into(&mut self, out: &mut [f32]) -> bool {
+        let step = 1.0 / FADE as f32;
+        let frames = out.len() / 2;
+        let mut done = 0;
+        while done < frames {
+            if self.len == 0 {
+                match self.source.next_frame(&mut self.held) {
+                    Some(len) if len > 0 => {
+                        self.start = 0;
+                        self.len = len.min(MAX_FRAME);
+                        self.played = true;
+                    }
+                    _ => return done > 0,
+                }
+            }
+            let take = self.len.min(frames - done);
+            for i in 0..take {
+                self.gain += (self.wanted - self.gain).clamp(-step, step);
+                let (to, from) = (2 * (done + i), 2 * (self.start + i));
+                out[to] += self.held[from] * self.gain;
+                out[to + 1] += self.held[from + 1] * self.gain;
+            }
+            self.start += take;
+            self.len -= take;
+            done += take;
+        }
+        true
+    }
+}
+
 // Sums every talker who has audio into what the render side asks for,
-// whatever its period. The render thread owns it.
-pub struct Mixer<K, S> {
+// whatever its period, and with render_stereo every stereo stream beside
+// them. The render thread owns it.
+pub struct Mixer<K, S, T = NoStreams> {
     voices: Vec<Voice<K, S>>,
+    streams: Vec<Stream<K, T>>,
     deafened: bool,
     gain: f32,
     period: usize,
     // The next 2.5 ms of talkers who just left, faded to nothing, still to be
     // added to the output.
     tail: [f32; FADE],
+    // The same for streams, in stereo, and how many of its frames are left.
+    stream_tail: [f32; 2 * FADE],
+    stream_tail_left: usize,
 }
 
 impl<K: PartialEq, S: FrameSource> Mixer<K, S> {
     pub fn new() -> Mixer<K, S> {
+        Mixer::with_streams()
+    }
+}
+
+impl<K: PartialEq, S: FrameSource, T: StereoSource> Mixer<K, S, T> {
+    // A mixer that takes stereo streams as well (add_stream).
+    pub fn with_streams() -> Mixer<K, S, T> {
         Mixer {
             voices: Vec::with_capacity(ROOM),
+            streams: Vec::with_capacity(ROOM),
             deafened: false,
             gain: 1.0,
             period: 0,
             tail: [0.0; FADE],
+            stream_tail: [0.0; 2 * FADE],
+            stream_tail_left: 0,
         }
     }
 
@@ -183,12 +266,71 @@ impl<K: PartialEq, S: FrameSource> Mixer<K, S> {
             .map(|voice| &mut voice.source)
     }
 
+    // A stream added under a key already in use replaces the old one, as for
+    // talkers. Make the source off the render thread.
+    pub fn add_stream(&mut self, key: K, mut source: T) -> Option<T> {
+        let replaced = self.remove_stream(&key);
+        source.set_period(self.period);
+        self.streams.push(Stream {
+            key,
+            source,
+            held: [0.0; 2 * MAX_FRAME],
+            start: 0,
+            len: 0,
+            gain: 1.0,
+            wanted: 1.0,
+            played: false,
+        });
+        replaced
+    }
+
+    // As set_gain, for a stream.
+    pub fn set_stream_gain(&mut self, key: &K, gain: f32) {
+        let Some(stream) = self.streams.iter_mut().find(|stream| stream.key == *key) else {
+            return;
+        };
+        stream.wanted = if gain.is_finite() { gain.max(0.0) } else { 1.0 };
+        if !stream.played {
+            stream.gain = stream.wanted;
+        }
+    }
+
+    // As remove, for a stream: its next 2.5 ms still play, fading out.
+    pub fn remove_stream(&mut self, key: &K) -> Option<T> {
+        let at = self.streams.iter().position(|stream| stream.key == *key)?;
+        let mut stream = self.streams.swap_remove(at);
+        if !self.silent() {
+            let mut last = [0.0f32; 2 * FADE];
+            if stream.add_into(&mut last) {
+                let (tail, _) = self.stream_tail.as_chunks_mut::<2>();
+                let (last, _) = last.as_chunks::<2>();
+                for (i, (tail, last)) in tail.iter_mut().zip(last).enumerate() {
+                    let fade = (FADE - i) as f32 / FADE as f32;
+                    tail[0] += last[0] * fade;
+                    tail[1] += last[1] * fade;
+                }
+                self.stream_tail_left = FADE;
+            }
+        }
+        Some(stream.source)
+    }
+
+    pub fn stream_mut(&mut self, key: &K) -> Option<&mut T> {
+        self.streams
+            .iter_mut()
+            .find(|stream| stream.key == *key)
+            .map(|stream| &mut stream.source)
+    }
+
     // The render side's period in samples, passed on to every talker's
-    // source, now and as they join.
+    // source, now and as they join; a stream's in frames, the same number.
     pub fn set_period(&mut self, samples: usize) {
         self.period = samples;
         for voice in &mut self.voices {
             voice.source.set_period(samples);
+        }
+        for stream in &mut self.streams {
+            stream.source.set_period(samples);
         }
     }
 
@@ -242,18 +384,81 @@ impl<K: PartialEq, S: FrameSource> Mixer<K, S> {
         }
     }
 
+    // As render, into interleaved stereo: the talkers in the middle, each
+    // stream on its own sides, under one deafen fade and one limiter, so a
+    // loud talker and a loud stream bend together and nothing bends twice.
+    // With no stream both channels are exactly what render gives.
+    pub fn render_stereo(&mut self, out: &mut [f32]) {
+        stats::gauge!("voice.mixer.voices", self.voices);
+        stats::gauge!("voice.mixer.streams", self.streams);
+        out.fill(0.0);
+        if self.silent() {
+            self.pause_all();
+            return;
+        }
+        let frames = out.len() / 2;
+        let (middle, _) = out.split_at_mut(frames);
+        for voice in &mut self.voices {
+            voice.add_into(middle);
+        }
+        let tail = frames.min(FADE);
+        for (sample, left) in middle.iter_mut().zip(&self.tail[..tail]) {
+            *sample += left;
+        }
+        self.tail.copy_within(tail.., 0);
+        self.tail[FADE - tail..].fill(0.0);
+        // From the back, so each sample is read before its place is written.
+        for i in (0..frames).rev() {
+            let value = out[i];
+            out[2 * i] = value;
+            out[2 * i + 1] = value;
+        }
+        for stream in &mut self.streams {
+            stream.add_into(out);
+        }
+        if self.stream_tail_left > 0 {
+            let tail = frames.min(self.stream_tail_left);
+            for (sample, left) in out.iter_mut().zip(&self.stream_tail[..2 * tail]) {
+                *sample += left;
+            }
+            self.stream_tail.copy_within(2 * tail.., 0);
+            self.stream_tail[2 * (FADE - tail)..].fill(0.0);
+            self.stream_tail_left -= tail;
+        }
+        let step = 1.0 / FADE as f32;
+        let (pairs, _) = out.as_chunks_mut::<2>();
+        for [left, right] in pairs {
+            self.gain = if self.deafened {
+                (self.gain - step).max(0.0)
+            } else {
+                (self.gain + step).min(1.0)
+            };
+            *left = limit(*left * self.gain);
+            *right = limit(*right * self.gain);
+        }
+        if self.silent() {
+            self.pause_all();
+        }
+    }
+
     fn silent(&self) -> bool {
         self.deafened && self.gain == 0.0
     }
 
-    // What was held belongs to before; after deafen every talker starts
-    // clean. Telling each source every period, not once, covers a talker who
-    // joins while deafened.
+    // What was held belongs to before; after deafen every talker and stream
+    // starts clean. Telling each source every period, not once, covers one
+    // that joins while deafened.
     fn pause_all(&mut self) {
         self.tail = [0.0; FADE];
         for voice in &mut self.voices {
             voice.len = 0;
             voice.source.pause();
+        }
+        self.stream_tail = [0.0; 2 * FADE];
+        self.stream_tail_left = 0;
+        for stream in &mut self.streams {
+            stream.len = 0;
+            stream.source.pause();
         }
     }
 }

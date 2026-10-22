@@ -2,7 +2,7 @@ use std::f32::consts::TAU;
 
 use voice::codec::{Encoder, MAX_FRAME, MAX_PACKET, Mode, SAMPLE_RATE};
 use voice::jitter::{JitterBuffer, VoicePacket};
-use voice::mix::{FrameSource, KNEE, Mixer, limit};
+use voice::mix::{FrameSource, KNEE, Mixer, StereoSource, limit};
 
 // Sample n of a counter's stream is (n + offset) mod 4096 over 16384:
 // exact in f32 and under the knee even when two are added, so a mix of
@@ -483,4 +483,190 @@ fn each_talker_has_a_volume_of_their_own() {
     );
     // A talker who is not in the mix is no one's business.
     mixer.set_gain(&9, 0.0);
+}
+
+// A stereo stream that plays the same pair in every frame.
+struct Pair {
+    left: f32,
+    right: f32,
+    frame: usize,
+    paused: u64,
+}
+
+impl Pair {
+    fn new(left: f32, right: f32) -> Pair {
+        Pair {
+            left,
+            right,
+            frame: 480,
+            paused: 0,
+        }
+    }
+}
+
+impl StereoSource for Pair {
+    fn next_frame(&mut self, out: &mut [f32]) -> Option<usize> {
+        let (frames, _) = out[..2 * self.frame].as_chunks_mut::<2>();
+        for frame in frames {
+            *frame = [self.left, self.right];
+        }
+        Some(self.frame)
+    }
+
+    fn pause(&mut self) {
+        self.paused += 1;
+    }
+}
+
+type Both = Mixer<u32, Talker, Pair>;
+
+// The same script on two mixers, one through render and one through
+// render_stereo with no stream: both channels are the mono mix to the bit.
+fn same_bits(script: impl Fn(&mut Both, usize)) {
+    let mut mono: Both = Mixer::with_streams();
+    let mut stereo: Both = Mixer::with_streams();
+    for (step, period) in periods().take(200).enumerate() {
+        script(&mut mono, step);
+        script(&mut stereo, step);
+        let mut one = vec![0.0f32; period];
+        let mut two = vec![0.0f32; 2 * period];
+        mono.render(&mut one);
+        stereo.render_stereo(&mut two);
+        let (pairs, _) = two.as_chunks::<2>();
+        for (i, (m, [l, r])) in one.iter().zip(pairs).enumerate() {
+            assert_eq!(
+                (l.to_bits(), r.to_bits()),
+                (m.to_bits(), m.to_bits()),
+                "step {step}, sample {i}"
+            );
+        }
+    }
+}
+
+#[test]
+fn stereo_with_no_stream_is_the_mono_mix_on_both_sides() {
+    // Talkers summed, quiet ones too.
+    same_bits(|mixer, step| {
+        if step == 0 {
+            mixer.add(1, Talker::Counter(Counter::new(240, 0)));
+            mixer.add(2, Talker::Counter(Counter::new(480, 100)));
+            mixer.add(3, Talker::Quiet(Quiet));
+        }
+    });
+    // Past the knee, and past full scale.
+    same_bits(|mixer, step| {
+        if step == 0 {
+            mixer.add(1, Talker::Level(Level(0.9)));
+            mixer.add(2, Talker::Level(Level(0.8)));
+        }
+    });
+    // Deafened and back.
+    same_bits(|mixer, step| match step {
+        0 => {
+            mixer.add(1, Talker::Counter(Counter::new(240, 7)));
+        }
+        20 => mixer.set_deafened(true),
+        40 => mixer.set_deafened(false),
+        _ => {}
+    });
+    // Talkers coming and going, one leaving mid-frame.
+    same_bits(|mixer, step| match step {
+        0 => {
+            mixer.add(1, Talker::Counter(Counter::new(240, 0)));
+        }
+        10 => {
+            mixer.add(2, Talker::Counter(Counter::new(480, 9)));
+        }
+        30 => {
+            mixer.remove(&1);
+        }
+        50 => {
+            mixer.add(1, Talker::Level(Level(0.3)));
+        }
+        70 => {
+            mixer.remove(&2);
+        }
+        _ => {}
+    });
+    // Volumes moving.
+    same_bits(|mixer, step| match step {
+        0 => {
+            mixer.add(1, Talker::Counter(Counter::new(240, 0)));
+            mixer.add(2, Talker::Level(Level(0.2)));
+        }
+        10 => mixer.set_gain(&1, 0.3),
+        30 => mixer.set_gain(&2, 1.4),
+        _ => {}
+    });
+}
+
+fn rendered(mixer: &mut Both, frames: usize) -> Vec<[f32; 2]> {
+    let mut out = vec![0.0f32; 2 * frames];
+    mixer.render_stereo(&mut out);
+    out.as_chunks::<2>().0.to_vec()
+}
+
+#[test]
+fn a_stream_keeps_its_sides_beside_the_talkers() {
+    let mut mixer: Both = Mixer::with_streams();
+    mixer.add(1, Talker::Level(Level(0.1)));
+    assert!(mixer.add_stream(1, Pair::new(0.2, -0.2)).is_none());
+    for [left, right] in rendered(&mut mixer, 480) {
+        assert!((left - 0.3).abs() < 1e-6 && (right + 0.1).abs() < 1e-6);
+    }
+    // One under the same key takes its place.
+    assert!(mixer.add_stream(1, Pair::new(0.0, 0.25)).is_some());
+    let frames = rendered(&mut mixer, 480);
+    let [left, right] = frames[479];
+    assert!((left - 0.1).abs() < 1e-6 && (right - 0.35).abs() < 1e-6);
+}
+
+#[test]
+fn deafen_fades_and_pauses_streams() {
+    let mut mixer: Both = Mixer::with_streams();
+    mixer.add_stream(1, Pair::new(0.3, 0.3));
+    rendered(&mut mixer, 240);
+    mixer.set_deafened(true);
+    rendered(&mut mixer, 240);
+    let silent = rendered(&mut mixer, 240);
+    assert!(silent.iter().all(|&frame| frame == [0.0, 0.0]));
+    assert!(mixer.stream_mut(&1).unwrap().paused > 0);
+    mixer.set_deafened(false);
+    rendered(&mut mixer, 240);
+    let back = rendered(&mut mixer, 240);
+    assert!(back.iter().all(|&[left, _]| (left - 0.3).abs() < 1e-6));
+}
+
+#[test]
+fn a_stream_that_leaves_fades_out_over_2_5_ms() {
+    let mut mixer: Both = Mixer::with_streams();
+    mixer.add_stream(1, Pair::new(0.4, -0.4));
+    rendered(&mut mixer, 240);
+    assert!(mixer.remove_stream(&1).is_some());
+    let after = rendered(&mut mixer, 240);
+    assert!((after[0][0] - 0.4).abs() < 0.01, "{:?}", after[0]);
+    for pair in after.windows(2) {
+        assert!(pair[1][0] <= pair[0][0] && pair[1][1] >= pair[0][1]);
+    }
+    assert!(after[120..].iter().all(|&frame| frame == [0.0, 0.0]));
+    assert!(mixer.remove_stream(&1).is_none());
+}
+
+#[test]
+fn a_stream_volume_ramps_without_a_step() {
+    let mut mixer: Both = Mixer::with_streams();
+    mixer.add_stream(1, Pair::new(0.4, -0.4));
+    // Set before it plays, it starts there.
+    mixer.set_stream_gain(&1, 0.5);
+    let first = rendered(&mut mixer, 240);
+    assert!((first[0][0] - 0.2).abs() < 1e-6);
+    mixer.set_stream_gain(&1, 0.0);
+    let ramp = rendered(&mut mixer, 240);
+    let most = 0.4 / 120.0 + 1e-6;
+    let mut before = first[239][0];
+    for [left, _] in &ramp {
+        assert!((before - left).abs() <= most, "{before} to {left}");
+        before = *left;
+    }
+    assert_eq!(ramp[239], [0.0, 0.0]);
 }
