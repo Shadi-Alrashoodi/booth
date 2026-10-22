@@ -692,7 +692,8 @@ impl Work {
                     interleaved(packet.data, &format, stereo);
                 }
                 mid.clear();
-                mid.extend(stereo.chunks_exact(2).map(|pair| (pair[0] + pair[1]) * 0.5));
+                let (pairs, _) = stereo.as_chunks::<2>();
+                mid.extend(pairs.iter().map(|[left, right]| (left + right) * 0.5));
                 meter.push(mid, &shared.level);
                 let length = frames_to_time(packet.frames);
                 let time = packet_time(packet.time, *end, Instant::now(), length);
