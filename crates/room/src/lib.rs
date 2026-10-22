@@ -48,8 +48,8 @@ use crate::invites::Local;
 use crate::known::{DeviceBook, HostBook};
 use crate::log::{Log, Writer, log, yes_no};
 use crate::mapper::Target;
-use crate::screen::ScreenSetup;
 pub use crate::screen::StripClick;
+use crate::screen::{ScreenSetup, Shown};
 use crate::socket::Socket;
 use crate::talk::Speaker;
 use crate::threads::{Outlets, Side, Threads, VoiceStart};
@@ -70,7 +70,7 @@ pub use remote::{
 };
 pub use reply::{ReplyAccepted, ReplyRefused};
 // What the panel needs to name a monitor and say how the viewer opens.
-pub use share::{Capturing, Monitor, MonitorId, Show, monitors};
+pub use share::{Capturing, Monitor, MonitorId, Show, WindowId, monitors};
 pub use talk::{
     DEFAULT_SENSITIVITY_DB, Devices, MOST_VOLUME, SENSITIVITY_DB, TalkMode, VoiceConfig,
 };
@@ -385,7 +385,7 @@ impl Room {
     /// the one it started with.
     pub fn share(&self, fps: u8, monitor: Option<MonitorId>) {
         self.threads
-            .share(fps.clamp(1, control::MAX_FPS), monitor, None);
+            .share(fps.clamp(1, control::MAX_FPS), Shown::Monitor(monitor));
     }
 
     /// As share, with only `region` of the monitor going out, in its
@@ -393,8 +393,19 @@ impl Room {
     /// while the monitor keeps the resolution and rotation it has now. A
     /// share that runs already keeps what it shows.
     pub fn share_region(&self, fps: u8, monitor: MonitorId, region: share::Region) {
+        self.threads.share(
+            fps.clamp(1, control::MAX_FPS),
+            Shown::Region { monitor, region },
+        );
+    }
+
+    /// As share, with one window going out: what Windows composes of it,
+    /// at its own size, the pointer only while it is over it. The window's
+    /// title never goes into a message, the log or the settings. A share
+    /// that runs already keeps what it shows.
+    pub fn share_window(&self, fps: u8, window: WindowId) {
         self.threads
-            .share(fps.clamp(1, control::MAX_FPS), Some(monitor), Some(region));
+            .share(fps.clamp(1, control::MAX_FPS), Shown::Window(window));
     }
 
     /// Needs no answer: the share is over for everyone at once, and its

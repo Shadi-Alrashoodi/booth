@@ -38,7 +38,7 @@ use crate::peer::Clock;
 use crate::remote::{self, Controls, Gate};
 use crate::reply::{ReplyAccepted, ReplyRefused};
 use crate::saver::{SaveHandle, Saver};
-use crate::screen::{self, Sharing, Watching};
+use crate::screen::{self, Sharing, Shown, Watching};
 use crate::socket::Socket;
 use crate::talk::{self, Timing, VoiceConfig};
 use crate::view::View;
@@ -673,14 +673,9 @@ impl Threads {
         lock(&self.shared.view).clone()
     }
 
-    pub(crate) fn share(
-        &self,
-        fps: u8,
-        monitor: Option<share::MonitorId>,
-        region: Option<share::Region>,
-    ) {
+    pub(crate) fn share(&self, fps: u8, shown: Shown) {
         if self.sharing.number().is_none() {
-            self.sharing.set_monitor(monitor, region);
+            self.sharing.set_shown(shown);
         }
         self.with_side(|side, now, socket| side.share(fps, now, socket));
     }

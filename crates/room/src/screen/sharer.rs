@@ -19,12 +19,12 @@ use net::pace::Timer;
 use share::rate::{Lost, Rate, Second, Step};
 use share::{
     Audience, Back, CaptureOptions, Choice, CursorShape, CursorUpdate, FineTimer, Kind, Line,
-    MonitorId, PauseReason, Preset, Region, SMALLEST_REGION, Sent, Settings, Setup, Sharer,
-    SharerNumbers, Software, spread,
+    PauseReason, Preset, SMALLEST_REGION, Sent, Settings, Setup, Sharer, SharerNumbers, Software,
+    WINDOW_CLOSED, WINDOW_GONE, spread,
 };
 
 use super::wire::{Shape, ShapeKind};
-use super::{Answer, Outbox, OwnShare, SOFTWARE_ENCODER, ShareFacts, ShareNews, Sharing};
+use super::{Answer, Outbox, OwnShare, SOFTWARE_ENCODER, ShareFacts, ShareNews, Sharing, Shown};
 use crate::config::VideoSource;
 use crate::log::{Log, log};
 use crate::remote::Area;
@@ -128,8 +128,11 @@ fn share(
             None
         }
     };
-    let choice =
-        choose(source, sharing.monitor(), sharing.region(), log, number).map_err(did_not_start)?;
+    let choice = choose(source, &sharing.shown(), log, number).map_err(did_not_start)?;
+    let window = match &choice {
+        Choice::Window { window, .. } => Some(*window),
+        _ => None,
+    };
     // Capture turns a rotated monitor upright and scales the whole of it
     // into the picture, so the picture is exactly this rectangle.
     sharing.set_area(match &choice {
@@ -301,6 +304,11 @@ fn share(
             || (applied.is_some_and(|facts| facts.watchers == 0) && !sharing.answers_waiting())
         {
             rest.until(sharing, next_second);
+            // Nothing reads the window while the share rests, so its closing
+            // is looked for here: the share ends as it would have.
+            if window.is_some_and(|window| !window.exists()) {
+                return Err(ran(String::from(WINDOW_CLOSED)));
+            }
         } else {
             sharer.next(&mut watchers).map_err(ran)?;
             // The GPU encoder failed on that frame and the software encoder
@@ -423,18 +431,14 @@ fn share(
     Ok(())
 }
 
-// What the source can show: the monitor asked for, or the primary one; or
-// the test pattern on the GPU that drives the primary monitor. A
-// monitor that is gone is never swapped for another: the person chose what
-// to show. The error is the chat's clause; the log has the device name.
-fn choose(
-    source: &VideoSource,
-    monitor: Option<MonitorId>,
-    region: Option<Region>,
-    log: &Log,
-    number: u32,
-) -> Result<Choice, String> {
-    if let Some(region) = region
+// What the source can show: the monitor asked for, or the primary one, a
+// region of a monitor or a window; or the test pattern on the GPU that
+// drives the primary monitor. A monitor or window that is gone is never
+// swapped for another: the person chose what to show. The error is the
+// chat's clause; the log has the device name or the window's handle, never
+// its title.
+fn choose(source: &VideoSource, shown: &Shown, log: &Log, number: u32) -> Result<Choice, String> {
+    if let Shown::Region { region, .. } = shown
         && (region.width < SMALLEST_REGION || region.height < SMALLEST_REGION)
     {
         return Err(format!(
@@ -449,30 +453,64 @@ fn choose(
     }
     let monitors = share::monitors().map_err(|err| err.to_string())?;
     let primary = || monitors.iter().find(|m| m.primary).or(monitors.first());
+    let attached = |id: &share::MonitorId| {
+        monitors
+            .iter()
+            .find(|monitor| monitor.id == *id)
+            .cloned()
+            .ok_or_else(|| {
+                log!(
+                    log,
+                    "share {number}: the monitor asked for, {}, is not attached",
+                    id.device_name
+                );
+                String::from("the monitor you chose is not attached any more. Choose another one")
+            })
+    };
     match source {
-        VideoSource::Screen => match monitor {
-            Some(id) => monitors
-                .iter()
-                .find(|monitor| monitor.id == id)
-                .cloned()
-                .map(|monitor| match region {
-                    Some(region) => Choice::Region { monitor, region },
-                    None => Choice::Screen(monitor),
-                })
-                .ok_or_else(|| {
-                    log!(
-                        log,
-                        "share {number}: the monitor asked for, {}, is not attached",
-                        id.device_name
-                    );
-                    String::from(
-                        "the monitor you chose is not attached any more. Choose another one",
-                    )
-                }),
-            None => primary()
+        VideoSource::Screen => match shown {
+            Shown::Monitor(Some(id)) => attached(id).map(Choice::Screen),
+            Shown::Region { monitor, region } => attached(monitor).map(|monitor| Choice::Region {
+                monitor,
+                region: *region,
+            }),
+            Shown::Monitor(None) => primary()
                 .cloned()
                 .map(Choice::Screen)
                 .ok_or_else(|| String::from("no monitor is attached to this PC")),
+            Shown::Window(window) => {
+                if !window.exists() {
+                    log!(
+                        log,
+                        "share {number}: the window asked for, {:#x}, is not open",
+                        window.hwnd
+                    );
+                    return Err(String::from(WINDOW_GONE));
+                }
+                // On the GPU of the monitor it is on, so no copy goes
+                // between GPUs when it can be helped.
+                let adapter = match share::window_monitor(*window) {
+                    Some(monitor) => monitor.adapter,
+                    None => match primary() {
+                        Some(monitor) => monitor.adapter.clone(),
+                        None => share::adapters()
+                            .map_err(|err| err.to_string())?
+                            .into_iter()
+                            .next()
+                            .ok_or("this PC has no graphics card a window can be captured on")?,
+                    },
+                };
+                log!(
+                    log,
+                    "share {number}: window {:#x} on {}",
+                    window.hwnd,
+                    adapter.description
+                );
+                Ok(Choice::Window {
+                    window: *window,
+                    adapter,
+                })
+            }
         },
         VideoSource::Pattern {
             width,
@@ -998,7 +1036,7 @@ fn kbps(bytes: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use share::CursorKind;
+    use share::{CursorKind, MonitorId, Region, WindowId};
 
     // What capture gives crosses the room as it was, its scale with it, and
     // the watcher's viewer gets it back as capture made it.
@@ -1048,7 +1086,12 @@ mod tests {
             device_name: String::from(r"\\.\NOT-A-MONITOR"),
             adapter_luid: 0,
         };
-        let Err(why) = choose(&VideoSource::Screen, Some(nowhere), None, &log, 4) else {
+        let Err(why) = choose(
+            &VideoSource::Screen,
+            &Shown::Monitor(Some(nowhere)),
+            &log,
+            4,
+        ) else {
             panic!("a monitor that does not exist was chosen");
         };
         assert_eq!(
@@ -1065,8 +1108,33 @@ mod tests {
             busy: false,
         };
         assert_eq!(
-            choose(&pattern, None, None, &log, 5).err().as_deref(),
+            choose(&pattern, &Shown::Monitor(None), &log, 5)
+                .err()
+                .as_deref(),
             Some("the test pattern cannot be 0x1440")
+        );
+    }
+
+    // A window that closed before the share started, or a handle that names
+    // no window any more, is refused with what to do; the log has the
+    // handle, never a title.
+    #[test]
+    fn gone_window_sentence() {
+        let (log, captured) = Log::capture(8);
+        let gone = WindowId {
+            hwnd: 0x5150,
+            process: 4,
+        };
+        let Err(why) = choose(&VideoSource::Screen, &Shown::Window(gone), &log, 7) else {
+            panic!("a window that does not exist was chosen");
+        };
+        assert_eq!(
+            crate::screen::share_failed(&why, false),
+            "Could not start sharing: the window you chose is not open any more. Choose another one."
+        );
+        assert_eq!(
+            captured.lines(),
+            ["share 7: the window asked for, 0x5150, is not open"]
         );
     }
 
@@ -1081,7 +1149,15 @@ mod tests {
             width: 255,
             height: 1080,
         };
-        let Err(why) = choose(&VideoSource::Screen, None, Some(small), &log, 6) else {
+        let nowhere = MonitorId {
+            device_name: String::from(r"\\.\NOT-A-MONITOR"),
+            adapter_luid: 0,
+        };
+        let shown = Shown::Region {
+            monitor: nowhere,
+            region: small,
+        };
+        let Err(why) = choose(&VideoSource::Screen, &shown, &log, 6) else {
             panic!("a region too small was shared");
         };
         assert_eq!(

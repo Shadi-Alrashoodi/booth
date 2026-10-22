@@ -1,7 +1,8 @@
 // The video path through the room: the room's own share thread captures,
 // encodes and sends, and the room's own viewer thread decodes and shows, on
 // this PC over loopback with fake voice devices. Nothing of the screen is
-// captured: every share here is capture's test pattern.
+// captured but a window a test makes: every other share here is capture's
+// test pattern.
 // Every viewer window opens without taking the focus and closes within
 // seconds, and the tests take turns on the GPU.
 //
@@ -15,12 +16,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::voiced::heard_cues;
+use common::window::Window;
 use common::{Member, code_to_invite, config, fresh_log, loopback, poll, read_log, timers};
 use room::view::{
-    Codec, LineKind, LinkState, OwnShare, ShareState, SharingNumbers, View, WatchingNumbers,
+    Codec, LineKind, LinkState, OwnShare, Paused, ShareState, SharingNumbers, View, WatchingNumbers,
 };
 use room::{Config, Devices, LossKnob, Show, VideoConfig, VideoSource};
 use voice::audio::fake::Fake;
+use windows::Win32::UI::WindowsAndMessaging::{SW_MINIMIZE, SW_RESTORE, WS_OVERLAPPEDWINDOW};
 
 const NVIDIA: u32 = 0x10de;
 const FFMPEG: [&str; 2] = ["avcodec-62.dll", "avutil-60.dll"];
@@ -1227,4 +1230,156 @@ fn watchers_hear_that_the_share_is_paused() {
     host.wait_for(WAIT, "the host hearing it is live again", |v| {
         v.share.watched_state == ShareState::Live
     });
+}
+
+// The screen, for the tests that share a window they make.
+fn screen() -> VideoConfig {
+    VideoConfig {
+        source: VideoSource::Screen,
+        ..pattern(None)
+    }
+}
+
+fn shares_window(member: &Member, window: &Window) -> u32 {
+    member.room().share_window(60, window.id());
+    let view = member.wait_for(WAIT, "the window share running", |v| {
+        own_share(v).is_some() && v.share.running.is_some()
+    });
+    own_share(&view).expect("granted")
+}
+
+// A window goes to whoever watches at the size of its pictures, decoding.
+#[test]
+fn a_shared_window_reaches_its_watchers() {
+    let _turn = turn();
+    if !ready() {
+        return;
+    }
+    let window = Window::open(640, 360);
+    let (host, friends) = room_of(
+        config_with("Mara", screen(), room::DEFAULT_VIDEO_UPLOAD_KBPS),
+        vec![config_with(
+            "Ana",
+            pattern(None),
+            room::DEFAULT_VIDEO_UPLOAD_KBPS,
+        )],
+    );
+    let ana = &friends[0];
+    let number = shares_window(&host, &window);
+    watches(ana, number);
+    let watched = poll(WAIT, "Ana's first frames", || {
+        ana.view().numbers.watching.filter(|w| w.shown > 0)
+    });
+    assert_eq!(watched.decode_failed, 0);
+    let numbers = poll(WAIT, "the sharing numbers", || host.view().numbers.sharing);
+    assert_eq!((numbers.width, numbers.height), (640, 360));
+}
+
+// A window closed while it is shared ends the share for everyone with a
+// plain sentence: while someone watches, and while nobody does and the
+// share rests, reading nothing of the window.
+#[test]
+fn closing_the_shared_window_ends_the_share() {
+    let _turn = turn();
+    if !ready() {
+        return;
+    }
+    let (host, friends) = room_of(
+        config_with("Mara", screen(), room::DEFAULT_VIDEO_UPLOAD_KBPS),
+        vec![config_with(
+            "Ana",
+            pattern(None),
+            room::DEFAULT_VIDEO_UPLOAD_KBPS,
+        )],
+    );
+    let ana = &friends[0];
+    for watched in [true, false] {
+        let window = Window::open(480, 320);
+        let number = shares_window(&host, &window);
+        if watched {
+            watches(ana, number);
+        } else {
+            // Long enough for the facts to say nobody watches.
+            thread::sleep(Duration::from_millis(1500));
+        }
+        window.close();
+        let view = host.wait_for(WAIT, "the share over", |v| v.share.current.is_none());
+        let problems = lines(&view, LineKind::Problem);
+        assert_eq!(
+            problems.last().map(String::as_str),
+            Some("Sharing stopped: the shared window was closed."),
+            "watched {watched}: {problems:?}"
+        );
+        ana.wait_for(WAIT, "no share in the room", |v| v.share.current.is_none());
+    }
+}
+
+// Minimized, a shared window pauses with its own sentence and watchers
+// hear it is away; restored, frames come again. Paused by hand while it is
+// minimized, it stays paused when it is restored.
+#[test]
+fn a_minimized_window_pauses_the_share() {
+    let _turn = turn();
+    if !ready() {
+        return;
+    }
+    let reads = invite::Version {
+        major: 1,
+        minor: 3,
+        patch: 0,
+    };
+    let config = |name, video| {
+        let mut config = config_with(name, video, room::DEFAULT_VIDEO_UPLOAD_KBPS);
+        config.version = reads;
+        config
+    };
+    let window = Window::with_style(WS_OVERLAPPEDWINDOW, 640, 360);
+    let (host, friends) = room_of(config("Mara", screen()), vec![config("Ana", pattern(None))]);
+    let ana = &friends[0];
+    let number = shares_window(&host, &window);
+    watches(ana, number);
+    poll(WAIT, "Ana's first frames", || {
+        ana.view().numbers.watching.filter(|w| w.shown > 0)
+    });
+    window.show(SW_MINIMIZE);
+    host.wait_for(WAIT, "the share paused by Windows", |v| {
+        v.share
+            .running
+            .as_ref()
+            .is_some_and(|running| running.paused == Some(Paused::Minimized))
+    });
+    ana.wait_for(WAIT, "Ana hearing the window is away", |v| {
+        v.share.watched_state == ShareState::Away
+    });
+    let shown = || ana.view().numbers.watching.map_or(0, |w| w.shown);
+    let before = shown();
+    window.show(SW_RESTORE);
+    ana.wait_for(WAIT, "Ana hearing it is back", |v| {
+        v.share.watched_state == ShareState::Live
+    });
+    poll(WAIT, "frames after the restore", || {
+        (shown() > before).then_some(())
+    });
+    window.show(SW_MINIMIZE);
+    host.wait_for(WAIT, "the share paused by Windows again", |v| {
+        v.share
+            .running
+            .as_ref()
+            .is_some_and(|running| running.paused == Some(Paused::Minimized))
+    });
+    host.room().pause_share(true);
+    host.wait_for(WAIT, "the share paused by hand", |v| {
+        v.share.running.as_ref().is_some_and(|running| running.held)
+    });
+    window.show(SW_RESTORE);
+    thread::sleep(Duration::from_millis(1000));
+    let view = host.view();
+    assert!(
+        view.share
+            .running
+            .as_ref()
+            .is_some_and(|running| running.held),
+        "the share came back by itself after a pause by hand"
+    );
+    assert_eq!(ana.view().share.watched_state, ShareState::Paused);
 }

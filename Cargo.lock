@@ -2901,6 +2901,7 @@ dependencies = [
  "stats",
  "unicode-bidi",
  "voice",
+ "windows",
  "zeroize",
 ]
 

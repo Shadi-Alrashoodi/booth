@@ -25,3 +25,8 @@ unicode-bidi.workspace = true
 proptest.workspace = true
 # tests/video.rs makes NVENC fail a frame during a share.
 encode = { workspace = true, features = ["fault"] }
+# tests/common/window.rs makes the windows tests/video.rs shares.
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
