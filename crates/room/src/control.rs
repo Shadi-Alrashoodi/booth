@@ -62,6 +62,8 @@ const SHARE_LIMITS: u8 = 26;
 // From 1.3.0 on: whether the share under way is live, paused by the sharer,
 // or away while Windows has taken the sharer's screen.
 const SHARE_STATE: u8 = 27;
+// From 1.3.0 on: whether the sharer's PC sound goes out with the share.
+const SHARE_SOUND: u8 = 28;
 
 const IS_HOST: u8 = 1 << 0;
 const JOINED_BY_INVITE: u8 = 1 << 1;
@@ -279,6 +281,12 @@ pub(crate) enum Message {
     ShareState {
         share: u32,
         state: ShareState,
+    },
+    // The sharer to the host whenever it changes, and the host to each
+    // watcher then and when one starts watching a share whose sound is on.
+    ShareSound {
+        share: u32,
+        on: bool,
     },
 }
 
@@ -667,6 +675,11 @@ impl Message {
                     ShareState::Away => 2,
                 });
             }
+            Message::ShareSound { share, on } => {
+                out.push(SHARE_SOUND);
+                out.extend_from_slice(&share.to_le_bytes());
+                out.push(u8::from(*on));
+            }
         }
         out
     }
@@ -978,6 +991,10 @@ impl Message {
                     _ => return None,
                 },
             },
+            SHARE_SOUND => Message::ShareSound {
+                share: r.share()?,
+                on: r.yes_no()?,
+            },
             _ => return None,
         };
         r.0.is_empty().then_some(message)
@@ -1134,6 +1151,11 @@ impl fmt::Debug for Message {
                 .debug_struct("ShareState")
                 .field("share", share)
                 .field("state", state)
+                .finish(),
+            Message::ShareSound { share, on } => f
+                .debug_struct("ShareSound")
+                .field("share", share)
+                .field("on", on)
                 .finish(),
         }
     }
@@ -3021,6 +3043,55 @@ mod share_state_tests {
             good[..good.len() - 1].to_vec(),
         ] {
             assert!(Message::decode(&bent).is_none(), "{bent:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod share_sound_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn sound(on: bool) -> Message {
+        Message::ShareSound { share: 7, on }
+    }
+
+    #[test]
+    fn share_sound_bytes() {
+        for (on, byte) in [(false, 0), (true, 1)] {
+            let bytes = sound(on).encode().to_vec();
+            assert_eq!(bytes, [28, 7, 0, 0, 0, byte]);
+            let back = Message::decode(&bytes).expect("decodes");
+            assert_eq!(back.encode().to_vec(), bytes);
+        }
+    }
+
+    // Share 0, an on byte but 0 and 1, and a byte too many or too few.
+    #[test]
+    fn bent_share_sound_refused() {
+        let good = sound(true).encode().to_vec();
+        for bent in [
+            vec![28, 0, 0, 0, 0, 1],
+            vec![28, 7, 0, 0, 0, 2],
+            vec![28, 7, 0, 0, 0, 0xFF],
+            [&good[..], &[0]].concat(),
+            good[..good.len() - 1].to_vec(),
+        ] {
+            assert!(Message::decode(&bent).is_none(), "{bent:?}");
+        }
+    }
+
+    proptest! {
+        // Whatever gets through encodes back to the same bytes.
+        #[test]
+        fn any_share_sound_bytes_parse_or_refused(
+            body in prop::collection::vec(any::<u8>(), 0..12),
+        ) {
+            let mut sent = vec![SHARE_SOUND];
+            sent.extend(body);
+            if let Some(message) = Message::decode(&sent) {
+                prop_assert_eq!(message.encode().to_vec(), sent);
+            }
         }
     }
 }

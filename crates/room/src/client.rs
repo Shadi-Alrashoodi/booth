@@ -2023,7 +2023,8 @@ impl Client {
             Some(Plain::Video(payload)) => return self.on_video(payload, now),
             Some(Plain::Cursor(payload)) => return self.on_cursor(payload, now),
             Some(Plain::Input(payload)) => return self.on_input(payload, now),
-            None => {
+            // Not read yet: counted bad, as by a copy before 1.3.0.
+            Some(Plain::Sound(_)) | None => {
                 self.drops.bad(now);
             }
         }

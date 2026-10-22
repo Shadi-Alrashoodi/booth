@@ -351,6 +351,8 @@ pub(crate) enum Plain<'a> {
     Video(&'a [u8]),
     Cursor(&'a [u8]),
     Input(&'a [u8]),
+    #[cfg_attr(not(test), expect(dead_code, reason = "nothing hears PC sound yet"))]
+    Sound(&'a [u8]),
 }
 
 pub(crate) fn read_plain(plain: &[u8]) -> Option<Plain<'_>> {
@@ -363,8 +365,7 @@ pub(crate) fn read_plain(plain: &[u8]) -> Option<Plain<'_>> {
         (Channel::Video, payload) => Some(Plain::Video(payload)),
         (Channel::Cursor, payload) => Some(Plain::Cursor(payload)),
         (Channel::Input, payload) => Some(Plain::Input(payload)),
-        // Not read yet: counted bad, as by a copy before 1.3.0.
-        (Channel::Sound, _) => None,
+        (Channel::Sound, payload) => Some(Plain::Sound(payload)),
     }
 }
 

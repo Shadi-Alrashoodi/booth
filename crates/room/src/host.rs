@@ -474,8 +474,9 @@ pub(crate) struct Host {
     // The sharing limits of friends who left lately.
     left_limits: Vec<Kept>,
     // What a video packet is sealed into for each watcher, kept so passing
-    // one on allocates nothing.
+    // one on allocates nothing, and the same for PC sound.
     video_sealed: Vec<u8>,
+    sound_sealed: Vec<u8>,
     // This host's upload setting, which the bitrate rule divides.
     upload_kbps: u32,
     // What a friend's share passed on over internet paths takes of that
@@ -613,6 +614,7 @@ impl Host {
             share_ended: None,
             left_limits: Vec::new(),
             video_sealed: Vec::with_capacity(crate::screen::LAN_DATAGRAM),
+            sound_sealed: Vec::with_capacity(crate::sound::MAX_SOUND + 1 + session::DATA_OVERHEAD),
             next_control: 1,
             control_ended: None,
             input_events: Vec::with_capacity(crate::remote::MAX_EVENTS),
@@ -1238,6 +1240,7 @@ impl Host {
         stats::gauge!("room.host.voice_sealed", self.voice_sealed);
         stats::gauge!("room.host.left_limits", self.left_limits);
         stats::gauge!("room.host.video_sealed", self.video_sealed);
+        stats::gauge!("room.host.sound_sealed", self.sound_sealed);
         stats::gauge!("room.host.input_events", self.input_events);
         stats::gauge!("room.host.input_sealed", self.input_sealed);
         self.invites.gauge();
@@ -2582,12 +2585,14 @@ impl Host {
         now: Instant,
         socket: &Socket,
     ) -> bool {
-        // Video, pointers and input are passed on with their prefix turned
-        // around in place, so they are taken before the read that borrows it.
+        // Video, pointers, input and PC sound are passed on with their prefix
+        // turned around in place, so they are taken before the read that
+        // borrows it.
         match plain.first().map(|&byte| Channel::try_from(byte)) {
             Some(Ok(Channel::Video)) => return self.on_video(i, plain, now, socket),
             Some(Ok(Channel::Cursor)) => return self.on_cursor(i, plain, now, socket),
             Some(Ok(Channel::Input)) => return self.on_input(i, plain, now, socket),
+            Some(Ok(Channel::Sound)) => return self.on_sound(i, plain, now, socket),
             _ => {}
         }
         let clock = self.clock;
@@ -2617,7 +2622,7 @@ impl Host {
             Some(Plain::Feedback(frame)) => self.on_feedback(i, frame, now, socket),
             Some(Plain::Voice(payload)) => self.on_voice(i, payload, now, socket),
             // Taken above.
-            Some(Plain::Video(_) | Plain::Cursor(_) | Plain::Input(_)) | None => {
+            Some(Plain::Video(_) | Plain::Cursor(_) | Plain::Input(_) | Plain::Sound(_)) | None => {
                 self.drops.bad(now)
             }
         }
@@ -3088,6 +3093,7 @@ impl Host {
                     | Message::Watch { .. }
                     | Message::WatchLimits { .. }
                     | Message::ShareState { .. }
+                    | Message::ShareSound { .. }
                     | Message::Recover { .. }
                     | Message::Idr { .. }
                     | Message::VideoLoss { .. }
@@ -6750,6 +6756,258 @@ mod tests {
             assert!(states(&mut dan, share, start).is_empty(), "{host}");
         }
     }
+
+    // A 10 ms stereo frame as a sharer's encoder makes it.
+    fn stereo_frame() -> Vec<u8> {
+        use voice::stereo::{Encoder, FRAME, MAX_PACKET};
+        let mut encoder = Encoder::new().unwrap();
+        let pcm: Vec<f32> = (0..FRAME * 2)
+            .map(|n| 0.2 * ((n / 2) as f32 * 0.06).sin())
+            .collect();
+        let mut out = [0u8; MAX_PACKET];
+        let len = encoder.encode(&pcm, &mut out).unwrap();
+        out[..len].to_vec()
+    }
+
+    fn sound_frame(share: u32, seq: u16, frame: &[u8]) -> crate::sound::SoundFrame<'_> {
+        crate::sound::SoundFrame {
+            slot: 0,
+            share,
+            seq,
+            captured: 1_000_000 + u64::from(seq) * 10_000,
+            first: seq == 0,
+            last: false,
+            frame,
+        }
+    }
+
+    // PC sound for `share` from `guest`, sealed for the host.
+    fn sent_sound(guest: &mut Guest, share: u32, seq: u16, frame: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        sound_frame(share, seq, frame).write_sent(&mut payload);
+        seal(
+            guest.session.as_mut().expect("joined"),
+            Channel::Sound,
+            &payload,
+        )
+    }
+
+    // What came to `guest` since the last look: each PC sound packet the
+    // host passed on, whole, and each ShareSound it was told.
+    fn sound_to(guest: &mut Guest, now: Instant) -> (Vec<Vec<u8>>, Vec<(u32, bool)>) {
+        let mut sounds = Vec::new();
+        for packet in guest.wire.packets() {
+            let mut plain = Vec::new();
+            let session = guest.session.as_mut().expect("joined");
+            if session.decrypt(&packet, &mut plain).is_err() {
+                continue;
+            }
+            match peer::read_plain(&plain) {
+                Some(Plain::Sound(payload)) => sounds.push(payload.to_vec()),
+                Some(Plain::Control(frame)) => {
+                    let _ = guest.reliable.receive(frame, now);
+                }
+                _ => {}
+            }
+        }
+        let told = messages(&mut guest.reliable)
+            .into_iter()
+            .filter_map(|message| match message {
+                Message::ShareSound { share, on } => Some((share, on)),
+                _ => None,
+            })
+            .collect();
+        (sounds, told)
+    }
+
+    // PC sound, and ShareSound, go from the sharer to each watcher whose
+    // Hello says PC_SOUND_SINCE or later: never to an older one, to someone
+    // who does not watch, or back to the sharer. A new watcher hears "on" at
+    // once, and the sound goes on whatever ShareSound says. A room standing
+    // for an older copy passes none of it on and counts each sound packet
+    // bad, as such a copy does.
+    #[test]
+    fn pc_sound_goes_only_to_watchers_that_read_it() {
+        let older = Version {
+            major: 1,
+            minor: 2,
+            patch: 0,
+        };
+        let frame = stereo_frame();
+        for host in [older, peer::PC_SOUND_SINCE] {
+            let passes = host >= peer::PC_SOUND_SINCE;
+            let start = Instant::now();
+            let mut rig = Rig::new(start);
+            rig.host.version = host;
+            let mut ana = Guest::new();
+            ana.join_as(&mut rig, "Ana", peer::PC_SOUND_SINCE, None, start);
+            let mut bo = Guest::new();
+            bo.join_as(&mut rig, "Bo", older, None, start);
+            let mut cy = Guest::new();
+            cy.join_as(&mut rig, "Cy", peer::PC_SOUND_SINCE, None, start);
+            let mut dee = Guest::new();
+            dee.join_as(&mut rig, "Dee", peer::PC_SOUND_SINCE, None, start);
+            let share = granted(&mut rig, &mut ana, start);
+            let watch = Message::Watch {
+                share,
+                on: true,
+                hevc: true,
+            };
+            bo.say(&mut rig, &watch, start);
+            cy.say(&mut rig, &watch, start);
+            for guest in [&mut bo, &mut cy, &mut dee] {
+                sound_to(guest, start);
+            }
+            let on = Message::ShareSound { share, on: true };
+            ana.say(&mut rig, &on, start);
+            let from = ana.wire.addr();
+            rig.deliver(&sent_sound(&mut ana, share, 0, &frame), from, start);
+            let at = peer_at(&mut rig, &ana);
+            let slot = rig.host.peers[at].slot;
+            let mut relayed = Vec::new();
+            sound_frame(share, 0, &frame).write_relayed(slot, &mut relayed);
+            let heard = if passes {
+                (vec![relayed], vec![(share, true)])
+            } else {
+                (vec![], vec![])
+            };
+            assert_eq!(sound_to(&mut cy, start), heard, "{host}");
+            for guest in [&mut ana, &mut bo, &mut dee] {
+                assert_eq!(sound_to(guest, start), (vec![], vec![]), "{host}");
+            }
+            // Said again, it is no news.
+            ana.say(&mut rig, &on, start);
+            assert!(sound_to(&mut cy, start).1.is_empty(), "{host}");
+            let mut eve = Guest::new();
+            eve.join_as(&mut rig, "Eve", peer::PC_SOUND_SINCE, None, start);
+            eve.say(&mut rig, &watch, start);
+            let told = sound_to(&mut eve, start).1;
+            assert_eq!(
+                told,
+                if passes { vec![(share, true)] } else { vec![] },
+                "{host}"
+            );
+            // Off changes the words, not what is passed on.
+            ana.say(&mut rig, &Message::ShareSound { share, on: false }, start);
+            rig.deliver(&sent_sound(&mut ana, share, 1, &frame), from, start);
+            for guest in [&mut cy, &mut eve] {
+                let (sounds, told) = sound_to(guest, start);
+                let heard = if passes {
+                    (1, vec![(share, false)])
+                } else {
+                    (0, vec![])
+                };
+                assert_eq!((sounds.len(), told), heard, "{host}");
+            }
+            assert!(sound_to(&mut ana, start).0.is_empty(), "{host}");
+            assert_eq!(rig.host.drops.bad, if passes { 0 } else { 2 }, "{host}");
+        }
+    }
+
+    // Only the sharer of the live share sends its PC sound and says whether
+    // it goes out. Sound from anyone else, for share 0 or for a share that
+    // is not the sender's, is bad, and so is ShareSound from anyone else.
+    // What the sharer sent just before its share ended goes nowhere and is
+    // not bad, as video is not; a second later it is.
+    #[test]
+    fn pc_sound_only_from_its_sharer() {
+        let start = Instant::now();
+        let mut rig = Rig::new(start);
+        rig.host.version = peer::PC_SOUND_SINCE;
+        let mut ana = Guest::new();
+        ana.join_as(&mut rig, "Ana", peer::PC_SOUND_SINCE, None, start);
+        let mut bo = Guest::new();
+        bo.join_as(&mut rig, "Bo", peer::PC_SOUND_SINCE, None, start);
+        let mut cy = Guest::new();
+        cy.join_as(&mut rig, "Cy", peer::PC_SOUND_SINCE, None, start);
+        let frame = stereo_frame();
+        let watch = |share| Message::Watch {
+            share,
+            on: true,
+            hevc: true,
+        };
+        let share = granted(&mut rig, &mut ana, start);
+        cy.say(&mut rig, &watch(share), start);
+        sound_to(&mut cy, start);
+        let (from_ana, from_bo) = (ana.wire.addr(), bo.wire.addr());
+        rig.deliver(&sent_sound(&mut bo, share, 0, &frame), from_bo, start);
+        assert_eq!(rig.host.drops.bad, 1);
+        rig.deliver(&sent_sound(&mut ana, 0, 0, &frame), from_ana, start);
+        assert_eq!(rig.host.drops.bad, 2);
+        rig.deliver(&sent_sound(&mut ana, share + 1, 0, &frame), from_ana, start);
+        assert_eq!(rig.host.drops.bad, 3);
+        bo.say(&mut rig, &Message::ShareSound { share, on: true }, start);
+        assert_eq!(rig.host.drops.bad, 4);
+        assert_eq!(sound_to(&mut cy, start), (vec![], vec![]));
+
+        ana.say(&mut rig, &Message::ShareStop, start);
+        let late = start + Duration::from_millis(100);
+        rig.deliver(&sent_sound(&mut ana, share, 1, &frame), from_ana, late);
+        assert_eq!(rig.host.drops.bad, 4);
+        let later = start + Duration::from_secs(2);
+        rig.deliver(&sent_sound(&mut ana, share, 2, &frame), from_ana, later);
+        assert_eq!(rig.host.drops.bad, 5);
+        assert!(sound_to(&mut cy, later).0.is_empty());
+
+        // ShareSound about a share of theirs that ended was on its way.
+        let next = granted(&mut rig, &mut ana, later);
+        cy.say(&mut rig, &watch(next), later);
+        sound_to(&mut cy, later);
+        ana.say(&mut rig, &Message::ShareSound { share, on: true }, later);
+        assert_eq!(rig.host.drops.bad, 5);
+        assert!(sound_to(&mut cy, later).1.is_empty());
+        let on = Message::ShareSound {
+            share: next,
+            on: true,
+        };
+        ana.say(&mut rig, &on, later);
+        assert_eq!(sound_to(&mut cy, later).1, [(next, true)]);
+        assert_eq!(rig.host.drops.bad, 5);
+    }
+
+    // A friend's PC can send as fast as its link goes. With a clock that
+    // stands still, a sharer gets its burst of 50 sound packets, then 150 a
+    // second; the rest is dropped and counted, and nothing of it counts as
+    // bad.
+    #[test]
+    fn sharer_sound_burst_and_rate() {
+        let start = Instant::now();
+        let mut rig = Rig::new(start);
+        rig.host.version = peer::PC_SOUND_SINCE;
+        let mut ana = Guest::new();
+        ana.join_as(&mut rig, "Ana", peer::PC_SOUND_SINCE, None, start);
+        let mut bo = Guest::new();
+        bo.join_as(&mut rig, "Bo", peer::PC_SOUND_SINCE, None, start);
+        let share = granted(&mut rig, &mut ana, start);
+        bo.say(
+            &mut rig,
+            &Message::Watch {
+                share,
+                on: true,
+                hevc: true,
+            },
+            start,
+        );
+        sound_to(&mut bo, start);
+        let frame = stereo_frame();
+        let from = ana.wire.addr();
+        let dropped = rig.host.screen.dropped;
+        for seq in 0..60 {
+            let packet = sent_sound(&mut ana, share, seq, &frame);
+            rig.deliver(&packet, from, start);
+        }
+        assert_eq!(sound_to(&mut bo, start).0.len(), 50);
+        assert_eq!(rig.host.screen.dropped - dropped, 10);
+        let later = start + Duration::from_millis(100);
+        for seq in 60..90 {
+            let packet = sent_sound(&mut ana, share, seq, &frame);
+            rig.deliver(&packet, from, later);
+        }
+        assert_eq!(sound_to(&mut bo, later).0.len(), 15);
+        assert_eq!(rig.host.screen.dropped - dropped, 10 + 15);
+        assert_eq!(rig.host.drops.bad, 0);
+    }
+
     // A watcher picking caps as fast as it can: the sharer is told at most
     // LIMITS_PER_GAP changes in a SWITCH_GAP, a new watcher's first two at
     // once, and the last pick still reaches it once the gap allows, past any

@@ -20,6 +20,7 @@ use crate::screen::{
     WatchNews, is_after, percent, permille, recover_span,
 };
 use crate::socket::Socket;
+use crate::sound;
 use crate::talk::{Outlet, Sent};
 use crate::view::{ChatLine, CurrentShare, LineKind, ShareState, ShareView, Unheard};
 
@@ -78,8 +79,10 @@ pub(super) struct Live {
     shape: Option<ShapeUnderWay>,
     // Remote control of this share, asked for or allowed: it ends with it.
     pub control: Option<Grant>,
-    // As its sharer last said.
+    // As its sharer last said: how it stands, and whether its PC sound goes
+    // out.
     state: ShareState,
+    sound: bool,
 }
 
 // The shape the sharer is sending, as its first chunk gave it.
@@ -168,6 +171,7 @@ pub(super) struct Kept {
 struct Limits {
     video: Bucket,
     pointer: Bucket,
+    sound: Bucket,
     shape_bytes: Bucket,
     asks: Bucket,
     watches: Bucket,
@@ -183,6 +187,7 @@ impl PeerShare {
             limits: Limits {
                 video: Bucket::full(now, screen::VIDEO_BURST),
                 pointer: Bucket::full(now, screen::POINTER_BURST),
+                sound: Bucket::full(now, sound::SOUND_BURST),
                 shape_bytes: Bucket::full(now, screen::SHAPE_BYTES_BURST),
                 asks: Bucket::full(now, screen::SHARE_ASK_BURST),
                 watches: Bucket::full(now, screen::WATCH_BURST),
@@ -598,6 +603,57 @@ impl Host {
         false
     }
 
+    // PC sound goes on the moment it arrives as well, to the watchers of the
+    // share it names, which has to be the one its sender shares now. It never
+    // waits on ShareSound, which travels on the control stream and can arrive
+    // before the first packets or after them. This host's own viewer plays
+    // none of it.
+    pub(super) fn on_sound(
+        &mut self,
+        i: usize,
+        plain: &mut [u8],
+        now: Instant,
+        socket: &Socket,
+    ) -> bool {
+        // A room standing for an older copy counts the channel bad, as such a
+        // copy does.
+        if self.version < crate::peer::PC_SOUND_SINCE {
+            return self.drops.bad(now);
+        }
+        let peer = &mut self.peers[i];
+        // Over the rate is not malformed, so it is counted apart.
+        if !peer
+            .share
+            .limits
+            .sound
+            .take(now, sound::SOUND_PER_SECOND, sound::SOUND_BURST)
+        {
+            self.screen.dropped += 1;
+            return false;
+        }
+        let slot = peer.slot;
+        let share = match sound::read_sent(plain.get(1..).unwrap_or_default()) {
+            Ok(frame) => frame.share,
+            Err(why) => return self.refused_media(i, "pc sound", &why.to_string(), now),
+        };
+        let theirs = self.shared_by(i);
+        if theirs != Some(share) {
+            if self.ended_lately(i, now) {
+                return false;
+            }
+            let why = match theirs {
+                Some(theirs) => format!("it names share {share}, theirs is {theirs}"),
+                None => String::from("they are not sharing"),
+            };
+            return self.refused_media(i, "pc sound", &why, now);
+        }
+        sound::relay_in_place(&mut plain[1..], slot);
+        let timers = self.timers;
+        self.peers[i].link.media_passed(now, &timers);
+        self.relay_sound(share, plain, now, socket);
+        false
+    }
+
     // Seals `plain` once for each friend who watches `number` and sends it
     // where their media goes, with buffers kept for it. Each packet starts
     // at the next friend in turn, so a full uplink drops each one's copies
@@ -639,6 +695,29 @@ impl Host {
         }
     }
 
+    // Seals PC sound once for each friend who watches `number` and whose
+    // copy reads it, and sends it where their media goes. Unlike video it is
+    // not held to the upload: as with voice, its rate never moves, and the
+    // share's, which does, backs off around it on a full link.
+    fn relay_sound(&mut self, number: u32, plain: &[u8], now: Instant, socket: &Socket) {
+        let timers = self.timers;
+        for other in &mut self.peers {
+            if other.share.watching != Some(number) || !other.link.sound_read {
+                continue;
+            }
+            let Some(session) = other.sessions.current.as_mut() else {
+                continue;
+            };
+            if session.encrypt(plain, &mut self.sound_sealed).is_err() {
+                continue;
+            }
+            other
+                .traffic
+                .send(socket, &self.sound_sealed, other.media.to());
+            other.link.media_passed(now, &timers);
+        }
+    }
+
     // The share friend `i` shares now, if any.
     fn shared_by(&self, i: usize) -> Option<u32> {
         let live = self.live.as_ref()?;
@@ -651,8 +730,8 @@ impl Host {
             .is_some_and(|(key, until)| key == self.peers[i].key && now < until)
     }
 
-    // Video or a pointer from someone who does not share, or that does not
-    // parse, goes nowhere and counts as bad.
+    // Video, a pointer or PC sound from someone who does not share, or that
+    // does not parse, goes nowhere and counts as bad.
     fn refused_media(&mut self, i: usize, what: &str, why: &str, now: Instant) -> bool {
         let peer = &self.peers[i];
         let (key, ip) = (peer.key, peer.addr.ip());
@@ -701,6 +780,20 @@ impl Host {
                 match self.live.as_ref() {
                     Some(live) if live.sharer == key && live.number == share => {
                         self.share_state(state, now, socket);
+                    }
+                    Some(live) if live.sharer == key => {}
+                    _ => {
+                        self.drops.bad(now);
+                    }
+                }
+                false
+            }
+            // From the live share's sharer only, as its state is.
+            Message::ShareSound { share, on } => {
+                let key = self.peers[i].key;
+                match self.live.as_ref() {
+                    Some(live) if live.sharer == key && live.number == share => {
+                        self.share_sound(on, now, socket);
                     }
                     Some(live) if live.sharer == key => {}
                     _ => {
@@ -997,6 +1090,7 @@ impl Host {
             shape: None,
             control: None,
             state: ShareState::Live,
+            sound: false,
         });
         log!(
             self.log,
@@ -1106,12 +1200,26 @@ impl Host {
         if !self.tell_facts_with(asks, now, socket) && asks {
             self.ask_idr(None, now, socket);
         }
-        // A new watcher of a share that is not live hears so at once: a
-        // paused picture and a still one look alike.
         let Some(live) = self.live.as_ref() else {
             return;
         };
-        let (number, state) = (live.number, live.state);
+        let (number, state, sound) = (live.number, live.state, live.sound);
+        // A new watcher of a share whose PC sound goes out hears so at once:
+        // a quiet stretch and no sound at all sound alike.
+        if sound
+            && self.version >= crate::peer::PC_SOUND_SINCE
+            && let By::Peer(i) = by
+            && self.peers[i].link.sound_read
+        {
+            let peer = &mut self.peers[i];
+            peer.link.queue(&Message::ShareSound {
+                share: number,
+                on: true,
+            });
+            peer.flush(socket, now);
+        }
+        // And of a share that is not live: a paused picture and a still one
+        // look alike.
         if state == ShareState::Live || self.version < crate::peer::SHARE_STATE_SINCE {
             return;
         }
@@ -1159,6 +1267,31 @@ impl Host {
                     share: number,
                     state,
                 });
+                peer.flush(socket, now);
+            }
+        }
+    }
+
+    // Whether the live share's PC sound goes out, from its sharer: to every
+    // watcher whose copy reads it (peer::PC_SOUND_SINCE). A room standing
+    // for an older copy passes nothing on.
+    fn share_sound(&mut self, on: bool, now: Instant, socket: &Socket) {
+        if self.version < crate::peer::PC_SOUND_SINCE {
+            return;
+        }
+        let Some(live) = self.live.as_mut().filter(|live| live.sound != on) else {
+            return;
+        };
+        live.sound = on;
+        let number = live.number;
+        log!(
+            self.log,
+            "share {number}: pc sound {}",
+            if on { "on" } else { "off" }
+        );
+        for peer in &mut self.peers {
+            if peer.share.watching == Some(number) && peer.link.sound_read {
+                peer.link.queue(&Message::ShareSound { share: number, on });
                 peer.flush(socket, now);
             }
         }

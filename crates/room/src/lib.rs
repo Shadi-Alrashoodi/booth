@@ -26,6 +26,7 @@ mod router;
 mod saver;
 pub mod screen;
 mod socket;
+mod sound;
 mod stun;
 mod talk;
 #[cfg(test)]
