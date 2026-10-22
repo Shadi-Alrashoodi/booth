@@ -23,10 +23,10 @@ pub use convert::{Plan, Region, SMALLEST_SIDE, output_size};
 pub use device::device_on;
 pub use duplication::{Capture, make_process_dpi_aware};
 pub use error::{CaptureError, ErrorKind};
-pub use monitors::{Adapter, Monitor, MonitorId, Rotation, adapters, monitors};
+pub use monitors::{Adapter, Monitor, MonitorId, Rotation, adapters, monitors, window_monitor};
 pub use pattern::{Pattern, pattern_image, read_frame_number};
 pub use reference::Nv12Image;
-pub use window::WindowCapture;
+pub use window::{WINDOW_GONE, WindowCapture, WindowId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {

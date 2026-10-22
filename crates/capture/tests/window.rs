@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use capture::{Next, Options, PauseReason, WindowCapture};
+use capture::{Next, Options, PauseReason, WINDOW_GONE, WindowCapture, WindowId};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DispatchMessageW, IsWindow, MSG, PM_REMOVE, PeekMessageW, PostMessageW,
@@ -65,6 +65,10 @@ impl Window {
 
     fn hwnd(&self) -> HWND {
         HWND(self.0 as *mut _)
+    }
+
+    fn id(&self) -> WindowId {
+        WindowId::of(self.0).unwrap()
     }
 
     fn resize(&self, width: i32, height: i32) {
@@ -145,7 +149,7 @@ fn a_window_is_captured_at_its_own_size() {
     let Some(adapter) = adapter() else { return };
     let window = Window::open(640, 360);
     let opened = Instant::now();
-    let mut capture = WindowCapture::open(window.0, &adapter, Options::default()).unwrap();
+    let mut capture = WindowCapture::open(window.id(), &adapter, Options::default()).unwrap();
     let first = frame_size(&mut capture, Duration::from_secs(2));
     println!(
         "first frame {first:?} {:.1} ms after opening",
@@ -153,6 +157,58 @@ fn a_window_is_captured_at_its_own_size() {
     );
     assert_eq!(first, Ok((640, 360)));
     assert_eq!((capture.plan().width, capture.plan().height), (640, 360));
+}
+
+// With a title bar and borders, the pictures are DWM's frame without the
+// shadow, smaller than the window's own rectangle: the share opens at that
+// size, so its first frame needs no second encoder.
+#[test]
+fn a_bordered_window_opens_at_the_size_of_its_pictures() {
+    let Some(adapter) = adapter() else { return };
+    let window = Window::with_style(WS_OVERLAPPEDWINDOW, 640, 360);
+    let capture = WindowCapture::open(window.id(), &adapter, Options::default()).unwrap();
+    let opened = (capture.plan().width, capture.plan().height);
+    let mut capture = capture;
+    let first = frame_size(&mut capture, Duration::from_secs(2));
+    println!("a 640x360 window with a title bar opens at {opened:?}, first frame {first:?}");
+    assert_eq!(first, Ok(opened));
+}
+
+#[test]
+fn a_window_names_the_monitor_it_is_on() {
+    let Some(_) = adapter() else { return };
+    let window = Window::open(400, 300);
+    let monitor = capture::window_monitor(window.id()).expect("no monitor for the window");
+    // The helper puts its windows at 120,120 on the desktop.
+    let (left, top) = (monitor.left, monitor.top);
+    assert!(
+        (left..left + monitor.width as i32).contains(&120)
+            && (top..top + monitor.height as i32).contains(&120),
+        "{monitor:?}"
+    );
+}
+
+// A window closed before the share opens is refused with the sentence the
+// room shows, and a handle that names no window is no window.
+#[test]
+fn a_closed_window_does_not_open() {
+    let Some(adapter) = adapter() else { return };
+    assert_eq!(WindowId::of(0), None);
+    let window = Window::open(320, 240);
+    let id = window.id();
+    window.close();
+    let start = Instant::now();
+    while id.exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the window did not close"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let Err(err) = WindowCapture::open(id, &adapter, Options::default()) else {
+        panic!("a closed window opened");
+    };
+    assert_eq!(err.to_string(), WINDOW_GONE);
 }
 
 #[test]
@@ -164,7 +220,7 @@ fn a_window_scaled_down_into_the_box() {
         max_height: 800,
         max_fps: 0,
     };
-    let mut capture = WindowCapture::open(window.0, &adapter, options).unwrap();
+    let mut capture = WindowCapture::open(window.id(), &adapter, options).unwrap();
     assert_eq!(
         frame_size(&mut capture, Duration::from_secs(2)),
         Ok((800, 400))
@@ -177,7 +233,7 @@ fn a_window_scaled_down_into_the_box() {
 fn a_small_window_is_padded_to_256() {
     let Some(adapter) = adapter() else { return };
     let window = Window::open(200, 120);
-    let mut capture = WindowCapture::open(window.0, &adapter, Options::default()).unwrap();
+    let mut capture = WindowCapture::open(window.id(), &adapter, Options::default()).unwrap();
     assert_eq!(
         frame_size(&mut capture, Duration::from_secs(2)),
         Ok((256, 256))
@@ -197,7 +253,7 @@ fn a_small_window_is_padded_to_256() {
 fn a_resized_window_comes_out_at_its_new_size() {
     let Some(adapter) = adapter() else { return };
     let window = Window::open(640, 360);
-    let mut capture = WindowCapture::open(window.0, &adapter, Options::default()).unwrap();
+    let mut capture = WindowCapture::open(window.id(), &adapter, Options::default()).unwrap();
     assert_eq!(
         frame_size(&mut capture, Duration::from_secs(2)),
         Ok((640, 360))
@@ -220,7 +276,7 @@ fn a_minimized_window_pauses_and_comes_back() {
     let Some(adapter) = adapter() else { return };
     // With a title bar and borders, as most windows shared are.
     let window = Window::with_style(WS_OVERLAPPEDWINDOW, 640, 360);
-    let mut capture = WindowCapture::open(window.0, &adapter, Options::default()).unwrap();
+    let mut capture = WindowCapture::open(window.id(), &adapter, Options::default()).unwrap();
     let size = frame_size(&mut capture, Duration::from_secs(2)).unwrap();
     println!("a 640x360 window with a title bar comes out {size:?}");
     window.show(SW_MINIMIZE);
@@ -251,7 +307,7 @@ fn a_minimized_window_pauses_and_comes_back() {
 fn a_closed_window_ends_the_capture() {
     let Some(adapter) = adapter() else { return };
     let window = Window::open(640, 360);
-    let mut capture = WindowCapture::open(window.0, &adapter, Options::default()).unwrap();
+    let mut capture = WindowCapture::open(window.id(), &adapter, Options::default()).unwrap();
     assert_eq!(
         frame_size(&mut capture, Duration::from_secs(2)),
         Ok((640, 360))

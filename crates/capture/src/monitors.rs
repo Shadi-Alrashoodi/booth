@@ -8,7 +8,7 @@ use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS,
     QueryDisplayConfig,
 };
-use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, LUID};
+use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HWND, LUID};
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_ROTATE90,
     DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270,
@@ -17,10 +17,13 @@ use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ADAPTER_DESC1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_ERROR_NOT_FOUND,
     IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput6,
 };
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromWindow,
+};
 use windows::core::Interface;
 
 use crate::error::{CaptureError, ErrorKind};
+use crate::window::WindowId;
 
 // The Microsoft Basic Render Driver: the CPU pretending to be a GPU, which
 // has no outputs worth sharing and no encoder.
@@ -308,6 +311,38 @@ pub fn monitors() -> Result<Vec<Monitor>, CaptureError> {
         }
     }
     Ok(monitors)
+}
+
+// The attached monitor that shows most of `window`, or showed it before it
+// was minimized: its GPU is the one a share of the window runs on. None when
+// no attached monitor is that one.
+pub fn window_monitor(window: WindowId) -> Option<Monitor> {
+    // SAFETY: a plain query; NEAREST answers with a monitor for any window.
+    let monitor =
+        unsafe { MonitorFromWindow(HWND(window.hwnd as *mut _), MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFOEXW {
+        monitorInfo: MONITORINFO {
+            cbSize: size_of::<MONITORINFOEXW>() as u32,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    // SAFETY: a live MONITORINFOEXW whose size says so, which the call
+    // fills as the extended kind; a stale monitor only makes it fail.
+    let filled = unsafe {
+        GetMonitorInfoW(
+            monitor,
+            &mut info as *mut MONITORINFOEXW as *mut MONITORINFO,
+        )
+    };
+    if !filled.as_bool() {
+        return None;
+    }
+    let name = wide_to_string(&info.szDevice);
+    monitors()
+        .ok()?
+        .into_iter()
+        .find(|monitor| monitor.id.device_name == name)
 }
 
 // Keyed by GDI device name. A failure here only costs the friendly names and

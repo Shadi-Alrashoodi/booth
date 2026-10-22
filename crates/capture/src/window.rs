@@ -18,7 +18,7 @@ use windows::Graphics::Capture::{
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, RECT};
+use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED, HANDLE, HWND, RECT};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11DeviceContext,
     ID3D11Texture2D,
@@ -32,7 +32,7 @@ use windows::Win32::System::WinRT::Direct3D11::{
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
-use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindow};
+use windows::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsIconic};
 use windows::core::{Interface, factory};
 
 use crate::cap::{Decision, FpsCap};
@@ -53,8 +53,44 @@ const TICKS: i64 = 10_000_000;
 // window's own are dropped.
 const RESTORING: Duration = Duration::from_millis(500);
 
+// Why a window share does not start, or stops after a pause, when the
+// window is gone.
+pub const WINDOW_GONE: &str = "the window you chose is not open any more. Choose another one";
+
+// What a window share is opened by: the window's handle and the program that
+// owns it, since Windows gives the handle of a closed window to new ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WindowId {
+    pub hwnd: isize,
+    pub process: u32,
+}
+
+impl WindowId {
+    // The window this handle names now; None for no window.
+    pub fn of(hwnd: isize) -> Option<WindowId> {
+        let mut process = 0;
+        // SAFETY: a plain query; a handle that names no window answers 0.
+        let thread = unsafe { GetWindowThreadProcessId(HWND(hwnd as *mut _), Some(&mut process)) };
+        (thread != 0).then_some(WindowId { hwnd, process })
+    }
+
+    // Still open, and still the same program's.
+    pub fn exists(self) -> bool {
+        WindowId::of(self.hwnd) == Some(self)
+    }
+
+    pub fn minimized(self) -> bool {
+        // SAFETY: a plain query; a window that is gone answers false.
+        unsafe { IsIconic(self.handle()) }.as_bool()
+    }
+
+    fn handle(self) -> HWND {
+        HWND(self.hwnd as *mut _)
+    }
+}
+
 pub struct WindowCapture {
-    hwnd: isize,
+    window: WindowId,
     options: Options,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -146,19 +182,27 @@ thread_local! {
 }
 
 impl WindowCapture {
-    // `hwnd` is the window's handle as a number; the frames are made on
-    // `adapter`, which the encoder then opens on.
+    // The frames are made on `adapter`, which the encoder then opens on.
     pub fn open(
-        hwnd: isize,
+        window: WindowId,
         adapter: &Adapter,
         options: Options,
     ) -> Result<WindowCapture, CaptureError> {
+        if !window.exists() {
+            return Err(CaptureError::other(WINDOW_GONE));
+        }
         WINRT.with(|_| {});
+        if !GraphicsCaptureSession::IsSupported().unwrap_or(false) {
+            return Err(CaptureError::other(
+                "this Windows cannot capture a single window. Share a monitor instead",
+            ));
+        }
         let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
             .map_err(fail("start capturing"))?;
-        // SAFETY: a window handle the caller found; a gone one is refused.
-        let item: GraphicsCaptureItem =
-            unsafe { interop.CreateForWindow(HWND(hwnd as *mut _)) }.map_err(fail("capture"))?;
+        // SAFETY: a window handle checked just now; one gone since is
+        // refused.
+        let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(window.handle()) }
+            .map_err(|err| refused(window, &err))?;
         let device = device_on(adapter)?;
         // SAFETY: GetImmediateContext hands back an owned reference.
         let context =
@@ -168,7 +212,16 @@ impl WindowCapture {
         let graphics: IDirect3DDevice = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi) }
             .and_then(|inspectable| inspectable.cast())
             .map_err(fail("share the GPU with"))?;
-        let size = item.Size().map_err(fail("read the size of"))?;
+        // The pictures are what DWM composes, without the shadow and the
+        // invisible borders the item's own size counts, so the first plan
+        // is made from DWM's bounds where it has them.
+        let size = match frame_size(window) {
+            Some((width, height)) => SizeInt32 {
+                Width: width,
+                Height: height,
+            },
+            None => item.Size().map_err(fail("read the size of"))?,
+        };
         // Everything that can refuse comes before the pool, so a failed open
         // leaves no capture running.
         let converter = Converter::new(&device, &adapter.description)?;
@@ -222,7 +275,7 @@ impl WindowCapture {
         // SAFETY: fills one live i64; it cannot fail on Windows XP and later.
         let _ = unsafe { QueryPerformanceFrequency(&mut qpc_frequency) };
         Ok(WindowCapture {
-            hwnd,
+            window,
             options,
             device,
             context,
@@ -267,16 +320,13 @@ impl WindowCapture {
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Next, CaptureError> {
         let idle_at = Instant::now() + IDLE_WAIT;
-        let hwnd = HWND(self.hwnd as *mut _);
         loop {
             // The item's Closed event does not always come for a destroyed
-            // window, so its handle is asked too.
-            // SAFETY: plain queries; a window that is gone answers false.
-            if self.closed.load(Ordering::Acquire) || !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+            // window, so the window is asked too.
+            if self.closed.load(Ordering::Acquire) || !self.window.exists() {
                 return Err(CaptureError::other("the shared window was closed"));
             }
-            // SAFETY: as above.
-            if unsafe { IsIconic(hwnd) }.as_bool() {
+            if self.window.minimized() {
                 // What Windows composes of a minimized window is only its
                 // caption: no picture to send, and no size to follow.
                 while let Ok(frame) = self.pool.TryGetNextFrame() {
@@ -381,19 +431,6 @@ impl WindowCapture {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         // SAFETY: a getter on a live texture filling a live local.
         unsafe { texture.GetDesc(&mut desc) };
-        // Only a window bigger than every monitor gets here. This frame is
-        // cut to the old frames' size, and the next one at the new size
-        // comes when the window next changes.
-        if content.Width > self.pool_size.Width || content.Height > self.pool_size.Height {
-            let size = SizeInt32 {
-                Width: content.Width.max(self.pool_size.Width),
-                Height: content.Height.max(self.pool_size.Height),
-            };
-            self.pool
-                .Recreate(&self.graphics, FORMAT, 2, size)
-                .map_err(fail("follow the new size of"))?;
-            self.pool_size = size;
-        }
         // The picture is the content part of a surface that can still be
         // the old size, and never more than the surface.
         let width = (content.Width.max(2) as u32).min(desc.Width);
@@ -429,6 +466,20 @@ impl WindowCapture {
         drop(view);
         drop(texture);
         let _ = frame.Close();
+        // Only a window bigger than every monitor gets here. This frame was
+        // cut to the old frames' size, and the next one at the new size
+        // comes when the window next changes. Recreate drops every frame of
+        // the pool, so it comes once this one is converted and closed.
+        if content.Width > self.pool_size.Width || content.Height > self.pool_size.Height {
+            let size = SizeInt32 {
+                Width: content.Width.max(self.pool_size.Width),
+                Height: content.Height.max(self.pool_size.Height),
+            };
+            self.pool
+                .Recreate(&self.graphics, FORMAT, 2, size)
+                .map_err(fail("follow the new size of"))?;
+            self.pool_size = size;
+        }
         // SAFETY: a call on the live immediate context.
         unsafe { self.context.Flush() };
         let converted = Instant::now();
@@ -466,21 +517,8 @@ impl WindowCapture {
         Ok(())
     }
 
-    // What Windows composes of the window: its frame without the shadow
-    // and the invisible borders, as the captured pictures are.
     fn size(&self) -> Option<(i32, i32)> {
-        let mut bounds = RECT::default();
-        // SAFETY: a live RECT of the size passed; a gone window fails.
-        unsafe {
-            DwmGetWindowAttribute(
-                HWND(self.hwnd as *mut _),
-                DWMWA_EXTENDED_FRAME_BOUNDS,
-                &mut bounds as *mut RECT as *mut _,
-                mem::size_of::<RECT>() as u32,
-            )
-        }
-        .ok()?;
-        Some((bounds.right - bounds.left, bounds.bottom - bounds.top))
+        frame_size(self.window)
     }
 
     fn drop_pending(&mut self) {
@@ -515,9 +553,41 @@ impl WindowCapture {
     }
 }
 
+// What Windows composes of the window: its frame without the shadow and the
+// invisible borders, as the captured pictures are.
+fn frame_size(window: WindowId) -> Option<(i32, i32)> {
+    let mut bounds = RECT::default();
+    // SAFETY: a live RECT of the size passed; a gone window fails.
+    unsafe {
+        DwmGetWindowAttribute(
+            window.handle(),
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut bounds as *mut RECT as *mut _,
+            mem::size_of::<RECT>() as u32,
+        )
+    }
+    .ok()?;
+    Some((bounds.right - bounds.left, bounds.bottom - bounds.top))
+}
+
 // `step` reads before "the shared window", as in "read the size of".
 fn fail(step: &'static str) -> impl Fn(windows::core::Error) -> CaptureError {
     move |err| CaptureError::windows(format_args!("{step} the shared window"), &err)
+}
+
+// Why Windows would not make a capture of the window: gone in the meantime,
+// or refused, in its own words. E_ACCESSDENIED here is not the secure
+// desktop it means for a monitor.
+fn refused(window: WindowId, err: &windows::core::Error) -> CaptureError {
+    if !window.exists() {
+        CaptureError::other(WINDOW_GONE)
+    } else if err.code() == E_ACCESSDENIED {
+        CaptureError::other(
+            "could not capture the window you chose: Windows refused it (E_ACCESSDENIED)",
+        )
+    } else {
+        CaptureError::windows("capture the window you chose", err)
+    }
 }
 
 // The capture stops when this is dropped, as a paused share needs: closing
