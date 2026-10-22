@@ -29,3 +29,5 @@ windows = { workspace = true, features = [
 
 [dev-dependencies]
 proptest.workspace = true
+# tests/audio_pc_sound.rs starts its other process under the shell.
+windows = { workspace = true, features = ["Win32_UI_WindowsAndMessaging"] }
