@@ -1408,16 +1408,10 @@ fn options_for(
 }
 
 // Whether capture asked for `options` makes the picture `plan` describes
-// at the rate `fps`, from the same source.
+// at the rate `fps`, from the same source: the same monitor, region or
+// window.
 fn same_picture(plan: capture::Plan, fps: u32, options: capture::Options) -> bool {
-    let fitted = capture::Plan::new(
-        plan.source_width,
-        plan.source_height,
-        plan.rotation,
-        options.max_width,
-        options.max_height,
-    );
-    options.max_fps == fps && fitted == plan
+    options.max_fps == fps && plan.refit(options.max_width, options.max_height) == plan
 }
 
 // A limit with its box brought down to capture's default, which is all
@@ -1509,6 +1503,38 @@ mod tests {
         let portrait = plan(2560, 1440, capture::Rotation::Rotate90);
         assert_eq!((portrait.width, portrait.height), (810, 1440));
         assert!(!same_picture(portrait, 120, four_k));
+        // A region kept as it is in every box keeps its capture; one the
+        // 1080 box scales down, or narrows under 256, does not.
+        let short = capture::Options {
+            max_width: 4096,
+            max_height: 1080,
+            max_fps: 120,
+        };
+        let region = |width, height| {
+            let region = capture::Region {
+                left: 100,
+                top: 0,
+                width,
+                height,
+            };
+            capture::Plan::region(
+                2560,
+                1440,
+                capture::Rotation::Identity,
+                region,
+                default.max_width,
+                default.max_height,
+            )
+            .unwrap()
+        };
+        assert!(same_picture(region(1280, 720), 120, four_k));
+        assert!(same_picture(region(1280, 720), 120, short));
+        assert!(!same_picture(region(2000, 1200), 120, short));
+        assert!(!same_picture(region(256, 1440), 120, short));
+        // A window under 256 a side is padded the same way in every box.
+        let window = plan(300, 200, capture::Rotation::Identity);
+        assert!(same_picture(window, 120, four_k));
+        assert!(same_picture(window, 120, short));
     }
 
     // A viewer without HEVC comes and goes: H.264 at once, HEVC a gap after

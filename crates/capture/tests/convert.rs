@@ -946,3 +946,44 @@ fn no_frame_is_smaller_than_256_a_side() {
         }
     }
 }
+
+// Under new limits a plan comes out as the plan made under them from the
+// start: a monitor's as Plan::new, a region's as Plan::region.
+#[test]
+fn refit_is_the_plan_under_new_limits() {
+    let boxes = [(4096, 1440), (4096, 1080), (4096, 2160), (1920, 1080)];
+    let region = Region {
+        left: 300,
+        top: 100,
+        width: 2000,
+        height: 1200,
+    };
+    for (max_width, max_height) in boxes {
+        for (width, height, rotation) in [
+            (3840, 2160, Rotation::Identity),
+            (2560, 1440, Rotation::Rotate90),
+            (300, 200, Rotation::Identity),
+        ] {
+            let plan = Plan::new(width, height, rotation, 4096, 1440);
+            assert_eq!(
+                plan.refit(max_width, max_height),
+                Plan::new(width, height, rotation, max_width, max_height),
+                "{width}x{height} {rotation:?} under {max_width}x{max_height}"
+            );
+        }
+        let plan = Plan::region(2560, 1440, Rotation::Identity, region, 4096, 1440).unwrap();
+        assert_eq!(
+            plan.refit(max_width, max_height),
+            Plan::region(
+                2560,
+                1440,
+                Rotation::Identity,
+                region,
+                max_width,
+                max_height
+            )
+            .unwrap(),
+            "{region:?} under {max_width}x{max_height}"
+        );
+    }
+}

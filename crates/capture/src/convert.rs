@@ -119,6 +119,19 @@ impl Plan {
         })
     }
 
+    // The same picture of the same source under other limits: what capture
+    // makes of it after set_limits, for a monitor, a region or a window.
+    pub fn refit(&self, max_width: u32, max_height: u32) -> Plan {
+        Plan::fit(
+            (self.source_width, self.source_height),
+            self.rotation,
+            self.crop,
+            (self.upright_width, self.upright_height),
+            max_width,
+            max_height,
+        )
+    }
+
     fn fit(
         (source_width, source_height): (u32, u32),
         rotation: Rotation,
