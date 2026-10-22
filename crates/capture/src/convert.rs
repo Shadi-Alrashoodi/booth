@@ -59,8 +59,9 @@ pub struct Plan {
     pub width: u32,
     pub height: u32,
     // The picture in it, at its top left: the upright picture scaled to fit
-    // the limits. Smaller than the frame only where it fits smaller than
-    // SMALLEST_SIDE, and the rest of the frame is black.
+    // the limits. Smaller than the frame where it fits smaller than
+    // SMALLEST_SIDE, or in a frame kept for a window (framed), and the rest
+    // of the frame is black.
     pub picture: (u32, u32),
     // Upright source pixels under one output pixel, per axis: 1 when the
     // size is kept, 1.5 for 3840x2160 to 2560x1440, 1.25 for 5120x1440 to
@@ -130,6 +131,21 @@ impl Plan {
             max_width,
             max_height,
         )
+    }
+
+    // The same picture in a frame of `frame`'s size, which a share keeps
+    // while a window changes size under it: fitted into the frame as well
+    // as the limits, scaled down when bigger and never up, at the frame's top
+    // left with black around it. `frame` is a frame a plan had, so even and
+    // at least SMALLEST_SIDE each way.
+    pub fn framed(&self, max_width: u32, max_height: u32, frame: (u32, u32)) -> Plan {
+        let within = |max: u32, side: u32| if max == 0 { side } else { max.min(side) };
+        let fitted = self.refit(within(max_width, frame.0), within(max_height, frame.1));
+        Plan {
+            width: frame.0,
+            height: frame.1,
+            ..fitted
+        }
     }
 
     fn fit(

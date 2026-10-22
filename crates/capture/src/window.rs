@@ -20,8 +20,8 @@ use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED, HANDLE, HWND, RECT};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11DeviceContext,
-    ID3D11Texture2D,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device,
+    ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
@@ -115,8 +115,29 @@ pub struct WindowCapture {
     // The size DWM has of the window while it is minimized: its caption.
     caption: Option<(i32, i32)>,
     restoring_until: Option<Instant>,
+    // Set by the share: every picture goes out in a frame of this size,
+    // fitted into it (set_frame).
+    frame: Option<(u32, u32)>,
+    // The size of the frame the newest picture would have of its own. None
+    // until a picture comes, and while the window is minimized or coming
+    // back from it.
+    natural: Option<(u32, u32)>,
+    // The newest picture's size, for natural() under new limits.
+    content: Option<(u32, u32)>,
+    kept: Option<Kept>,
     number: u64,
     qpc_frequency: i64,
+}
+
+// A copy of the newest picture, made only while it goes out fitted into a
+// frame of another size, so again() can convert it once more at its own
+// size after the window stands still. A frame of the pool is never held:
+// Windows draws only into frames handed back.
+struct Kept {
+    texture: ID3D11Texture2D,
+    view: ID3D11ShaderResourceView,
+    // What the texture holds, at its top left; None for nothing.
+    picture: Option<(u32, u32)>,
 }
 
 // An auto-reset event the frame pool's thread sets, kept as a number so it
@@ -296,6 +317,10 @@ impl WindowCapture {
             minimized: false,
             caption: None,
             restoring_until: None,
+            frame: None,
+            natural: None,
+            content: None,
+            kept: None,
             number: 0,
             qpc_frequency: qpc_frequency.max(1),
         })
@@ -313,6 +338,48 @@ impl WindowCapture {
     pub fn set_limits(&mut self, max_width: u32, max_height: u32) {
         self.options.max_width = max_width;
         self.options.max_height = max_height;
+        if let Some((width, height)) = self.content.filter(|_| !self.minimized) {
+            self.natural = Some(self.own_size(width, height));
+        }
+    }
+
+    // From the next picture on, each picture goes out in a frame of this size,
+    // fitted into it; None gives each its own. A share keeps its encoder's
+    // size this way while the window changes size.
+    pub fn set_frame(&mut self, frame: Option<(u32, u32)>) {
+        self.frame = frame;
+    }
+
+    // The frame the newest picture would have of its own, under the limits.
+    pub fn natural(&self) -> Option<(u32, u32)> {
+        self.natural
+    }
+
+    // The newest picture converted once more under the frame set now, for a
+    // window that stood still while it went out fitted into a frame of
+    // another size. None when no such picture is kept. Stamped now, as a
+    // still screen's picture sent again is: it is new to whoever sees it.
+    pub fn again(&mut self) -> Result<Option<Frame>, CaptureError> {
+        let Some((view, (width, height))) = self
+            .kept
+            .as_ref()
+            .and_then(|kept| Some((kept.view.clone(), kept.picture?)))
+        else {
+            return Ok(None);
+        };
+        let plan = self.plan_for(width, height);
+        self.rebuild(plan)?;
+        self.drop_pending();
+        let slot = 1 - self.last_out;
+        self.converter
+            .convert(&view, &self.layout, &self.targets[slot]);
+        // SAFETY: a call on the live immediate context.
+        unsafe { self.context.Flush() };
+        if !self.fitted() {
+            self.forget_kept();
+        }
+        let now = Instant::now();
+        Ok(Some(self.frame_out(slot, (now, now, now))))
     }
 
     // As Capture::next. A minimized window is a pause, told once, until a
@@ -335,6 +402,8 @@ impl WindowCapture {
                 if let Some(size) = self.size() {
                     self.caption = Some(size);
                 }
+                self.natural = None;
+                self.forget_kept();
                 if !mem::replace(&mut self.minimized, true) {
                     self.drop_pending();
                     return Ok(Next::Paused(PauseReason::Minimized));
@@ -435,13 +504,9 @@ impl WindowCapture {
         // the old size, and never more than the surface.
         let width = (content.Width.max(2) as u32).min(desc.Width);
         let height = (content.Height.max(2) as u32).min(desc.Height);
-        self.rebuild(Plan::new(
-            width,
-            height,
-            Rotation::Identity,
-            self.options.max_width,
-            self.options.max_height,
-        ))?;
+        self.content = Some((width, height));
+        self.natural = Some(self.own_size(width, height));
+        self.rebuild(self.plan_for(width, height))?;
         if desc.BindFlags & D3D11_BIND_SHADER_RESOURCE.0 as u32 == 0 {
             return Err(CaptureError::other(
                 "could not read the picture of the shared window: Windows handed a texture the GPU cannot read",
@@ -463,6 +528,11 @@ impl WindowCapture {
         let slot = 1 - self.last_out;
         self.converter
             .convert(&view, &self.layout, &self.targets[slot]);
+        if self.fitted() {
+            self.keep(&texture, &desc, (width, height))?;
+        } else {
+            self.forget_kept();
+        }
         drop(view);
         drop(texture);
         let _ = frame.Close();
@@ -519,6 +589,126 @@ impl WindowCapture {
 
     fn size(&self) -> Option<(i32, i32)> {
         frame_size(self.window)
+    }
+
+    // The frame a picture of this size has of its own.
+    fn own_size(&self, width: u32, height: u32) -> (u32, u32) {
+        let plan = Plan::new(
+            width,
+            height,
+            Rotation::Identity,
+            self.options.max_width,
+            self.options.max_height,
+        );
+        (plan.width, plan.height)
+    }
+
+    // A picture of this size under the limits, in the frame set if it has
+    // another size of its own.
+    fn plan_for(&self, width: u32, height: u32) -> Plan {
+        let own = Plan::new(
+            width,
+            height,
+            Rotation::Identity,
+            self.options.max_width,
+            self.options.max_height,
+        );
+        match self.frame {
+            Some(frame) if frame != (own.width, own.height) => {
+                own.framed(self.options.max_width, self.options.max_height, frame)
+            }
+            _ => own,
+        }
+    }
+
+    // The newest picture goes out in a frame of another size than its own.
+    fn fitted(&self) -> bool {
+        self.frame
+            .is_some_and(|frame| self.natural.is_some_and(|natural| natural != frame))
+    }
+
+    // Copies the picture's part of a pool frame's surface, before the frame
+    // goes back to the pool. The copy is the surface's size, made again only
+    // for a bigger one, since the picture changes size with every step of a
+    // drag.
+    fn keep(
+        &mut self,
+        surface: &ID3D11Texture2D,
+        desc: &D3D11_TEXTURE2D_DESC,
+        (width, height): (u32, u32),
+    ) -> Result<(), CaptureError> {
+        let big_enough = self.kept.as_ref().is_some_and(|kept| {
+            let mut have = D3D11_TEXTURE2D_DESC::default();
+            // SAFETY: a getter on a live texture filling a live local.
+            unsafe { kept.texture.GetDesc(&mut have) };
+            have.Width >= desc.Width && have.Height >= desc.Height && have.Format == desc.Format
+        });
+        if !big_enough {
+            self.kept = None;
+            let copy = D3D11_TEXTURE2D_DESC {
+                Width: desc.Width,
+                Height: desc.Height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: desc.Format,
+                SampleDesc: desc.SampleDesc,
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                ..Default::default()
+            };
+            let mut texture = None;
+            // SAFETY: a full description and a live out parameter.
+            unsafe { self.device.CreateTexture2D(&copy, None, Some(&mut texture)) }
+                .map_err(fail("keep a picture of"))?;
+            let texture = texture.ok_or_else(|| {
+                CaptureError::other(
+                    "could not keep a picture of the shared window: Direct3D returned no texture",
+                )
+            })?;
+            let mut view = None;
+            // SAFETY: a live texture made for shader reads, the default
+            // view, a live out parameter.
+            unsafe {
+                self.device
+                    .CreateShaderResourceView(&texture, None, Some(&mut view))
+            }
+            .map_err(fail("keep a picture of"))?;
+            let view = view.ok_or_else(|| {
+                CaptureError::other(
+                    "could not keep a picture of the shared window: Direct3D returned no view",
+                )
+            })?;
+            self.kept = Some(Kept {
+                texture,
+                view,
+                picture: None,
+            });
+        }
+        let Some(kept) = &mut self.kept else {
+            return Ok(());
+        };
+        let part = D3D11_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: width,
+            bottom: height,
+            back: 1,
+        };
+        // SAFETY: both textures are on this device with the same format,
+        // and the box is inside both.
+        unsafe {
+            self.context
+                .CopySubresourceRegion(&kept.texture, 0, 0, 0, 0, surface, 0, Some(&part))
+        };
+        kept.picture = Some((width, height));
+        Ok(())
+    }
+
+    fn forget_kept(&mut self) {
+        if let Some(kept) = &mut self.kept {
+            kept.picture = None;
+        }
     }
 
     fn drop_pending(&mut self) {

@@ -271,6 +271,42 @@ fn a_resized_window_comes_out_at_its_new_size() {
     assert_eq!(sizes.last(), Some(&(1000, 560)), "{sizes:?}");
 }
 
+// Kept in a frame, the window comes out at the frame's size whatever its
+// own, while natural() says its own; once it stands still, again() makes
+// its newest picture at its own size.
+#[test]
+fn a_window_kept_in_a_frame() {
+    let Some(adapter) = adapter() else { return };
+    let window = Window::open(640, 360);
+    let mut capture = WindowCapture::open(window.id(), &adapter, Options::default()).unwrap();
+    assert_eq!(
+        frame_size(&mut capture, Duration::from_secs(2)),
+        Ok((640, 360))
+    );
+    assert_eq!(capture.again().unwrap().map(|frame| frame.number), None);
+    capture.set_frame(Some((640, 360)));
+    window.resize(800, 480);
+    let sizes = sizes_for(&mut capture, Duration::from_secs(1));
+    assert!(
+        !sizes.is_empty() && sizes.iter().all(|&size| size == (640, 360)),
+        "{sizes:?}"
+    );
+    assert_eq!(capture.natural(), Some((800, 480)));
+    assert_eq!(capture.plan().picture, (600, 360));
+    window.resize(400, 200);
+    let sizes = sizes_for(&mut capture, Duration::from_secs(1));
+    assert_eq!(sizes.last(), Some(&(640, 360)), "{sizes:?}");
+    assert_eq!(capture.plan().picture, (400, 200));
+    window.resize(1000, 600);
+    sizes_for(&mut capture, Duration::from_secs(1));
+    capture.set_frame(None);
+    let frame = capture.again().unwrap().expect("no picture kept");
+    assert_eq!((frame.width, frame.height), (1000, 600));
+    assert!(frame.present.elapsed() < Duration::from_millis(100));
+    // Out at its own size, nothing is kept any more.
+    assert!(capture.again().unwrap().is_none());
+}
+
 #[test]
 fn a_minimized_window_pauses_and_comes_back() {
     let Some(adapter) = adapter() else { return };

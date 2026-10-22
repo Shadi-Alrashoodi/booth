@@ -987,3 +987,33 @@ fn refit_is_the_plan_under_new_limits() {
         );
     }
 }
+
+// In a frame of another size, a picture is fitted into it and the limits
+// together, never scaled up, and the frame keeps its size.
+#[test]
+fn a_framed_picture_fits_its_frame() {
+    let plan = |width, height, max_width, max_height| {
+        Plan::new(width, height, Rotation::Identity, max_width, max_height)
+    };
+    let picture_and_frame = |plan: Plan| (plan.picture, (plan.width, plan.height));
+    let grown = plan(1000, 600, 4096, 1440);
+    assert_eq!(
+        picture_and_frame(grown.framed(4096, 1440, (800, 480))),
+        ((800, 480), (800, 480))
+    );
+    assert_eq!(
+        picture_and_frame(grown.framed(4096, 1440, (800, 600))),
+        ((800, 480), (800, 600))
+    );
+    assert_eq!(
+        picture_and_frame(grown.framed(0, 0, (800, 480))),
+        ((800, 480), (800, 480))
+    );
+    let shrunk = plan(500, 300, 4096, 1440).framed(4096, 1440, (800, 480));
+    assert_eq!(picture_and_frame(shrunk), ((500, 300), (800, 480)));
+    assert_eq!(shrunk.footprint, (1.0, 1.0));
+    let tall = plan(3000, 2000, 4096, 1080).framed(4096, 1080, (2560, 1440));
+    assert_eq!(picture_and_frame(tall), ((1620, 1080), (2560, 1440)));
+    let own = plan(640, 360, 4096, 1440);
+    assert_eq!(own.framed(4096, 1440, (640, 360)), own);
+}
