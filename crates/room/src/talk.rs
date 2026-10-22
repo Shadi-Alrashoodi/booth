@@ -90,13 +90,17 @@ pub enum TalkMode {
     OpenMic,
 }
 
-// How the room opens its microphone and speakers: Windows' own, or the fake
-// devices in memory, so no test ever opens a real microphone or plays a
-// sound.
+// How the room opens its microphone and speakers, and the PC sound a share
+// sends: Windows' own, or the fake devices in memory, so no test ever opens
+// a real microphone, plays a sound or captures what this PC plays.
 #[derive(Clone)]
 pub enum Devices {
     Windows,
-    Fake { microphone: Fake, speakers: Fake },
+    Fake {
+        microphone: Fake,
+        speakers: Fake,
+        pc_sound: Fake,
+    },
 }
 
 impl fmt::Debug for Devices {
@@ -494,7 +498,7 @@ impl Shared {
     }
 }
 
-fn random_seq() -> u16 {
+pub(crate) fn random_seq() -> u16 {
     let mut bytes = [0u8; 2];
     let _ = getrandom::fill(&mut bytes);
     u16::from_le_bytes(bytes)

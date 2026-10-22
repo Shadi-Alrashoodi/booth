@@ -69,6 +69,8 @@ struct State {
     unstamped: AtomicBool,
     // The next packet captured comes after lost sound.
     glitch: AtomicBool,
+    // Every open fails with this, as Windows refusing the stream would.
+    refuse: Mutex<Option<AudioError>>,
     record: Mutex<Record>,
     // Off for a fake left running for hours, where a record of every
     // sample would be the biggest thing in the process.
@@ -123,6 +125,7 @@ impl Fake {
                 quiet: AtomicBool::new(false),
                 unstamped: AtomicBool::new(false),
                 glitch: AtomicBool::new(false),
+                refuse: Mutex::new(None),
                 record: Mutex::new(Record::default()),
                 recording,
             }),
@@ -178,6 +181,11 @@ impl Fake {
         self.state.glitch.store(true, Ordering::Relaxed);
     }
 
+    // Every open from now on fails with `err`; None lets them work again.
+    pub fn fail_opens(&self, err: Option<AudioError>) {
+        *lock(&self.state.refuse) = err;
+    }
+
     pub fn record(&self) -> Record {
         lock(&self.state.record).clone()
     }
@@ -220,7 +228,11 @@ impl Device for FakeDevice {
             record.most_at_once = record.most_at_once.max(record.at_once);
         }
         thread::sleep(self.state.setup.open_time);
-        let opened = self.find(choice);
+        let refused = lock(&self.state.refuse).clone();
+        let opened = match refused {
+            Some(err) => Err(err),
+            None => self.find(choice),
+        };
         if opened.is_err() {
             lock(&self.state.record).at_once -= 1;
         }

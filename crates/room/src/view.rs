@@ -79,6 +79,31 @@ pub struct ShareView {
     // with it, so the panel can say "sharing with sound". False when the
     // sharer or the host is older than 1.3.0.
     pub watched_sound: bool,
+    // Share sound on this PC's own share (Room::share_sound).
+    pub own_sound: OwnSound,
+}
+
+// Off at the start of every share, and never saved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OwnSound {
+    pub on: bool,
+    // Why it cannot go on.
+    pub unavailable: Option<NoSound>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoSound {
+    // The host runs a Booth older than 1.3.0, which passes no PC sound on.
+    OldHost,
+}
+
+impl NoSound {
+    // What the line under the switch says.
+    pub fn sentence(self) -> &'static str {
+        match self {
+            NoSound::OldHost => "The host needs Booth 1.3.0 or later for sound.",
+        }
+    }
 }
 
 impl ShareView {

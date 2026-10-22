@@ -279,6 +279,13 @@ impl Side {
         }
     }
 
+    fn set_share_sound(&mut self, on: bool, press: Instant, now: Instant, socket: &Socket) -> bool {
+        match self {
+            Side::Host(host) => host.set_share_sound(on, press, now, socket),
+            Side::Client(client) => client.set_share_sound(on, press, now, socket),
+        }
+    }
+
     fn screen_work(&mut self, now: Instant, socket: &Socket) -> bool {
         match self {
             Side::Host(host) => host.screen_work(now, socket),
@@ -605,6 +612,10 @@ impl Threads {
         });
         let commands = shared.commands.clone();
         sharing.on_work(move || commands.send(Command::Screen));
+        let commands = shared.commands.clone();
+        sharing
+            .sound()
+            .on_work(move || commands.send(Command::Screen));
         let (speakers, clock) = (Arc::clone(&voice.shared), voice.clock);
         sharing.on_cue(move |cue| speakers.cue(cue, clock.micros(Instant::now())));
         let commands = shared.commands.clone();
@@ -686,6 +697,16 @@ impl Threads {
 
     pub(crate) fn watch(&self, share: u32, on: bool) {
         self.with_side(|side, now, socket| side.watch(share, on, now, socket));
+    }
+
+    // Turned off, the stop is stored at the press, before the lock: nothing
+    // captured from it on goes out, whatever the room is busy with.
+    pub(crate) fn share_sound(&self, on: bool) {
+        let press = Instant::now();
+        if !on {
+            self.sharing.sound().stop(press);
+        }
+        self.with_side(|side, now, socket| side.set_share_sound(on, press, now, socket));
     }
 
     pub(crate) fn sharing(&self) -> Arc<Sharing> {
@@ -833,9 +854,10 @@ impl Threads {
             return;
         }
         let started = Instant::now();
-        // First, so no voice goes out while the room closes, and so the
-        // socket closes with the room even while a device is slow to.
+        // First, so no voice or PC sound goes out while the room closes, and
+        // so the socket closes with the room even while a device is slow to.
         self.voice.let_go();
+        self.sharing.sound().let_go();
         if let Some(mut streams) = self.streams.take()
             && !streams.stop(DEVICES_WAIT)
         {

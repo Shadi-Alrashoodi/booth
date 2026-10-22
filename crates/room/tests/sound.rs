@@ -1,22 +1,27 @@
 // PC sound through rooms on loopback, with the fake audio devices: no test
-// here opens a real microphone or plays a sound. Booth sends PC sound from a
-// share's own capture, which is not here yet, so the sharer is a friend's
-// program played by hand (common::Hand) sending what a sharer's PC sends.
+// here opens a real microphone, plays a sound or captures what this PC
+// plays. The sharer is Booth itself, its PC sound a fake that plays a tone,
+// except in the first test, where a friend's program played by hand
+// (common::Hand) sends what a sharer's PC sends. Where a test reads every
+// packet the host passes on, the watcher is played by hand too.
 
 mod common;
 
 use std::f64::consts::TAU;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use channels::Channel;
-use common::voiced::{RATE, Voiced, alone, silence, voiced};
-use common::{Hand, code_to_invite, loopback, timers, wall_clock_us};
+use common::voiced::{RATE, Voiced, alone, silence, sine, talking, voiced};
+use common::{Hand, code_to_invite, loopback, poll, timers, wall_clock_us};
 use invite::Version;
-use room::view::View;
-use room::{Config, TalkMode};
-use voice::audio::fake::Fake;
-use voice::stereo::{Encoder, FRAME, MAX_PACKET};
+use room::view::{LineKind, NoSound, OwnShare, View};
+use room::{Config, Devices, Show, TalkMode, VideoConfig, VideoSource};
+use voice::audio::AudioError;
+use voice::audio::fake::{Fake, Setup};
+use voice::stereo::{Decoder, Encoder, FRAME, MAX_PACKET};
 
 const WAIT: Duration = Duration::from_secs(3);
 const PC_SOUND_SINCE: Version = Version {
@@ -243,4 +248,734 @@ fn a_friends_pc_sound_reaches_its_watchers_on_their_sides() {
     ana.member.wait_for(WAIT, "Ana's ear gone", |v| {
         !v.share.watched_sound && v.numbers.sound.is_none()
     });
+}
+
+// The sharer's PC sound: 500 Hz at 0.4 on the left, 700 Hz at 0.2 on the
+// right.
+fn left_and_right(frame: u64, channel: u16) -> f32 {
+    if channel == 0 {
+        sine(frame, 500.0, 0.4)
+    } else {
+        sine(frame, 700.0, 0.2)
+    }
+}
+
+// The sharer's voice, which plays in the middle: 300 Hz at 0.1.
+fn voice_300(frame: u64, _: u16) -> f32 {
+    sine(frame, 300.0, 0.1)
+}
+
+// PC sound playing `signal` in 128-frame packets, each stop taking `close`.
+fn pc_sound(signal: fn(u64, u16) -> f32, close: Duration) -> Fake {
+    let setup = Setup {
+        signal,
+        close_time: close,
+        ..Setup::default()
+    };
+    Fake::new(setup, &[("pc", "Test PC sound")], Some("pc"))
+}
+
+// A member whose share sends `pc_sound`, its microphone playing
+// `microphone`.
+fn sharer(
+    name: &str,
+    version: Version,
+    microphone: fn(u64, u16) -> f32,
+    pc_sound: &Fake,
+) -> (Config, Fake, Fake) {
+    let mut config = voiced(name, timers(), microphone, TalkMode::PushToTalk, true);
+    config.0.version = version;
+    if let Devices::Fake { pc_sound: fake, .. } = &mut config.0.voice.devices {
+        *fake = pc_sound.clone();
+    }
+    config
+}
+
+// The host, a multi-use invite to it, and where it is.
+fn hosting(config: (Config, Fake, Fake)) -> (Voiced, String, SocketAddr) {
+    let host = Voiced::host_with(config);
+    host.room().new_invite(true);
+    let code = host
+        .member
+        .wait_for(WAIT, "a multi-use invite", |v| {
+            v.invite
+                .as_ref()
+                .is_some_and(|i| i.multi_use && !i.code.is_empty())
+        })
+        .invite
+        .expect("an invite")
+        .code;
+    let to_host = loopback(host.member.port());
+    (host, code, to_host)
+}
+
+fn joins(config: (Config, Fake, Fake), code: &str, to_host: SocketAddr, people: usize) -> Voiced {
+    let member = Voiced::join(config, code_to_invite(code, to_host));
+    member
+        .member
+        .wait_for(WAIT, "in the room", |v| v.people.len() == people);
+    member
+}
+
+fn own_share(view: &View) -> Option<u32> {
+    match view.share.own {
+        OwnShare::Sharing { number, .. } => Some(number),
+        _ => None,
+    }
+}
+
+fn shares(member: &Voiced) -> u32 {
+    member.room().share(60, None);
+    let view = member
+        .member
+        .wait_for(WAIT, "the share granted", |v| own_share(v).is_some());
+    own_share(&view).expect("granted")
+}
+
+fn watches(watcher: &Voiced, share: u32) {
+    watcher
+        .member
+        .wait_for(WAIT, "the share in the roster", |v| {
+            v.share
+                .current
+                .as_ref()
+                .is_some_and(|current| current.number == share)
+        });
+    watcher.room().watch(share, true);
+}
+
+fn watched_by(sharer: &Voiced, count: u8) {
+    sharer.member.wait_for(WAIT, "the watchers counted", |v| {
+        v.share
+            .current
+            .as_ref()
+            .is_some_and(|current| current.watchers == Some(count))
+    });
+}
+
+// A watcher played by hand on 1.3.0, which keeps every packet the host
+// passes on.
+fn hand_watcher(code: &str, to_host: SocketAddr) -> Hand {
+    Hand::join_as(
+        &code_to_invite(code, to_host),
+        to_host,
+        "Ana",
+        PC_SOUND_SINCE,
+    )
+}
+
+// Watch, kind 12: the share, on, and flags that take no HEVC.
+fn watch(share: u32) -> Vec<u8> {
+    let mut out = vec![12];
+    out.extend_from_slice(&share.to_le_bytes());
+    out.extend_from_slice(&[1, 0]);
+    out
+}
+
+// A PC sound packet as the host passed it on, at the offsets sound\wire.rs
+// gives its fields.
+struct Passed {
+    share: u32,
+    seq: u16,
+    captured: u64,
+    first: bool,
+    last: bool,
+    frame: Vec<u8>,
+}
+
+fn passed(payload: &[u8]) -> Passed {
+    let len = usize::from(payload[17]);
+    Passed {
+        share: u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]),
+        seq: u16::from_le_bytes([payload[6], payload[7]]),
+        captured: u64::from_le_bytes(payload[8..16].try_into().expect("8 bytes")),
+        first: payload[16] & 2 != 0,
+        last: payload[16] & 1 != 0,
+        frame: payload[18..18 + len].to_vec(),
+    }
+}
+
+// The flags of each, for a failure to show.
+fn flags(sound: &[Passed]) -> Vec<(u16, bool, bool)> {
+    sound
+        .iter()
+        .map(|packet| (packet.seq, packet.first, packet.last))
+        .collect()
+}
+
+// What came to the hand over `span`, its pings answered as they came: the
+// PC sound passed on, and each ShareSound it was told.
+fn listen(hand: &mut Hand, span: Duration) -> (Vec<Passed>, Vec<(u32, bool)>) {
+    let mut sound = Vec::new();
+    let mut told = Vec::new();
+    let end = Instant::now() + span;
+    while Instant::now() < end {
+        hand.answer_pings();
+        for (channel, payload) in hand.received() {
+            if channel == Channel::Sound {
+                sound.push(passed(&payload));
+            }
+        }
+        for message in hand.messages() {
+            if let [28, a, b, c, d, on] = message[..] {
+                told.push((u32::from_le_bytes([a, b, c, d]), on == 1));
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    (sound, told)
+}
+
+// The most of `hz` on the left in any frame of `sound`, decoded as a
+// watcher decodes it, each spell from its first frame.
+fn most_in_frames(sound: &[Passed], hz: f64) -> f64 {
+    let mut decoder = Decoder::new().expect("a stereo decoder");
+    let mut out = [0f32; FRAME * 2];
+    let mut most = 0.0f64;
+    for packet in sound {
+        if packet.first {
+            decoder.reset().expect("reset");
+        }
+        let frames = decoder.decode(&packet.frame, &mut out).expect("decoded");
+        let left: Vec<f32> = out[..frames * 2].iter().step_by(2).copied().collect();
+        most = most.max(amplitude(&left, hz));
+    }
+    most
+}
+
+// The most of `hz` on one side in any 200 ms of what `speakers` played.
+fn most_played(speakers: &Fake, side: usize, hz: f64) -> f64 {
+    let written = speakers.record().written;
+    let (frames, _) = written.as_chunks::<2>();
+    let played: Vec<f32> = frames.iter().map(|pair| pair[side]).collect();
+    let (blocks, _) = played.as_chunks::<9_600>();
+    blocks
+        .iter()
+        .map(|block| amplitude(block, hz))
+        .fold(0.0, f64::max)
+}
+
+// Mara shares with Share sound on and talks. Ana, watching on 1.3.0, hears
+// its left on her left and its right on her right, at half the level it was
+// captured, with Mara's voice in the middle of both. Cy, watching on 1.2.0,
+// and Dee, who does not watch, hear her voice and none of the PC sound, and
+// count nothing bad.
+#[test]
+fn the_hosts_pc_sound_reaches_its_watchers_on_their_sides() {
+    let _alone = alone();
+    let fake = pc_sound(left_and_right, Duration::ZERO);
+    let (host, code, to_host) = hosting(sharer("Mara", PC_SOUND_SINCE, voice_300, &fake));
+    let ana = joins(member("Ana", PC_SOUND_SINCE), &code, to_host, 2);
+    let cy = joins(member("Cy", OLDER), &code, to_host, 3);
+    let dee = joins(member("Dee", PC_SOUND_SINCE), &code, to_host, 4);
+    let share = shares(&host);
+    watches(&ana, share);
+    watches(&cy, share);
+    watched_by(&host, 2);
+    host.room().talk(true);
+    for listener in [&ana, &cy, &dee] {
+        listener
+            .member
+            .wait_for(WAIT, "Mara talking", |v| talking(v, "Mara"));
+    }
+    host.room().share_sound(true);
+    assert!(host.view().share.own_sound.on);
+    let view = ana.member.wait_for(WAIT, "Ana hearing the pc sound", |v| {
+        v.share.watched_sound
+            && v.numbers
+                .sound
+                .is_some_and(|sound| sound.capture_to_ear.is_some())
+    });
+    thread::sleep(Duration::from_millis(600));
+
+    let numbers = view.numbers.sound.expect("pc sound numbers");
+    let capture_to_ear = numbers.capture_to_ear.expect("a capture to ear time");
+    let (left, right) = sides(&ana.speakers).expect("pc sound on the speakers");
+    let at = |side: &[f32], hz| amplitude(side, hz);
+    println!(
+        "Ana: capture to ear {:.1} ms, p95 {:.1} ms, buffer {} ms, {} made up; left 500 Hz {:.3} 700 Hz {:.4} voice {:.3}, right 700 Hz {:.3} 500 Hz {:.4} voice {:.3}",
+        capture_to_ear.median_ms,
+        capture_to_ear.p95_ms,
+        numbers.depth_ms,
+        numbers.made_up,
+        at(&left, 500.0),
+        at(&left, 700.0),
+        at(&left, 300.0),
+        at(&right, 700.0),
+        at(&right, 500.0),
+        at(&right, 300.0),
+    );
+    assert!(
+        (0.0..100.0).contains(&capture_to_ear.median_ms),
+        "{capture_to_ear:?}"
+    );
+    assert!((0.17..0.23).contains(&at(&left, 500.0)));
+    assert!((0.085..0.115).contains(&at(&right, 700.0)));
+    assert!(
+        at(&left, 700.0) < 0.01 && at(&right, 500.0) < 0.01,
+        "the sides mix"
+    );
+    for side in [&left, &right] {
+        assert!(
+            (0.07..0.13).contains(&at(side, 300.0)),
+            "the voice is not in the middle"
+        );
+    }
+    assert_eq!(ana.view().numbers.dropped_bad, 0);
+    for (who, member) in [("Cy", &cy), ("Dee", &dee)] {
+        let view = member.view();
+        assert!(view.numbers.sound.is_none(), "{who}");
+        assert!(!view.share.watched_sound, "{who}");
+        assert_eq!(view.numbers.dropped_bad, 0, "{who}");
+        let pc_sound =
+            most_played(&member.speakers, 0, 500.0).max(most_played(&member.speakers, 1, 700.0));
+        assert!(pc_sound < 0.005, "{who} heard the pc sound: {pc_sound}");
+        assert!(
+            most_played(&member.speakers, 0, 300.0) > 0.07,
+            "{who} heard no voice"
+        );
+    }
+}
+
+// Bo, a friend, shares with Share sound on. The host passes it on to Ana and
+// plays it itself, both watching on 1.3.0: each hears his left on the left
+// and his right on the right.
+#[test]
+fn a_friends_pc_sound_goes_through_the_host() {
+    let _alone = alone();
+    let fake = pc_sound(left_and_right, Duration::ZERO);
+    let (host, code, to_host) = hosting(member("Mara", PC_SOUND_SINCE));
+    let ana = joins(member("Ana", PC_SOUND_SINCE), &code, to_host, 2);
+    let bo = joins(
+        sharer("Bo", PC_SOUND_SINCE, silence, &fake),
+        &code,
+        to_host,
+        3,
+    );
+    let share = shares(&bo);
+    watches(&host, share);
+    watches(&ana, share);
+    watched_by(&bo, 2);
+    bo.room().share_sound(true);
+    let own = bo.view().share.own_sound;
+    assert!(own.on && own.unavailable.is_none(), "{own:?}");
+    for (who, member) in [("Ana", &ana), ("the host", &host)] {
+        let view = member.member.wait_for(WAIT, "the pc sound heard", |v| {
+            v.share.watched_sound && v.numbers.sound.is_some()
+        });
+        thread::sleep(Duration::from_millis(600));
+        let (left, right) = sides(&member.speakers).expect("pc sound on the speakers");
+        let (left_500, right_700) = (amplitude(&left, 500.0), amplitude(&right, 700.0));
+        println!("{who}: left 500 Hz {left_500:.3}, right 700 Hz {right_700:.3}");
+        assert!((0.17..0.23).contains(&left_500), "{who}: {left_500}");
+        assert!((0.085..0.115).contains(&right_700), "{who}: {right_700}");
+        assert!(amplitude(&left, 700.0) < 0.01 && amplitude(&right, 500.0) < 0.01);
+        assert_eq!(view.numbers.dropped_bad, 0, "{who}");
+    }
+}
+
+// Bo on 1.3.0 shares through a host on 1.2.0, which would count a packet on
+// channel 8 or a ShareSound as bad. His Share sound stays off and says why,
+// his PC sound never opens, and the host counts nothing bad.
+#[test]
+fn a_client_sends_no_pc_sound_through_a_host_on_1_2_0() {
+    let _alone = alone();
+    let fake = pc_sound(left_and_right, Duration::ZERO);
+    let (host, code, to_host) = hosting(member("Mara", OLDER));
+    let ana = joins(member("Ana", PC_SOUND_SINCE), &code, to_host, 2);
+    let bo = joins(
+        sharer("Bo", PC_SOUND_SINCE, silence, &fake),
+        &code,
+        to_host,
+        3,
+    );
+    let share = shares(&bo);
+    watches(&ana, share);
+    watched_by(&host, 1);
+    bo.room().share_sound(true);
+    let own = bo.view().share.own_sound;
+    assert!(!own.on);
+    assert_eq!(own.unavailable, Some(NoSound::OldHost));
+    assert_eq!(
+        NoSound::OldHost.sentence(),
+        "The host needs Booth 1.3.0 or later for sound."
+    );
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(host.view().numbers.dropped_bad, 0);
+    assert!(fake.record().opens.is_empty(), "the pc sound opened");
+    assert!(ana.view().numbers.sound.is_none());
+}
+
+// A watcher played by hand watches Mara's share with Share sound on: the
+// sound and the word that it is on come, each frame of it named for the
+// share.
+fn hand_watches(fake: &Fake) -> (Voiced, Hand, u32, Vec<Passed>) {
+    let (host, code, to_host) = hosting(sharer("Mara", PC_SOUND_SINCE, silence, fake));
+    let mut ana = hand_watcher(&code, to_host);
+    let share = shares(&host);
+    ana.say(&watch(share));
+    watched_by(&host, 1);
+    host.room().share_sound(true);
+    let (sound, told) = listen(&mut ana, Duration::from_millis(400));
+    assert!(sound.len() >= 25, "{}", sound.len());
+    assert!(sound[0].first, "{:?}", flags(&sound));
+    assert!(
+        sound
+            .iter()
+            .all(|packet| packet.share == share && !packet.last)
+    );
+    assert_eq!(told, [(share, true)]);
+    (host, ana, share, sound)
+}
+
+// Paused by hand, the share's PC sound ends with the frame under way,
+// marked LAST, and nothing comes after it, nor a word that it is off: the
+// share says it is paused. Resumed, it comes back from a FIRST.
+#[test]
+fn a_pause_ends_the_sound_and_resume_brings_it_back() {
+    let _alone = alone();
+    let fake = pc_sound(left_and_right, Duration::ZERO);
+    let (host, mut ana, _, _) = hand_watches(&fake);
+    host.room().pause_share(true);
+    let (paused, told) = listen(&mut ana, Duration::from_millis(400));
+    let last = paused.iter().position(|packet| packet.last);
+    assert_eq!(last, Some(paused.len() - 1), "{:?}", flags(&paused));
+    assert!(told.is_empty(), "{told:?}");
+    assert!(host.view().share.own_sound.on);
+    host.room().pause_share(false);
+    let (resumed, told) = listen(&mut ana, Duration::from_millis(400));
+    assert!(resumed.len() >= 25, "{}", resumed.len());
+    assert!(resumed[0].first, "{:?}", flags(&resumed));
+    assert!(told.is_empty(), "{told:?}");
+}
+
+static MARK: AtomicBool = AtomicBool::new(false);
+
+// The two tones, or 1 kHz on both sides while MARK is set.
+fn marked(frame: u64, channel: u16) -> f32 {
+    if MARK.load(Ordering::Relaxed) {
+        sine(frame, 1000.0, 0.5)
+    } else {
+        left_and_right(frame, channel)
+    }
+}
+
+// Paused, then resumed 50 ms later, on PC sound whose stop takes a second:
+// the capture let go at the pause is still closing when the one for the
+// resume opens. Nothing captured between the two presses, a 1 kHz mark,
+// reaches the watcher.
+#[test]
+fn nothing_captured_between_a_pause_and_a_quick_resume_goes_out() {
+    let _alone = alone();
+    let fake = pc_sound(marked, Duration::from_secs(1));
+    let (host, mut ana, _, mut sound) = hand_watches(&fake);
+    host.room().pause_share(true);
+    MARK.store(true, Ordering::Relaxed);
+    let (between, _) = listen(&mut ana, Duration::from_millis(50));
+    MARK.store(false, Ordering::Relaxed);
+    host.room().pause_share(false);
+    let (after, _) = listen(&mut ana, Duration::from_millis(500));
+    assert!(after.len() >= 25 && after[0].first, "{:?}", flags(&after));
+    sound.extend(between);
+    sound.extend(after);
+    let (tone, mark) = (
+        most_in_frames(&sound, 500.0),
+        most_in_frames(&sound, 1000.0),
+    );
+    let record = fake.record();
+    println!(
+        "500 Hz {tone:.3}, the mark {mark:.4}, {} captures open at most at once",
+        record.most_at_once
+    );
+    assert!(tone > 0.3, "{tone}");
+    assert!(
+        mark < 0.1,
+        "sound from between the presses went out: {mark}"
+    );
+    assert!(
+        record.most_at_once >= 2,
+        "the first capture had closed before the second opened"
+    );
+}
+
+// After 2 s in which the PC sound sent nothing, the share is paused and
+// packets with no stamp come: nothing of them goes out, only the frame that
+// was under way at the press, with LAST.
+#[test]
+fn a_packet_without_a_stamp_after_a_gap_sends_nothing_after_the_press() {
+    let _alone = alone();
+    let fake = pc_sound(left_and_right, Duration::ZERO);
+    let (host, mut ana, _, _) = hand_watches(&fake);
+    fake.stall(true);
+    listen(&mut ana, Duration::from_secs(2));
+    fake.unstamped(true);
+    host.room().pause_share(true);
+    fake.stall(false);
+    let (after, told) = listen(&mut ana, Duration::from_millis(500));
+    assert!(after.len() == 1 && after[0].last, "{:?}", flags(&after));
+    assert!(told.is_empty(), "{told:?}");
+    fake.unstamped(false);
+    host.room().pause_share(false);
+    let (back, _) = listen(&mut ana, Duration::from_millis(400));
+    assert!(back.len() >= 25 && back[0].first, "{:?}", flags(&back));
+}
+
+// Share after share with a tone playing: Share sound is off at the start of
+// each, and no packet ever names a share whose switch was off when it was
+// captured.
+#[test]
+fn no_packet_names_a_share_whose_switch_is_off() {
+    const SLACK_US: u64 = 5_000;
+    let _alone = alone();
+    let fake = pc_sound(left_and_right, Duration::ZERO);
+    let (host, code, to_host) = hosting(sharer("Mara", PC_SOUND_SINCE, silence, &fake));
+    let mut ana = hand_watcher(&code, to_host);
+    let mut turned_on: Vec<(u32, u64, u64)> = Vec::new();
+    let mut heard = Vec::new();
+    let mut last = None;
+    for _ in 0..4 {
+        host.room().share(60, None);
+        let view = host.member.wait_for(WAIT, "a new share", |v| {
+            own_share(v).is_some_and(|number| Some(number) != last)
+        });
+        let share = own_share(&view).expect("granted");
+        last = Some(share);
+        assert!(
+            !view.share.own_sound.on,
+            "share {share} began with sound on"
+        );
+        ana.say(&watch(share));
+        watched_by(&host, 1);
+        let (quiet, _) = listen(&mut ana, Duration::from_millis(200));
+        heard.extend(quiet);
+        let on_us = wall_clock_us();
+        host.room().share_sound(true);
+        let (sound, _) = listen(&mut ana, Duration::from_millis(300));
+        assert!(
+            sound.iter().any(|packet| packet.share == share),
+            "share {share}: nothing came"
+        );
+        heard.extend(sound);
+        host.room().stop_sharing();
+        let off_us = wall_clock_us();
+        turned_on.push((share, on_us, off_us));
+        host.member
+            .wait_for(WAIT, "the share over", |v| v.share.current.is_none());
+    }
+    let (tail, _) = listen(&mut ana, Duration::from_millis(200));
+    heard.extend(tail);
+    for packet in &heard {
+        let Some(&(share, on_us, off_us)) =
+            turned_on.iter().find(|(share, ..)| *share == packet.share)
+        else {
+            panic!("a packet names share {}, never turned on", packet.share);
+        };
+        assert!(
+            packet.captured + SLACK_US >= on_us && packet.captured <= off_us + SLACK_US,
+            "share {share}: captured at {}, on from {on_us} to {off_us}",
+            packet.captured
+        );
+    }
+}
+
+// The sharer's Mute and Deafen are its microphone's and its speakers', not
+// its share's: the PC sound goes on as it was, in the same spell.
+#[test]
+fn the_sharers_mute_and_deafen_change_nothing() {
+    let _alone = alone();
+    let fake = pc_sound(left_and_right, Duration::ZERO);
+    let (host, mut ana, _, before) = hand_watches(&fake);
+    host.room().mute(true);
+    host.room().deafen(true);
+    let (after, told) = listen(&mut ana, Duration::from_millis(400));
+    println!("{} frames before, {} after", before.len(), after.len());
+    assert!(
+        after.len() * 10 >= before.len() * 8,
+        "{} of {}",
+        after.len(),
+        before.len()
+    );
+    assert!(
+        after.iter().all(|packet| !packet.first && !packet.last),
+        "{:?}",
+        flags(&after)
+    );
+    assert!(told.is_empty(), "{told:?}");
+    assert!(host.view().share.own_sound.on);
+}
+
+static QUIET_NOW: AtomicBool = AtomicBool::new(false);
+
+fn tone_until_quiet(frame: u64, channel: u16) -> f32 {
+    if QUIET_NOW.load(Ordering::Relaxed) {
+        0.0
+    } else {
+        left_and_right(frame, channel)
+    }
+}
+
+// 200 ms of silence ends a spell: 20 silent frames go out, the 20th with
+// LAST, and nothing more while it lasts. The next sound starts a spell from
+// a FIRST.
+#[test]
+fn silence_ends_a_spell_and_the_next_sound_starts_one() {
+    let _alone = alone();
+    QUIET_NOW.store(false, Ordering::Relaxed);
+    let fake = pc_sound(tone_until_quiet, Duration::ZERO);
+    let (_host, mut ana, _, _) = hand_watches(&fake);
+    QUIET_NOW.store(true, Ordering::Relaxed);
+    let (quiet, _) = listen(&mut ana, Duration::from_millis(600));
+    QUIET_NOW.store(false, Ordering::Relaxed);
+    let (back, _) = listen(&mut ana, Duration::from_millis(300));
+    let last = quiet.iter().position(|packet| packet.last);
+    assert_eq!(last, Some(quiet.len() - 1), "{:?}", flags(&quiet));
+    // The frame the silence began in, and one more of the tone at most.
+    assert!((20..=22).contains(&quiet.len()), "{}", quiet.len());
+    assert!(back.len() >= 15 && back[0].first, "{:?}", flags(&back));
+}
+
+// PC sound that cannot open turns Share sound off with a line that says
+// why, and the share goes on; its watcher never hears that the sound is on.
+#[test]
+fn a_capture_that_cannot_start_turns_share_sound_off() {
+    let _alone = alone();
+    let fake = pc_sound(left_and_right, Duration::ZERO);
+    fake.fail_opens(Some(AudioError::PcSound {
+        code: 0x8889_0008,
+        text: String::from("Windows would not give its sound as 48 kHz stereo"),
+        lost: false,
+    }));
+    let (host, code, to_host) = hosting(sharer("Mara", PC_SOUND_SINCE, silence, &fake));
+    let ana = joins(member("Ana", PC_SOUND_SINCE), &code, to_host, 2);
+    let share = shares(&host);
+    watches(&ana, share);
+    watched_by(&host, 1);
+    host.room().share_sound(true);
+    let view = host.member.wait_for(WAIT, "Share sound off and why", |v| {
+        !v.share.own_sound.on && v.share.problem.is_some()
+    });
+    let line = "PC sound could not start: Windows would not give its sound as 48 kHz stereo (0x88890008). The share goes on without it.";
+    assert_eq!(view.share.problem.as_deref(), Some(line));
+    assert!(
+        view.chat
+            .iter()
+            .any(|said| said.kind == LineKind::Problem && said.text == line)
+    );
+    assert_eq!(own_share(&view), Some(share));
+    ana.member.holds_for(
+        Duration::from_millis(300),
+        "Ana told the sound is on",
+        |v| !v.share.watched_sound,
+    );
+    assert_eq!(ana.view().numbers.dropped_bad, 0);
+}
+
+// Lost while it runs, PC sound opens again by itself a second later: its
+// watcher hears it is off and then on again once it has opened, and Share
+// sound stays on meanwhile. Lost again and refused when it opens again, it
+// has stopped: Share sound goes off with a line that says why.
+#[test]
+fn lost_pc_sound_comes_back_by_itself_or_turns_share_sound_off() {
+    let _alone = alone();
+    let fake = pc_sound(left_and_right, Duration::ZERO);
+    let (host, mut ana, share, _) = hand_watches(&fake);
+    fake.unplug("pc");
+    let (_, told) = listen(&mut ana, Duration::from_millis(300));
+    assert_eq!(told, [(share, false)]);
+    assert!(host.view().share.own_sound.on);
+    fake.plug("pc", "Test PC sound");
+    let (back, told) = listen(&mut ana, Duration::from_millis(1500));
+    assert_eq!(told, [(share, true)]);
+    assert!(back.len() >= 25 && back[0].first, "{:?}", flags(&back));
+
+    fake.fail_opens(Some(AudioError::PcSound {
+        code: 0x8889_0008,
+        text: String::from("Windows would not give its sound as 48 kHz stereo"),
+        lost: false,
+    }));
+    fake.unplug("pc");
+    let view = host.member.wait_for(WAIT, "Share sound off and why", |v| {
+        !v.share.own_sound.on && v.share.problem.is_some()
+    });
+    assert_eq!(
+        view.share.problem.as_deref(),
+        Some(
+            "PC sound stopped: Windows would not give its sound as 48 kHz stereo (0x88890008). Turn Share sound on to try again."
+        )
+    );
+    let (_, told) = listen(&mut ana, Duration::from_millis(200));
+    assert_eq!(told, [(share, false)]);
+}
+
+fn captures_open(fake: &Fake, opens: usize, open: usize) {
+    poll(WAIT, "the captures as asked", || {
+        let record = fake.record();
+        (record.opens.len() == opens && record.at_once == open).then_some(())
+    });
+}
+
+// Stop sharing and Leave let the capture go at once, and a new share
+// starts with Share sound off.
+#[test]
+fn stop_and_leave_let_the_capture_go() {
+    let _alone = alone();
+    let fake = pc_sound(left_and_right, Duration::ZERO);
+    let (mut host, _, _) = hosting(sharer("Mara", PC_SOUND_SINCE, silence, &fake));
+    shares(&host);
+    host.room().share_sound(true);
+    captures_open(&fake, 1, 1);
+    host.room().stop_sharing();
+    captures_open(&fake, 1, 0);
+    shares(&host);
+    assert!(!host.view().share.own_sound.on);
+    host.room().share_sound(true);
+    captures_open(&fake, 2, 1);
+    host.member.leave();
+    captures_open(&fake, 2, 0);
+}
+
+// A share that cannot start ends a moment after it is granted. With Share
+// sound turned on in that moment, the capture goes with the share.
+#[test]
+fn a_failed_share_lets_the_capture_go() {
+    let _alone = alone();
+    let fake = pc_sound(left_and_right, Duration::ZERO);
+    let mut config = sharer("Mara", PC_SOUND_SINCE, silence, &fake);
+    config.0.video = VideoConfig {
+        source: VideoSource::Pattern {
+            width: 0,
+            height: 0,
+            busy: false,
+        },
+        show: Show::NoActivate,
+        ..VideoConfig::default()
+    };
+    let host = Voiced::host_with(config);
+    let problems = |v: &View| {
+        v.chat
+            .iter()
+            .filter(|said| said.kind == LineKind::Problem)
+            .count()
+    };
+    for attempt in 0.. {
+        assert!(
+            attempt < 20,
+            "every share failed before Share sound went on"
+        );
+        let (before, opens) = (problems(&host.view()), fake.record().opens.len());
+        host.room().share(60, None);
+        host.room().share_sound(true);
+        host.member.wait_for(WAIT, "the share failed", |v| {
+            problems(v) > before && v.share.own == OwnShare::Off
+        });
+        // A capture started just before the end opens and closes on its own
+        // thread.
+        thread::sleep(Duration::from_millis(200));
+        let record = fake.record();
+        assert_eq!(record.at_once, 0, "a capture outlived its share");
+        if record.opens.len() > opens {
+            break;
+        }
+    }
+    assert!(!host.view().share.own_sound.on);
 }

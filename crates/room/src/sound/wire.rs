@@ -86,7 +86,6 @@ impl fmt::Display for SoundRefused {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "nothing sends PC sound yet"))]
 impl SoundFrame<'_> {
     pub(crate) fn write_sent(&self, out: &mut Vec<u8>) {
         self.write(SENT, 0, out);

@@ -433,6 +433,19 @@ impl Room {
         self.threads.sharing().held()
     }
 
+    /// Share sound, for this PC's share: the sound of every other program
+    /// on this PC goes out with it to those watching on 1.3.0 or later, and
+    /// only while someone who can hear it watches. Off at the start of
+    /// every share and never saved; `share.own_sound` says whether it is on
+    /// and why it cannot be. On, the capture opens, and the watchers hear it
+    /// is on once it has; it runs while the share is not paused. A capture
+    /// that cannot start, or stops on an error, turns it off with a problem
+    /// line, and the share goes on. Nothing captured after the press that
+    /// turns it off or pauses the share goes out.
+    pub fn share_sound(&self, on: bool) {
+        self.threads.share_sound(on);
+    }
+
     /// Watch, or Stop watching, the share the view named with `share`. The
     /// host passes video on only to those who watch. Watching opens the
     /// viewer's window, on the room's own thread; closing the window is the
@@ -638,6 +651,10 @@ fn screen_setup(config: &Config, socket: &Arc<Socket>) -> Result<ScreenSetup, Ro
         hevc: config.video.hevc,
         injector: config.video.injector.clone(),
         control_wake: net::pace::Signal::new().map_err(RoomError::Start)?,
+        pc_sound: match &config.voice.devices {
+            Devices::Windows => None,
+            Devices::Fake { pc_sound, .. } => Some(pc_sound.clone()),
+        },
     })
 }
 

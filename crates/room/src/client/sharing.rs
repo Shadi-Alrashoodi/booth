@@ -19,7 +19,9 @@ use crate::screen::{
 use crate::socket::Socket;
 use crate::sound;
 use crate::talk::Outlet;
-use crate::view::{ChatLine, CurrentShare, LineKind, LinkState, ShareView, Unheard};
+use crate::view::{
+    ChatLine, CurrentShare, LineKind, LinkState, NoSound, OwnSound, ShareView, Unheard,
+};
 
 // Who shares in a roster, and their share.
 fn sharer_of(roster: &Roster) -> Option<(&Entry, EntryShare)> {
@@ -96,6 +98,67 @@ impl Client {
         self.control_share_ended(now);
         self.screen.sharing.set_state(OwnShare::Off);
         true
+    }
+
+    // The panel's Share sound for this PC's share, pressed at `press`: only
+    // through a host whose copy reads it (peer::PC_SOUND_SINCE), and never
+    // from a room standing for an older copy (Config::version).
+    pub(crate) fn set_share_sound(
+        &mut self,
+        on: bool,
+        press: Instant,
+        now: Instant,
+        socket: &Socket,
+    ) -> bool {
+        if self.state == LinkState::Closed {
+            return false;
+        }
+        let Some(share) = self.screen.sharing.number() else {
+            return false;
+        };
+        if on && !self.sound_goes() {
+            if self.link.sound_read {
+                log!(
+                    self.log,
+                    "share {share}: share sound left off, this room stands for booth {}",
+                    self.version
+                );
+            } else {
+                log!(
+                    self.log,
+                    "share {share}: share sound left off, the host runs a booth older than 1.3.0"
+                );
+            }
+            return false;
+        }
+        if !self.own_sound.turn(on, share, press) {
+            return false;
+        }
+        self.own_sound_step(now, socket);
+        true
+    }
+
+    fn sound_goes(&self) -> bool {
+        self.link.sound_read && self.version >= crate::peer::PC_SOUND_SINCE
+    }
+
+    // What the capture of this PC's share said, and the pause: the host
+    // hears whether its sound goes out, and the chat why it stopped. True
+    // when the view changed.
+    fn own_sound_step(&mut self, now: Instant, socket: &Socket) -> bool {
+        let share = self.screen.sharing.number();
+        let said = self.own_sound.step(share);
+        let changed = said.tell.is_some() || said.problem.is_some();
+        if let (Some(on), Some(share)) = (said.tell, share)
+            && self.sound_goes()
+        {
+            self.link.queue(&Message::ShareSound { share, on });
+            self.flush(now, socket);
+        }
+        if let Some(line) = said.problem {
+            self.problem_line(line);
+        }
+        changed
     }
 
     // The panel's Watch and Stop watching, for the share it showed.
@@ -179,6 +242,7 @@ impl Client {
         for news in self.screen.watching.take_news() {
             changed |= self.watch_news(news, now, socket);
         }
+        changed |= self.own_sound_step(now, socket);
         // The viewer found out what it decodes after the Watch went: the
         // host hears it again, as it may change the share's codec.
         if self.screen.watching.take_hevc_changed()
@@ -342,6 +406,39 @@ impl Client {
             .into_iter();
         let sent = &self.video_out;
         self.screen.publish(links, || {
+            session
+                .zip(to)
+                .and_then(|(session, to)| {
+                    Some(Outlet {
+                        sealer: session.sealer()?,
+                        to,
+                        sent: Arc::clone(sent),
+                    })
+                })
+                .into_iter()
+                .collect()
+        });
+        // Its PC sound goes to the host only while someone watches, and
+        // stops at once with the share.
+        let number = self
+            .screen
+            .sharing
+            .number()
+            .filter(|_| self.state != LinkState::Closed);
+        self.own_sound.follow(number);
+        let heard = number.is_some()
+            && self.sound_goes()
+            && self
+                .screen
+                .sharing
+                .facts()
+                .is_some_and(|facts| facts.watchers > 0);
+        let session = session.filter(|_| heard);
+        let links = session
+            .zip(to)
+            .map(|(session, to)| (session.remote_index(), to))
+            .into_iter();
+        self.own_sound.publish(links, || {
             session
                 .zip(to)
                 .and_then(|(session, to)| {
@@ -659,6 +756,7 @@ impl Client {
     pub(super) fn share_over(&mut self) {
         self.control_over(ControlEnd::SessionLost);
         self.end_own_share();
+        self.own_sound.follow(None);
         self.stop_watching();
     }
 
@@ -711,6 +809,10 @@ impl Client {
                 .screen
                 .watched
                 .is_some_and(|share| self.sound.says_on(share)),
+            own_sound: OwnSound {
+                on: self.own_sound.is_on(self.screen.sharing.number()),
+                unavailable: (!self.link.sound_read).then_some(NoSound::OldHost),
+            },
         }
     }
 

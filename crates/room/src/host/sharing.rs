@@ -22,7 +22,7 @@ use crate::screen::{
 use crate::socket::Socket;
 use crate::sound;
 use crate::talk::{Outlet, Sent};
-use crate::view::{ChatLine, CurrentShare, LineKind, ShareState, ShareView, Unheard};
+use crate::view::{ChatLine, CurrentShare, LineKind, OwnSound, ShareState, ShareView, Unheard};
 
 // A watcher's loss report counts for this long, as a listener's voice
 // report does.
@@ -301,6 +301,56 @@ impl Host {
         true
     }
 
+    // The panel's Share sound for this host's own share, pressed at
+    // `press`. A room standing for an older copy has none.
+    pub(crate) fn set_share_sound(
+        &mut self,
+        on: bool,
+        press: Instant,
+        now: Instant,
+        socket: &Socket,
+    ) -> bool {
+        let Some(share) = self.own_live_share().filter(|_| !self.closed) else {
+            return false;
+        };
+        if on && self.version < crate::peer::PC_SOUND_SINCE {
+            log!(
+                self.log,
+                "share {share}: share sound left off, this room stands for booth {}",
+                self.version
+            );
+            return false;
+        }
+        if !self.own_sound.turn(on, share, press) {
+            return false;
+        }
+        self.own_sound_step(now, socket);
+        true
+    }
+
+    // What the capture of this host's own share said, and the pause: its
+    // watchers hear whether its sound goes out, and the chat why it stopped.
+    // True when the view changed.
+    fn own_sound_step(&mut self, now: Instant, socket: &Socket) -> bool {
+        let said = self.own_sound.step(self.own_live_share());
+        let changed = said.tell.is_some() || said.problem.is_some();
+        if let Some(on) = said.tell {
+            self.share_sound(on, now, socket);
+        }
+        if let Some(line) = said.problem {
+            self.problem_line(line);
+        }
+        changed
+    }
+
+    fn own_live_share(&self) -> Option<u32> {
+        let own = *self.identity.public();
+        self.live
+            .as_ref()
+            .filter(|live| live.sharer == own)
+            .map(|live| live.number)
+    }
+
     // The panel's Watch and Stop watching, for the share it showed.
     pub(crate) fn watch(&mut self, share: u32, on: bool, now: Instant, socket: &Socket) -> bool {
         if self.closed {
@@ -351,6 +401,7 @@ impl Host {
         for news in self.screen.watching.take_news() {
             changed |= self.watch_news(news, now, socket);
         }
+        changed |= self.own_sound_step(now, socket);
         // This host's viewer found out what it decodes after it started
         // watching.
         if self.screen.watching.take_hevc_changed() && self.screen.watched.is_some() {
@@ -498,6 +549,30 @@ impl Host {
             peers
                 .iter()
                 .filter(watching)
+                .filter_map(|peer| {
+                    Some(Outlet {
+                        sealer: peer.sessions.current.as_ref()?.sealer()?,
+                        to: peer.media.to(),
+                        sent: Arc::clone(&peer.share.video_out),
+                    })
+                })
+                .collect()
+        });
+        // Its PC sound goes only to the watchers whose copies read it, and
+        // stops at once with the share.
+        self.own_sound.follow(number);
+        let reads = self.version >= crate::peer::PC_SOUND_SINCE;
+        let hears = |peer: &&Peer| reads && watching(peer) && peer.link.sound_read;
+        let links = peers.iter().filter(hears).filter_map(|peer| {
+            let session = peer.sessions.current.as_ref()?;
+            session
+                .is_confirmed()
+                .then(|| (session.remote_index(), peer.media.to()))
+        });
+        self.own_sound.publish(links, || {
+            peers
+                .iter()
+                .filter(hears)
                 .filter_map(|peer| {
                     Some(Outlet {
                         sealer: peer.sessions.current.as_ref()?.sealer()?,
@@ -1147,6 +1222,7 @@ impl Host {
         self.close_control();
         self.live = None;
         self.screen.sharing.set_state(OwnShare::Off);
+        self.own_sound.follow(None);
         self.screen.stop_watching();
         self.sound.stop(Instant::now());
     }
@@ -1854,6 +1930,10 @@ impl Host {
                 .screen
                 .watched
                 .is_some_and(|share| self.sound.says_on(share)),
+            own_sound: OwnSound {
+                on: self.own_sound.is_on(self.own_live_share()),
+                unavailable: None,
+            },
         }
     }
 

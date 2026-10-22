@@ -2144,6 +2144,7 @@ fn on_headset(close: Duration) -> (VoiceConfig, Fake, Fake) {
     voice.devices = Devices::Fake {
         microphone: microphone.clone(),
         speakers: speakers.clone(),
+        pc_sound: common::quiet_pc_sound(),
     };
     (voice, microphone, speakers)
 }
@@ -2277,6 +2278,7 @@ fn waiting_for_a_headset_says_so() {
     voice.devices = Devices::Fake {
         microphone: microphone.clone(),
         speakers: speakers.clone(),
+        pc_sound: common::quiet_pc_sound(),
     };
     let mut first = host_on(&voice, 0);
     poll(Duration::from_secs(3), "the first room opens both", || {
@@ -2372,6 +2374,7 @@ fn mute_while_waiting_leaves_no_line() {
     voice.devices = Devices::Fake {
         microphone: microphone.clone(),
         speakers: speakers.clone(),
+        pc_sound: common::quiet_pc_sound(),
     };
     let mut first = host_on(&voice, 0);
     poll(Duration::from_secs(3), "the first room opens both", || {

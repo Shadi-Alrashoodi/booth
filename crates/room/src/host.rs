@@ -40,7 +40,7 @@ use crate::reply::{self, Punches, ReplyAccepted, ReplyRefused};
 use crate::router::{self, PortMap};
 use crate::screen::{Screen, ScreenSetup, Sharing, Watching};
 use crate::socket::Socket;
-use crate::sound::Sound;
+use crate::sound::{Sound, Switch};
 use crate::stun::{Answer, Moved, Stun};
 use crate::talk::{self, Outlet, Sent, Talk, ToSpeaker};
 use crate::view::{
@@ -470,6 +470,8 @@ pub(crate) struct Host {
     // This host as a watcher of a friend's share, and that share's PC sound.
     own_watcher: Watcher,
     sound: Sound,
+    // Share sound on this host's own share.
+    own_sound: Switch,
     // The friend whose share ended last, until when what they sent before
     // it ended is let go quietly.
     share_ended: Option<([u8; 32], Instant)>,
@@ -524,6 +526,13 @@ impl Host {
         );
         let clock = Clock::new(setup.now);
         let sound = Sound::new(setup.speaker.clone(), clock, setup.log.clone(), setup.now);
+        let (pc_sound, upload_kbps) = (setup.screen.pc_sound.clone(), setup.screen.upload_kbps);
+        let screen = Screen::new(clock, true, setup.screen, setup.now);
+        let own_sound = Switch::new(
+            Arc::clone(screen.sharing.sound()),
+            pc_sound,
+            setup.log.clone(),
+        );
         let talk = Talk::new(
             setup.voice,
             setup.speaker,
@@ -604,17 +613,15 @@ impl Host {
             voice_plain: Vec::with_capacity(talk::MAX_VOICE + 1),
             voice_sealed: Vec::with_capacity(talk::MAX_VOICE + 1 + session::DATA_OVERHEAD),
             last_slot: 0,
-            upload_kbps: setup.screen.upload_kbps,
-            relay_upload: Bucket::full(
-                setup.now,
-                sharing::relay_per_second(setup.screen.upload_kbps),
-            ),
+            upload_kbps,
+            relay_upload: Bucket::full(setup.now, sharing::relay_per_second(upload_kbps)),
             relay_first: 0,
-            screen: Screen::new(clock, true, setup.screen, setup.now),
+            screen,
             live: None,
             next_share: 1,
             own_watcher: Watcher::default(),
             sound,
+            own_sound,
             share_ended: None,
             left_limits: Vec::new(),
             video_sealed: Vec::with_capacity(crate::screen::LAN_DATAGRAM),

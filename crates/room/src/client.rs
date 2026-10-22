@@ -28,7 +28,7 @@ use crate::peer::{self, Clock, Drops, Link, MediaPath, Opened, Plain, Sessions, 
 use crate::reply;
 use crate::screen::{Screen, ScreenSetup, Sharing, Watching};
 use crate::socket::Socket;
-use crate::sound::Sound;
+use crate::sound::{Sound, Switch};
 use crate::stun::{Answer, Moved, Stun};
 use crate::talk::{self, Outlet, Sent, Talk, ToSpeaker};
 use crate::view::{
@@ -417,6 +417,8 @@ pub(crate) struct Client {
     screen: Screen,
     // The PC sound of the share this PC watches.
     sound: Sound,
+    // Share sound on this PC's own share.
+    own_sound: Switch,
     // What this PC's share sent to the host, from the sharer's thread.
     video_out: Arc<Sent>,
     // The host's word on the clock of the friend whose share this PC
@@ -488,6 +490,13 @@ impl Client {
             clock,
             setup.log.clone(),
             setup.joined,
+        );
+        let pc_sound = setup.screen.pc_sound.clone();
+        let screen = Screen::new(clock, false, setup.screen, setup.joined);
+        let own_sound = Switch::new(
+            Arc::clone(screen.sharing.sound()),
+            pc_sound,
+            setup.log.clone(),
         );
         let talk = Talk::new(
             setup.voice,
@@ -581,8 +590,9 @@ impl Client {
             host_periods: None,
             told_periods: None,
             jittery: false,
-            screen: Screen::new(clock, false, setup.screen, setup.joined),
+            screen,
             sound,
+            own_sound,
             video_out: Arc::default(),
             sharer_clock: None,
             sharer_unread: None,

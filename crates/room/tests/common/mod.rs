@@ -99,10 +99,22 @@ pub fn quiet_voice() -> VoiceConfig {
         devices: Devices::Fake {
             microphone: Fake::new(setup, &[("mic", "Test microphone")], Some("mic")),
             speakers: Fake::new(setup, &[("out", "Test speakers")], Some("out")),
+            pc_sound: quiet_pc_sound(),
         },
         automatic_volume: false,
         ..VoiceConfig::default()
     }
+}
+
+// PC sound that is silence, so a room that turns Share sound on captures
+// nothing of this PC's.
+pub fn quiet_pc_sound() -> Fake {
+    let setup = Setup {
+        period_frames: 480,
+        buffer_frames: 960,
+        ..Setup::default()
+    };
+    Fake::new(setup, &[("pc", "Test PC sound")], Some("pc"))
 }
 
 // A folder of its own for each room's known list, so tests running side by
@@ -1325,6 +1337,16 @@ pub struct Hand {
 
 impl Hand {
     pub fn join(invite: &Invite, host: SocketAddr, name: &str) -> Hand {
+        Hand::join_as(invite, host, name, invite::VERSION)
+    }
+
+    // As join, with a Hello that says `version`.
+    pub fn join_as(
+        invite: &Invite,
+        host: SocketAddr,
+        name: &str,
+        version: invite::Version,
+    ) -> Hand {
         let identity = Identity::generate();
         let socket = Arc::new(UdpSocket::bind(loopback(0)).expect("bind the hand's socket"));
         let stop = Arc::new(AtomicBool::new(false));
@@ -1366,7 +1388,6 @@ impl Hand {
         // The control message Hello: kind 24, the protocol and the version,
         // each little-endian, the name, and no address.
         let mut hello = vec![24];
-        let version = invite::VERSION;
         for part in [
             invite::PROTOCOL,
             version.major,
@@ -1400,6 +1421,20 @@ impl Hand {
     pub fn received(&mut self) -> Vec<(channels::Channel, Vec<u8>)> {
         self.pump();
         std::mem::take(&mut self.inbox)
+    }
+
+    // The control messages the host's stream delivered since the last look,
+    // in order, each acked as a real client acks it.
+    pub fn messages(&mut self) -> Vec<Vec<u8>> {
+        self.pump();
+        let mut messages = Vec::new();
+        while let Some(message) = self.reliable.next_delivered() {
+            messages.push(message);
+        }
+        while let Some(frame) = self.reliable.poll_transmit(Instant::now(), None) {
+            self.send(channels::Channel::Control, &frame);
+        }
+        messages
     }
 
     // Answers the host's pings that came since the last look, on the clock

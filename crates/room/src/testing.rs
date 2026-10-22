@@ -130,10 +130,23 @@ pub(crate) fn fake_voice() -> crate::talk::VoiceConfig {
         devices: crate::talk::Devices::Fake {
             microphone: Fake::new(setup, &[("mic", "Test microphone")], Some("mic")),
             speakers: Fake::new(setup, &[("out", "Test speakers")], Some("out")),
+            pc_sound: quiet_pc_sound(),
         },
         automatic_volume: false,
         ..crate::talk::VoiceConfig::default()
     }
+}
+
+// PC sound that is silence, so a room that turns Share sound on captures
+// nothing of this PC's.
+pub(crate) fn quiet_pc_sound() -> voice::audio::fake::Fake {
+    use voice::audio::fake::{Fake, Setup};
+    let setup = Setup {
+        period_frames: 480,
+        buffer_frames: 960,
+        ..Setup::default()
+    };
+    Fake::new(setup, &[("pc", "Test PC sound")], Some("pc"))
 }
 
 // Sharing for a Host or a Client built by hand: no socket, so an Outbox
@@ -149,6 +162,7 @@ pub(crate) fn quiet_screen() -> crate::screen::ScreenSetup {
         hevc: true,
         injector: None,
         control_wake: net::pace::Signal::new().expect("create an event"),
+        pc_sound: Some(quiet_pc_sound()),
     }
 }
 

@@ -50,6 +50,7 @@ use crate::limit::Bucket;
 use crate::peer::{Clock, MEDIA_FLOWS_FOR};
 use crate::remote::{Area, Controls, Gate, Injector, Remote};
 use crate::socket::Socket;
+use crate::sound;
 use crate::talk::{Cue, HOST_SLOT, OnLink, Outlet};
 use crate::view::{
     Numbers, Paused, RunningShare, ShareState, SharingNumbers, WatchCap, WatchingNumbers,
@@ -331,6 +332,8 @@ pub struct Sharing {
     // The shared monitor on this PC's desktop, while a share of one runs:
     // where a controller's points land, and where the indicator goes.
     area: Mutex<Option<Area>>,
+    // Where the share's PC sound goes, from its capture's own thread.
+    sound: Arc<sound::Outgoing>,
 }
 
 // This PC's own share, and the one the rising cue played for until the
@@ -390,6 +393,7 @@ impl Sharing {
         wake: Signal,
     ) -> Arc<Sharing> {
         Arc::new(Sharing {
+            sound: Arc::new(sound::Outgoing::new(clock, host, socket.clone())),
             clock,
             host,
             socket,
@@ -524,6 +528,14 @@ impl Sharing {
             }
             _ => true,
         };
+        // Before the state says so: the PC sound of a share that ended, or a
+        // gate that a new share would inherit, never goes out.
+        if ended || new_share {
+            self.sound.share_changed(match state {
+                OwnShare::Sharing { number, .. } => Some(number),
+                _ => None,
+            });
+        }
         if own.cued.is_some() && (ended || new_share) {
             own.cued = None;
             self.play(Cue::Falling);
@@ -545,8 +557,15 @@ impl Sharing {
     // encoder and sends nothing, not even to someone who starts watching.
     // A new share starts unheld.
     pub(crate) fn set_held(&self, held: bool) {
+        // First, on the thread that pressed: no PC sound captured from the
+        // press on goes out, whatever the room is doing.
+        self.sound.set_held(held, Instant::now());
         self.held.store(held, Ordering::Relaxed);
         self.wake.set();
+    }
+
+    pub(crate) fn sound(&self) -> &Arc<sound::Outgoing> {
+        &self.sound
     }
 
     pub(crate) fn held(&self) -> bool {
@@ -667,11 +686,12 @@ impl Sharing {
         }
     }
 
-    // This PC's video went out lately.
+    // This PC's video or PC sound went out lately.
     pub(crate) fn sent_lately(&self, now: Instant) -> bool {
         let last = self.last_sent_us.load(Ordering::Relaxed);
-        last != 0
-            && self.clock.micros(now).saturating_sub(last) < MEDIA_FLOWS_FOR.as_micros() as u64
+        let video = last != 0
+            && self.clock.micros(now).saturating_sub(last) < MEDIA_FLOWS_FOR.as_micros() as u64;
+        video || self.sound.sent_lately(now)
     }
 
     fn set_outlets(&self, outlets: Vec<Outlet>) {
@@ -1618,6 +1638,9 @@ pub(crate) struct ScreenSetup {
     // thread waits on.
     pub injector: Option<Arc<dyn Injector>>,
     pub control_wake: Signal,
+    // Where the share's PC sound is captured: the fake of Devices::Fake, or
+    // Windows' own with None.
+    pub pc_sound: Option<voice::audio::fake::Fake>,
 }
 
 // The room's side of sharing that both roles keep, under the state lock.

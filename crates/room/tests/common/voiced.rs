@@ -12,7 +12,7 @@ use room::view::{LinkState, View};
 use room::{Config, Devices, TalkMode, Timers, VoiceConfig};
 use voice::audio::fake::{Fake, Setup};
 
-use super::{Member, config, poll};
+use super::{Member, config, poll, quiet_pc_sound};
 
 // Each test runs audio threads on the real clock, and two at once would
 // measure each other.
@@ -84,6 +84,7 @@ pub fn voiced_at(
         devices: Devices::Fake {
             microphone: microphone.clone(),
             speakers: speakers.clone(),
+            pc_sound: quiet_pc_sound(),
         },
         talk,
         constant_rate,
@@ -107,6 +108,7 @@ pub fn slow_to_close(
     config.voice.devices = Devices::Fake {
         microphone: microphone.clone(),
         speakers: speakers.clone(),
+        pc_sound: quiet_pc_sound(),
     };
     (config, microphone, speakers)
 }

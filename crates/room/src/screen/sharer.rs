@@ -943,6 +943,7 @@ impl Audience for Watchers<'_> {
     }
 
     fn resumed(&mut self) {
+        self.sharing.sound().set_away(false, Instant::now());
         log!(self.log, "share {}: capture back", self.number);
         self.sharing
             .set_running(self.sharing.running().map(|running| RunningShare {
@@ -952,6 +953,15 @@ impl Audience for Watchers<'_> {
     }
 
     fn paused(&mut self, reason: &PauseReason) {
+        // Locked, on a UAC prompt or disconnected, the PC may be left alone,
+        // and what it plays then is not the sharer's to send: the PC sound
+        // stops as for a pause by hand, before anything says paused. A
+        // minimized window, a monitor taken, changing or gone keep it.
+        let away = matches!(
+            reason,
+            PauseReason::SecureDesktop | PauseReason::Disconnected
+        );
+        self.sharing.sound().set_away(away, Instant::now());
         log!(self.log, "share {}: capture paused: {reason}", self.number);
         let paused = match reason {
             PauseReason::SecureDesktop => Paused::SecureDesktop,
@@ -1231,6 +1241,38 @@ mod tests {
             crate::screen::share_failed(&why, false),
             "Could not start sharing: the region is 255x1080, smaller than 256 by 256 pixels. Draw a bigger one."
         );
+    }
+
+    // The lock screen, a UAC prompt and a disconnected session stop the
+    // share's PC sound as a pause by hand does, and it comes back with the
+    // picture. A minimized window and the monitor's own pauses keep it.
+    #[test]
+    fn the_secure_desktop_and_a_lost_session_stop_pc_sound() {
+        let wake = net::pace::Signal::new().expect("create an event");
+        let clock = crate::peer::Clock::new(Instant::now());
+        let sharing = Sharing::new(clock, false, None, 1000, wake);
+        let log = Log::off();
+        let mut watchers = Watchers::new(&sharing, &log, 1);
+        let sound = Arc::clone(sharing.sound());
+        for (reason, stops) in [
+            (PauseReason::Minimized, false),
+            (PauseReason::Taken, false),
+            (PauseReason::Missing, false),
+            (PauseReason::SecureDesktop, true),
+            (PauseReason::Disconnected, true),
+        ] {
+            watchers.paused(&reason);
+            assert_eq!(sound.paused(), stops, "{reason}");
+            watchers.resumed();
+            assert!(!sound.paused(), "{reason}");
+        }
+        // Paused by hand as well, it stays paused when the picture is back.
+        watchers.paused(&PauseReason::SecureDesktop);
+        sharing.set_held(true);
+        watchers.resumed();
+        assert!(sound.paused());
+        sharing.set_held(false);
+        assert!(!sound.paused());
     }
 
     // The source can answer with a pointer update, or with nothing new,

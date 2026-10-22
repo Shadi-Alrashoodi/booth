@@ -3,8 +3,8 @@
 // working set and private bytes, every gauge the crates set (stats::mem),
 // the heap Booth's own code holds by the name of the thread that took it,
 // and the sizes of egui's caches. --fake-audio swaps the microphone for a
-// tone that comes and goes and the speakers for a sink, so voice runs on a
-// PC with no microphone.
+// tone that comes and goes, the speakers for a sink and PC sound for
+// silence, so voice runs on a PC with no microphone.
 //
 // The heap counts come from a global allocator that puts a small header in
 // front of every block with the thread it was taken on, so a block freed on
@@ -50,11 +50,11 @@ pub fn take_flags(args: Vec<OsString>) -> Vec<OsString> {
 // None for Windows' own devices, which is what a run without --fake-audio
 // gets.
 pub fn devices() -> Option<Devices> {
-    static PAIR: OnceLock<(Fake, Fake)> = OnceLock::new();
+    static DEVICES: OnceLock<(Fake, Fake, Fake)> = OnceLock::new();
     if !FAKE.load(Ordering::Relaxed) {
         return None;
     }
-    let (microphone, speakers) = PAIR.get_or_init(|| {
+    let (microphone, speakers, pc_sound) = DEVICES.get_or_init(|| {
         let tone = Setup {
             signal: tone,
             ..Setup::default()
@@ -62,11 +62,15 @@ pub fn devices() -> Option<Devices> {
         (
             Fake::unrecorded(tone, &[("tone", "Tone")], Some("tone")),
             Fake::unrecorded(Setup::default(), &[("sink", "Sink")], Some("sink")),
+            // Silence in place of what this PC plays: Share sound sends
+            // nothing.
+            Fake::unrecorded(Setup::default(), &[("quiet", "Quiet")], Some("quiet")),
         )
     });
     Some(Devices::Fake {
         microphone: microphone.clone(),
         speakers: speakers.clone(),
+        pc_sound: pc_sound.clone(),
     })
 }
 
