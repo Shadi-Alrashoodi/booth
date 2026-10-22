@@ -2,7 +2,8 @@
 // test makes and moves about. Numbers only, as for the desktop: sizes,
 // pauses and timings, never the pixels.
 
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -11,10 +12,10 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DispatchMessageW, IsWindow, MSG, PM_REMOVE, PeekMessageW, PostMessageW,
     SW_MINIMIZE, SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetWindowPos,
-    ShowWindowAsync, TranslateMessage, WINDOW_STYLE, WM_CLOSE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    SetWindowTextW, ShowWindowAsync, TranslateMessage, WINDOW_STYLE, WM_CLOSE, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
-use windows::core::w;
+use windows::core::{HSTRING, w};
 
 // A window on its own thread, which pumps its messages until it is closed.
 struct Window(isize);
@@ -313,6 +314,75 @@ fn a_window_kept_in_a_frame() {
     let sizes = sizes_for(&mut capture, Duration::from_secs(1));
     assert_eq!(sizes.last(), Some(&(900, 500)), "{sizes:?}");
     assert!(capture.again().unwrap().is_none());
+}
+
+// A window whose text changes as fast as its thread paints, about 180 times
+// a second, shared at 120: more than 60 frames a second where Windows takes
+// a shorter interval than its own pace, build 26100 and later, and no more
+// than 60 where it does not. The frames the fps cap held and sent later are
+// counted: judged by the moments frames arrive, a quarter of them were;
+// judged by Windows' stamps, from 1 in 40 to 1 in 10, the holds a change
+// rate off the refresh grid makes anyway.
+#[test]
+fn a_fast_window_comes_at_the_rate_asked() {
+    let Some(adapter) = adapter() else { return };
+    let window = Window::open(640, 360);
+    let options = Options {
+        max_width: 0,
+        max_height: 0,
+        max_fps: 120,
+    };
+    let mut capture = WindowCapture::open(window.id(), &adapter, options).unwrap();
+    frame_size(&mut capture, Duration::from_secs(2)).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let changes = Arc::new(AtomicU64::new(0));
+    let changer = {
+        let (stop, changes, hwnd) = (Arc::clone(&stop), Arc::clone(&changes), window.0);
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let text = HSTRING::from(format!("{}", changes.load(Ordering::Relaxed)));
+                // SAFETY: sent to the window's own thread, which paints it.
+                let _ = unsafe { SetWindowTextW(HWND(hwnd as *mut _), &text) };
+                changes.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    };
+    thread::sleep(Duration::from_millis(200));
+    let (mut frames, mut held) = (0u32, 0u32);
+    let changed = changes.load(Ordering::Relaxed);
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        if let Next::Frame(frame) = capture.next().unwrap() {
+            frames += 1;
+            if frame.converted.elapsed() > Duration::from_millis(1) {
+                held += 1;
+            }
+        }
+    }
+    let changed = changes.load(Ordering::Relaxed) - changed;
+    stop.store(true, Ordering::Relaxed);
+    changer.join().unwrap();
+    let seconds = start.elapsed().as_secs_f64();
+    let fps = f64::from(frames) / seconds;
+    println!(
+        "{:.0} changes a second, {fps:.1} frames a second, {held} of {frames} sent after being held; {}",
+        changed as f64 / seconds,
+        capture
+            .pacing_note()
+            .unwrap_or("Windows takes a shorter interval")
+    );
+    assert!(
+        changed as f64 / seconds > 150.0,
+        "the window changed too slowly"
+    );
+    // DWM composes no faster than the monitor's refresh.
+    let refresh = capture::window_monitor(window.id()).map_or(60.0, |monitor| monitor.refresh_hz);
+    if capture.pacing_note().is_some() {
+        assert!(fps < 62.0, "{fps:.1} frames a second");
+    } else {
+        assert!(fps > refresh.min(120.0) * 0.9, "{fps:.1} frames a second");
+        assert!(held * 5 < frames, "{held} of {frames} frames were held");
+    }
 }
 
 #[test]

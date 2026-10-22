@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
-use windows::Foundation::TypedEventHandler;
+use windows::Foundation::{TimeSpan, TypedEventHandler};
 use windows::Graphics::Capture::{
     Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
 };
@@ -66,6 +66,13 @@ pub const WINDOW_GONE: &str = "the window you chose is not open any more. Choose
 
 // Why a window share stops when the window closes while it runs.
 pub const WINDOW_CLOSED: &str = "the shared window was closed";
+
+// The furthest ahead of the moment a frame is taken that its stamp is
+// believed: more than a refresh at 60 Hz.
+const STAMP_AHEAD: Duration = Duration::from_millis(20);
+
+// For the log, where Windows keeps a window share to its own pace.
+const PACED: &str = "Windows sends the shared window at most 60 frames a second: only build 26100 and later let a program ask for more";
 
 // What a window share is opened by: the window's handle and the program that
 // owns it, since Windows gives the handle of a closed window to new ones.
@@ -136,6 +143,7 @@ pub struct WindowCapture {
     content: Option<(u32, u32)>,
     kept: Option<Kept>,
     border: Border,
+    paced: bool,
     pointer: Pointer,
     timer: Timer,
     number: u64,
@@ -329,6 +337,7 @@ impl WindowCapture {
         session
             .SetIsCursorCaptureEnabled(false)
             .map_err(fail("leave the pointer out of the pictures of"))?;
+        let paced = !unpace(&session);
         let border = border::apply(&session);
         let arrived = Arc::new(Arrived::new()?);
         let closed = Arc::new(AtomicBool::new(false));
@@ -376,6 +385,7 @@ impl WindowCapture {
             content: None,
             kept: None,
             border,
+            paced,
             pointer: Pointer::new(window.hwnd),
             timer,
             number: 0,
@@ -394,6 +404,11 @@ impl WindowCapture {
     // Whether Windows draws its yellow border around the window, for the log.
     pub fn border(&self) -> &Border {
         &self.border
+    }
+
+    // For the log, when Windows holds the share under the rate it asked for.
+    pub fn pacing_note(&self) -> Option<&'static str> {
+        (self.paced && self.options.max_fps > 60).then_some(PACED)
     }
 
     // From the next picture on.
@@ -649,12 +664,19 @@ impl WindowCapture {
         let present_qpc =
             (i128::from(time.Duration) * i128::from(self.qpc_frequency) / i128::from(TICKS)) as i64;
         let present = present_instant(acquired, acquired_qpc, present_qpc, self.qpc_frequency);
+        let stamped = stamp_instant(
+            present,
+            acquired,
+            acquired_qpc,
+            present_qpc,
+            self.qpc_frequency,
+        );
         let times = (present, acquired, converted);
         if self.pending.take().is_some() {
             self.skipped += 1;
         }
         let cursor = self.poll_pointer(self.layout.plan != before);
-        Ok(match self.cap.arrive(present) {
+        Ok(match self.cap.arrive(stamped) {
             Decision::Send => Some(Next::Frame(self.frame_out(slot, times, cursor))),
             // The pointer never waits for the picture.
             Decision::Hold => {
@@ -854,6 +876,49 @@ fn frame_size(window: WindowId) -> Option<(i32, i32)> {
     }
     .ok()?;
     Some((bounds.right - bounds.left, bounds.bottom - bounds.top))
+}
+
+// Windows hands a window's frame over as soon as DWM has composed it, and
+// stamps it with the refresh it is for: on this PC's 240 Hz monitor the
+// stamp was 2.8 to 3.6 ms after the frame was taken. The stamps sit on the
+// refresh grid, where the moments frames arrive wobble by a millisecond and
+// more, so the fps cap judges frames by them, as it does a monitor's; a
+// frame's present stays the moment it was taken, the earliest the picture
+// can be said to be on the screen. A stamp before that, or more than
+// STAMP_AHEAD after it, is not on any grid near: the cap gets the present.
+fn stamp_instant(
+    present: Instant,
+    acquired: Instant,
+    acquired_qpc: i64,
+    stamp_qpc: i64,
+    frequency: i64,
+) -> Instant {
+    let ahead = stamp_qpc.saturating_sub(acquired_qpc);
+    if ahead <= 0 {
+        return present;
+    }
+    let nanos = ahead as u128 * 1_000_000_000 / frequency.max(1) as u128;
+    let ahead = Duration::from_nanos(nanos.min(u64::MAX as u128) as u64);
+    if ahead > STAMP_AHEAD {
+        return present;
+    }
+    acquired + ahead
+}
+
+// Windows paces a capture session to 60 frames a second unless it is given
+// a shorter interval, which only build 26100 and later take: a 120 fps share
+// of a window moving at 240 on a 240 Hz monitor here got 59.9 a second
+// without it. 1 ms lets every frame DWM composes through, as Desktop
+// Duplication does, and leaves the choice to the fps cap. Half the share's
+// interval, which also lifts the 60, made Windows hand frames over late:
+// a 60 fps share's capture to display went from 4.4 to 12.3 ms. False where
+// Windows keeps its own pace.
+fn unpace(session: &GraphicsCaptureSession) -> bool {
+    session
+        .SetMinUpdateInterval(TimeSpan {
+            Duration: TICKS / 1000,
+        })
+        .is_ok()
 }
 
 // `step` reads before "the shared window", as in "read the size of".

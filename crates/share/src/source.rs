@@ -413,6 +413,9 @@ pub(crate) fn open(
         let source = Source::open(choice, options)?;
         if let Source::Window(capture) = &source {
             say(Line::Log(capture.border().to_string()));
+            if let Some(note) = capture.pacing_note() {
+                say(Line::Log(note.to_string()));
+            }
         }
         let size = source.size();
         let fps = options.max_fps;
