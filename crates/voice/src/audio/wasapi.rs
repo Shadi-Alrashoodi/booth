@@ -1,6 +1,8 @@
 // Every call into the Windows audio API (WASAPI and the device enumerator)
-// is in this file, and all of Booth's unsafe audio code with it. Everything
-// above it sees plain Rust types.
+// is in this file and its pc_sound module, and all of Booth's unsafe audio
+// code with it. Everything above it sees plain Rust types.
+
+mod pc_sound;
 
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -56,6 +58,8 @@ use super::error::AudioError;
 use super::format::{Format, RATE, plan};
 use super::microphone::hands_free;
 use super::stream::{Device, DeviceStream, Packet, Refused, StreamInfo, Wake};
+
+pub(crate) use pc_sound::device as pc_sound_device;
 
 // HRESULT_FROM_WIN32(ERROR_NOT_FOUND): no default device, or no device with
 // that id.
@@ -402,6 +406,7 @@ impl Session {
             io,
             client,
             signal,
+            pc_sound: false,
         })
     }
 
@@ -893,11 +898,20 @@ pub(crate) struct WasapiStream {
     io: Io,
     client: IAudioClient,
     signal: Signal,
+    // Process loopback's stream, whose errors are PC sound's, never a
+    // device's.
+    pc_sound: bool,
 }
 
 impl WasapiStream {
     fn fail(&self, step: &'static str) -> impl Fn(windows::core::Error) -> AudioError + '_ {
-        move |err| classify(&err, self.info.direction, &self.info.device, step)
+        move |err| {
+            if self.pc_sound {
+                pc_sound::classify(&err, true)
+            } else {
+                classify(&err, self.info.direction, &self.info.device, step)
+            }
+        }
     }
 
     // Points Windows' canceller at `reference`, the speakers Booth plays to,

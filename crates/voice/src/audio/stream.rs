@@ -4,7 +4,7 @@
 // only so a stop request is seen when the device has gone quiet.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -25,6 +25,8 @@ const WAIT: Duration = Duration::from_millis(20);
 // and come back in about this time when they switch profiles, and Windows
 // needs a moment to pick the next default.
 pub const REOPEN_AFTER: Duration = Duration::from_secs(1);
+// Windows' process loopback, which PC sound needs, comes with this build.
+pub const PC_SOUND_BUILD: u32 = 20348;
 // A device chosen in settings that is away is tried again whenever Windows
 // says the devices changed, and at least this often: a format change in the
 // sound settings ends a stream with no such notice, and a stream whose
@@ -226,10 +228,14 @@ struct Handle {
     // after it let go of the device and dropped the owner's callbacks.
     ended: Receiver<()>,
     shared: Arc<Shared>,
+    // Set at stop as well, for a device whose open waits on Windows and
+    // looks at it meanwhile.
+    stopping: Option<Arc<AtomicBool>>,
 }
 
 impl Handle {
     fn stop(&mut self) {
+        self.stopping();
         let _ = self.control.send(Control::Stop);
         if let Some(thread) = self.thread.take() {
             // A panic in a callback ends the thread; there is nothing left
@@ -246,9 +252,16 @@ impl Handle {
     }
 
     fn let_go(mut self) -> StreamThread {
+        self.stopping();
         let _ = self.control.send(Control::Stop);
         self.thread = None;
         self.outside()
+    }
+
+    fn stopping(&self) {
+        if let Some(stopping) = &self.stopping {
+            stopping.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -451,6 +464,21 @@ impl Render {
 pub struct PcSound(Handle);
 
 impl PcSound {
+    // From Windows' process loopback (see wasapi.rs), which leaves this
+    // process and every process it started out. Builds before PC_SOUND_BUILD
+    // have none, and the open fails there.
+    pub fn start(
+        audio: impl FnMut(&[f32], Instant, bool) + Send + 'static,
+        events: impl FnMut(Event) + Send + 'static,
+    ) -> Result<PcSound, AudioError> {
+        let stopping = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stopping);
+        let make = move |_, _| wasapi::pc_sound_device(flag);
+        let mut sound = PcSound::start_with(make, audio, events)?;
+        sound.0.stopping = Some(stopping);
+        Ok(sound)
+    }
+
     // `make` runs on the new thread, as for Capture::start_with. The device
     // has to give two channels.
     pub fn start_with<D, F>(
@@ -727,6 +755,7 @@ where
         thread: Some(thread),
         ended,
         shared,
+        stopping: None,
     })
 }
 

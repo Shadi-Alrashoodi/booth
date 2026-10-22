@@ -3,6 +3,9 @@ use std::fmt;
 use super::devices::Direction;
 use super::format::FormatError;
 
+// E_ACCESSDENIED, as Windows hands it over.
+const ACCESS_DENIED: u32 = 0x8007_0005;
+
 // Written the way the rest of Booth writes errors: lower case, what happened
 // and then what to do, parts joined with ". " so the panel can show them as
 // sentences.
@@ -178,6 +181,15 @@ impl fmt::Display for AudioError {
                 }
                 Ok(())
             }
+            // Windows' activation page says access denied may mean consent
+            // was not given, and loopback is heard as a microphone.
+            AudioError::PcSound {
+                code: ACCESS_DENIED,
+                lost: false,
+                ..
+            } => f.write_str(
+                "could not start PC sound: Windows says access is denied (0x80070005). Allow microphone access for desktop apps in Settings, Privacy and security, Microphone, then turn it on again",
+            ),
             AudioError::PcSound { code, text, lost } => {
                 let code = if *code == 0 {
                     String::new()

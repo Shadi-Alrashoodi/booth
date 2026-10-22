@@ -2,12 +2,17 @@
 // devices are listed, the output plays silence for a fraction of a second,
 // and the microphone is asked for its period and format, and opened once
 // for a moment to see what Windows does to it, what it hears going nowhere.
+// PC sound is opened for half a second, and of what other programs play only
+// the packets' sizes and times are kept.
 
+use std::process::Command;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use voice::audio::{self, AudioError, Capture, Choice, Direction, Echo, Event, Render};
+use voice::audio::{
+    self, AudioError, Capture, Choice, Direction, Echo, Event, PC_SOUND_BUILD, PcSound, Render,
+};
 
 // The tests that open a stream take turns: opening a Bluetooth headset's
 // microphone switches it to hands-free, and its output stream stops while
@@ -200,4 +205,127 @@ fn default_microphone_with_echo_cancellation() {
     // The microphone's own canceller, or Windows' in the communications
     // category: either way Windows lists it on the stream Booth kept.
     assert_eq!(info.echo.cancelled(), info.effects.echo_cancellation);
+}
+
+// The build as the registry has it: a test runs under no compatibility mode.
+fn windows_build() -> u32 {
+    let out = Command::new("reg")
+        .args([
+            "query",
+            r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+            "/v",
+            "CurrentBuildNumber",
+        ])
+        .output()
+        .expect("run reg");
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .last()
+        .and_then(|build| build.parse().ok())
+        .expect("a build number from reg")
+}
+
+fn ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+// Windows' process loopback opened as a room will: its stream as Windows
+// gives it, and the packets' stamps, one after another, read soon after.
+#[test]
+fn pc_sound_opens_and_stamps_its_packets() {
+    if audio::default_id(Direction::Output)
+        .expect("ask for the default output")
+        .is_none()
+    {
+        println!("skipped: Windows has no speakers or headphones turned on");
+        return;
+    }
+    let build = windows_build();
+    if build < PC_SOUND_BUILD {
+        println!(
+            "skipped: PC sound needs Windows build {PC_SOUND_BUILD} or later, this PC runs build {build}"
+        );
+        return;
+    }
+    let _turn = ONE_STREAM_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (tx, rx) = mpsc::channel();
+    let packets = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&packets);
+    let sound = PcSound::start(
+        move |samples: &[f32], time, gap| {
+            let quiet = samples.iter().all(|&s| s == 0.0);
+            seen.lock()
+                .unwrap()
+                .push((samples.len() / 2, time, gap, quiet, Instant::now()));
+        },
+        move |event| {
+            let _ = tx.send(event);
+        },
+    )
+    .expect("start the pc sound thread");
+    let info = match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Event::Opened(info)) => info,
+        other => panic!("pc sound did not open: {other:?}"),
+    };
+    std::thread::sleep(Duration::from_millis(500));
+    let (event_reads, quiet_reads) = sound.reads();
+    let glitches = sound.glitches();
+    let stopping = Instant::now();
+    sound.stop();
+    let stop_time = stopping.elapsed();
+
+    let packets = packets.lock().unwrap();
+    println!(
+        "{}: {}, opened in {:.1} ms",
+        info.device,
+        info.format,
+        ms(info.opened_in)
+    );
+    println!(
+        "period {:.2} ms ({} frames), buffer {} frames, stream latency {:.2} ms, refused first: {:?}",
+        info.period_ms(),
+        info.period_frames,
+        info.buffer_frames,
+        ms(info.stream_latency),
+        info.refused
+    );
+    let mut ages: Vec<Duration> = packets
+        .iter()
+        .map(|(_, time, _, _, read)| read.saturating_duration_since(*time))
+        .collect();
+    ages.sort();
+    let at = |share: f64| ages.get(((ages.len().max(1) - 1) as f64 * share).round() as usize);
+    println!(
+        "in 500 ms: {} packets, sizes {:?}, {} all zeros, {} after a gap; {event_reads} reads on the event, {quiet_reads} after a quiet wait; {glitches} glitches; stop took {:.2} ms",
+        packets.len(),
+        packets.iter().map(|p| p.0).take(8).collect::<Vec<_>>(),
+        packets.iter().filter(|p| p.3).count(),
+        packets.iter().filter(|p| p.2).count(),
+        ms(stop_time)
+    );
+    if let (Some(median), Some(p95), Some(most)) = (at(0.5), at(0.95), at(1.0)) {
+        println!(
+            "read after its stamp: median {:.2} ms, 95th {:.2} ms, longest {:.2} ms",
+            ms(*median),
+            ms(*p95),
+            ms(*most)
+        );
+    }
+    assert_eq!((info.format.rate, info.format.channels), (48_000, 2));
+    for pair in packets.windows(2) {
+        let (frames, time, ..) = pair[0];
+        let (_, next, gap, ..) = pair[1];
+        assert!(next > time, "stamps went backwards");
+        if !gap {
+            let length = Duration::from_secs_f64(frames as f64 / 48_000.0);
+            let step = next - time;
+            assert!(
+                step.abs_diff(length) < Duration::from_millis(1),
+                "{step:?} after a packet of {length:?}"
+            );
+        }
+    }
+    assert!(stop_time < Duration::from_millis(100));
 }

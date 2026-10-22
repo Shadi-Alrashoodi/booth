@@ -31,8 +31,8 @@ pub(crate) use level::Meter;
 pub use level::{Level, Reading};
 pub use microphone::{Microphone, hands_free};
 pub use stream::{
-    Capture, Device, DeviceStream, Event, LOOK_AGAIN, Packet, PcSound, REOPEN_AFTER, Refused,
-    Render, StreamInfo, StreamThread, Wake,
+    Capture, Device, DeviceStream, Event, LOOK_AGAIN, PC_SOUND_BUILD, Packet, PcSound,
+    REOPEN_AFTER, Refused, Render, StreamInfo, StreamThread, Wake,
 };
 pub use wasapi::{EnginePeriods, Probe};
 pub use watch::Watch;
