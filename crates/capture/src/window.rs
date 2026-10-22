@@ -7,8 +7,8 @@
 // event; everything else happens on the caller's thread.
 
 use std::mem;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use windows::Foundation::TypedEventHandler;
@@ -25,6 +25,7 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::System::Com::CoIncrementMTAUsage;
 use windows::Win32::System::Performance::QueryPerformanceFrequency;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForSingleObject};
 use windows::Win32::System::WinRT::Direct3D11::{
@@ -180,6 +181,15 @@ impl Drop for Arrived {
 // opens a window capture, from the first open until the thread ends. A
 // thread already in the other mode stays that way: the capture objects
 // used here are agile.
+//
+// The windows crate keeps each class's factory for the life of the
+// process, and when the last thread leaves the multithreaded apartment
+// Windows unloads the DLLs those factories live in: a share's thread
+// ending at the end of a room, then a window share in the next room, called
+// into an unloaded GraphicsCapture.dll. So the apartment is kept for the
+// process from the first window capture on.
+static KEEP_APARTMENT: Once = Once::new();
+
 struct WinRt {
     joined: bool,
 }
@@ -212,6 +222,11 @@ impl WindowCapture {
         if !window.exists() {
             return Err(CaptureError::other(WINDOW_GONE));
         }
+        KEEP_APARTMENT.call_once(|| {
+            // SAFETY: a plain call. Its cookie is never given back, so the
+            // apartment stays until the process ends.
+            let _ = unsafe { CoIncrementMTAUsage() };
+        });
         WINRT.with(|_| {});
         if !GraphicsCaptureSession::IsSupported().unwrap_or(false) {
             return Err(CaptureError::other(
