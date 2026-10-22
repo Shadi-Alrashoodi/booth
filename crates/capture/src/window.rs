@@ -56,8 +56,8 @@ const TICKS: i64 = 10_000_000;
 // A window coming back from minimized is sent once more at the size of
 // the caption it was minimized to, sometimes after IsIconic, and even
 // DWM's bounds of the window, already say it is back. For this long after
-// it is back, frames of the caption's size or of a size other than the
-// window's own are dropped.
+// it is back, frames of the caption's size, or of a size other than the
+// window's own once DWM has it, are dropped.
 const RESTORING: Duration = Duration::from_millis(500);
 
 // Why a window share does not start, or stops after a pause, when the
@@ -566,7 +566,13 @@ impl WindowCapture {
         let content = frame.ContentSize().map_err(fail("read the size of"))?;
         if let Some(until) = self.restoring_until {
             let size = Some((content.Width, content.Height));
-            if acquired < until && (size == self.caption || size != self.size()) {
+            // While DWM still has the caption's bounds, they say nothing of
+            // the window's size, and the window's first real picture can
+            // already be here: dropped, a window that then stands still
+            // would stay paused.
+            let bounds = self.size();
+            let judged = bounds != self.caption && size != bounds;
+            if acquired < until && (size == self.caption || judged) {
                 let _ = frame.Close();
                 self.skipped += 1;
                 return Ok(None);
