@@ -2,13 +2,16 @@
 <!-- tools\store.ps1 fills in the {{...}} values. The firewall rules come
      with the package and go with it, so Booth never asks for administrator
      rights to let friends in. The display name is the one reserved in
-     Partner Center; the window title stays Booth. -->
+     Partner Center; the window title stays Booth. Borderless capture lets a
+     window share ask Windows to leave its yellow border off; Windows 10
+     ignores it. -->
 <Package
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
   xmlns:desktop2="http://schemas.microsoft.com/appx/manifest/desktop/windows10/2"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-  IgnorableNamespaces="uap desktop2 rescap">
+  xmlns:uap11="http://schemas.microsoft.com/appx/manifest/uap/windows10/11"
+  IgnorableNamespaces="uap desktop2 rescap uap11">
 
   <Identity Name="{{Name}}" Publisher="{{Publisher}}" Version="{{Version}}" ProcessorArchitecture="x64" />
 
@@ -51,6 +54,7 @@
 
   <Capabilities>
     <rescap:Capability Name="runFullTrust" />
+    <uap11:Capability Name="graphicsCaptureWithoutBorder" />
     <DeviceCapability Name="microphone" />
   </Capabilities>
 </Package>

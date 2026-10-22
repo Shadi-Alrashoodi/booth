@@ -2,6 +2,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod border;
 mod cap;
 mod convert;
 mod device;
@@ -21,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
+pub use border::Border;
 pub use convert::{Plan, Region, SMALLEST_SIDE, output_size};
 pub use device::device_on;
 pub use duplication::{Capture, make_process_dpi_aware};

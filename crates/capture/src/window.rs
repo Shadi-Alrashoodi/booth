@@ -39,6 +39,7 @@ use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUnini
 use windows::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsIconic};
 use windows::core::{Interface, factory};
 
+use crate::border::{self, Border};
 use crate::cap::{Decision, FpsCap};
 use crate::convert::{Converter, Layout, Plan, Target};
 use crate::device::device_on;
@@ -134,6 +135,7 @@ pub struct WindowCapture {
     // The newest picture's size, for natural() under new limits.
     content: Option<(u32, u32)>,
     kept: Option<Kept>,
+    border: Border,
     pointer: Pointer,
     timer: Timer,
     number: u64,
@@ -327,6 +329,7 @@ impl WindowCapture {
         session
             .SetIsCursorCaptureEnabled(false)
             .map_err(fail("leave the pointer out of the pictures of"))?;
+        let border = border::apply(&session);
         let arrived = Arc::new(Arrived::new()?);
         let closed = Arc::new(AtomicBool::new(false));
         let wake = Arc::clone(&arrived);
@@ -372,6 +375,7 @@ impl WindowCapture {
             natural: None,
             content: None,
             kept: None,
+            border,
             pointer: Pointer::new(window.hwnd),
             timer,
             number: 0,
@@ -385,6 +389,11 @@ impl WindowCapture {
 
     pub fn plan(&self) -> Plan {
         self.layout.plan
+    }
+
+    // Whether Windows draws its yellow border around the window, for the log.
+    pub fn border(&self) -> &Border {
+        &self.border
     }
 
     // From the next picture on.

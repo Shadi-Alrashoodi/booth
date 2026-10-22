@@ -411,6 +411,9 @@ pub(crate) fn open(
     let mut fitted = false;
     loop {
         let source = Source::open(choice, options)?;
+        if let Source::Window(capture) = &source {
+            say(Line::Log(capture.border().to_string()));
+        }
         let size = source.size();
         let fps = options.max_fps;
         let mut chosen = codec_for(&source, choice, kind, pick, known.take(), size, fps, say);

@@ -157,6 +157,9 @@ fn a_window_is_captured_at_its_own_size() {
     );
     assert_eq!(first, Ok((640, 360)));
     assert_eq!((capture.plan().width, capture.plan().height), (640, 360));
+    // What Windows answers an unpackaged program about its yellow border,
+    // recorded on every run.
+    println!("{}", capture.border());
 }
 
 // With a title bar and borders, the pictures are DWM's frame without the
