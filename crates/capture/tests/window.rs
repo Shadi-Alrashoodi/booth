@@ -171,6 +171,28 @@ fn a_window_scaled_down_into_the_box() {
     );
 }
 
+// Under 256 a side the frame is 256 with the window at its top left, and it
+// keeps that size while the window changes inside it.
+#[test]
+fn a_small_window_is_padded_to_256() {
+    let Some(adapter) = adapter() else { return };
+    let window = Window::open(200, 120);
+    let mut capture = WindowCapture::open(window.0, &adapter, Options::default()).unwrap();
+    assert_eq!(
+        frame_size(&mut capture, Duration::from_secs(2)),
+        Ok((256, 256))
+    );
+    assert_eq!(capture.plan().picture, (200, 120));
+    window.resize(300, 200);
+    let sizes = sizes_for(&mut capture, Duration::from_secs(1));
+    assert_eq!(sizes.last(), Some(&(300, 256)), "{sizes:?}");
+    assert_eq!(capture.plan().picture, (300, 200));
+    window.resize(640, 360);
+    let sizes = sizes_for(&mut capture, Duration::from_secs(1));
+    assert_eq!(sizes.last(), Some(&(640, 360)), "{sizes:?}");
+    assert_eq!(capture.plan().picture, (640, 360));
+}
+
 #[test]
 fn a_resized_window_comes_out_at_its_new_size() {
     let Some(adapter) = adapter() else { return };

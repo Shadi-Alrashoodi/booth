@@ -78,9 +78,14 @@ fn convert(bgra: &[u8], plan: &Plan) -> Nv12Image {
         plan.source_width,
         plan.source_height
     );
+    let (picture_width, picture_height) = plan.picture;
     let mut y = vec![0; (plan.width * plan.height) as usize];
     by_rows(&mut y, plan.width, |row, out| {
         for (column, luma) in (0..).zip(out.iter_mut()) {
+            if column >= picture_width || row >= picture_height {
+                *luma = 16;
+                continue;
+            }
             let rgb = area_average(bgra, plan, column, row, plan.footprint);
             *luma = code(16.0 + 219.0 * dot(rgb));
         }
@@ -89,6 +94,10 @@ fn convert(bgra: &[u8], plan: &Plan) -> Nv12Image {
     let mut uv = vec![0; (plan.width * plan.height / 2) as usize];
     by_rows(&mut uv, plan.width, |row, out| {
         for (column, [u, v]) in (0..).zip(out.as_chunks_mut::<2>().0) {
+            if column >= picture_width / 2 || row >= picture_height / 2 {
+                (*u, *v) = (128, 128);
+                continue;
+            }
             let rgb = area_average(bgra, plan, column, row, double);
             let luma = dot(rgb);
             *u = code(128.0 + 224.0 * (rgb[2] - luma) / 1.8556);

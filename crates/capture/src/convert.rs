@@ -26,6 +26,13 @@ use crate::monitors::Rotation;
 
 const SHADER: &str = include_str!("convert.hlsl");
 
+// No frame is smaller than this either way. A picture that fits smaller, a
+// small window or a narrow region under a watcher's box, sits at the frame's
+// top left with the rest black: below some size GPUs refuse pictures
+// (NVIDIA's HEVC decoder takes nothing under 144x144), and a window shrunk
+// under it keeps its frame and its encoder.
+pub const SMALLEST_SIDE: u32 = 256;
+
 // A rectangle of a monitor's picture as it shows on the desktop, upright,
 // in its pixels from its top left corner: what a region share sends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,8 +55,13 @@ pub struct Plan {
     pub upright_width: u32,
     pub upright_height: u32,
     pub crop: (u32, u32),
+    // The frame that goes out, at least SMALLEST_SIDE each way.
     pub width: u32,
     pub height: u32,
+    // The picture in it, at its top left: the upright picture scaled to fit
+    // the limits. Smaller than the frame only where it fits smaller than
+    // SMALLEST_SIDE, and the rest of the frame is black.
+    pub picture: (u32, u32),
     // Upright source pixels under one output pixel, per axis: 1 when the
     // size is kept, 1.5 for 3840x2160 to 2560x1440, 1.25 for 5120x1440 to
     // 4096x1152.
@@ -79,8 +91,9 @@ impl Plan {
 
     // Only `region` of the upright picture, cut to the picture where it
     // reaches past it and its sides brought down to even, which NV12 needs,
-    // so a region share never sends a pixel more than was asked for. None
-    // when less than two pixels each way of it are on the picture.
+    // so a region share never sends a pixel more than was asked for: what
+    // pads it out to SMALLEST_SIDE is black. None when less than two pixels
+    // each way of it are on the picture.
     pub fn region(
         source_width: u32,
         source_height: u32,
@@ -117,17 +130,19 @@ impl Plan {
         let max_width = limit(max_width);
         let max_height = limit(max_height);
         let kept = upright_width <= max_width && upright_height <= max_height;
-        let (width, height, footprint) = if kept {
+        let (picture, footprint) = if kept {
             // Kept pixel for pixel. NV12 needs even sides, so an odd side
             // gets one more pixel, a copy of the edge, rather than a
             // resample that would soften every line of text.
-            (even_up(upright_width), even_up(upright_height), (1.0, 1.0))
+            (
+                (even_up(upright_width), even_up(upright_height)),
+                (1.0, 1.0),
+            )
         } else {
             let (width, height) =
                 scaled_to_fit(upright_width, upright_height, max_width, max_height);
             (
-                width,
-                height,
+                (width, height),
                 (
                     upright_width as f32 / width as f32,
                     upright_height as f32 / height as f32,
@@ -141,8 +156,9 @@ impl Plan {
             upright_width,
             upright_height,
             crop,
-            width,
-            height,
+            width: picture.0.max(SMALLEST_SIDE),
+            height: picture.1.max(SMALLEST_SIDE),
+            picture,
             footprint,
         }
     }
@@ -154,10 +170,11 @@ impl Plan {
 
 // 0 is no limit. A limit is rounded down to even, since NV12 needs even
 // sides, and so is no limit, so that a side rounded up to even never
-// passes it.
+// passes it. One under SMALLEST_SIDE counts as that: the frame is that big
+// anyway, so the picture may as well fill it.
 fn limit(max: u32) -> u32 {
     let max = if max == 0 { u32::MAX } else { max };
-    (max & !1).max(2)
+    (max & !1).max(SMALLEST_SIDE)
 }
 
 // The source's size turned upright, never 0 a side.
@@ -212,9 +229,12 @@ struct PlaneConstants {
     quarter_turns: u32,
     unused: u32,
     crop_origin: [u32; 2],
-    // Constant buffers come in whole 16-byte registers.
-    padding: [u32; 2],
+    // Where the black around a small picture starts, in this plane's
+    // pixels. It also brings the buffer to whole 16-byte registers.
+    picture_size: [u32; 2],
 }
+
+const _: () = assert!(size_of::<PlaneConstants>().is_multiple_of(16));
 
 // A Plan with its constant buffers on the device.
 pub(crate) struct Layout {
@@ -310,18 +330,21 @@ impl Converter {
     }
 
     pub(crate) fn layout(&self, plan: Plan) -> Result<Layout, CaptureError> {
-        let constants = |footprint: (f32, f32)| PlaneConstants {
+        let constants = |footprint: (f32, f32), picture: (u32, u32)| PlaneConstants {
             source_size: [plan.source_width, plan.source_height],
             upright_size: [plan.upright_width, plan.upright_height],
             footprint: [footprint.0, footprint.1],
             quarter_turns: plan.rotation.degrees() / 90,
             unused: 0,
             crop_origin: [plan.crop.0, plan.crop.1],
-            padding: [0, 0],
+            picture_size: [picture.0, picture.1],
         };
-        let luma = self.constant_buffer(constants(plan.footprint))?;
-        let chroma =
-            self.constant_buffer(constants((plan.footprint.0 * 2.0, plan.footprint.1 * 2.0)))?;
+        let luma = self.constant_buffer(constants(plan.footprint, plan.picture))?;
+        // The picture's sides are even, so its box halves exactly.
+        let chroma = self.constant_buffer(constants(
+            (plan.footprint.0 * 2.0, plan.footprint.1 * 2.0),
+            (plan.picture.0 / 2, plan.picture.1 / 2),
+        ))?;
         Ok(Layout { plan, luma, chroma })
     }
 

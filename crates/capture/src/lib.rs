@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
-pub use convert::{Plan, Region, output_size};
+pub use convert::{Plan, Region, SMALLEST_SIDE, output_size};
 pub use device::device_on;
 pub use duplication::{Capture, make_process_dpi_aware};
 pub use error::{CaptureError, ErrorKind};
@@ -33,7 +33,8 @@ pub struct Options {
     // A monitor wider or taller than these is scaled down until it fits
     // both, aspect ratio kept. 0 is no limit on that side. H.264 on NVENC
     // takes at most 4096 wide, so a 5120x1440 monitor comes out 4096x1152,
-    // while 3840x2160 still comes out 2560x1440.
+    // while 3840x2160 still comes out 2560x1440. A limit under SMALLEST_SIDE
+    // counts as SMALLEST_SIDE.
     pub max_width: u32,
     pub max_height: u32,
     // 0 is no cap: every picture the monitor shows goes out.
@@ -51,7 +52,8 @@ impl Default for Options {
 }
 
 // One picture ready to encode. The texture is NV12 on the capture device:
-// BT.709, limited range, width and height even.
+// BT.709, limited range, width and height even and at least SMALLEST_SIDE.
+// A smaller picture sits at the top left with the rest black (Plan::picture).
 //
 // The texture comes from a pool of two. The next call to next() converts
 // only into the other one, so an encoder may still be reading this frame

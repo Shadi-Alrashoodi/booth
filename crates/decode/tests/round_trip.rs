@@ -162,3 +162,21 @@ fn hevc_720p() {
 fn hevc_1440p() {
     round_trip(Codec::Hevc, 2560, 1440);
 }
+
+// The smallest pictures a share sends: 256 a side, a window or a region
+// padded or fitted down to it, and as long the other way as each codec goes.
+#[test]
+fn h264_at_the_smallest_sizes() {
+    for (width, height) in [(256, 256), (4096, 256), (256, 1440)] {
+        println!("{width}x{height}:");
+        round_trip(Codec::H264, width, height);
+    }
+}
+
+#[test]
+fn hevc_at_the_smallest_sizes() {
+    for (width, height) in [(256, 256), (4096, 256), (256, 2160)] {
+        println!("{width}x{height}:");
+        round_trip(Codec::Hevc, width, height);
+    }
+}

@@ -5,7 +5,8 @@ use std::time::Instant;
 
 use capture::reference::{region_to_nv12, to_nv12};
 use capture::{
-    Nv12Image, Options, Pattern, Plan, Region, Rotation, pattern_image, read_frame_number,
+    Nv12Image, Options, Pattern, Plan, Region, Rotation, SMALLEST_SIDE, pattern_image,
+    read_frame_number,
 };
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 
@@ -100,8 +101,8 @@ fn primary_colours_come_out_as_bt709_limited_range() {
         ("blue", [255, 0, 0, 255], (32, 240, 118)),
     ];
     for (name, bgra, (y, u, v)) in cases {
-        let bgra = solid(64, 64, bgra);
-        let image = convert(&device, &bgra, 64, 64, Rotation::Identity, unpaced());
+        let bgra = solid(256, 256, bgra);
+        let image = convert(&device, &bgra, 256, 256, Rotation::Identity, unpaced());
         let ys: Vec<u8> = image.y.iter().copied().filter(|&got| got != y).collect();
         assert!(
             ys.is_empty(),
@@ -305,9 +306,9 @@ fn odd_sizes_come_out_even() {
         ((5120, 1440, Rotation::Identity, 0, 1440), (5120, 1440)),
         ((3840, 2160, Rotation::Identity, 0, 0), (3840, 2160)),
         ((3841, 2161, Rotation::Rotate90, 0, 0), (2162, 3842)),
-        // The smallest limits NV12 allows.
-        ((3840, 2160, Rotation::Identity, 4096, 1), (4, 2)),
-        ((3840, 2160, Rotation::Identity, 1, 1440), (2, 2)),
+        // A limit under 256 counts as 256, and no frame is smaller.
+        ((3840, 2160, Rotation::Identity, 4096, 1), (456, 256)),
+        ((3840, 2160, Rotation::Identity, 1, 1440), (256, 256)),
     ];
     for ((width, height, rotation, max_width, max_height), want) in cases {
         let got = capture::output_size(width, height, rotation, max_width, max_height);
@@ -321,16 +322,22 @@ fn odd_sizes_come_out_even() {
     }
 }
 
-// Within both limits, both sides even, and the shape kept: the side that was
-// not scaled to its limit is within a pixel of where the other one puts it.
+// The picture within both limits, both sides even, and the shape kept: the
+// side that was not scaled to its limit is within a pixel of where the other
+// one puts it. The frame is the picture, padded to 256 a side.
 fn assert_fits(plan: &Plan, max_width: u32, max_height: u32, what: &str) {
-    let (width, height) = (plan.width, plan.height);
+    let (width, height) = plan.picture;
     assert!(
         width <= max_width && height <= max_height,
         "{what}: {plan:?}"
     );
     assert!(
         width.is_multiple_of(2) && height.is_multiple_of(2),
+        "{what}: {plan:?}"
+    );
+    assert_eq!(
+        (plan.width, plan.height),
+        (width.max(SMALLEST_SIDE), height.max(SMALLEST_SIDE)),
         "{what}: {plan:?}"
     );
     if plan.footprint == (1.0, 1.0) {
@@ -403,8 +410,8 @@ fn a_share_is_never_wider_than_4096_or_taller_than_1440() {
 #[test]
 fn odd_sizes_convert_like_the_cpu_reference() {
     let Some(device) = device() else { return };
-    // Kept as it is and padded by one pixel each way, then scaled down to a
-    // height and to a width.
+    // Kept as it is with the edge copied one pixel further each way (and
+    // black under it to 256), then scaled down to a height and to a width.
     for (width, height, max_width, max_height) in [
         (333, 187, 4096, 1440),
         (1001, 1501, 4096, 1000),
@@ -468,7 +475,8 @@ fn super_wide_monitors_convert_like_the_cpu_reference() {
 #[test]
 fn each_rotation_is_turned_upright() {
     let Some(device) = device() else { return };
-    let (width, height) = (320, 180);
+    // No smaller than 256 either way, so no rotation pads it.
+    let (width, height) = (320, 256);
     let mut bgra = pattern_image(5, width, height);
     for y in 0..8 {
         for x in 0..8 {
@@ -695,11 +703,12 @@ fn a_region_matches_the_cpu_reference() {
             under(640, 360),
             (640, 360),
         ),
+        // 300x200 once scaled, padded to 256 high.
         (
             Rotation::Identity,
             region(300, 100, 600, 400),
             under(300, 200),
-            (300, 200),
+            (300, 256),
         ),
         (
             Rotation::Rotate90,
@@ -711,7 +720,7 @@ fn a_region_matches_the_cpu_reference() {
             Rotation::Rotate270,
             region(41, 300, 400, 600),
             under(200, 300),
-            (200, 300),
+            (256, 300),
         ),
     ];
     for (rotation, asked, options, size) in cases {
@@ -749,6 +758,191 @@ fn a_region_matches_the_cpu_reference() {
         for x in 0..part.width / 2 {
             let there = whole.chroma(left / 2 + x, top / 2 + y);
             assert_eq!(part.chroma(x, y), there, "UV at {x},{y}");
+        }
+    }
+}
+
+// Every Y past the picture is black's 16 and every U and V pair past its
+// half-size box is 128, 128.
+fn assert_black_outside(image: &Nv12Image, (width, height): (u32, u32), what: &str) {
+    for y in 0..image.height {
+        for x in 0..image.width {
+            if x >= width || y >= height {
+                assert_eq!(image.luma(x, y), 16, "{what}: Y at {x},{y}");
+            }
+        }
+    }
+    for y in 0..image.height / 2 {
+        for x in 0..image.width / 2 {
+            if x >= width / 2 || y >= height / 2 {
+                assert_eq!(image.chroma(x, y), (128, 128), "{what}: UV at {x},{y}");
+            }
+        }
+    }
+}
+
+// A picture under 256 a side goes out at the top left of a 256 frame with
+// black around it, as the CPU reference has it, and its pixels are the
+// picture's own: a 200x120 region is the whole picture's pixels there.
+#[test]
+fn a_small_picture_is_padded_with_black() {
+    let Some(device) = device() else { return };
+    let (width, height) = (200, 120);
+    let bgra = pattern_image(3, width, height);
+    let got = convert(&device, &bgra, width, height, Rotation::Identity, unpaced());
+    assert_eq!((got.width, got.height), (256, 256));
+    let want = to_nv12(&bgra, width, height, Rotation::Identity, unpaced());
+    assert_matches_reference(&got, &want, "200x120");
+    assert_black_outside(&got, (width, height), "200x120");
+
+    let (whole_width, whole_height) = (640, 360);
+    let bgra = pattern_image(4, whole_width, whole_height);
+    let whole = convert(
+        &device,
+        &bgra,
+        whole_width,
+        whole_height,
+        Rotation::Identity,
+        unpaced(),
+    );
+    let (left, top) = (100, 36);
+    let asked = Region {
+        left,
+        top,
+        width,
+        height,
+    };
+    let mut pattern = Pattern::with_region(
+        &device,
+        whole_width,
+        whole_height,
+        Rotation::Identity,
+        asked,
+        unpaced(),
+    )
+    .unwrap();
+    let frame = pattern.convert(&bgra).unwrap();
+    assert_eq!(pattern.plan().picture, (width, height));
+    let part = pattern.read_back(&frame).unwrap();
+    assert_black_outside(&part, (width, height), "a 200x120 region");
+    for y in 0..height {
+        for x in 0..width {
+            assert_eq!(
+                part.luma(x, y),
+                whole.luma(left + x, top + y),
+                "Y at {x},{y}"
+            );
+        }
+    }
+    for y in 0..height / 2 {
+        for x in 0..width / 2 {
+            let there = whole.chroma(left / 2 + x, top / 2 + y);
+            assert_eq!(part.chroma(x, y), there, "UV at {x},{y}");
+        }
+    }
+}
+
+// Scaled and then padded, padded one way only, odd and padded, and a turned
+// region padded: the GPU as the CPU reference, and black past the picture.
+#[test]
+fn small_pictures_scale_then_pad_like_the_cpu_reference() {
+    let Some(device) = device() else { return };
+    let cases = [
+        ((3000, 100), under(1920, 1080), (1920, 256), (1920, 64)),
+        ((120, 600), unpaced(), (256, 600), (120, 600)),
+        ((201, 121), unpaced(), (256, 256), (202, 122)),
+    ];
+    for ((width, height), options, frame, picture) in cases {
+        let what = format!("{width}x{height}");
+        let bgra = pattern_image(9, width, height);
+        let got = convert(&device, &bgra, width, height, Rotation::Identity, options);
+        assert_eq!((got.width, got.height), frame, "{what}");
+        let want = to_nv12(&bgra, width, height, Rotation::Identity, options);
+        assert_matches_reference(&got, &want, &what);
+        assert_black_outside(&got, picture, &what);
+    }
+    let (width, height) = (640, 360);
+    let bgra = pattern_image(10, width, height);
+    let asked = Region {
+        left: 20,
+        top: 100,
+        width: 200,
+        height: 120,
+    };
+    let mut pattern =
+        Pattern::with_region(&device, width, height, Rotation::Rotate90, asked, unpaced()).unwrap();
+    let frame = pattern.convert(&bgra).unwrap();
+    let got = pattern.read_back(&frame).unwrap();
+    assert_eq!((got.width, got.height), (256, 256));
+    let want = region_to_nv12(&bgra, width, height, Rotation::Rotate90, asked, unpaced());
+    assert_matches_reference(&got, &want, "a turned 200x120 region");
+    assert_black_outside(&got, (200, 120), "a turned 200x120 region");
+}
+
+// Whatever the source and the limits, the frame is the picture padded to
+// 256 a side, both even, and the picture keeps within the limits, a limit
+// under 256 counting as 256.
+#[test]
+fn no_frame_is_smaller_than_256_a_side() {
+    let picture_and_frame = |plan: Plan| (plan.picture, (plan.width, plan.height));
+    assert_eq!(
+        picture_and_frame(Plan::new(200, 120, Rotation::Identity, 4096, 1440)),
+        ((200, 120), (256, 256))
+    );
+    assert_eq!(
+        picture_and_frame(Plan::new(3000, 100, Rotation::Identity, 1920, 1080)),
+        ((1920, 64), (1920, 256))
+    );
+    assert_eq!(
+        picture_and_frame(Plan::new(7680, 200, Rotation::Identity, 4096, 1440)),
+        ((4096, 106), (4096, 256))
+    );
+    let narrow = Region {
+        left: 0,
+        top: 0,
+        width: 256,
+        height: 1440,
+    };
+    let fitted = Plan::region(2560, 1440, Rotation::Identity, narrow, 4096, 1080).unwrap();
+    assert_eq!(picture_and_frame(fitted), ((192, 1080), (256, 1080)));
+    let boxes = [
+        (0, 0),
+        (1, 1),
+        (255, 255),
+        (4096, 1080),
+        (4096, 1440),
+        (1920, 1080),
+    ];
+    for width in (2..4400).step_by(37) {
+        for height in (2..2400).step_by(29) {
+            for (max_width, max_height) in boxes {
+                let plan = Plan::new(width, height, Rotation::Identity, max_width, max_height);
+                let what = format!("{width}x{height} under {max_width}x{max_height}: {plan:?}");
+                let (picture_width, picture_height) = plan.picture;
+                assert_eq!(
+                    (plan.width, plan.height),
+                    (
+                        picture_width.max(SMALLEST_SIDE),
+                        picture_height.max(SMALLEST_SIDE)
+                    ),
+                    "{what}"
+                );
+                assert!(
+                    plan.width.is_multiple_of(2) && plan.height.is_multiple_of(2),
+                    "{what}"
+                );
+                let most = |max: u32| {
+                    if max == 0 {
+                        u32::MAX
+                    } else {
+                        max.max(SMALLEST_SIDE)
+                    }
+                };
+                assert!(
+                    plan.width <= most(max_width) && plan.height <= most(max_height),
+                    "{what}"
+                );
+            }
         }
     }
 }

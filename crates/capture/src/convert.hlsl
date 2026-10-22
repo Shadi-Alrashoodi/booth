@@ -13,6 +13,9 @@
 //
 // Chroma is computed from the area of its whole 2x2 block of luma pixels,
 // which is the average of those four pixels' colours.
+//
+// A picture smaller than the frame sits at its top left, and the rest is
+// written black without reading anything.
 
 cbuffer Plane : register(b0)
 {
@@ -29,7 +32,8 @@ cbuffer Plane : register(b0)
     // Where the upright picture that goes out starts in the whole upright
     // image: 0, 0 but for a region of it.
     uint2 crop_origin;
-    uint2 padding;
+    // The picture's size in this plane; past it the frame is black.
+    uint2 picture_size;
 };
 
 Texture2D<float4> source : register(t0);
@@ -82,14 +86,23 @@ float3 area_average(float2 position)
 
 static const float3 luma_weights = float3(0.2126, 0.7152, 0.0722);
 
+bool past_picture(float2 position)
+{
+    return any(uint2(position) >= picture_size);
+}
+
 float ps_luma(float4 position : SV_Position) : SV_Target
 {
+    [branch] if (past_picture(position.xy))
+        return 16.0 / 255.0;
     float y = dot(area_average(position.xy), luma_weights);
     return (16.0 + 219.0 * y) / 255.0;
 }
 
 float2 ps_chroma(float4 position : SV_Position) : SV_Target
 {
+    [branch] if (past_picture(position.xy))
+        return float2(128.0, 128.0) / 255.0;
     float3 rgb = area_average(position.xy);
     float y = dot(rgb, luma_weights);
     float2 uv = float2((rgb.b - y) / 1.8556, (rgb.r - y) / 1.5748);

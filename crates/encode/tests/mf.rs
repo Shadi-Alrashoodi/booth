@@ -245,6 +245,45 @@ fn software_forced_idr() {
     forced_idr(SOFTWARE);
 }
 
+// The smallest pictures a share sends on both encoders: 256 a side, a
+// window or a region padded or fitted down to it. The moving pattern does
+// not go that small, so the picture is one still texture.
+#[test]
+fn the_smallest_sizes_encode() {
+    let _turn = common::turn();
+    let Some(gpu) = gpu() else {
+        return;
+    };
+    for base in [HARDWARE, SOFTWARE] {
+        for (width, height) in [(256, 256), (4096, 256), (256, 1440)] {
+            let case = Case {
+                width,
+                height,
+                ..base
+            };
+            let Some(mut encoder) = open(&gpu, case, Preset::P1) else {
+                continue;
+            };
+            let texture = common::texture(&gpu, width, height, DXGI_FORMAT_NV12);
+            for index in 0..30 {
+                let unit = encoder
+                    .encode(&Frame {
+                        texture: &texture,
+                        index,
+                        force_idr: false,
+                    })
+                    .unwrap_or_else(|e| panic!("{width}x{height}, frame {index}: {e}"));
+                assert!(
+                    !unit.is_empty(),
+                    "{} at {width}x{height}: frame {index} came out empty",
+                    encoder.name()
+                );
+            }
+            println!("{} encodes {width}x{height}", encoder.name());
+        }
+    }
+}
+
 fn recover_with_idr(case: Case) {
     let _turn = common::turn();
     let Some(gpu) = gpu() else {

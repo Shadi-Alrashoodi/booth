@@ -7,12 +7,16 @@ use std::time::{Duration, Instant};
 
 use decode::{Codec, DecodeError, probe};
 
-const SIZES: [(u32, u32); 5] = [
+const SIZES: [(u32, u32); 9] = [
     (1280, 720),
     (1920, 1080),
     (2560, 1440),
     (3840, 2160),
     (8192, 64),
+    (256, 256),
+    (4096, 256),
+    (256, 1440),
+    (256, 2160),
 ];
 const ASKED: usize = 200;
 
@@ -53,10 +57,11 @@ fn every_gpu_answers() {
                 // NVIDIA's decoders take both codecs at the sizes Booth
                 // shares and H.264 no wider than 4096 (tests/peer_sps.rs
                 // finds the same through FFmpeg). HEVC as wide as 8192 but
-                // only 64 lines tall is printed, not checked.
-                let expected = match (codec, width) {
-                    (Codec::H264, 8192) => Some(false),
-                    (Codec::Hevc, 8192) => None,
+                // only 64 lines tall is printed, not checked, and so is H.264
+                // 256 wide and 2160 tall, which a share never sends.
+                let expected = match (codec, width, height) {
+                    (Codec::H264, 8192, _) => Some(false),
+                    (Codec::Hevc, 8192, _) | (Codec::H264, 256, 2160) => None,
                     _ => Some(true),
                 };
                 if adapter.vendor_id == common::NVIDIA

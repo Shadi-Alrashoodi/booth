@@ -1,9 +1,10 @@
 // Windows.Graphics.Capture of one window, for a window share: what Windows
 // composes of it, at its own size, converted to NV12 by the same shader as a
-// monitor's picture. The pointer is left out of the pictures where Windows
-// allows that (build 19041 and later). Frames come through a free-threaded
-// frame pool, whose thread only sets an event; everything else happens on
-// the caller's thread.
+// monitor's picture. A window under SMALLEST_SIDE is padded at its right and
+// bottom with black, never with the desktop around it. The pointer is left
+// out of the pictures where Windows allows that (build 19041 and later).
+// Frames come through a free-threaded frame pool, whose thread only sets an
+// event; everything else happens on the caller's thread.
 
 use std::mem;
 use std::sync::Arc;

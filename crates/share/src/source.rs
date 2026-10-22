@@ -24,9 +24,9 @@ macro_rules! device {
     };
 }
 
-// A region share's region is at least this many pixels each way: smaller is
-// no picture to watch, and under the floors some encoders and decoders have.
-pub const SMALLEST_REGION: u32 = 256;
+// A region share's region is at least this many pixels each way: one drawn
+// smaller would go out mostly black (capture pads any picture under it).
+pub const SMALLEST_REGION: u32 = capture::SMALLEST_SIDE;
 
 #[derive(Clone)]
 pub enum Choice {
