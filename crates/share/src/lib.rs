@@ -42,8 +42,8 @@ pub use source::{Choice, SMALLEST_REGION};
 // as the room needs no dependency on capture, encode or viewer for them.
 pub use capture::{
     Adapter, CursorKind, CursorShape, CursorUpdate, Monitor, MonitorId, Options as CaptureOptions,
-    PauseReason, Region, WINDOW_CLOSED, WINDOW_GONE, WindowId, adapters, make_process_dpi_aware,
-    monitors, window_monitor,
+    PauseReason, Region, TopWindow, WINDOW_CLOSED, WINDOW_GONE, WindowId, adapters,
+    make_process_dpi_aware, monitors, top_windows, window_monitor,
 };
 pub use encode::{Codec, Kind, Preset, Settings};
 pub use viewer::{

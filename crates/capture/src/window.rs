@@ -218,6 +218,14 @@ impl Drop for Arrived {
 // process from the first window capture on.
 static KEEP_APARTMENT: Once = Once::new();
 
+pub(crate) fn keep_apartment() {
+    KEEP_APARTMENT.call_once(|| {
+        // SAFETY: a plain call. Its cookie is never given back, so the
+        // apartment stays until the process ends.
+        let _ = unsafe { CoIncrementMTAUsage() };
+    });
+}
+
 struct WinRt {
     joined: bool,
 }
@@ -250,11 +258,7 @@ impl WindowCapture {
         if !window.exists() {
             return Err(CaptureError::other(WINDOW_GONE));
         }
-        KEEP_APARTMENT.call_once(|| {
-            // SAFETY: a plain call. Its cookie is never given back, so the
-            // apartment stays until the process ends.
-            let _ = unsafe { CoIncrementMTAUsage() };
-        });
+        keep_apartment();
         WINRT.with(|_| {});
         if !GraphicsCaptureSession::IsSupported().unwrap_or(false) {
             return Err(CaptureError::other(

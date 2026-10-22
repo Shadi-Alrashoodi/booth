@@ -13,6 +13,7 @@ mod pattern;
 mod pointer;
 pub mod reference;
 mod timer;
+mod top_windows;
 mod window;
 
 use std::fmt;
@@ -27,6 +28,7 @@ pub use error::{CaptureError, ErrorKind};
 pub use monitors::{Adapter, Monitor, MonitorId, Rotation, adapters, monitors, window_monitor};
 pub use pattern::{Pattern, pattern_image, read_frame_number};
 pub use reference::Nv12Image;
+pub use top_windows::{TopWindow, top_windows};
 pub use window::{WINDOW_CLOSED, WINDOW_GONE, WindowCapture, WindowId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
