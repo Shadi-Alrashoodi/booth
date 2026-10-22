@@ -160,11 +160,19 @@ impl Voiced {
 
     // What the speakers were given, the first channel only, and when the
     // first of it played, on the fake's own clock: after the two periods of
-    // silence a stream starts with, which the fake does not record.
+    // silence a stream starts with, which the fake does not record. Voices
+    // play in the middle, so the second channel is the same.
     pub fn heard(&self) -> (Vec<f32>, Instant) {
         let record = self.speakers.record();
         let opened = record.opens.first().expect("the speakers opened").0;
-        let mono = record.written.iter().step_by(2).copied().collect();
+        let (frames_written, _) = record.written.as_chunks::<2>();
+        assert!(
+            frames_written
+                .iter()
+                .all(|[left, right]| left.to_bits() == right.to_bits()),
+            "the speakers' two channels differ"
+        );
+        let mono = frames_written.iter().map(|[left, _]| *left).collect();
         (mono, opened + frames(2 * u64::from(PERIOD)))
     }
 

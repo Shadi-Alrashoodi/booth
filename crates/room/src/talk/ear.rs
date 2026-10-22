@@ -245,7 +245,8 @@ impl FrameSource for Sound {
     }
 }
 
-// The render callback: every talker mixed into what the device asks for.
+// The render callback: every talker mixed into what the device asks for, in
+// stereo, the talkers in the middle.
 pub(crate) struct Speaker {
     mixer: Mixer<Key, Sound>,
     // The control cue, which plays past the mixer (cue.rs).
@@ -253,7 +254,7 @@ pub(crate) struct Speaker {
     orders: Receiver<ToSpeaker>,
     shared: Arc<Shared>,
     clock: Clock,
-    // Samples played since the stream began.
+    // Frames played since the stream began.
     rendered: u64,
     period: usize,
 }
@@ -311,12 +312,12 @@ impl Speaker {
         self.mixer.set_deafened(self.shared.deafened());
         now.start_sample.store(self.rendered, Ordering::Relaxed);
         now.start_us.store(began_us, Ordering::Relaxed);
-        self.mixer.render(out);
+        self.mixer.render_stereo(out);
         if let Some(cue) = self.shared.take_control_cue(began_us) {
             self.control.start(cue);
         }
         cue::mix_over(&mut self.control, out);
-        self.rendered += out.len() as u64;
+        self.rendered += (out.len() / 2) as u64;
         self.shared.render_times.record(began.elapsed());
     }
 }
@@ -370,13 +371,17 @@ mod tests {
             .send(ToSpeaker::Add([1; 32], Arc::clone(&ear), 1.0))
             .unwrap();
         shared.render_now.latency_us.store(5000, Ordering::Relaxed);
-        let mut out = [0.0f32; 240];
+        // 240 frames of stereo.
+        let mut out = [0.0f32; 480];
         let mut heard_any = false;
         for (seq, bytes) in frames(20).iter().enumerate() {
             let captured = clock.micros(Instant::now()) - 10_000;
             assert!(lock(&ear).push(&frame(seq as u16, bytes), Some(captured), false));
             speaker.fill(&mut out);
             heard_any |= out.iter().any(|&s| s != 0.0);
+            for [left, right] in out.as_chunks::<2>().0 {
+                assert_eq!(left.to_bits(), right.to_bits());
+            }
         }
         let mut recent = Vec::new();
         let last = lock(&ear)
@@ -403,7 +408,7 @@ mod tests {
         let clock = Clock::new(Instant::now());
         let (_orders_in, orders) = crossbeam_channel::unbounded();
         let mut speaker = Speaker::new(orders, Arc::clone(&shared), clock);
-        let mut out = [0.0f32; 240];
+        let mut out = [0.0f32; 480];
         // The loudest sample over the next 200 ms.
         let mut loudest = |speaker: &mut Speaker| {
             (0..40).fold(0.0f32, |most, _| {
@@ -431,12 +436,16 @@ mod tests {
         let clock = Clock::new(Instant::now());
         let (_orders_in, orders) = crossbeam_channel::unbounded();
         let mut speaker = Speaker::new(orders, Arc::clone(&shared), clock);
-        let mut out = [0.0f32; 240];
+        let mut out = [0.0f32; 480];
+        // The left side; the right is the same.
         let mut heard = |speaker: &mut Speaker| {
             let mut samples = Vec::new();
             for _ in 0..40 {
                 speaker.fill(&mut out);
-                samples.extend_from_slice(&out);
+                for [left, right] in out.as_chunks::<2>().0 {
+                    assert_eq!(left.to_bits(), right.to_bits());
+                    samples.push(*left);
+                }
             }
             samples
         };

@@ -148,18 +148,22 @@ fn swell(at: usize, len: usize) -> f64 {
     0.5 - 0.5 * (PI * at as f64 / len as f64).cos()
 }
 
-// The control cue added to what the mixer made, and held by the limiter
-// again where it plays: the mixer's own limit is behind it already.
+// The control cue added to both sides of what the mixer made, interleaved
+// stereo, and held by the limiter again where it plays: the mixer's own
+// limit is behind it already.
 pub(super) fn mix_over(tone: &mut Tone, out: &mut [f32]) {
     let mut chunk = [0.0f32; CHUNK];
+    let (frames, _) = out.as_chunks_mut::<2>();
     let mut done = 0;
-    while done < out.len() {
-        let want = (out.len() - done).min(CHUNK);
+    while done < frames.len() {
+        let want = (frames.len() - done).min(CHUNK);
         let Some(len) = tone.next_frame(&mut chunk[..want]) else {
             return;
         };
-        for (sample, add) in out[done..done + len].iter_mut().zip(&chunk[..len]) {
-            *sample = voice::mix::limit(*sample + add);
+        for (frame, add) in frames[done..done + len].iter_mut().zip(&chunk[..len]) {
+            for sample in frame {
+                *sample = voice::mix::limit(*sample + add);
+            }
         }
         done += len;
     }

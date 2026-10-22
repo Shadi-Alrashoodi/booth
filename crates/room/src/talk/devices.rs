@@ -552,9 +552,9 @@ fn open_speakers(
     let events = on_event(Arc::clone(shared), log.clone(), Side::Speakers);
     let choice = config.output.clone();
     match &config.devices {
-        Devices::Windows => Render::start(choice, fill, events),
+        Devices::Windows => Render::start_stereo(choice, fill, events),
         Devices::Fake { speakers, .. } => {
-            Render::start_with(speakers.device(), choice, fill, events)
+            Render::start_stereo_with(speakers.device(), choice, fill, events)
         }
     }
 }
