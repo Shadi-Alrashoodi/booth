@@ -33,8 +33,8 @@ pub use screen::{
     LinkNumbers, Report, Screen, Second, Watch, Window, primary_takes_4k, primary_takes_hevc,
 };
 pub use sharer::{
-    Audience, SOFTWARE_DID_NOT_START, SOFTWARE_FAILED_TOO, SWITCH_GAP, Sent, Setup, Sharer,
-    Software,
+    Audience, RESIZE_SPACING, SOFTWARE_DID_NOT_START, SOFTWARE_FAILED_TOO, SWITCH_GAP, Sent, Setup,
+    Sharer, Software,
 };
 pub use source::{Choice, SMALLEST_REGION};
 
@@ -42,7 +42,8 @@ pub use source::{Choice, SMALLEST_REGION};
 // as the room needs no dependency on capture, encode or viewer for them.
 pub use capture::{
     Adapter, CursorKind, CursorShape, CursorUpdate, Monitor, MonitorId, Options as CaptureOptions,
-    PauseReason, Region, adapters, make_process_dpi_aware, monitors,
+    PauseReason, Region, WINDOW_CLOSED, WINDOW_GONE, WindowId, adapters, make_process_dpi_aware,
+    monitors, window_monitor,
 };
 pub use encode::{Codec, Kind, Preset, Settings};
 pub use viewer::{

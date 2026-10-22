@@ -3132,6 +3132,7 @@ dependencies = [
  "net",
  "stats",
  "viewer",
+ "windows",
  "windows-sys 0.61.2",
 ]
 

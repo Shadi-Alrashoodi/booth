@@ -26,7 +26,7 @@ pub use error::{CaptureError, ErrorKind};
 pub use monitors::{Adapter, Monitor, MonitorId, Rotation, adapters, monitors, window_monitor};
 pub use pattern::{Pattern, pattern_image, read_frame_number};
 pub use reference::Nv12Image;
-pub use window::{WINDOW_GONE, WindowCapture, WindowId};
+pub use window::{WINDOW_CLOSED, WINDOW_GONE, WindowCapture, WindowId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {

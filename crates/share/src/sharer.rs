@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use capture::{CursorUpdate, Frame, Next, PauseReason};
 use channels::video::{FrameFacts, PacketizeError, Packetizer, parity_percent};
-use encode::{AccessUnit, Codec, EncodeError, Encoder, Kind, Settings};
+use encode::{AccessUnit, Codec, EncodeError, Encoder, Fit, Kind, Settings};
 use net::{PaceNumbers, Pacer};
 
 use crate::numbers::{SharerNumbers, ms};
@@ -39,6 +39,20 @@ const RESTED_AFTER: Duration = Duration::from_millis(250);
 // viewer has needed H.264 for a whole gap, so someone who closes the
 // viewer and opens it again within it costs no change at all.
 pub const SWITCH_GAP: Duration = Duration::from_secs(3);
+
+// A shared window's new size gets a new encoder only this long after the
+// last new encoder of any kind, the first after a quiet spell at once; in
+// between the window goes out fitted into the frame it has. Every Booth
+// viewer counts each new size or codec as a decoder set up again, and
+// holds the picture when one comes while its last three came within
+// SWITCH_GAP (the third hold in 30 s ends the watch). At this spacing any
+// three span more than SWITCH_GAP, so one more the sharer cannot see or
+// delay, such as a new watcher's first HEVC decoder, still makes no hold.
+pub const RESIZE_SPACING: Duration = Duration::from_millis(1600);
+
+// New encoders for a window's new size that did not open, in a row, before
+// the share stops following the window's size and keeps it fitted.
+const RESIZE_TRIES: u32 = 3;
 
 // Why a share ended when the software encoder did not open after a GPU
 // encoder failed, or failed on any frame later, as the room shows it after
@@ -250,6 +264,12 @@ pub struct Sharer {
     fallback: Option<Fallback>,
     // Paused by hand (pause), until resume.
     held: bool,
+    // When the last new encoder opened, and for a window share, when a new
+    // size may try again after a new encoder did not open and how many did
+    // not in a row (RESIZE_SPACING, RESIZE_TRIES).
+    last_encoder: Option<Instant>,
+    resize_retry: Option<Instant>,
+    resizes_failed: u32,
 }
 
 // The change from a failed GPU encoder to the software one, timed for the
@@ -323,12 +343,15 @@ impl Sharer {
         send: impl FnMut(&[u8]) + Send + 'static,
         say: &mut dyn FnMut(Line),
     ) -> Result<Sharer, String> {
-        let options = capture::Options {
-            max_fps: setup.fps,
-            ..capture::Options::default()
-        };
         let adapter = setup.choice.adapter();
         let intel = source::starts_in_software(adapter.vendor_id, setup.encoder, setup.codec);
+        let options = match setup.choice {
+            Choice::Window { .. } if intel => source::window_box(setup.fps),
+            _ => capture::Options {
+                max_fps: setup.fps,
+                ..capture::Options::default()
+            },
+        };
         let (kind, pick) = if intel {
             say(Line::Say(source::intel_in_software(&adapter.description)));
             (Some(Kind::MfSoftware), SOFTWARE_PICK)
@@ -366,7 +389,8 @@ impl Sharer {
         }
         let encoder_bitrate = setup.settings.bitrate;
         let (size, fps) = (opened.source.size(), opened.fps);
-        Ok(Sharer {
+        opened.source.set_frame(Some(size));
+        let mut sharer = Sharer {
             opened: Some(opened),
             setup,
             size,
@@ -395,7 +419,12 @@ impl Sharer {
             reopens: 0,
             fallback: None,
             held: false,
-        })
+            last_encoder: Some(Instant::now()),
+            resize_retry: None,
+            resizes_failed: 0,
+        };
+        sharer.box_software_window();
+        Ok(sharer)
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -517,7 +546,7 @@ impl Sharer {
     // on. False when the share is that small already, as one on the
     // software encoder always is. An error ends the share.
     pub fn step_down(&mut self, say: &mut dyn FnMut(Line)) -> Result<bool, String> {
-        let Some(fit) = encode::software_fit(self.size.0, self.size.1, self.fps) else {
+        let Some(fit) = self.small_fit() else {
             return Ok(false);
         };
         let options = capture::Options {
@@ -576,6 +605,26 @@ impl Sharer {
         self.small.is_some()
     }
 
+    // What 1080p60 makes of this share, None when it is that small already:
+    // its size with the shape kept, or for a window, which changes size,
+    // the box of 1080p60 (source::window_box).
+    fn small_fit(&self) -> Option<Fit> {
+        match self.setup.choice {
+            Choice::Window { .. } => {
+                let small = source::window_box(self.fps);
+                let fits = self.size.0 <= small.max_width
+                    && self.size.1 <= small.max_height
+                    && self.fps <= small.max_fps;
+                (!fits).then_some(Fit {
+                    width: small.max_width,
+                    height: small.max_height,
+                    fps: small.max_fps,
+                })
+            }
+            _ => encode::software_fit(self.size.0, self.size.1, self.fps),
+        }
+    }
+
     // None while paused by hand, and after a failed reopen, when the share
     // is over.
     pub fn kind(&self) -> Option<Kind> {
@@ -603,11 +652,42 @@ impl Sharer {
             Some(Codec::Hevc) => self.limit,
             _ => self.limit.map(within_default),
         };
+        let software_window = self.software_window().then(|| {
+            let small = source::window_box(fps);
+            (small.max_width, small.max_height)
+        });
         options_for(
             fps,
-            self.small.or(self.software.map(|software| software.limits)),
+            self.small
+                .or(self.software.map(|software| software.limits))
+                .or(software_window),
             largest,
         )
+    }
+
+    // A window share whose encoder is Windows' software one, however it came
+    // to be, which keeps to 1080p60's box whatever size the window takes
+    // (source::window_box).
+    fn software_window(&self) -> bool {
+        matches!(self.setup.choice, Choice::Window { .. }) && self.kind() == Some(Kind::MfSoftware)
+    }
+
+    // After a new encoder for a window: on the software encoder, the live
+    // capture keeps to its box from now on.
+    fn box_software_window(&mut self) {
+        if !self.software_window() {
+            return;
+        }
+        let small = source::window_box(self.fps);
+        if let Some(opened) = &mut self.opened {
+            let options = capture::Options {
+                max_fps: opened.options.max_fps,
+                ..small
+            };
+            opened.source.set_limits(options);
+            opened.options = options;
+            self.options = options;
+        }
     }
 
     // True when the source opened again, which it does only for a picture
@@ -646,17 +726,37 @@ impl Sharer {
         self.interval = Duration::from_secs(1) / self.fps;
         self.notes_said = opened.encoder.notes().len();
         self.options = opened.options;
+        opened.source.set_frame(Some(self.size));
         self.opened = Some(opened);
         self.encoder_bitrate = self.setup.settings.bitrate;
+        self.last_encoder = Some(Instant::now());
+        // A new source and encoder at the window's own size end any row of
+        // failed resizes.
+        self.resizes_failed = 0;
+        self.resize_retry = None;
+        self.box_software_window();
         Ok(true)
     }
 
     // Whether the source in use gives the same picture at the same rate
-    // under `options`.
+    // under `options`. A window's frame is the share's own, which a box
+    // keeps as long as the frame fits in it: a bigger size the window has
+    // under the new box then comes as any new size of the window does.
     fn keeps(&self, options: capture::Options) -> bool {
-        self.opened
-            .as_ref()
-            .is_some_and(|opened| same_picture(opened.source.plan(), self.options.max_fps, options))
+        let Some(opened) = &self.opened else {
+            return false;
+        };
+        match self.setup.choice {
+            Choice::Window { .. } => {
+                let fits = |max: u32, side: u32| {
+                    max == 0 || (max & !1).max(capture::SMALLEST_SIDE) >= side
+                };
+                options.max_fps == self.options.max_fps
+                    && fits(options.max_width, self.size.0)
+                    && fits(options.max_height, self.size.1)
+            }
+            _ => same_picture(opened.source.plan(), self.options.max_fps, options),
+        }
     }
 
     // `options` for the source in use, which keeps its picture under them.
@@ -730,32 +830,112 @@ impl Sharer {
                 if let Some(cursor) = frame.cursor.clone() {
                     audience.cursor(cursor);
                 }
-                if (frame.width, frame.height) != self.size {
-                    self.new_size(&frame, audience)?;
+                // Decided before this picture goes out fitted, so it goes
+                // once, to the new encoder, at the window's own size.
+                if let Some(mut own) = self.window_resize(Instant::now())? {
+                    own.present = frame.present;
+                    if self.go(own, audience)? {
+                        return Ok(());
+                    }
                 }
-                let reopens = self.reopens;
-                self.answer(audience);
-                // A change of codec opened the source again, at a new size:
-                // this frame is the old one's, and the next is the new one's.
-                if self.reopens != reopens {
-                    return Ok(());
-                }
-                self.send(&frame, None, audience)?;
-                if self.reopens == reopens {
-                    self.last = Some(frame);
-                }
+                self.go(frame, audience)?;
             }
             Next::Cursor(update) => {
                 audience.cursor(update);
-                self.still(audience)?;
+                self.quiet(audience)?;
             }
-            Next::Idle => self.still(audience)?,
+            Next::Idle => self.quiet(audience)?,
             Next::Paused(reason) => {
                 self.paused = true;
                 audience.paused(&reason);
             }
         }
         Ok(())
+    }
+
+    // A picture from capture out to the viewers, through a new encoder
+    // first when its size is new. False when that encoder did not open for
+    // a window, which keeps the one it has: nothing went out.
+    fn go(&mut self, frame: Frame, audience: &mut dyn Audience) -> Result<bool, String> {
+        if (frame.width, frame.height) != self.size && !self.new_size(&frame, audience)? {
+            return Ok(false);
+        }
+        let reopens = self.reopens;
+        self.answer(audience);
+        // A change of codec opened the source again, at a new size: this
+        // frame is the old one's, and the next is the new one's.
+        if self.reopens != reopens {
+            return Ok(true);
+        }
+        self.send(&frame, None, audience)?;
+        if self.reopens == reopens {
+            self.last = Some(frame);
+        }
+        Ok(true)
+    }
+
+    // No new picture: a window that stood still at a size it went out
+    // fitted at goes out at its own size once it may, else as still().
+    fn quiet(&mut self, audience: &mut dyn Audience) -> Result<(), String> {
+        if let Some(own) = self.window_resize(Instant::now())?
+            && self.go(own, audience)?
+        {
+            return Ok(());
+        }
+        self.still(audience)
+    }
+
+    // For a window share, its newest picture at the window's own size when
+    // that is not the share's and a new encoder may open now
+    // (RESIZE_SPACING); until then its pictures go out fitted into the
+    // share's frame. With no picture kept, the next one comes fitted and
+    // kept, and is decided then. None for any other source.
+    fn window_resize(&mut self, now: Instant) -> Result<Option<Frame>, String> {
+        let may = self.resizes_failed < RESIZE_TRIES
+            && self.resize_retry.is_none_or(|at| now >= at)
+            && self
+                .last_encoder
+                .is_none_or(|at| now.saturating_duration_since(at) >= RESIZE_SPACING)
+            && !self.answers.within_floor(now);
+        let size = self.size;
+        let Some(opened) = &mut self.opened else {
+            return Ok(None);
+        };
+        let Some(natural) = opened.source.natural() else {
+            return Ok(None);
+        };
+        if natural == size || !may {
+            opened.source.set_frame(Some(size));
+            return Ok(None);
+        }
+        opened.source.set_frame(None);
+        let own = opened.source.again()?;
+        if own.is_none() {
+            opened.source.set_frame(Some(size));
+        }
+        Ok(own)
+    }
+
+    // A new encoder for a window's new size did not open: the window goes on
+    // fitted into the frame it has, and the size is tried again after the
+    // spacing, RESIZE_TRIES times in a row at most.
+    fn resize_failed(&mut self, size: (u32, u32), why: &str, audience: &mut dyn Audience) {
+        self.resizes_failed += 1;
+        self.resize_retry = Some(Instant::now() + RESIZE_SPACING);
+        let frame = self.size;
+        if let Some(opened) = &mut self.opened {
+            opened.source.set_frame(Some(frame));
+        }
+        audience.line(Line::Log(format!(
+            "no new encoder for the window at {}x{}: {why}; it goes on fitted into {}x{}",
+            size.0, size.1, frame.0, frame.1
+        )));
+        if self.resizes_failed == RESIZE_TRIES {
+            audience.line(Line::Say(format!(
+                "no encoder opened for the window's new size {RESIZE_TRIES} times in a row, so the share stays at {}x{} with the window fitted into it",
+                frame.0, frame.1
+            )));
+        }
     }
 
     // Capture is paused: no picture comes until it gives one again.
@@ -802,18 +982,23 @@ impl Sharer {
         }
     }
 
-    // A mode change on the shared monitor: a new encoder, whose first frame
-    // is an IDR, as a new share would start.
-    fn new_size(&mut self, frame: &Frame, audience: &mut dyn Audience) -> Result<(), String> {
+    // A mode change on the shared monitor, or a shared window's new size: a
+    // new encoder, whose first frame is an IDR, as a new share would start.
+    // False when it did not open for a window, which keeps its encoder.
+    fn new_size(&mut self, frame: &Frame, audience: &mut dyn Audience) -> Result<bool, String> {
         let size = (frame.width, frame.height);
-        audience.line(Line::Say(format!(
-            "the picture went from {}x{} to {}x{}: starting a new encoder",
-            self.size.0, self.size.1, size.0, size.1
-        )));
-        let pick = self.pick();
+        let now = Instant::now();
+        let window = matches!(self.setup.choice, Choice::Window { .. });
+        let current = self.codec();
+        let mut pick = self.pick();
+        // A window changes size often, so its new encoder changes codec only
+        // as pick_codec would: back to HEVC only once SWITCH_GAP allows it.
+        if window && current == Some(Codec::H264) && !self.switches.hevc_may(now) {
+            pick.takes_hevc = false;
+        }
         let kind = self.encoder_kind();
         let Some(opened) = &mut self.opened else {
-            return Ok(());
+            return Ok(false);
         };
         let mut say = |line| audience.line(line);
         let chosen = source::codec_for(
@@ -827,13 +1012,25 @@ impl Sharer {
             &mut say,
         );
         self.hevc_offer = chosen.hevc;
+        // H.264 keeps to capture's default box (source::open): a window past
+        // it goes on fitted while capture brings its pictures within it.
+        let default = capture::Options::default();
+        let past_default = size.0 > default.max_width || size.1 > default.max_height;
+        if window && past_default && chosen.codec == Codec::H264 {
+            self.keep_to_h264_box();
+            return Ok(false);
+        }
+        audience.line(Line::Say(format!(
+            "the picture went from {}x{} to {}x{}: starting a new encoder",
+            self.size.0, self.size.1, size.0, size.1
+        )));
         let settings = &self.setup.settings;
         let fps = self.fps;
         let encoder = opened
             .source
             .encoder(chosen.kind, chosen.codec, size, fps, settings);
-        opened.encoder = match encoder {
-            Ok(encoder) => encoder,
+        let encoder = match encoder {
+            Ok(encoder) => Ok(encoder),
             Err(err) if chosen.codec == Codec::Hevc && self.setup.codec.is_none() => {
                 audience.line(Line::Log(format!(
                     "HEVC did not open at {}x{}: {err}; going on in H.264",
@@ -843,17 +1040,47 @@ impl Sharer {
                     offer.kind = None;
                     offer.why_not = err.to_string();
                 }
+                if window && past_default {
+                    self.keep_to_h264_box();
+                    return Ok(false);
+                }
                 opened
                     .source
                     .encoder(self.setup.encoder, Codec::H264, size, fps, settings)
-                    .map_err(|err| err.to_string())?
+                    .map_err(|err| err.to_string())
             }
-            Err(err) => return Err(err.to_string()),
+            Err(err) => Err(err.to_string()),
         };
-        self.notes_said = opened.encoder.notes().len();
+        match encoder {
+            Ok(encoder) => opened.encoder = encoder,
+            Err(why) if window => {
+                self.resize_failed(size, &why, audience);
+                return Ok(false);
+            }
+            Err(why) => return Err(why),
+        }
+        let codec_changed = current.is_some_and(|was| was != opened.encoder.codec());
+        if codec_changed {
+            self.switches.changed(now);
+        }
         self.size = size;
-        self.encoder_bitrate = self.setup.settings.bitrate;
-        Ok(())
+        self.resizes_failed = 0;
+        self.numbers.resized += u64::from(window);
+        self.changed_encoder(codec_changed);
+        self.box_software_window();
+        Ok(true)
+    }
+
+    // A window that would need H.264 past capture's default box: capture
+    // takes H.264's box, and the window goes on fitted into the frame it has
+    // until its next picture comes within the box.
+    fn keep_to_h264_box(&mut self) {
+        let options = self.source_options_in(Some(Codec::H264), self.setup.fps);
+        self.take_options(options);
+        let size = self.size;
+        if let Some(opened) = &mut self.opened {
+            opened.source.set_frame(Some(size));
+        }
     }
 
     // What came back since the last frame, all of it before this frame is
@@ -907,7 +1134,13 @@ impl Sharer {
         let Some(codec) = self.switches.due(current, takes_hevc, now) else {
             return;
         };
-        if codec == Codec::Hevc && self.answers.within_floor(now) {
+        // A window's encoders keep apart (RESIZE_SPACING), and the change
+        // back to HEVC can wait for that as it waits for the floor.
+        let spaced = !matches!(self.setup.choice, Choice::Window { .. })
+            || self
+                .last_encoder
+                .is_none_or(|at| now.saturating_duration_since(at) >= RESIZE_SPACING);
+        if codec == Codec::Hevc && (self.answers.within_floor(now) || !spaced) {
             return;
         }
         let kind = match codec {
@@ -1007,6 +1240,12 @@ impl Sharer {
     // told to the viewers the way every such change is, by its first frame,
     // an IDR whose header says the codec.
     fn changed_encoder(&mut self, codec_changed: bool) {
+        self.last_encoder = Some(Instant::now());
+        // A window's pictures go out in the new encoder's frame from now on.
+        let size = self.size;
+        if let Some(opened) = &mut self.opened {
+            opened.source.set_frame(Some(size));
+        }
         self.encoder_bitrate = self.setup.settings.bitrate;
         self.notes_said = self
             .opened
@@ -1045,7 +1284,7 @@ impl Sharer {
         };
         let Opened {
             mut encoder,
-            source,
+            mut source,
             fps,
             options,
             hevc,
@@ -1069,7 +1308,7 @@ impl Sharer {
             audience.line(Line::Log(format!("{was}: {left}")));
         }
         let opening = Instant::now();
-        let fit = encode::software_fit(self.size.0, self.size.1, self.fps);
+        let fit = self.small_fit();
         let did_not_start = |why: &dyn std::fmt::Display, audience: &mut dyn Audience| {
             audience.line(Line::Log(format!(
                 "the software encoder did not open after {was} failed: {why} ({:.1} ms to shut the GPU encoder down, and {:.1} ms trying)",
@@ -1089,6 +1328,18 @@ impl Sharer {
                         &self.setup.settings,
                     )
                     .map_err(|why| did_not_start(&why, audience))?;
+                // A window that fits now must still fit when it grows.
+                let options = match self.setup.choice {
+                    Choice::Window { .. } => {
+                        let small = source::window_box(self.fps);
+                        source.set_limits(small);
+                        capture::Options {
+                            max_fps: options.max_fps,
+                            ..small
+                        }
+                    }
+                    _ => options,
+                };
                 self.opened = Some(Opened {
                     encoder,
                     source,
@@ -1158,6 +1409,9 @@ impl Sharer {
             why: Software::GpuFailed,
             limits: (self.options.max_width, self.options.max_height),
         });
+        // The GPU encoder whose opens may have failed is gone.
+        self.resizes_failed = 0;
+        self.resize_retry = None;
         self.changed_encoder(was_codec != Codec::H264);
         self.fallback = Some(Fallback {
             was,
@@ -1376,6 +1630,15 @@ impl Switches {
     pub(crate) fn changed(&mut self, now: Instant) {
         self.last = Some(now);
     }
+
+    // Whether a new encoder may bring HEVC back now, as due() lets it: no
+    // change and no viewer needing H.264 for a whole gap.
+    pub(crate) fn hevc_may(&self, now: Instant) -> bool {
+        let quiet = |at: Option<Instant>| {
+            at.is_none_or(|at| now.saturating_duration_since(at) >= SWITCH_GAP)
+        };
+        quiet(self.last) && quiet(self.needed_h264)
+    }
 }
 
 // Capture's options at `fps`: within `small` (step_down's size, or what
@@ -1579,6 +1842,16 @@ mod tests {
         let mut settled = Switches::default();
         assert_eq!(settled.due(Codec::H264, false, at(0)), None);
         assert_eq!(settled.due(Codec::Hevc, true, at(0)), None);
+        // A window's new size may bring HEVC back only when due() would: a
+        // gap after the last change and after H.264 was last needed.
+        let mut window = Switches::default();
+        assert!(window.hevc_may(at(0)));
+        window.changed(at(100));
+        assert!(!window.hevc_may(at(3099)));
+        assert!(window.hevc_may(at(3100)));
+        assert_eq!(window.due(Codec::H264, false, at(3200)), None);
+        assert!(!window.hevc_may(at(6199)));
+        assert!(window.hevc_may(at(6200)));
     }
 
     #[test]

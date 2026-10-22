@@ -1,10 +1,13 @@
-// What a share shows: a monitor through Desktop Duplication, or capture's
-// test pattern standing in for one, and the encoder opened on the same
+// What a share shows: a monitor or a region of one through Desktop
+// Duplication, a window through Windows.Graphics.Capture, or capture's test
+// pattern standing in for a monitor, and the encoder opened on the same
 // device.
 
 use std::time::{Duration, Instant};
 
-use capture::{Adapter, Capture, CaptureError, Frame, Monitor, Next, Pattern, Rotation};
+use capture::{
+    Adapter, Capture, CaptureError, Frame, Monitor, Next, Pattern, Rotation, WindowCapture,
+};
 use encode::{Codec, EncodeError, Encoder, Fit, Kind, Settings};
 use net::Timer;
 
@@ -18,6 +21,7 @@ macro_rules! device {
     ($source:expr) => {
         match $source {
             Source::Screen(capture) => capture.device(),
+            Source::Window(capture) => capture.device(),
             Source::Pattern(pattern) => pattern.device(),
             Source::Busy(busy) => busy.pattern.device(),
         }
@@ -37,6 +41,12 @@ pub enum Choice {
         monitor: Monitor,
         region: capture::Region,
     },
+    // One window, captured and encoded on `adapter`: the GPU of the monitor
+    // it was on when the share started.
+    Window {
+        window: capture::WindowId,
+        adapter: Adapter,
+    },
     // A monitor of this size, made up: one past 4096 wide or 1440 high is
     // scaled down to fit the way a capture would be. Nothing of the screen
     // is captured. Busy turns it to noise (Busy below).
@@ -53,7 +63,7 @@ impl Choice {
     pub fn adapter(&self) -> &Adapter {
         match self {
             Choice::Screen(monitor) | Choice::Region { monitor, .. } => &monitor.adapter,
-            Choice::Pattern { adapter, .. } => adapter,
+            Choice::Window { adapter, .. } | Choice::Pattern { adapter, .. } => adapter,
         }
     }
 }
@@ -86,6 +96,25 @@ pub(crate) struct HevcOffer {
 impl HevcOffer {
     pub(crate) fn is_for(&self, size: (u32, u32), fps: u32) -> bool {
         self.size == size && self.fps == fps
+    }
+
+    // An encoder that takes HEVC at a size takes it at a smaller one too at
+    // the same rate, as levels and NVENC's limits only grow with the
+    // picture, so a window share does not ask again for every new size. A
+    // refusal stands only for its own size.
+    pub(crate) fn covers(&self, size: (u32, u32), fps: u32) -> bool {
+        self.kind.is_some() && self.fps == fps && size.0 <= self.size.0 && size.1 <= self.size.1
+    }
+}
+
+// What a window share on the software encoder keeps to, whatever size the
+// window takes later: the software encoder takes up to 1080p at 60 fps,
+// and a window, unlike a monitor, changes size mid-share.
+pub(crate) fn window_box(fps: u32) -> capture::Options {
+    capture::Options {
+        max_width: 1920,
+        max_height: 1080,
+        max_fps: fps.min(60),
     }
 }
 
@@ -145,6 +174,7 @@ fn not_that_one(offered: &[Kind], pinned: Option<Kind>) -> String {
 
 pub(crate) enum Source {
     Screen(Box<Capture>),
+    Window(Box<WindowCapture>),
     Pattern(Box<Pattern>),
     Busy(Box<Busy>),
 }
@@ -158,6 +188,9 @@ impl Source {
             }
             Choice::Region { monitor, region } => Source::Screen(Box::new(
                 Capture::open_region(monitor, *region, options).map_err(text)?,
+            )),
+            Choice::Window { window, adapter } => Source::Window(Box::new(
+                WindowCapture::open(*window, adapter, options).map_err(text)?,
             )),
             Choice::Pattern {
                 adapter,
@@ -181,6 +214,7 @@ impl Source {
     pub(crate) fn plan(&self) -> capture::Plan {
         match self {
             Source::Screen(capture) => capture.plan(),
+            Source::Window(capture) => capture.plan(),
             Source::Pattern(pattern) => pattern.plan(),
             Source::Busy(busy) => busy.pattern.plan(),
         }
@@ -191,16 +225,47 @@ impl Source {
         (plan.width, plan.height)
     }
 
-    // A pattern's picture keeps its size, so only a screen needs them.
+    // A pattern's picture keeps its size, so only a screen or a window
+    // needs them.
     pub(crate) fn set_limits(&mut self, options: capture::Options) {
-        if let Source::Screen(capture) = self {
-            capture.set_limits(options.max_width, options.max_height);
+        match self {
+            Source::Screen(capture) => capture.set_limits(options.max_width, options.max_height),
+            Source::Window(capture) => capture.set_limits(options.max_width, options.max_height),
+            Source::Pattern(_) | Source::Busy(_) => {}
+        }
+    }
+
+    // A window's own frame for its newest picture, which the share's
+    // frame can differ from while the window changes size; None for any
+    // other source, whose pictures are always the share's size.
+    pub(crate) fn natural(&self) -> Option<(u32, u32)> {
+        match self {
+            Source::Window(capture) => capture.natural(),
+            _ => None,
+        }
+    }
+
+    // A window's pictures from the next one on go out in a frame of this
+    // size (WindowCapture::set_frame).
+    pub(crate) fn set_frame(&mut self, frame: Option<(u32, u32)>) {
+        if let Source::Window(capture) = self {
+            capture.set_frame(frame);
+        }
+    }
+
+    // A window's newest picture once more, under the frame set now
+    // (WindowCapture::again).
+    pub(crate) fn again(&mut self) -> Result<Option<Frame>, String> {
+        match self {
+            Source::Window(capture) => capture.again().map_err(|err| err.to_string()),
+            _ => Ok(None),
         }
     }
 
     pub(crate) fn next(&mut self) -> Result<Next, String> {
         match self {
             Source::Screen(capture) => capture.next().map_err(|err| err.to_string()),
+            Source::Window(capture) => capture.next().map_err(|err| err.to_string()),
             Source::Pattern(pattern) => pattern
                 .next()
                 .map(Next::Frame)
@@ -400,11 +465,15 @@ pub(crate) fn open(
                 known = chosen.hevc;
                 // Both sides: the fit's width is worked out from the share's
                 // size and capture's from the monitor's, and the two can
-                // round apart.
-                options = capture::Options {
-                    max_width: fit.width,
-                    max_height: fit.height,
-                    max_fps: fit.fps,
+                // round apart. A window gets a box that holds any size it
+                // takes later.
+                options = match choice {
+                    Choice::Window { .. } => window_box(options.max_fps),
+                    _ => capture::Options {
+                        max_width: fit.width,
+                        max_height: fit.height,
+                        max_fps: fit.fps,
+                    },
                 };
                 fitted = true;
             }
@@ -458,7 +527,7 @@ pub(crate) fn codec_for(
         };
     }
     let offer = match known {
-        Some(offer) if offer.is_for(size, fps) => offer,
+        Some(offer) if offer.is_for(size, fps) || offer.covers(size, fps) => offer,
         known => {
             let offer = source.hevc_offer(kind, choice.adapter().vendor_id, size, fps);
             if new_reason(known.as_ref(), &offer) {

@@ -96,6 +96,8 @@ pub struct SharerNumbers {
     // New encoders for a share left to pick its codec, as its viewers came
     // and went (sharer::SWITCH_GAP).
     pub codec_changes: u64,
+    // New encoders for a shared window's new size (sharer::RESIZE_SPACING).
+    pub resized: u64,
     pub pace: PaceNumbers,
     // Every frame's, only with Setup::keep_times.
     pub encode_ms: Vec<f32>,

@@ -401,6 +401,10 @@ fn describe(options: &Options, setup: &Setup) -> String {
             "a {}x{} region of {} at {},{}",
             region.width, region.height, monitor.name, region.left, region.top
         ),
+        // The handle only: a window's title never goes into the log.
+        Choice::Window { window, adapter } => {
+            format!("window {:#x} on {}", window.hwnd, adapter.description)
+        }
         Choice::Pattern {
             width,
             height,

@@ -303,7 +303,12 @@ fn a_window_kept_in_a_frame() {
     let frame = capture.again().unwrap().expect("no picture kept");
     assert_eq!((frame.width, frame.height), (1000, 600));
     assert!(frame.present.elapsed() < Duration::from_millis(100));
-    // Out at its own size, nothing is kept any more.
+    // Kept for another try until a picture goes out at its own size.
+    let frame = capture.again().unwrap().expect("no picture kept");
+    assert_eq!((frame.width, frame.height), (1000, 600));
+    window.resize(900, 500);
+    let sizes = sizes_for(&mut capture, Duration::from_secs(1));
+    assert_eq!(sizes.last(), Some(&(900, 500)), "{sizes:?}");
     assert!(capture.again().unwrap().is_none());
 }
 

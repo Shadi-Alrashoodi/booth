@@ -58,6 +58,9 @@ const RESTORING: Duration = Duration::from_millis(500);
 // window is gone.
 pub const WINDOW_GONE: &str = "the window you chose is not open any more. Choose another one";
 
+// Why a window share stops when the window closes while it runs.
+pub const WINDOW_CLOSED: &str = "the shared window was closed";
+
 // What a window share is opened by: the window's handle and the program that
 // owns it, since Windows gives the handle of a closed window to new ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -130,10 +133,11 @@ pub struct WindowCapture {
     qpc_frequency: i64,
 }
 
-// A copy of the newest picture, made only while it goes out fitted into a
-// frame of another size, so again() can convert it once more at its own
-// size after the window stands still. A frame of the pool is never held:
-// Windows draws only into frames handed back.
+// A copy of the newest picture, made while it goes out fitted into a frame
+// of another size and kept until a picture goes out at its own size, so
+// again() can convert it once more after the window stands still, and
+// again if the encoder for its size did not open. A frame of the pool is
+// never held: Windows draws only into frames handed back.
 struct Kept {
     texture: ID3D11Texture2D,
     view: ID3D11ShaderResourceView,
@@ -390,9 +394,6 @@ impl WindowCapture {
             .convert(&view, &self.layout, &self.targets[slot]);
         // SAFETY: a call on the live immediate context.
         unsafe { self.context.Flush() };
-        if !self.fitted() {
-            self.forget_kept();
-        }
         let now = Instant::now();
         Ok(Some(self.frame_out(slot, (now, now, now))))
     }
@@ -406,7 +407,7 @@ impl WindowCapture {
             // The item's Closed event does not always come for a destroyed
             // window, so the window is asked too.
             if self.closed.load(Ordering::Acquire) || !self.window.exists() {
-                return Err(CaptureError::other("the shared window was closed"));
+                return Err(CaptureError::other(WINDOW_CLOSED));
             }
             if self.window.minimized() {
                 // What Windows composes of a minimized window is only its
