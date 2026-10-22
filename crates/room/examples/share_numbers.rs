@@ -29,20 +29,35 @@
 // instead, in the middle of the primary monitor: 1920x1080 and 2560x1440 at
 // their own size, and all of the monitor as a region, which set beside the
 // desktop case is what the crop itself costs; its links at 2560x1440.
+// window shares viewer_pattern's own window, sized and placed so that what
+// DWM draws of it is exactly the 2560x1440 region's rectangle, and kept above
+// everything, through Windows Graphics Capture, and the same pixels as a
+// region of the monitor through Desktop Duplication, clean and on the links;
+// then the window while it is dragged in and out over a second every 4 s,
+// and while it steps between 2560x1440 and 1920x1080 every 250 ms, which
+// count the new sizes the share sent. A case says so when the window moved
+// or the watch ended while it was measured.
 
 #[path = "../tests/common/mod.rs"]
 mod common;
 
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::Arc;
-use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use common::link::{Link, Shape};
 use common::{Member, config, invite_to, loopback};
 use keys::Identity;
 use room::view::{LinkState, OwnShare, PresentPath, SharingNumbers, View, WatchingNumbers};
-use room::{Show, Timers, VideoConfig, VideoSource};
+use room::{Show, Timers, VideoConfig, VideoSource, WindowId};
+use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GWL_EXSTYLE, GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOZORDER,
+    SetWindowPos, WS_EX_TOPMOST,
+};
 
 const FFMPEG: [&str; 2] = ["avcodec-62.dll", "avutil-60.dll"];
 const WAIT: Duration = Duration::from_secs(15);
@@ -51,6 +66,12 @@ const MEASURED: u64 = 30;
 const MEASURED_LONG: u64 = 60;
 // How often the views are read for a new second of numbers.
 const LOOK: Duration = Duration::from_millis(50);
+// What DWM draws of the pattern window in the window cases, on the same
+// rectangle as the 2560x1440 region: a size neither path scales or rounds.
+const WINDOW_AT: (u32, u32) = (2560, 1440);
+// The stepped case's other size, and how often it changes.
+const STEPPED_TO: (u32, u32) = (1920, 1080);
+const STEP_EVERY: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, PartialEq)]
 enum Source {
@@ -58,6 +79,10 @@ enum Source {
     Desktop,
     // A region of the desktop this size, or all of it as a region.
     Region(Option<(u32, u32)>),
+    Window,
+    WindowAsRegion,
+    WindowDragged,
+    WindowStepped,
 }
 
 impl Source {
@@ -67,7 +92,22 @@ impl Source {
             Source::Desktop => String::from("desktop"),
             Source::Region(Some((width, height))) => format!("desktop region {width}x{height}"),
             Source::Region(None) => String::from("desktop region of all of it"),
+            Source::Window => String::from("pattern window"),
+            Source::WindowAsRegion => String::from("pattern window as a desktop region"),
+            Source::WindowDragged => String::from("pattern window dragged to new sizes"),
+            Source::WindowStepped => String::from("pattern window stepping between two sizes"),
         }
+    }
+
+    fn window(self) -> bool {
+        matches!(
+            self,
+            Source::Window | Source::WindowAsRegion | Source::WindowDragged | Source::WindowStepped
+        )
+    }
+
+    fn resized(self) -> bool {
+        matches!(self, Source::WindowDragged | Source::WindowStepped)
     }
 }
 
@@ -127,6 +167,9 @@ fn cases(sources: &[&str], halves: &[&str]) -> Vec<Case> {
             Source::Region(None),
         ]);
     }
+    if sources.contains(&"window") {
+        all.extend([Source::Window, Source::WindowAsRegion]);
+    }
     if wants(halves, "clean") {
         for &source in &all {
             for fps in [60, 120] {
@@ -139,15 +182,36 @@ fn cases(sources: &[&str], halves: &[&str]) -> Vec<Case> {
                 });
             }
         }
+        if sources.contains(&"window") {
+            for source in [Source::WindowDragged, Source::WindowStepped] {
+                picked.push(Case {
+                    source,
+                    fps: 120,
+                    link: "clean",
+                    shape: Shape::default(),
+                    secs: MEASURED,
+                });
+            }
+        }
     }
     if wants(halves, "links") {
-        for source in all.into_iter().filter(|&s| {
-            matches!(
-                s,
-                Source::Pattern(_, 1440) | Source::Desktop | Source::Region(Some((_, 1440)))
-            )
-        }) {
-            for (link, shape, secs) in links() {
+        let linked: Vec<Source> = all
+            .into_iter()
+            .filter(|&s| {
+                matches!(
+                    s,
+                    Source::Pattern(_, 1440)
+                        | Source::Desktop
+                        | Source::Region(Some((_, 1440)))
+                        | Source::Window
+                        | Source::WindowAsRegion
+                )
+            })
+            .collect();
+        // Each link for every source in turn, so the cases set side by side
+        // ran minutes apart, not a whole source's links apart.
+        for (link, shape, secs) in links() {
+            for &source in &linked {
                 picked.push(Case {
                     source,
                     fps: 120,
@@ -168,14 +232,31 @@ fn own_share(view: &View) -> Option<u32> {
     }
 }
 
-// The pattern moving on the whole monitor at its refresh, for a desktop case.
-fn drawing() -> Result<Child, String> {
+// viewer_pattern, killed however the case ends, so a panic never leaves it
+// above everything in the middle of the screen.
+struct Drawing(Child);
+
+impl Drop for Drawing {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+// The pattern moving at 240 frames a second: on the whole monitor for a
+// desktop case, in a window of its own for a window case.
+fn drawing(fullscreen: bool) -> Result<Drawing, String> {
     let exe = std::env::current_exe().map_err(|err| format!("no path to this example: {err}"))?;
     let pattern = exe.with_file_name("viewer_pattern.exe");
+    let mut args = vec!["--fps", "240"];
+    if fullscreen {
+        args.push("--fullscreen");
+    }
     Command::new(&pattern)
-        .args(["--fps", "240", "--fullscreen"])
+        .args(args)
         .stdout(Stdio::null())
         .spawn()
+        .map(Drawing)
         .map_err(|err| {
             format!(
                 "could not start {}: {err}; build it with cargo build --release -p viewer --example viewer_pattern",
@@ -184,14 +265,212 @@ fn drawing() -> Result<Child, String> {
         })
 }
 
-// The primary monitor, and the region of it in its middle, or all of it.
-fn middle(size: Option<(u32, u32)>) -> (share::MonitorId, share::Region) {
+fn primary() -> share::Monitor {
     let monitors = share::monitors().expect("the monitors");
-    let monitor = monitors
+    monitors
         .iter()
         .find(|monitor| monitor.primary)
         .or(monitors.first())
-        .expect("a monitor");
+        .cloned()
+        .expect("a monitor")
+}
+
+fn outer(hwnd: isize) -> RECT {
+    let mut rect = RECT::default();
+    // SAFETY: a plain query with a live out parameter; a window that is
+    // gone leaves it empty.
+    let _ = unsafe { GetWindowRect(HWND(hwnd as *mut _), &mut rect) };
+    rect
+}
+
+// What DWM draws of the window, the picture a window capture takes, in
+// desktop pixels.
+fn bounds(hwnd: isize) -> Option<RECT> {
+    let mut bounds = RECT::default();
+    // SAFETY: a RECT of the size passed, which this attribute fills.
+    unsafe {
+        DwmGetWindowAttribute(
+            HWND(hwnd as *mut _),
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut bounds as *mut RECT as *mut _,
+            size_of::<RECT>() as u32,
+        )
+    }
+    .ok()?;
+    Some(bounds)
+}
+
+// Sizes and moves the window so DWM draws it on `to`: its own rectangle also
+// holds borders nobody sees, which Windows sizes for each window. topmost
+// puts it above every other window as well.
+fn place(hwnd: isize, to: RECT, topmost: bool) -> Result<(), String> {
+    let outer = outer(hwnd);
+    let drawn = bounds(hwnd).ok_or("could not read the pattern window's bounds")?;
+    let rect = RECT {
+        left: to.left - (drawn.left - outer.left),
+        top: to.top - (drawn.top - outer.top),
+        right: to.right + (outer.right - drawn.right),
+        bottom: to.bottom + (outer.bottom - drawn.bottom),
+    };
+    let order = if topmost {
+        SWP_NOACTIVATE
+    } else {
+        SWP_NOACTIVATE | SWP_NOZORDER
+    };
+    // SAFETY: a window of another process, placed without the focus
+    // changing; a window that is gone makes it fail.
+    unsafe {
+        SetWindowPos(
+            HWND(hwnd as *mut _),
+            topmost.then_some(HWND_TOPMOST),
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            order,
+        )
+    }
+    .map_err(|err| format!("could not place the pattern window: {err}"))
+}
+
+// viewer_pattern's window once it shows, put above every other window and
+// drawn on the 2560x1440 region's rectangle in the middle of the primary
+// monitor, and that rectangle: nothing covers it, so a region of it is the
+// same pixels the window capture takes, and a 120 fps case runs at the
+// primary's refresh. The pattern is letterboxed into the window's client.
+fn pattern_window(drawing: &Drawing) -> Result<(WindowId, RECT), String> {
+    let end = Instant::now() + WAIT;
+    let window = loop {
+        let windows = share::top_windows().map_err(|err| err.to_string())?;
+        if let Some(window) = windows.iter().find(|w| w.id.process == drawing.0.id()) {
+            break window.id;
+        }
+        if Instant::now() >= end {
+            return Err(format!(
+                "viewer_pattern showed no window within {} s",
+                WAIT.as_secs()
+            ));
+        }
+        thread::sleep(LOOK);
+    };
+    let monitor = primary();
+    let (_, region) = middle(Some(WINDOW_AT));
+    let left = monitor.left + region.left as i32;
+    let top = monitor.top + region.top as i32;
+    let to = RECT {
+        left,
+        top,
+        right: left + region.width as i32,
+        bottom: top + region.height as i32,
+    };
+    place(window.hwnd, to, true)?;
+    // SAFETY: a plain query; a window that is gone answers 0.
+    let style = unsafe { GetWindowLongPtrW(HWND(window.hwnd as *mut _), GWL_EXSTYLE) } as u32;
+    if style & WS_EX_TOPMOST.0 == 0 {
+        return Err(String::from(
+            "Windows did not put the pattern window above the others",
+        ));
+    }
+    // DWM's bounds follow a moment after the move.
+    let mut same = 0;
+    while same < 2 {
+        if Instant::now() >= end {
+            return Err(format!(
+                "the pattern window is drawn at {:?}, not at {to:?}",
+                bounds(window.hwnd)
+            ));
+        }
+        thread::sleep(LOOK);
+        same = if bounds(window.hwnd) == Some(to) {
+            same + 1
+        } else {
+            0
+        };
+    }
+    Ok((window, to))
+}
+
+// What DWM draws of the window as a region of the monitor it is on.
+fn window_region(window: WindowId) -> Result<(share::MonitorId, share::Region), String> {
+    let monitor = share::window_monitor(window).ok_or("the pattern window is on no monitor")?;
+    let bounds = bounds(window.hwnd).ok_or("could not read the pattern window's bounds")?;
+    let (left, top) = (bounds.left - monitor.left, bounds.top - monitor.top);
+    let (width, height) = (bounds.right - bounds.left, bounds.bottom - bounds.top);
+    if left < 0
+        || top < 0
+        || width <= 0
+        || height <= 0
+        || left + width > monitor.width as i32
+        || top + height > monitor.height as i32
+    {
+        return Err(format!(
+            "the pattern window at {bounds:?} is not all on {}",
+            monitor.name
+        ));
+    }
+    let region = share::Region {
+        left: left as u32,
+        top: top as u32,
+        width: width as u32,
+        height: height as u32,
+    };
+    Ok((monitor.id, region))
+}
+
+// Changes the window's size while a resized case is measured, its top left
+// kept, until told to stop, and puts the size back. Dragged pulls the bottom
+// right corner in to seven tenths and out again over about a second, a size
+// each 16 ms as a mouse drag gives them, then leaves it still for 3 s.
+// Stepped switches between WINDOW_AT and STEPPED_TO every STEP_EVERY, so a
+// new size always waits and the share's own spacing sets how often one goes
+// out.
+fn resizing(source: Source, window: WindowId, stop: Arc<AtomicBool>) -> JoinHandle<()> {
+    let hwnd = window.hwnd;
+    thread::spawn(move || {
+        let Some(start) = bounds(hwnd) else {
+            return;
+        };
+        let (width, height) = (start.right - start.left, start.bottom - start.top);
+        let size = |width: i32, height: i32| {
+            let to = RECT {
+                right: start.left + width,
+                bottom: start.top + height,
+                ..start
+            };
+            let _ = place(hwnd, to, false);
+        };
+        let rest = |time: Duration| {
+            let until = Instant::now() + time;
+            while Instant::now() < until && !stop.load(Ordering::Relaxed) {
+                thread::sleep(LOOK.min(until.saturating_duration_since(Instant::now())));
+            }
+        };
+        let mut stepped = false;
+        while !stop.load(Ordering::Relaxed) {
+            if source == Source::WindowStepped {
+                stepped = !stepped;
+                let (width, height) = if stepped { STEPPED_TO } else { WINDOW_AT };
+                size(width as i32, height as i32);
+                rest(STEP_EVERY);
+                continue;
+            }
+            for step in (0..30).chain((0..30).rev()) {
+                let tenths = 1.0 - 0.3 * f64::from(step) / 29.0;
+                size(
+                    (f64::from(width) * tenths) as i32,
+                    (f64::from(height) * tenths) as i32,
+                );
+                thread::sleep(Duration::from_millis(16));
+            }
+            rest(Duration::from_secs(3));
+        }
+        size(width, height);
+    })
+}
+
+// The primary monitor, and the region of it in its middle, or all of it.
+fn middle(size: Option<(u32, u32)>) -> (share::MonitorId, share::Region) {
+    let monitor = primary();
     let (width, height) = size.unwrap_or((monitor.width, monitor.height));
     let region = share::Region {
         left: monitor.width.saturating_sub(width) / 2,
@@ -209,7 +488,7 @@ struct Pair {
     link: Link,
 }
 
-fn open(source: Source, fps: u8) -> Pair {
+fn open(source: Source, fps: u8, window: Option<WindowId>) -> Pair {
     let video = |show| VideoConfig {
         source: match source {
             Source::Pattern(width, height) => VideoSource::Pattern {
@@ -217,7 +496,7 @@ fn open(source: Source, fps: u8) -> Pair {
                 height,
                 busy: false,
             },
-            Source::Desktop | Source::Region(_) => VideoSource::Screen,
+            _ => VideoSource::Screen,
         },
         show,
         ..VideoConfig::default()
@@ -231,7 +510,7 @@ fn open(source: Source, fps: u8) -> Pair {
     let mut friend_config = config("Ana", timers);
     friend_config.video = video(match source {
         Source::Pattern(..) => Show::NoActivate,
-        Source::Desktop | Source::Region(_) => Show::Hidden,
+        _ => Show::Hidden,
     });
     let friend = Member::join_with(
         friend_config,
@@ -241,10 +520,17 @@ fn open(source: Source, fps: u8) -> Pair {
     friend.wait_for(WAIT, "the friend in the room", |v| {
         v.strip.state == LinkState::Live
     });
-    match source {
-        Source::Region(size) => {
+    match (source, window) {
+        (Source::Region(size), _) => {
             let (monitor, region) = middle(size);
             host.room().share_region(fps, monitor, region);
+        }
+        (Source::WindowAsRegion, Some(window)) => {
+            let (monitor, region) = window_region(window).expect("the pattern window's region");
+            host.room().share_region(fps, monitor, region);
+        }
+        (Source::Window | Source::WindowDragged | Source::WindowStepped, Some(window)) => {
+            host.room().share_window(fps, window);
         }
         _ => host.room().share(fps, None),
     }
@@ -342,8 +628,12 @@ fn print_case(case: &Case, seconds: &[Second], until: Instant) {
         (Some(x), Some(y)) => (y.idrs - x.idrs, y.backoffs - x.backoffs),
         _ => (0, 0),
     };
+    let sizes = shared
+        .windows(2)
+        .filter(|pair| (pair[0].width, pair[0].height) != (pair[1].width, pair[1].height))
+        .count();
     println!(
-        "  {}: {fps:.1} fps shown in {took:.0} s, capture to display {latency} (median/p95, worst 10 s), slowest {slowest:.1} ms, {} stalls, longest wait {longest:.0} ms{}, lost for good {}, not decoded {}, repaired {}; {kbps} kbit/s, {idrs} IDRs, {backoffs} backoffs, rate at the end {} kbit/s",
+        "  {}: {fps:.1} fps shown in {took:.0} s, capture to display {latency} (median/p95, worst 10 s), slowest {slowest:.1} ms, {} stalls, longest wait {longest:.0} ms{}, lost for good {}, not decoded {}, repaired {}; {kbps} kbit/s, {idrs} IDRs, {backoffs} backoffs, {sizes} new sizes, rate at the end {} kbit/s",
         case.link,
         b.stalls - a.stalls,
         if dark { ", ended dark" } else { "" },
@@ -357,24 +647,36 @@ fn print_case(case: &Case, seconds: &[Second], until: Instant) {
 fn run(case: &Case) {
     let what = format!("{} at {} fps", case.source.name(), case.fps);
     let mut pattern = None;
-    let desktop = matches!(case.source, Source::Desktop | Source::Region(_));
+    let mut window = None;
+    let desktop =
+        matches!(case.source, Source::Desktop | Source::Region(_)) || case.source.window();
     if desktop {
-        match drawing() {
-            Ok(child) => pattern = Some(child),
+        let drawing = match drawing(!case.source.window()) {
+            Ok(drawing) => drawing,
             Err(err) => {
                 println!("{what}, {}: skipped, {err}", case.link);
                 return;
             }
+        };
+        if case.source.window() {
+            match pattern_window(&drawing) {
+                Ok(placed) => window = Some(placed),
+                Err(err) => {
+                    println!("{what}, {}: skipped, {err}", case.link);
+                    return;
+                }
+            }
         }
+        pattern = Some(drawing);
         thread::sleep(Duration::from_secs(2));
     }
-    let pair = open(case.source, case.fps);
+    let pair = open(case.source, case.fps, window.map(|(id, _)| id));
     thread::sleep(SETTLE);
     let host = pair.host.view();
     let friend = pair.friend.view();
     if let (Some(s), Some(w)) = (&host.numbers.sharing, &friend.numbers.watching) {
         println!(
-            "{what}, {}: shared {}x{} at {} fps with {}, present {}{}",
+            "{what}, {}: shared {}x{} at {} fps with {}, present {}{}{}",
             case.link,
             s.width,
             s.height,
@@ -386,12 +688,31 @@ fn run(case: &Case) {
                 None => "not known",
             },
             if desktop { " to a hidden viewer" } else { "" },
+            window.map_or_else(String::new, |(_, at)| format!(
+                ", the window drawn at {},{} {}x{}",
+                at.left,
+                at.top,
+                at.right - at.left,
+                at.bottom - at.top
+            )),
         );
     }
     pair.link.shape(case.shape, case.shape);
+    let stop = Arc::new(AtomicBool::new(false));
+    let resizer = match window {
+        Some((id, _)) if case.source.resized() => {
+            Some(resizing(case.source, id, Arc::clone(&stop)))
+        }
+        _ => None,
+    };
+    let problem = friend.share.problem;
     let before = pair.link.tallies();
     let (seconds, until) = measure(&pair, case.secs);
     let after = pair.link.tallies();
+    stop.store(true, Ordering::Relaxed);
+    if let Some(resizer) = resizer {
+        let _ = resizer.join();
+    }
     print_case(case, &seconds, until);
     if case.link != "clean" {
         println!(
@@ -400,11 +721,33 @@ fn run(case: &Case) {
             after.1.since(&before.1).lost_pct()
         );
     }
-    drop(pair);
-    if let Some(mut child) = pattern {
-        let _ = child.kill();
-        let _ = child.wait();
+    let view = pair.friend.view();
+    if !view.share.watching || view.share.problem != problem {
+        println!(
+            "    the watch ended or went wrong: {}",
+            view.share.problem.as_deref().unwrap_or("no line says why")
+        );
     }
+    if let Some((id, at)) = window {
+        // A resized case put the size back just now, and DWM follows a
+        // moment later.
+        let end = Instant::now() + Duration::from_secs(1);
+        while bounds(id.hwnd) != Some(at) && Instant::now() < end {
+            thread::sleep(LOOK);
+        }
+        if bounds(id.hwnd) != Some(at) {
+            println!(
+                "    the pattern window was moved to {:?} while measured, so these numbers are not of it",
+                bounds(id.hwnd)
+            );
+        }
+    }
+    if let Some(drawing) = &mut pattern
+        && drawing.0.try_wait().ok().flatten().is_some()
+    {
+        println!("    viewer_pattern ended while measured");
+    }
+    drop(pair);
 }
 
 fn main() -> ExitCode {
@@ -413,10 +756,10 @@ fn main() -> ExitCode {
     let mut halves = Vec::new();
     for word in &words {
         match word.as_str() {
-            "pattern" | "desktop" | "region" => sources.push(word.as_str()),
+            "pattern" | "desktop" | "region" | "window" => sources.push(word.as_str()),
             "clean" | "links" => halves.push(word.as_str()),
             _ => {
-                eprintln!("{word:?} is none of pattern, desktop, region, clean or links");
+                eprintln!("{word:?} is none of pattern, desktop, region, window, clean or links");
                 return ExitCode::from(2);
             }
         }
