@@ -1,7 +1,8 @@
 // Audio in and out: WASAPI in shared mode, so games keep their sound, at the
 // smallest period the driver allows. Capture delivers mono f32 at 48 kHz with
 // the capture time of each packet as an Instant; render asks for mono f32 at
-// 48 kHz and plays it on every channel.
+// 48 kHz and plays it on every channel, or for a stereo mix, which it spreads
+// over the speakers by side.
 //
 // The capture time is an Instant because the room's clock (room::peer::Clock)
 // turns an Instant into its wall-anchored microseconds, so a voice packet can

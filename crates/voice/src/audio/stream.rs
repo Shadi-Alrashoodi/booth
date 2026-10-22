@@ -14,7 +14,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use super::devices::{Choice, Direction};
 use super::echo::{Echo, Effects};
 use super::error::AudioError;
-use super::format::{Format, RATE, from_mono, interleaved, to_mono};
+use super::format::{Format, RATE, from_mono, from_stereo, interleaved, to_mono};
 use super::level::{Level, Meter, Reading};
 use super::wasapi;
 
@@ -382,7 +382,8 @@ impl Capture {
 }
 
 // Speakers or headphones. The callback fills exactly the frames the device
-// asks for, in mono; every channel gets the same samples. Stops when dropped.
+// asks for, in mono, and every channel gets the same samples; or with
+// start_stereo in stereo. Stops when dropped.
 pub struct Render(Handle);
 
 impl Render {
@@ -406,7 +407,46 @@ impl Render {
     {
         let work = Work::Render {
             fill: Box::new(fill),
-            mono: Vec::new(),
+            samples: Vec::new(),
+            stereo: false,
+        };
+        let name = format!("audio {}", Direction::Output);
+        spawn(
+            name,
+            Direction::Output,
+            make,
+            choice,
+            work,
+            Box::new(events),
+        )
+        .map(Render)
+    }
+
+    // As start, with the mix in stereo: the callback fills left and right
+    // interleaved, two samples for each frame the device asks for, and each
+    // speaker gets its side of them (format::from_stereo).
+    pub fn start_stereo(
+        choice: Choice,
+        fill: impl FnMut(&mut [f32]) + Send + 'static,
+        events: impl FnMut(Event) + Send + 'static,
+    ) -> Result<Render, AudioError> {
+        Render::start_stereo_with(wasapi::device, choice, fill, events)
+    }
+
+    pub fn start_stereo_with<D, F>(
+        make: F,
+        choice: Choice,
+        fill: impl FnMut(&mut [f32]) + Send + 'static,
+        events: impl FnMut(Event) + Send + 'static,
+    ) -> Result<Render, AudioError>
+    where
+        D: Device,
+        F: FnOnce(Direction, Wake) -> Result<D, AudioError> + Send + 'static,
+    {
+        let work = Work::Render {
+            fill: Box::new(fill),
+            samples: Vec::new(),
+            stereo: true,
         };
         let name = format!("audio {}", Direction::Output);
         spawn(
@@ -582,7 +622,9 @@ enum Work {
     },
     Render {
         fill: AudioOut,
-        mono: Vec<f32>,
+        // One sample a frame, or left and right with `stereo`.
+        samples: Vec<f32>,
+        stereo: bool,
     },
     Stereo {
         audio: StereoIn,
@@ -623,7 +665,7 @@ impl Work {
     fn gauge(&self) {
         match self {
             Work::Capture { mono, .. } => stats::gauge!("voice.capture.mono", *mono),
-            Work::Render { mono, .. } => stats::gauge!("voice.render.mono", *mono),
+            Work::Render { samples, .. } => stats::gauge!("voice.render.mono", *samples),
             Work::Stereo { stereo, mid, .. } => {
                 stats::gauge!("voice.pc_sound.stereo", *stereo);
                 stats::gauge!("voice.pc_sound.mid", *mid);
@@ -657,7 +699,11 @@ impl Work {
                     .unwrap_or_else(|| Instant::now() - frames_to_time(packet.frames));
                 audio(mono, time);
             }),
-            Work::Render { fill, mono } => {
+            Work::Render {
+                fill,
+                samples,
+                stereo,
+            } => {
                 let target = stream.info().render_target();
                 let queued = stream.queued()?;
                 let frames = target.saturating_sub(queued);
@@ -667,10 +713,17 @@ impl Work {
                 if frames == 0 {
                     return Ok(());
                 }
-                mono.clear();
-                mono.resize(frames as usize, 0.0);
-                fill(mono);
-                stream.write(frames, &mut |bytes| from_mono(mono, &format, bytes))?;
+                let width = if *stereo { 2 } else { 1 };
+                samples.clear();
+                samples.resize(frames as usize * width, 0.0);
+                fill(samples);
+                stream.write(frames, &mut |bytes| {
+                    if *stereo {
+                        from_stereo(samples, &format, bytes);
+                    } else {
+                        from_mono(samples, &format, bytes);
+                    }
+                })?;
                 shared.note_queued(queued);
                 Ok(())
             }

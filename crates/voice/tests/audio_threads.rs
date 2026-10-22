@@ -591,6 +591,61 @@ fn a_stream_that_is_not_48_khz_is_refused() {
     capture.stop();
 }
 
+// A stereo mix reaches two speakers as it is, and six with no layout named
+// as left, right and the middle of the two on the other four.
+#[test]
+fn render_spreads_a_stereo_mix_over_the_speakers() {
+    for (channels, frame) in [
+        (2u16, vec![0.25f32, -0.5]),
+        (6, vec![0.25, -0.5, -0.125, -0.125, -0.125, -0.125]),
+    ] {
+        let fake = Fake::new(
+            Setup {
+                channels,
+                ..Setup::default()
+            },
+            &[("out", "Fake speakers")],
+            Some("out"),
+        );
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&asked);
+        let (on_event, rx) = events();
+        let render = Render::start_stereo_with(
+            fake.device(),
+            Choice::Default,
+            move |samples: &mut [f32]| {
+                seen.lock().unwrap().push(samples.len());
+                for pair in samples.chunks_mut(2) {
+                    pair.copy_from_slice(&[0.25, -0.5]);
+                }
+            },
+            on_event,
+        )
+        .unwrap();
+        opened(&rx);
+        std::thread::sleep(Duration::from_millis(50));
+        render.stop();
+        let record = fake.record();
+        let asked = asked.lock().unwrap();
+        assert!(!asked.is_empty());
+        // Two samples for each frame written after the silence it starts
+        // with.
+        assert_eq!(
+            asked.iter().sum::<usize>(),
+            record
+                .packets
+                .iter()
+                .map(|&n| n as usize * 2)
+                .sum::<usize>()
+        );
+        let written = &record.written;
+        assert!(!written.is_empty());
+        for got in written.chunks_exact(usize::from(channels)) {
+            assert_eq!(got, frame.as_slice(), "{channels} channels");
+        }
+    }
+}
+
 #[test]
 fn render_fills_what_the_device_asks_for() {
     let fake = Fake::new(
