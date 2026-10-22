@@ -32,17 +32,27 @@ impl Timer {
         Ok(Timer(handle))
     }
 
+    // Sets the timer to fire at `deadline`, for a caller that waits on it
+    // with something else; false when Windows refused.
+    pub(crate) fn set(&self, deadline: Instant) -> bool {
+        let left = deadline.saturating_duration_since(Instant::now());
+        // Negative means relative, in 100 ns units.
+        let due = -((left.as_nanos() / 100).max(1) as i64);
+        // SAFETY: the handle is a live timer owned by self, `due` is a live
+        // i64, and no completion routine is passed.
+        unsafe { SetWaitableTimer(self.0, &due, 0, None, None, false) }.is_ok()
+    }
+
+    pub(crate) fn handle(&self) -> HANDLE {
+        self.0
+    }
+
     pub(crate) fn wait_until(&self, deadline: Instant) {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return;
         }
-        // Negative means relative, in 100 ns units.
-        let due = -((left.as_nanos() / 100).max(1) as i64);
-        // SAFETY: the handle is a live timer owned by self, `due` is a live
-        // i64, and no completion routine is passed.
-        let set = unsafe { SetWaitableTimer(self.0, &due, 0, None, None, false) };
-        if set.is_err() {
+        if !self.set(deadline) {
             std::thread::sleep(left);
             return;
         }

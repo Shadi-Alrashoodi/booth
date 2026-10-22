@@ -98,10 +98,13 @@ impl Drop for Window {
 struct Watching {
     sent: Vec<(Instant, Sent)>,
     lines: Vec<(Instant, String)>,
+    cursors: Vec<CursorUpdate>,
 }
 
 impl Audience for Watching {
-    fn cursor(&mut self, _: CursorUpdate) {}
+    fn cursor(&mut self, update: CursorUpdate) {
+        self.cursors.push(update);
+    }
 
     fn back(&mut self, _: &mut Vec<Back>) {}
 
@@ -200,6 +203,15 @@ fn a_window_share_opens_at_the_size_of_its_pictures() {
     assert_eq!(sharer.size(), opened);
     assert!(watching.new_sizes().is_empty(), "{:?}", watching.lines);
     assert_eq!(sharer.numbers().resized, 0);
+    // The pointer goes on its own: its first update goes whether it is over
+    // the window or not, and a shown one is on the picture.
+    assert!(!watching.cursors.is_empty());
+    for update in watching.cursors.iter().filter(|update| update.visible) {
+        assert!(
+            update.x < opened.0 as i32 && update.y < opened.1 as i32,
+            "{update:?}"
+        );
+    }
 }
 
 // On Windows' software encoder a window that grows past 1080p goes on within

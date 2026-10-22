@@ -10,6 +10,7 @@ mod error;
 mod missing;
 mod monitors;
 mod pattern;
+mod pointer;
 pub mod reference;
 mod timer;
 mod window;
@@ -103,7 +104,8 @@ pub enum Next {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CursorUpdate {
     // The pointer image's top left corner, in the frame's pixels. It can be
-    // negative or past the edge when the pointer is partly off the monitor.
+    // negative or past the edge when the pointer is partly off the monitor
+    // or the shared window.
     pub x: i32,
     pub y: i32,
     pub visible: bool,

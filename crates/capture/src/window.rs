@@ -2,9 +2,10 @@
 // composes of it, at its own size, converted to NV12 by the same shader as a
 // monitor's picture. A window under SMALLEST_SIDE is padded at its right and
 // bottom with black, never with the desktop around it. The pointer is left
-// out of the pictures where Windows allows that (build 19041 and later).
-// Frames come through a free-threaded frame pool, whose thread only sets an
-// event; everything else happens on the caller's thread.
+// out of the pictures and goes as updates of its own, read from
+// GetCursorInfo, only while it is over the window (pointer.rs). Frames come
+// through a free-threaded frame pool, whose thread only sets an event;
+// everything else happens on the caller's thread.
 
 use std::mem;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +28,9 @@ use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAtt
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::System::Com::CoIncrementMTAUsage;
 use windows::Win32::System::Performance::QueryPerformanceFrequency;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForSingleObject};
+use windows::Win32::System::Threading::{
+    CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+};
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
@@ -42,7 +45,9 @@ use crate::device::device_on;
 use crate::duplication::{IDLE_WAIT, present_instant, qpc};
 use crate::error::CaptureError;
 use crate::monitors::{Adapter, Rotation};
-use crate::{Frame, Next, Options, PauseReason};
+use crate::pointer::Pointer;
+use crate::timer::Timer;
+use crate::{CursorUpdate, Frame, Next, Options, PauseReason};
 
 const FORMAT: DirectXPixelFormat = DirectXPixelFormat::B8G8R8A8UIntNormalized;
 // SystemRelativeTime counts in these a second.
@@ -129,6 +134,8 @@ pub struct WindowCapture {
     // The newest picture's size, for natural() under new limits.
     content: Option<(u32, u32)>,
     kept: Option<Kept>,
+    pointer: Pointer,
+    timer: Timer,
     number: u64,
     qpc_frequency: i64,
 }
@@ -171,6 +178,23 @@ impl Arrived {
         let ms = u32::try_from(at_most.as_millis().max(1)).unwrap_or(INFINITE - 1);
         // SAFETY: a live event.
         unsafe { WaitForSingleObject(self.handle(), ms) };
+    }
+
+    // Until the event or `deadline`, on the high resolution timer: a
+    // millisecond wait runs on the system tick, which Windows may leave at
+    // 15.6 ms for a program out of sight, as Booth is beside a game.
+    fn wait_until(&self, deadline: Instant, timer: &Timer) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        if !timer.set(deadline) {
+            self.wait(left);
+            return;
+        }
+        let ms = u32::try_from(left.as_millis() + 1).unwrap_or(INFINITE - 1);
+        // SAFETY: a live event and a live timer; the timeout is a backstop.
+        unsafe { WaitForMultipleObjects(&[self.handle(), timer.handle()], false, ms) };
     }
 }
 
@@ -265,6 +289,7 @@ impl WindowCapture {
         // Everything that can refuse comes before the pool, so a failed open
         // leaves no capture running.
         let converter = Converter::new(&device, &adapter.description)?;
+        let timer = Timer::new()?;
         let plan = Plan::new(
             size.Width.max(2) as u32,
             size.Height.max(2) as u32,
@@ -293,8 +318,11 @@ impl WindowCapture {
         let session = pool
             .CreateCaptureSession(&item)
             .map_err(fail("start a capture of"))?;
-        // Windows 10 before 2004 has no such switch and draws the pointer in.
-        let _ = session.SetIsCursorCaptureEnabled(false);
+        // Booth runs on Windows 10 2004 and later, which all have it; left
+        // in, the pointer would show twice.
+        session
+            .SetIsCursorCaptureEnabled(false)
+            .map_err(fail("leave the pointer out of the pictures of"))?;
         let arrived = Arc::new(Arrived::new()?);
         let closed = Arc::new(AtomicBool::new(false));
         let wake = Arc::clone(&arrived);
@@ -340,6 +368,8 @@ impl WindowCapture {
             natural: None,
             content: None,
             kept: None,
+            pointer: Pointer::new(window.hwnd),
+            timer,
             number: 0,
             qpc_frequency: qpc_frequency.max(1),
         })
@@ -395,7 +425,8 @@ impl WindowCapture {
         // SAFETY: a call on the live immediate context.
         unsafe { self.context.Flush() };
         let now = Instant::now();
-        Ok(Some(self.frame_out(slot, (now, now, now))))
+        let cursor = self.poll_pointer(true);
+        Ok(Some(self.frame_out(slot, (now, now, now), cursor)))
     }
 
     // As Capture::next. A minimized window is a pause, told once, until a
@@ -424,6 +455,10 @@ impl WindowCapture {
                     self.drop_pending();
                     return Ok(Next::Paused(PauseReason::Minimized));
                 }
+                // The watchers' frozen picture loses its pointer.
+                if let Some(update) = self.pointer.hide() {
+                    return self.cursor(update);
+                }
                 let rest = idle_at.saturating_duration_since(Instant::now());
                 if rest.is_zero() {
                     return self.idle();
@@ -442,7 +477,12 @@ impl WindowCapture {
                         continue;
                     };
                     self.cap.release();
-                    return Ok(Next::Frame(self.frame_out(1 - self.last_out, times)));
+                    let cursor = self.poll_pointer(false);
+                    return Ok(Next::Frame(self.frame_out(
+                        1 - self.last_out,
+                        times,
+                        cursor,
+                    )));
                 }
                 Some(until) => until,
                 None => idle_at,
@@ -453,11 +493,14 @@ impl WindowCapture {
                 }
                 continue;
             }
+            if let Some(update) = self.poll_pointer(false) {
+                return self.cursor(update);
+            }
             if self.pending.is_none() && Instant::now() >= idle_at {
                 return self.idle();
             }
             self.arrived
-                .wait(until.saturating_duration_since(Instant::now()));
+                .wait_until(until.min(self.pointer.due()), &self.timer);
         }
     }
 
@@ -465,16 +508,30 @@ impl WindowCapture {
     // no frame comes nothing here touches it, so a driver restart or a GPU
     // reset would pass for a still window. A monitor's capture learns it
     // from AcquireNextFrame.
+    // A pointer that keeps moving keeps Idle away, so a pointer update asks
+    // the same.
     fn idle(&self) -> Result<Next, CaptureError> {
+        self.alive().map(|()| Next::Idle)
+    }
+
+    fn cursor(&self, update: CursorUpdate) -> Result<Next, CaptureError> {
+        self.alive().map(|()| Next::Cursor(update))
+    }
+
+    fn alive(&self) -> Result<(), CaptureError> {
         // SAFETY: a getter on a live interface; it answers for a removed
         // device too, which is what it is for.
-        match unsafe { self.device.GetDeviceRemovedReason() } {
-            Ok(()) => Ok(Next::Idle),
-            Err(err) => Err(crate::device::lost(
-                &self.device,
-                "capture the shared window",
-                &err,
-            )),
+        unsafe { self.device.GetDeviceRemovedReason() }
+            .map_err(|err| crate::device::lost(&self.device, "capture the shared window", &err))
+    }
+
+    // The pointer's update when it is time to look again, or now when the
+    // picture's plan changed under a pointer that has not moved.
+    fn poll_pointer(&mut self, now: bool) -> Option<CursorUpdate> {
+        if now || Instant::now() >= self.pointer.due() {
+            self.pointer.poll(&self.layout.plan)
+        } else {
+            None
         }
     }
 
@@ -522,6 +579,7 @@ impl WindowCapture {
         let height = (content.Height.max(2) as u32).min(desc.Height);
         self.content = Some((width, height));
         self.natural = Some(self.own_size(width, height));
+        let before = self.layout.plan;
         self.rebuild(self.plan_for(width, height))?;
         if desc.BindFlags & D3D11_BIND_SHADER_RESOURCE.0 as u32 == 0 {
             return Err(CaptureError::other(
@@ -576,11 +634,13 @@ impl WindowCapture {
         if self.pending.take().is_some() {
             self.skipped += 1;
         }
+        let cursor = self.poll_pointer(self.layout.plan != before);
         Ok(match self.cap.arrive(present) {
-            Decision::Send => Some(Next::Frame(self.frame_out(slot, times))),
+            Decision::Send => Some(Next::Frame(self.frame_out(slot, times, cursor))),
+            // The pointer never waits for the picture.
             Decision::Hold => {
                 self.pending = Some(times);
-                None
+                cursor.map(Next::Cursor)
             }
         })
     }
@@ -738,6 +798,7 @@ impl WindowCapture {
         &mut self,
         slot: usize,
         (present, acquired, converted): (Instant, Instant, Instant),
+        cursor: Option<CursorUpdate>,
     ) -> Frame {
         self.last_out = slot;
         let number = self.number;
@@ -753,7 +814,7 @@ impl WindowCapture {
             skipped: mem::take(&mut self.skipped),
             accumulated: 1,
             protected: false,
-            cursor: None,
+            cursor,
             gpu_convert: self.converter.gpu_time(),
         }
     }

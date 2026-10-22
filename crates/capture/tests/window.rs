@@ -331,11 +331,15 @@ fn a_minimized_window_pauses_and_comes_back() {
         }
     }
     assert_eq!(paused, Some(PauseReason::Minimized));
-    // Told once: the rest of the pause is idle.
+    // Told once: the rest of the pause is idle, but for the pointer hidden
+    // from the watchers' frozen picture.
     let start = Instant::now();
     while start.elapsed() < Duration::from_millis(500) {
         let next = capture.next().unwrap();
-        assert!(matches!(next, Next::Idle), "{next:?}");
+        assert!(
+            matches!(&next, Next::Idle) || matches!(&next, Next::Cursor(update) if !update.visible),
+            "{next:?}"
+        );
     }
     window.show(SW_RESTORE);
     let sizes = sizes_for(&mut capture, Duration::from_secs(1));
