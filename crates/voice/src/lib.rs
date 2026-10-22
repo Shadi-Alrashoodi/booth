@@ -5,3 +5,4 @@ pub mod codec;
 pub mod jitter;
 pub mod mix;
 pub mod process;
+pub mod stereo;
