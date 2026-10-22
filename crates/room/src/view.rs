@@ -75,6 +75,10 @@ pub struct ShareView {
     // While this PC watches: the share as its sharer says it is, Live when
     // the sharer or the host is older than 1.3.0.
     pub watched_state: ShareState,
+    // While this PC watches: its sharer says the share's PC sound goes out
+    // with it, so the panel can say "sharing with sound". False when the
+    // sharer or the host is older than 1.3.0.
+    pub watched_sound: bool,
 }
 
 impl ShareView {
@@ -553,6 +557,9 @@ pub struct Numbers {
     // did not parse and were dropped.
     pub voice_sent: u64,
     pub voice_dropped: u64,
+    // PC sound of the share watched that no ear took, since the room
+    // opened: past the limit on new ones, or after its sharer said off.
+    pub sound_dropped: u64,
     pub capture_callback: Option<Spread>,
     pub render_callback: Option<Spread>,
     // How late the room's timer thread woke for its deadlines, over its last
@@ -576,6 +583,8 @@ pub struct Numbers {
     // it watches one.
     pub sharing: Option<SharingNumbers>,
     pub watching: Option<WatchingNumbers>,
+    // While this PC hears the PC sound of the share it watches.
+    pub sound: Option<SoundNumbers>,
     // Remote control, both ways, since the room opened.
     pub control: ControlNumbers,
 }
@@ -737,6 +746,22 @@ pub struct WatchingNumbers {
     pub knob: Option<KnobNumbers>,
     // The codec of the last picture decoded; None before the first.
     pub codec: Option<Codec>,
+}
+
+// The PC sound of the share this PC watches, while it hears it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SoundNumbers {
+    // Over the last 10 s, from the capture of a frame's first sample on the
+    // sharer's PC to the moment it leaves this PC's speakers, through the
+    // clock offsets as capture to display is: "about" when either was taken
+    // over a jittery link.
+    pub capture_to_ear: Option<Latency>,
+    pub depth_ms: u32,
+    // Of the frames sent over the last 2 s, the share that never came or
+    // came later than the buffer holds.
+    pub loss_pct: f32,
+    // Frames made up for ones that never came, since the sound began.
+    pub made_up: u64,
 }
 
 // A share's video codec: HEVC when every watcher's GPU decodes it and the

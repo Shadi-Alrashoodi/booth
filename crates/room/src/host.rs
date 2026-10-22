@@ -40,6 +40,7 @@ use crate::reply::{self, Punches, ReplyAccepted, ReplyRefused};
 use crate::router::{self, PortMap};
 use crate::screen::{Screen, ScreenSetup, Sharing, Watching};
 use crate::socket::Socket;
+use crate::sound::Sound;
 use crate::stun::{Answer, Moved, Stun};
 use crate::talk::{self, Outlet, Sent, Talk, ToSpeaker};
 use crate::view::{
@@ -466,8 +467,9 @@ pub(crate) struct Host {
     // one gets.
     live: Option<Live>,
     next_share: u32,
-    // This host as a watcher of a friend's share.
+    // This host as a watcher of a friend's share, and that share's PC sound.
     own_watcher: Watcher,
+    sound: Sound,
     // The friend whose share ended last, until when what they sent before
     // it ended is let go quietly.
     share_ended: Option<([u8; 32], Instant)>,
@@ -521,6 +523,7 @@ impl Host {
             setup.now,
         );
         let clock = Clock::new(setup.now);
+        let sound = Sound::new(setup.speaker.clone(), clock, setup.log.clone(), setup.now);
         let talk = Talk::new(
             setup.voice,
             setup.speaker,
@@ -611,6 +614,7 @@ impl Host {
             live: None,
             next_share: 1,
             own_watcher: Watcher::default(),
+            sound,
             share_ended: None,
             left_limits: Vec::new(),
             video_sealed: Vec::with_capacity(crate::screen::LAN_DATAGRAM),
@@ -1166,6 +1170,7 @@ impl Host {
         self.tell_addresses(now, socket, None);
 
         changed |= self.talk.tick(now);
+        self.sound.tick(now);
         if self.talk.report_due(now) {
             self.voice_reports(now, socket);
             self.share_reports(now, socket);
@@ -1293,6 +1298,7 @@ impl Host {
         soonest.add(self.booth_lines.next_deadline());
         soonest.add(self.other_lines.next_deadline());
         soonest.add(self.talk.next_deadline(!self.peers.is_empty()));
+        soonest.add(self.sound.next_deadline());
         soonest.add(self.share_deadline());
         soonest.add(self.control_deadline());
         if let Some(change) = &self.change {
@@ -1461,6 +1467,7 @@ impl Host {
             |key: &[u8; 32], own_ears: VoiceLoss| self.worst_loss(key, &heard).unwrap_or(own_ears);
         self.talk.fill(&mut numbers, name, loss, far, now);
         self.screen.fill(&mut numbers);
+        self.sound.fill(&mut numbers, now);
 
         let sharer = self.live.as_ref().map(|live| live.sharer);
         let mut people = vec![Person {
@@ -7005,6 +7012,69 @@ mod tests {
         }
         assert_eq!(sound_to(&mut bo, later).0.len(), 15);
         assert_eq!(rig.host.screen.dropped - dropped, 10 + 15);
+        assert_eq!(rig.host.drops.bad, 0);
+    }
+
+    // This host, watching a friend's share, hears its PC sound from where it
+    // passes it on, and only then. The friend's word that it is off lets the
+    // ear go, a frame that starts a spell brings it back, and the end of the
+    // watch lets it go for good.
+    #[test]
+    fn the_host_hears_the_share_it_watches() {
+        let start = Instant::now();
+        let mut rig = Rig::new(start);
+        rig.host.version = peer::PC_SOUND_SINCE;
+        let (speaker, orders) = crossbeam_channel::unbounded();
+        rig.host.sound = Sound::new(speaker, rig.host.clock, Log::off(), start);
+        let mut ana = Guest::new();
+        ana.join_as(&mut rig, "Ana", peer::PC_SOUND_SINCE, None, start);
+        let ana_key = *ana.identity.public();
+        let share = granted(&mut rig, &mut ana, start);
+        let frame = stereo_frame();
+        let from = ana.wire.addr();
+        rig.deliver(&sent_sound(&mut ana, share, 0, &frame), from, start);
+        assert!(orders.try_recv().is_err(), "heard before watching");
+
+        assert!(rig.host.watch(share, true, start, &rig.socket));
+        rig.deliver(&sent_sound(&mut ana, share, 1, &frame), from, start);
+        match orders.try_recv() {
+            Ok(ToSpeaker::AddStream(key, ear, gain)) => {
+                assert_eq!((key, gain), (ana_key, 1.0));
+                assert_eq!(ear.lock().unwrap().stats().held_frames, 1);
+            }
+            _ => panic!("nothing for the speakers"),
+        }
+        assert!(rig.host.view(start, 0).numbers.sound.is_some());
+        ana.say(&mut rig, &Message::ShareSound { share, on: true }, start);
+        assert!(rig.host.view(start, 0).share.watched_sound);
+
+        ana.say(&mut rig, &Message::ShareSound { share, on: false }, start);
+        assert!(matches!(
+            orders.try_recv(),
+            Ok(ToSpeaker::RemoveStream(key)) if key == ana_key
+        ));
+        let view = rig.host.view(start, 0);
+        assert!(!view.share.watched_sound);
+        assert!(view.numbers.sound.is_none());
+        rig.deliver(&sent_sound(&mut ana, share, 2, &frame), from, start);
+        assert!(orders.try_recv().is_err(), "a frame from before off");
+        // Frame 0 is the one that starts a spell.
+        rig.deliver(&sent_sound(&mut ana, share, 0, &frame), from, start);
+        assert!(matches!(
+            orders.try_recv(),
+            Ok(ToSpeaker::AddStream(key, _, _)) if key == ana_key
+        ));
+
+        assert!(rig.host.watch(share, false, start, &rig.socket));
+        assert!(matches!(
+            orders.try_recv(),
+            Ok(ToSpeaker::RemoveStream(key)) if key == ana_key
+        ));
+        rig.deliver(&sent_sound(&mut ana, share, 3, &frame), from, start);
+        assert!(orders.try_recv().is_err(), "heard after watching");
+        let view = rig.host.view(start, 0);
+        assert!(view.numbers.sound.is_none());
+        assert_eq!(view.numbers.sound_dropped, 1);
         assert_eq!(rig.host.drops.bad, 0);
     }
 

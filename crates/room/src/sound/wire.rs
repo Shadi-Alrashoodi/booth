@@ -120,7 +120,6 @@ pub(crate) fn read_sent(packet: &[u8]) -> Result<SoundFrame<'_>, SoundRefused> {
     read(packet, SENT)
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "nothing hears PC sound yet"))]
 pub(crate) fn read_relayed(packet: &[u8]) -> Result<SoundFrame<'_>, SoundRefused> {
     read(packet, RELAYED)
 }

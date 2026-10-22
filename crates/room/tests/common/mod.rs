@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use invite::{Candidate, CandidateKind, Invite};
 use keys::Identity;
@@ -142,6 +142,15 @@ impl Drop for Folder {
 
 pub fn loopback(port: u16) -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, port))
+}
+
+// Microseconds since 1970: a room's ping clock starts from this when it
+// opens, so a time a test takes here is on every room's clock give or take
+// the clock offsets.
+pub fn wall_clock_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_micros() as u64)
 }
 
 pub struct Member {
@@ -1298,8 +1307,9 @@ impl Drop for Stranger {
 
 // A client played by hand, for what a friend's program could send that
 // Booth never would. It joins with an invite like anyone, says its name, and
-// then sends whatever the test gives it. It answers nothing, so it keeps its
-// place in the room only while it keeps sending.
+// then sends whatever the test gives it. It answers nothing but the pings a
+// test has it answer, so it keeps its place in the room only while it keeps
+// sending.
 pub struct Hand {
     pub identity: Identity,
     socket: Arc<UdpSocket>,
@@ -1390,6 +1400,37 @@ impl Hand {
     pub fn received(&mut self) -> Vec<(channels::Channel, Vec<u8>)> {
         self.pump();
         std::mem::take(&mut self.inbox)
+    }
+
+    // Answers the host's pings that came since the last look, on the clock
+    // a room's ping clock counts from, so the host learns this hand's offset
+    // as it does a real client's. The rest waits for received().
+    pub fn answer_pings(&mut self) {
+        self.pump();
+        let mut pings = Vec::new();
+        self.inbox.retain(
+            |(channel, payload)| match channels::PingMessage::decode(payload) {
+                Ok(channels::PingMessage::Ping { seq, t1 })
+                    if *channel == channels::Channel::Ping =>
+                {
+                    pings.push((seq, t1));
+                    false
+                }
+                _ => true,
+            },
+        );
+        for (seq, t1) in pings {
+            let now = wall_clock_us();
+            let mut pong = Vec::new();
+            channels::PingMessage::Pong {
+                seq,
+                t1,
+                t2: now,
+                t3: now,
+            }
+            .encode(&mut pong);
+            self.send(channels::Channel::Ping, &pong);
+        }
     }
 
     fn pump(&mut self) {

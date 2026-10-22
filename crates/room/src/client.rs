@@ -28,6 +28,7 @@ use crate::peer::{self, Clock, Drops, Link, MediaPath, Opened, Plain, Sessions, 
 use crate::reply;
 use crate::screen::{Screen, ScreenSetup, Sharing, Watching};
 use crate::socket::Socket;
+use crate::sound::Sound;
 use crate::stun::{Answer, Moved, Stun};
 use crate::talk::{self, Outlet, Sent, Talk, ToSpeaker};
 use crate::view::{
@@ -414,6 +415,8 @@ pub(crate) struct Client {
     // only about right. Worked out once a timer pass.
     jittery: bool,
     screen: Screen,
+    // The PC sound of the share this PC watches.
+    sound: Sound,
     // What this PC's share sent to the host, from the sharer's thread.
     video_out: Arc<Sent>,
     // The host's word on the clock of the friend whose share this PC
@@ -480,6 +483,12 @@ impl Client {
             name
         });
         let clock = Clock::new(setup.joined);
+        let sound = Sound::new(
+            setup.speaker.clone(),
+            clock,
+            setup.log.clone(),
+            setup.joined,
+        );
         let talk = Talk::new(
             setup.voice,
             setup.speaker,
@@ -573,6 +582,7 @@ impl Client {
             told_periods: None,
             jittery: false,
             screen: Screen::new(clock, false, setup.screen, setup.joined),
+            sound,
             video_out: Arc::default(),
             sharer_clock: None,
             sharer_unread: None,
@@ -820,6 +830,7 @@ impl Client {
             self.voice_reports(now, socket);
         }
         changed |= self.talk.tick(now);
+        self.sound.tick(now);
         changed
     }
 
@@ -905,6 +916,7 @@ impl Client {
         // Set only while logging and nothing has answered.
         soonest.add(self.next_summary);
         soonest.add(self.talk.next_deadline(self.sessions.current.is_some()));
+        soonest.add(self.sound.next_deadline());
         // Even with the host gone quiet: the cutoff is for exactly that.
         soonest.add(self.screen.remote.deadline());
         soonest.0
@@ -1178,6 +1190,7 @@ impl Client {
         self.voice_out.add_to(&mut numbers);
         self.video_out.add_to(&mut numbers);
         self.screen.fill(&mut numbers);
+        self.sound.fill(&mut numbers, now);
         self.delivery.fill(&mut numbers, now);
         let roster = &self.roster;
         let name = |key: &[u8; 32]| {
@@ -2023,8 +2036,8 @@ impl Client {
             Some(Plain::Video(payload)) => return self.on_video(payload, now),
             Some(Plain::Cursor(payload)) => return self.on_cursor(payload, now),
             Some(Plain::Input(payload)) => return self.on_input(payload, now),
-            // Not read yet: counted bad, as by a copy before 1.3.0.
-            Some(Plain::Sound(_)) | None => {
+            Some(Plain::Sound(payload)) => return self.on_sound(payload, now),
+            None => {
                 self.drops.bad(now);
             }
         }
@@ -2319,6 +2332,7 @@ impl Client {
                     | Message::ShareFacts(_)
                     | Message::ShareLimits { .. }
                     | Message::ShareState { .. }
+                    | Message::ShareSound { .. }
                     | Message::SharerClock { .. }
                     | Message::Shape(_)),
                 ) => self.on_share_message(message, now),
@@ -4562,4 +4576,5 @@ mod tests {
     }
 
     mod answers;
+    mod sound;
 }

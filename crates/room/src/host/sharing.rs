@@ -311,6 +311,7 @@ impl Host {
             if self.screen.watched == Some(share) {
                 self.stopped_watching(&own, now, socket);
                 self.screen.stop_watching();
+                self.sound.stop(now);
                 self.own_watcher.stopped();
                 self.tell_facts(now, socket);
             }
@@ -606,8 +607,8 @@ impl Host {
     // PC sound goes on the moment it arrives as well, to the watchers of the
     // share it names, which has to be the one its sender shares now. It never
     // waits on ShareSound, which travels on the control stream and can arrive
-    // before the first packets or after them. This host's own viewer plays
-    // none of it.
+    // before the first packets or after them. This host hears it too while it
+    // watches that share, as a watcher whose copy reads it does.
     pub(super) fn on_sound(
         &mut self,
         i: usize,
@@ -651,6 +652,13 @@ impl Host {
         let timers = self.timers;
         self.peers[i].link.media_passed(now, &timers);
         self.relay_sound(share, plain, now, socket);
+        if self.screen.watched == Some(share)
+            && let Ok(frame) = sound::read_relayed(&plain[1..])
+        {
+            let sharer = self.peers[i].key;
+            let captured = self.screen.watching.to_here(share, frame.captured);
+            return self.sound.hear(sharer, &frame, captured, now);
+        }
         false
     }
 
@@ -1116,6 +1124,7 @@ impl Host {
         }
         if self.screen.watched == Some(live.number) {
             self.screen.stop_watching();
+            self.sound.stop(now);
             self.own_watcher = Watcher::default();
         }
         let own = *self.identity.public();
@@ -1139,6 +1148,7 @@ impl Host {
         self.live = None;
         self.screen.sharing.set_state(OwnShare::Off);
         self.screen.stop_watching();
+        self.sound.stop(Instant::now());
     }
 
     // Someone left the room, or their link started over: a share of theirs
@@ -1206,17 +1216,19 @@ impl Host {
         let (number, state, sound) = (live.number, live.state, live.sound);
         // A new watcher of a share whose PC sound goes out hears so at once:
         // a quiet stretch and no sound at all sound alike.
-        if sound
-            && self.version >= crate::peer::PC_SOUND_SINCE
-            && let By::Peer(i) = by
-            && self.peers[i].link.sound_read
-        {
-            let peer = &mut self.peers[i];
-            peer.link.queue(&Message::ShareSound {
-                share: number,
-                on: true,
-            });
-            peer.flush(socket, now);
+        if sound && self.version >= crate::peer::PC_SOUND_SINCE {
+            match by {
+                By::Peer(i) if self.peers[i].link.sound_read => {
+                    let peer = &mut self.peers[i];
+                    peer.link.queue(&Message::ShareSound {
+                        share: number,
+                        on: true,
+                    });
+                    peer.flush(socket, now);
+                }
+                By::Peer(_) => {}
+                By::Host => self.sound.said(number, true, now),
+            }
         }
         // And of a share that is not live: a paused picture and a still one
         // look alike.
@@ -1273,8 +1285,8 @@ impl Host {
     }
 
     // Whether the live share's PC sound goes out, from its sharer: to every
-    // watcher whose copy reads it (peer::PC_SOUND_SINCE). A room standing
-    // for an older copy passes nothing on.
+    // watcher whose copy reads it (peer::PC_SOUND_SINCE) and to this host's
+    // viewer. A room standing for an older copy passes nothing on.
     fn share_sound(&mut self, on: bool, now: Instant, socket: &Socket) {
         if self.version < crate::peer::PC_SOUND_SINCE {
             return;
@@ -1289,6 +1301,9 @@ impl Host {
             "share {number}: pc sound {}",
             if on { "on" } else { "off" }
         );
+        if self.screen.watched == Some(number) {
+            self.sound.said(number, on, now);
+        }
         for peer in &mut self.peers {
             if peer.share.watching == Some(number) && peer.link.sound_read {
                 peer.link.queue(&Message::ShareSound { share: number, on });
@@ -1835,6 +1850,10 @@ impl Host {
             cap: self.screen.watching.cap(),
             cap_unheard: self.cap_unheard(),
             watched_state: self.screen.watching.share_state(),
+            watched_sound: self
+                .screen
+                .watched
+                .is_some_and(|share| self.sound.says_on(share)),
         }
     }
 

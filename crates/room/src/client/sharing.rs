@@ -17,6 +17,7 @@ use crate::screen::{
     recover_span,
 };
 use crate::socket::Socket;
+use crate::sound;
 use crate::talk::Outlet;
 use crate::view::{ChatLine, CurrentShare, LineKind, LinkState, ShareView, Unheard};
 
@@ -387,6 +388,31 @@ impl Client {
         false
     }
 
+    // PC sound the host passed on, as video: only from the share this PC
+    // watches, under the slot the roster gives its sharer, and only what
+    // names that share. It does not wait for ShareSound, which can come
+    // after the first frames.
+    pub(super) fn on_sound(&mut self, payload: &[u8], now: Instant) -> bool {
+        // A room standing for an older copy counts the channel bad, as such a
+        // copy does.
+        if self.version < crate::peer::PC_SOUND_SINCE {
+            return self.drops.bad(now);
+        }
+        let frame = match sound::read_relayed(payload) {
+            Ok(frame) => frame,
+            Err(why) => return self.refused_media("pc sound", &why.to_string(), now),
+        };
+        let Some((key, number, _)) = self
+            .watched_from(frame.slot)
+            .filter(|(_, number, _)| *number == frame.share)
+        else {
+            return false;
+        };
+        self.link.media_passed(now, &self.timers);
+        let captured = self.screen.watching.to_here(number, frame.captured);
+        self.sound.hear(key, &frame, captured, now)
+    }
+
     // The sharer's key, the share, and whether the host is the sharer, when
     // `slot` is the sharer of the share this PC watches.
     fn watched_from(&self, slot: u8) -> Option<([u8; 32], u32, bool)> {
@@ -445,6 +471,11 @@ impl Client {
             Message::ShareState { share, state } => {
                 if self.screen.watched == Some(share) {
                     self.screen.watching.set_share_state(state);
+                }
+            }
+            Message::ShareSound { share, on } => {
+                if self.screen.watched == Some(share) {
+                    self.sound.said(share, on, now);
                 }
             }
             Message::SharerClock {
@@ -641,6 +672,7 @@ impl Client {
 
     fn stop_watching(&mut self) {
         self.screen.stop_watching();
+        self.sound.stop(Instant::now());
         self.sharer_clock = None;
     }
 
@@ -675,6 +707,10 @@ impl Client {
             cap: self.screen.watching.cap(),
             cap_unheard: self.cap_unheard(),
             watched_state: self.screen.watching.share_state(),
+            watched_sound: self
+                .screen
+                .watched
+                .is_some_and(|share| self.sound.says_on(share)),
         }
     }
 

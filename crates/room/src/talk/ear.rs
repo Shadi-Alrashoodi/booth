@@ -1,6 +1,7 @@
 // Hearing: one jitter buffer per talker, filled by the receive thread and
 // pulled by the render thread through the voice crate's mixer, and the
-// mouth-to-ear time of every frame that leaves the speaker.
+// mouth-to-ear time of every frame that leaves the speaker. The PC sound of
+// the share watched plays through the same mixer (sound.rs).
 
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
@@ -13,8 +14,9 @@ use voice::jitter::{JitterBuffer, JitterStats, Source, VoicePacket};
 use voice::mix::{FrameSource, Mixer};
 
 use super::cue::{self, Tone};
-use super::{Frame, Shared, lock};
+use super::{Frame, RenderNow, Shared, lock};
 use crate::peer::Clock;
+use crate::sound::{self, SOUND_LEVEL};
 use crate::view::{MouthToEar, VoiceLoss};
 
 // Capture times remembered by sequence number: more than the 60 ms the
@@ -22,12 +24,12 @@ use crate::view::{MouthToEar, VoiceLoss};
 const STAMPS: usize = 64;
 // Mouth to ear is shown as the last value and over the last 10 s. 10 s of
 // 5 ms frames.
-const WINDOW_US: u64 = 10_000_000;
+pub(crate) const WINDOW_US: u64 = 10_000_000;
 pub(crate) const SAMPLES_KEPT: usize = 2048;
 // As chat delivery: past this, or this far before its capture, a time is a
 // clock or a peer that is wrong.
-const LONGEST_US: i64 = 60_000_000;
-const AHEAD_US: i64 = 1_000_000;
+pub(crate) const LONGEST_US: i64 = 60_000_000;
+pub(crate) const AHEAD_US: i64 = 1_000_000;
 
 #[derive(Clone, Copy)]
 struct Stamp {
@@ -175,19 +177,29 @@ struct Played {
     next_start: u64,
 }
 
+impl RenderNow {
+    // A frame pulled now starts where the one before it ended, `next_start`
+    // in frames since the stream began, or at the start of the callback
+    // under way when its source went quiet in between. That place, and when
+    // the frame's first sample leaves the speaker, on the ping clock.
+    pub(crate) fn place(&self, next_start: u64) -> (u64, u64) {
+        let callback_start = self.start_sample.load(Ordering::Relaxed);
+        let start = next_start.max(callback_start);
+        let into_callback = (start - callback_start) * 1_000_000 / u64::from(SAMPLE_RATE);
+        let ear_us = self.start_us.load(Ordering::Relaxed)
+            + into_callback
+            + self.latency_us.load(Ordering::Relaxed);
+        (start, ear_us)
+    }
+}
+
 impl FrameSource for Played {
     fn next_frame(&mut self, out: &mut [f32]) -> Option<usize> {
         let mut ear = lock(&self.ear);
         let pulled = ear.buffer.pull(out)?;
-        let now = &self.shared.render_now;
-        let callback_start = now.start_sample.load(Ordering::Relaxed);
-        let start = self.next_start.max(callback_start);
+        let (start, ear_us) = self.shared.render_now.place(self.next_start);
         self.next_start = start + pulled.samples as u64;
         if let Source::Packet(seq) = pulled.source {
-            let into_callback = (start - callback_start) * 1_000_000 / u64::from(SAMPLE_RATE);
-            let ear_us = now.start_us.load(Ordering::Relaxed)
-                + into_callback
-                + now.latency_us.load(Ordering::Relaxed);
             ear.played(seq, ear_us);
         }
         Some(pulled.samples)
@@ -208,13 +220,24 @@ pub(crate) enum ToSpeaker {
     Add([u8; 32], Arc<Mutex<Ear>>, f32),
     Remove([u8; 32]),
     Volume([u8; 32], f32),
+    // The PC sound of the share watched, by its sharer's key, with the
+    // volume this PC plays it at, 1.0 for 100 percent, which is SOUND_LEVEL
+    // of what was captured.
+    AddStream([u8; 32], Arc<Mutex<sound::Ear>>, f32),
+    RemoveStream([u8; 32]),
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "nothing sets a pc sound volume yet")
+    )]
+    StreamVolume([u8; 32], f32),
 }
 
-// What the mixer plays: every talker, and the share cue, which goes through
-// deafen and the limiter as they do.
+// What the mixer plays: every talker, the PC sound of the share watched, and
+// the share cue, which goes through deafen and the limiter as they do.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Key {
     Talker([u8; 32]),
+    Sharer([u8; 32]),
     Cue,
 }
 
@@ -246,9 +269,9 @@ impl FrameSource for Sound {
 }
 
 // The render callback: every talker mixed into what the device asks for, in
-// stereo, the talkers in the middle.
+// stereo, the talkers in the middle and PC sound on its own sides.
 pub(crate) struct Speaker {
-    mixer: Mixer<Key, Sound>,
+    mixer: Mixer<Key, Sound, sound::Stream>,
     // The control cue, which plays past the mixer (cue.rs).
     control: Tone,
     orders: Receiver<ToSpeaker>,
@@ -263,7 +286,7 @@ impl Speaker {
     pub(crate) fn new(orders: Receiver<ToSpeaker>, shared: Arc<Shared>, clock: Clock) -> Speaker {
         // The cue stays in the mixer, idle between cues, so starting one
         // never adds to the mixer's list on the render thread.
-        let mut mixer = Mixer::new();
+        let mut mixer = Mixer::with_streams();
         mixer.add(Key::Cue, Sound::Cue(Tone::idle()));
         Speaker {
             mixer,
@@ -295,6 +318,19 @@ impl Speaker {
                     self.mixer.remove(&Key::Talker(key));
                 }
                 ToSpeaker::Volume(key, gain) => self.mixer.set_gain(&Key::Talker(key), gain),
+                ToSpeaker::AddStream(key, ear, gain) => {
+                    let stream = sound::Stream::new(ear, Arc::clone(&self.shared));
+                    self.mixer.add_stream(Key::Sharer(key), stream);
+                    self.mixer
+                        .set_stream_gain(&Key::Sharer(key), SOUND_LEVEL * gain);
+                }
+                // As for a talker, the decoder is not freed here.
+                ToSpeaker::RemoveStream(key) => {
+                    self.mixer.remove_stream(&Key::Sharer(key));
+                }
+                ToSpeaker::StreamVolume(key, gain) => self
+                    .mixer
+                    .set_stream_gain(&Key::Sharer(key), SOUND_LEVEL * gain),
             }
         }
         let began_us = self.clock.micros(began);
@@ -328,7 +364,9 @@ impl Speaker {
 mod tests {
     use super::*;
     use crate::talk::{Cue, Shared, VoiceConfig};
+    use std::f32::consts::TAU;
     use voice::codec::{Encoder, Mode};
+    use voice::stereo::{FRAME, MAX_PACKET};
 
     fn frames(count: usize) -> Vec<Vec<u8>> {
         let mut encoder = Encoder::new(Mode::LowDelay, true).unwrap();
@@ -398,6 +436,159 @@ mod tests {
         }
         assert!(!heard.about);
         assert_eq!(lock(&ear).stats().depth_frames, 1);
+    }
+
+    // 10 ms stereo frames as a sharer's encoder makes them: 500 Hz at 0.4
+    // on the left, 700 Hz at 0.2 on the right.
+    fn stereo_frames(count: usize) -> Vec<Vec<u8>> {
+        let mut encoder = voice::stereo::Encoder::new().unwrap();
+        (0..count)
+            .map(|i| {
+                let pcm: Vec<f32> = (0..FRAME)
+                    .flat_map(|n| {
+                        let t = (i * FRAME + n) as f32 / 48_000.0;
+                        [0.4 * (TAU * 500.0 * t).sin(), 0.2 * (TAU * 700.0 * t).sin()]
+                    })
+                    .collect();
+                let mut out = [0u8; MAX_PACKET];
+                let len = encoder.encode(&pcm, &mut out).unwrap();
+                out[..len].to_vec()
+            })
+            .collect()
+    }
+
+    fn sound_frame(seq: u16, bytes: &[u8]) -> sound::SoundFrame<'_> {
+        sound::SoundFrame {
+            slot: 2,
+            share: 4,
+            seq,
+            captured: 1,
+            first: seq == 0,
+            last: false,
+            frame: bytes,
+        }
+    }
+
+    fn peak(frames: &[[f32; 2]], side: usize) -> f32 {
+        frames
+            .iter()
+            .fold(0.0f32, |most, frame| most.max(frame[side].abs()))
+    }
+
+    // PC sound is timed as voice is, in 10 ms callbacks: each frame arrives
+    // 10 ms after its capture and goes out at the start of the next
+    // callback, with 5 ms of render latency, 17.5 ms counting the codec's
+    // lookahead. Left and right keep to their sides, at SOUND_LEVEL.
+    #[test]
+    fn pc_sound_capture_to_ear_timing() {
+        let shared = Shared::new(&VoiceConfig::default(), None, false);
+        let clock = Clock::new(Instant::now());
+        let (orders_in, orders) = crossbeam_channel::unbounded();
+        let mut speaker = Speaker::new(orders, Arc::clone(&shared), clock);
+        let ear = Arc::new(Mutex::new(sound::Ear::new().unwrap()));
+        orders_in
+            .send(ToSpeaker::AddStream([2; 32], Arc::clone(&ear), 1.0))
+            .unwrap();
+        shared.render_now.latency_us.store(5000, Ordering::Relaxed);
+        // 480 frames of stereo.
+        let mut out = [0.0f32; 960];
+        let (mut left, mut right) = (0.0f32, 0.0f32);
+        for (seq, bytes) in stereo_frames(20).iter().enumerate() {
+            let captured = clock.micros(Instant::now()) - 10_000;
+            let frame = sound_frame(seq as u16, bytes);
+            assert!(lock(&ear).push(&frame, Some((captured, false))));
+            speaker.fill(&mut out);
+            // Past the fade in at the start.
+            if seq >= 2 {
+                let (frames, _) = out.as_chunks::<2>();
+                left = left.max(peak(frames, 0));
+                right = right.max(peak(frames, 1));
+            }
+        }
+        let mut recent = Vec::new();
+        let about = lock(&ear).heard(clock.micros(Instant::now()), &mut recent);
+        let (median, p95) = share::spread(&mut recent).expect("capture to ear times");
+        println!(
+            "pc sound capture to ear {median:.2} ms, p95 {p95:.2} ms, peak left {left:.3}, right {right:.3}"
+        );
+        for ms in [median, p95] {
+            assert!((17.4..19.0).contains(&ms), "{median} {p95}");
+        }
+        assert!(!about);
+        assert!((0.17..0.23).contains(&left), "{left}");
+        assert!((0.085..0.115).contains(&right), "{right}");
+        assert_eq!(lock(&ear).stats().depth_frames, 1);
+    }
+
+    // The volume asked is applied at SOUND_LEVEL and ramped as a talker's,
+    // and PC sound let go plays its next 2.5 ms fading out, from where it
+    // was, then nothing.
+    #[test]
+    fn pc_sound_volume_and_its_fade_out() {
+        let shared = Shared::new(&VoiceConfig::default(), None, false);
+        let clock = Clock::new(Instant::now());
+        let (orders_in, orders) = crossbeam_channel::unbounded();
+        let mut speaker = Speaker::new(orders, Arc::clone(&shared), clock);
+        let ear = Arc::new(Mutex::new(sound::Ear::new().unwrap()));
+        orders_in
+            .send(ToSpeaker::AddStream([2; 32], Arc::clone(&ear), 1.0))
+            .unwrap();
+        let frames = stereo_frames(32);
+        // One callback, 10 ms, with frame `seq` in just before it.
+        let mut callback = |seq: usize| {
+            let frame = sound_frame(seq as u16, &frames[seq]);
+            assert!(lock(&ear).push(&frame, None));
+            let mut out = [0.0f32; 960];
+            speaker.fill(&mut out);
+            out
+        };
+        let left = |out: &[f32; 960], from: usize| peak(&out.as_chunks::<2>().0[from..], 0);
+        let mut full = 0.0f32;
+        for seq in 0..10 {
+            let out = callback(seq);
+            if seq >= 2 {
+                full = full.max(left(&out, 0));
+            }
+        }
+        orders_in
+            .send(ToSpeaker::StreamVolume([2; 32], 1.5))
+            .unwrap();
+        let mut louder = 0.0f32;
+        for seq in 10..20 {
+            let out = callback(seq);
+            if seq >= 11 {
+                louder = louder.max(left(&out, 0));
+            }
+        }
+        orders_in
+            .send(ToSpeaker::StreamVolume([2; 32], 0.0))
+            .unwrap();
+        callback(20);
+        let muted = callback(21);
+        orders_in
+            .send(ToSpeaker::StreamVolume([2; 32], 1.0))
+            .unwrap();
+        let mut before = 0.0;
+        for seq in 22..30 {
+            before = callback(seq)[958];
+        }
+        orders_in.send(ToSpeaker::RemoveStream([2; 32])).unwrap();
+        let gone = callback(30);
+        let (gone, _) = gone.as_chunks::<2>();
+        let after = callback(31);
+        println!(
+            "pc sound peaks: {full:.3} at 100 percent, {louder:.3} at 150; first sample let go {:.3} after {before:.3}",
+            gone[0][0]
+        );
+        assert!((0.17..0.23).contains(&full), "{full}");
+        assert!((0.26..0.34).contains(&louder), "{louder}");
+        assert!(muted.iter().all(|&s| s == 0.0));
+        // No step where it was let go, a fade, then silence.
+        assert!((gone[0][0] - before).abs() < 0.04);
+        assert!(peak(&gone[..60], 0) > 0.08);
+        assert!(peak(&gone[100..], 0) < 0.04 && peak(&gone[100..], 1) < 0.04);
+        assert!(gone[120..].iter().all(|&[l, r]| l == 0.0 && r == 0.0));
+        assert!(after.iter().all(|&s| s == 0.0));
     }
 
     // Deafened, the speakers play silence, the share cue included, and a

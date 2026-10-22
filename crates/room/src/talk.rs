@@ -10,10 +10,10 @@
 // - The receive thread, under the state lock as for every packet, checks a
 //   voice packet (wire.rs), hands it on if this PC is the host, and pushes
 //   it into that talker's jitter buffer. Pushing copies at most 128 bytes.
-// - The render thread (ear.rs) mixes every talker's buffer. Each buffer has
-//   a lock of its own, held for one pull, which decodes one frame (two when
-//   the buffer drops one to shrink). The receive thread holds the same lock
-//   only for a push.
+// - The render thread (ear.rs) mixes every talker's buffer, and the PC sound
+//   of the share watched (sound.rs). Each buffer has a lock of its own, held
+//   for one pull, which decodes one frame (two when the buffer drops one to
+//   shrink). The receive thread holds the same lock only for a push.
 // - The timer thread, under the state lock, sends the loss reports, reads
 //   the numbers and switches redundancy and the frame size (adapt.rs).
 // - The devices thread (devices.rs) opens and closes the microphone and the
@@ -61,7 +61,7 @@ use crate::view::{Buffer, MouthToEar, Numbers, Spread, Voice as VoiceView, Voice
 
 pub(crate) use cue::Cue;
 pub(crate) use devices::Streams;
-pub(crate) use ear::{Ear, Speaker, ToSpeaker};
+pub(crate) use ear::{AHEAD_US, Ear, LONGEST_US, Speaker, ToSpeaker, WINDOW_US};
 pub(crate) use mouth::HOST_SLOT;
 pub(crate) use wire::{Frame, MAX_VOICE, read_relayed, read_spoken};
 
@@ -74,7 +74,7 @@ pub(crate) const HEARD_LATELY: Duration = Duration::from_secs(2);
 // How long an ear the mixer may still hold is kept after its talker left, so
 // the last reference, and the decoder with it, goes on this thread and not
 // the render thread.
-const RETIRED_FOR: Duration = Duration::from_secs(2);
+pub(crate) const RETIRED_FOR: Duration = Duration::from_secs(2);
 // New talkers a second: each is a decoder and its buffers, kept RETIRED_FOR
 // after it goes. A roster that names new people with every message, which
 // only a hostile host sends, would otherwise make thousands a second.
@@ -444,6 +444,11 @@ impl Shared {
 
     fn route(&self) -> Arc<Route> {
         Arc::clone(&lock(&self.route))
+    }
+
+    // PC sound's ear times what it plays by it, as a talker's does.
+    pub(crate) fn render_now(&self) -> &RenderNow {
+        &self.render_now
     }
 
     pub(crate) fn view(&self) -> VoiceView {

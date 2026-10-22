@@ -351,7 +351,6 @@ pub(crate) enum Plain<'a> {
     Video(&'a [u8]),
     Cursor(&'a [u8]),
     Input(&'a [u8]),
-    #[cfg_attr(not(test), expect(dead_code, reason = "nothing hears PC sound yet"))]
     Sound(&'a [u8]),
 }
 
