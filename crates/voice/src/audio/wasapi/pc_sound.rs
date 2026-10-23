@@ -192,11 +192,11 @@ fn activate(stopping: &AtomicBool) -> Result<IAudioClient, AudioError> {
             },
         },
     };
-    // Windows frees the blob once the activation is over, as PropVariantClear
-    // would, so it has to come from COM's allocator: pointed at a local, as
-    // Microsoft's sample does, the heap broke at the first activation on
-    // this PC. Booth never frees it itself, and loses its 12 bytes in the
-    // rare case where Windows refuses before taking it.
+    // The PROPVARIANT owns the blob: windows-rs clears it when it drops, and
+    // clearing a blob frees its data with CoTaskMemFree, so the blob has to
+    // come from COM's allocator and is never freed by hand. Pointed at a
+    // local, as Microsoft's sample in C++ does, the drop freed a stack
+    // address and the heap broke at the first activation on this PC.
     // SAFETY: a plain allocation, checked for null below.
     let blob = unsafe { CoTaskMemAlloc(size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>()) }
         .cast::<AUDIOCLIENT_ACTIVATION_PARAMS>();
@@ -207,7 +207,7 @@ fn activate(stopping: &AtomicBool) -> Result<IAudioClient, AudioError> {
             lost: false,
         });
     }
-    let mut variant = PROPVARIANT::default();
+    let mut variant = Box::new(PROPVARIANT::default());
     // SAFETY: `blob` holds room for one set of params, written whole; then
     // the plain fields of a zeroed PROPVARIANT, read as a blob from here on.
     unsafe {
@@ -226,12 +226,18 @@ fn activate(stopping: &AtomicBool) -> Result<IAudioClient, AudioError> {
         ActivateAudioInterfaceAsync(
             VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
             &IAudioClient::IID,
-            Some(&variant),
+            Some(&*variant),
             &done,
         )
     }
     .map_err(|err| classify(&err, false))?;
-    wait(&done, stopping)?;
+    if let Err(err) = wait(&done, stopping) {
+        // Windows may still be starting it, and nothing says it has copied
+        // the params or their blob by then: both are left to leak, some 40
+        // bytes, rather than freed under Windows.
+        Box::leak(variant);
+        return Err(err);
+    }
     let mut result = HRESULT(0);
     let mut activated: Option<IUnknown> = None;
     // SAFETY: called after ActivateCompleted, with two locals to fill.
