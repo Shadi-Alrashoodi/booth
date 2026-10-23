@@ -307,8 +307,11 @@ fn share(
         // spares a client's upload, where its own voice would wait behind
         // the video, and the GPU next to a game. The facts say so only once
         // the host has told them. A new watcher's IDR ask ends the rest at
-        // once, since the host can hold the facts back for FACTS_EVERY.
-        let nobody = applied.is_some_and(|facts| facts.watchers == 0);
+        // once, since the host can hold the facts back for FACTS_EVERY, and
+        // the share does not rest again on facts that do not count them
+        // yet.
+        let nobody =
+            applied.is_some_and(|facts| facts.watchers == 0) && !sharing.joining(Instant::now());
         if sharer.held() || (nobody && !sharing.answers_waiting()) {
             // Nothing looks at the desktop while the share rests, and the
             // lock screen can come up meanwhile: the PC sound waits until

@@ -387,7 +387,13 @@ impl Client {
     }
 
     pub(super) fn share_deadline(&self) -> Option<Instant> {
-        self.screen.shape_due()
+        // The PC sound a new watcher's ask sends stops when the ask is too
+        // old, which only a step sees.
+        let joining = self.screen.sharing.joining_until(Instant::now());
+        [self.screen.shape_due(), joining]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     // The link this PC's share goes out on: the host's current session, at
@@ -418,21 +424,22 @@ impl Client {
                 .into_iter()
                 .collect()
         });
-        // Its PC sound goes to the host only while someone watches, and
-        // stops at once with the share.
+        // Its PC sound goes to the host only while someone watches, as the
+        // facts say or as a new watcher's IDR ask says before those facts
+        // come, and stops at once with the share. A watcher who stops before
+        // the facts come leaves it going for up to JOINING_FOR, to a host
+        // that passes it to nobody.
         let number = self
             .screen
             .sharing
             .number()
             .filter(|_| self.state != LinkState::Closed);
         self.own_sound.follow(number);
+        let sharing = &self.screen.sharing;
         let heard = number.is_some()
             && self.sound_goes()
-            && self
-                .screen
-                .sharing
-                .facts()
-                .is_some_and(|facts| facts.watchers > 0);
+            && (sharing.facts().is_some_and(|facts| facts.watchers > 0)
+                || sharing.joining(Instant::now()));
         let session = session.filter(|_| heard);
         let links = session
             .zip(to)

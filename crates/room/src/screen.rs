@@ -141,6 +141,12 @@ pub(crate) const IDR_ASK_EVERY: Duration = Duration::from_millis(500);
 // sharer, which changes its encoder's rate, goes at most this often; the
 // first change in a while goes at once.
 pub(crate) const FACTS_EVERY: Duration = Duration::from_millis(250);
+// A new watcher's IDR ask goes at once, ahead of the facts that count them
+// when the host holds those back: until facts with another count of
+// watchers come, this PC's share counts the ask as someone watching, for
+// twice FACTS_EVERY at most, the facts' own wait and as much again for the
+// way here.
+pub(crate) const JOINING_FOR: Duration = FACTS_EVERY.saturating_mul(2);
 // A watcher's limits past the watches' limit still take effect, so the host
 // and the watcher never disagree about a cap. What they tell the sharer opens
 // its capture again, a new size and a new decoder for every viewer, and a
@@ -355,6 +361,9 @@ struct Own {
 struct Told {
     facts: Option<ShareFacts>,
     answers: Vec<Answer>,
+    // When a new watcher's IDR ask last came on its own, until facts with
+    // another count of watchers come.
+    joined: Option<Instant>,
     // The host's cap from its last facts, and what every watcher takes:
     // both bring the facts' rate down.
     host_cap_kbps: Option<u32>,
@@ -640,6 +649,9 @@ impl Sharing {
     // them, under the same lock.
     pub(crate) fn set_facts(&self, facts: &Facts) {
         let mut told = lock(&self.told);
+        if told.facts.map(|told| told.watchers) != Some(facts.watchers) {
+            told.joined = None;
+        }
         told.host_cap_kbps = (facts.cap_kbps > 0).then_some(facts.cap_kbps);
         let rate_kbps = self.rate_for(&told);
         told.facts = Some(ShareFacts {
@@ -683,8 +695,28 @@ impl Sharing {
     }
 
     pub(crate) fn answer(&self, answer: Answer) {
-        add_answer(&mut lock(&self.told).answers, answer);
+        let mut told = lock(&self.told);
+        if answer == (Answer::Idr { seen: None }) {
+            told.joined = Some(Instant::now());
+        }
+        add_answer(&mut told.answers, answer);
+        drop(told);
         self.wake.set();
+    }
+
+    // A new watcher's IDR ask came lately and the facts that count them have
+    // not: the share does not rest on the facts it has, and a friend's share
+    // sends its PC sound, until they come.
+    pub(crate) fn joining(&self, now: Instant) -> bool {
+        self.joining_until(now).is_some()
+    }
+
+    // When joining() ends, while it lasts.
+    pub(crate) fn joining_until(&self, now: Instant) -> Option<Instant> {
+        lock(&self.told)
+            .joined
+            .map(|at| at + JOINING_FOR)
+            .filter(|until| now < *until)
     }
 
     pub(crate) fn take_shape_if(&self, fits: impl FnOnce(&Shape) -> bool) -> Option<(u32, Shape)> {
@@ -2256,6 +2288,47 @@ mod tests {
             net::pace::wait(sharing.signal(), Some(&timer)),
             Ok(Woken::Signal)
         ));
+    }
+
+    // A new watcher's ask that comes on its own counts as someone watching
+    // from when it came, until facts with another count of watchers come,
+    // whatever else in them changes, or until JOINING_FOR passes. A viewer's
+    // own ask starts no count.
+    #[test]
+    fn a_lone_ask_counts_until_the_watchers_change() {
+        let screen = screen(Instant::now());
+        let sharing = &screen.sharing;
+        let facts = |watchers, cap_kbps| Facts {
+            share: 1,
+            watchers,
+            internet: 0,
+            cap_kbps,
+            lan: true,
+            hevc: true,
+            idr: false,
+        };
+        sharing.set_facts(&facts(0, 0));
+        sharing.answer(Answer::Idr { seen: Some(7) });
+        assert!(!sharing.joining(Instant::now()), "a viewer's ask");
+        let asked = Instant::now();
+        sharing.answer(Answer::Idr { seen: None });
+        assert!(sharing.joining(Instant::now()));
+        let until = sharing.joining_until(Instant::now()).expect("an end");
+        assert!(until >= asked + JOINING_FOR && until <= Instant::now() + JOINING_FOR);
+        assert!(!sharing.joining(until), "{until:?}");
+        sharing.set_facts(&facts(0, 8_000));
+        assert!(sharing.joining(Instant::now()), "another cap");
+        sharing.set_facts(&facts(1, 8_000));
+        assert!(
+            !sharing.joining(Instant::now()),
+            "the facts that count them"
+        );
+        sharing.answer(Answer::Idr { seen: None });
+        sharing.set_facts(&facts(0, 8_000));
+        assert!(
+            !sharing.joining(Instant::now()),
+            "the facts that say they left"
+        );
     }
 
     // A new watcher's IDR ask comes in the facts that count it, and the

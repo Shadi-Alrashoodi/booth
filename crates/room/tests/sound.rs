@@ -374,6 +374,27 @@ fn watch(share: u32) -> Vec<u8> {
     out
 }
 
+// Watch, kind 12, on, from a watcher that takes HEVC: the facts that count
+// it never move the share to H.264, so the host can hold them back.
+fn watch_taking_hevc(share: u32) -> Vec<u8> {
+    let mut out = vec![12];
+    out.extend_from_slice(&share.to_le_bytes());
+    out.extend_from_slice(&[1, 1]);
+    out
+}
+
+// WatchLimits, kind 25, as a viewer with a cap sends after its Watch: no
+// 4K, no height or frame rate cap, and `kbps`, one of the caps offered.
+fn watch_limits(share: u32, kbps: u32) -> Vec<u8> {
+    let mut out = vec![25];
+    out.extend_from_slice(&share.to_le_bytes());
+    out.push(0);
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.push(0);
+    out.extend_from_slice(&kbps.to_le_bytes());
+    out
+}
+
 // Watch, kind 12, off.
 fn stop_watching(share: u32) -> Vec<u8> {
     let mut out = vec![12];
@@ -785,6 +806,59 @@ impl Drop for Looks {
     }
 }
 
+// Mara hosts and shares a window with Share sound on, or Bo, a friend, does;
+// Ana, played by hand, watches it and hears it.
+struct WindowHeard {
+    bo: Option<Voiced>,
+    host: Voiced,
+    ana: Hand,
+    share: u32,
+    _window: Window,
+}
+
+// None where no monitor is attached, as on the runner.
+fn window_heard(fake: &Fake, by_friend: bool) -> Option<WindowHeard> {
+    if share::monitors().map_or(true, |monitors| monitors.is_empty()) {
+        println!("skipped: no monitor is attached to the desktop");
+        return None;
+    }
+    let screen = |mut config: (Config, Fake, Fake)| {
+        config.0.video.source = VideoSource::Screen;
+        config
+    };
+    let (host, code, to_host) = if by_friend {
+        hosting(member("Mara", PC_SOUND_SINCE))
+    } else {
+        hosting(screen(sharer("Mara", PC_SOUND_SINCE, silence, fake)))
+    };
+    let mut ana = hand_watcher(&code, to_host);
+    let bo = by_friend.then(|| {
+        let config = screen(sharer("Bo", PC_SOUND_SINCE, silence, fake));
+        joins(config, &code, to_host, 3)
+    });
+    let sharer = bo.as_ref().unwrap_or(&host);
+    let window = Window::open(640, 360);
+    sharer.room().share_window(60, window.id());
+    let view = sharer
+        .member
+        .wait_for(WAIT, "the window share running", |v| {
+            own_share(v).is_some() && v.share.running.is_some()
+        });
+    let share = own_share(&view).expect("granted");
+    sharer.room().share_sound(true);
+    ana.say(&watch(share));
+    watched_by(&host, 1);
+    let (sound, _) = listen(&mut ana, Duration::from_millis(400));
+    assert!(sound.len() >= 25 && sound[0].first, "{:?}", flags(&sound));
+    Some(WindowHeard {
+        bo,
+        host,
+        ana,
+        share,
+        _window: window,
+    })
+}
+
 // A shared window's capture says nothing of the lock screen, a UAC prompt or
 // a lost session, so its share looks at the desktop itself, told here what
 // it finds. Away, the PC sound ends with a LAST and the capture is let go;
@@ -794,27 +868,18 @@ impl Drop for Looks {
 #[test]
 fn a_shared_window_sends_no_pc_sound_while_the_desktop_is_away() {
     let _alone = alone();
-    if share::monitors().map_or(true, |monitors| monitors.is_empty()) {
-        println!("skipped: no monitor is attached to the desktop");
-        return;
-    }
     let _looks = Looks::find(None);
     let fake = pc_sound(left_and_right, Duration::ZERO);
-    let mut config = sharer("Mara", PC_SOUND_SINCE, silence, &fake);
-    config.0.video.source = VideoSource::Screen;
-    let (host, code, to_host) = hosting(config);
-    let mut ana = hand_watcher(&code, to_host);
-    let window = Window::open(640, 360);
-    host.room().share_window(60, window.id());
-    let view = host.member.wait_for(WAIT, "the window share running", |v| {
-        own_share(v).is_some() && v.share.running.is_some()
-    });
-    let share = own_share(&view).expect("granted");
-    host.room().share_sound(true);
-    ana.say(&watch(share));
-    watched_by(&host, 1);
-    let (sound, _) = listen(&mut ana, Duration::from_millis(400));
-    assert!(sound.len() >= 25 && sound[0].first, "{:?}", flags(&sound));
+    let Some(heard) = window_heard(&fake, false) else {
+        return;
+    };
+    let WindowHeard {
+        host,
+        mut ana,
+        share,
+        bo: _bo,
+        _window,
+    } = heard;
     let mut opens = 1;
     for away in [PauseReason::SecureDesktop, PauseReason::Disconnected] {
         Looks::set(Some(away.clone()));
@@ -848,6 +913,64 @@ fn a_shared_window_sends_no_pc_sound_while_the_desktop_is_away() {
     captures_open(&fake, opens, 1);
     let (back, _) = listen(&mut ana, Duration::from_millis(400));
     assert!(back.len() >= 25 && back[0].first, "{:?}", flags(&back));
+}
+
+// Someone who stops watching and starts again within 250 ms gets the facts
+// that count them up to 250 ms after their IDR ask, which the host sends at
+// once: the share goes on from the ask instead of resting again on the
+// facts that still say nobody watches, so the sound starts at once and
+// plays on as one spell, whether the host shares or a friend does. The cap
+// a viewer sends after its Watch changes the facts' rate on the way, but
+// not who watches.
+#[test]
+fn watching_again_at_once_hears_the_sound_at_once() {
+    let _alone = alone();
+    let _looks = Looks::find(None);
+    for (who, by_friend) in [("Mara", false), ("Bo", true)] {
+        let fake = pc_sound(left_and_right, Duration::ZERO);
+        let Some(heard) = window_heard(&fake, by_friend) else {
+            return;
+        };
+        let WindowHeard {
+            host,
+            mut ana,
+            share,
+            bo: _bo,
+            _window,
+        } = heard;
+        // Past the host's gaps: the facts that say Ana stopped go at once,
+        // and so does the IDR ask of her next watch.
+        listen(&mut ana, Duration::from_millis(600));
+        let stopped = Instant::now();
+        ana.say(&stop_watching(share));
+        watched_by(&host, 0);
+        // Long enough for the share to take the facts that say nobody
+        // watches and rest, short of the 250 ms the host then holds new
+        // facts back.
+        listen(&mut ana, Duration::from_millis(120));
+        // The facts that count Ana come 250 ms after the stop: the watch
+        // goes 80 ms and more before them, so a share that waited for them
+        // would send nothing in the 60 ms looked at.
+        let after = stopped.elapsed();
+        assert!(
+            after < Duration::from_millis(170),
+            "{who}: watching again {after:?} after stopping comes too late to tell"
+        );
+        ana.say(&watch_taking_hevc(share));
+        ana.say(&watch_limits(share, 8_000));
+        let (early, _) = listen(&mut ana, Duration::from_millis(60));
+        assert!(
+            early.first().is_some_and(|packet| packet.first),
+            "{who}: {:?}",
+            flags(&early)
+        );
+        let (then, _) = listen(&mut ana, Duration::from_millis(400));
+        assert!(
+            then.len() >= 35 && then.iter().all(|packet| !packet.first && !packet.last),
+            "{who}: {:?}",
+            flags(&then)
+        );
+    }
 }
 
 // Share after share with a tone playing: Share sound is off at the start of

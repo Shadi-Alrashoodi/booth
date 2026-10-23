@@ -4585,6 +4585,28 @@ mod tests {
         assert_eq!(asks(&rig), 1);
     }
 
+    // A new watcher's ask that comes ahead of the facts that count them
+    // sends this PC's PC sound to the host until those facts come or
+    // JOINING_FOR runs out, and only a step sees it run out: the share's
+    // deadline brings one then.
+    #[test]
+    fn a_lone_ask_brings_a_step_when_it_runs_out() {
+        use crate::screen::{Answer, JOINING_FOR, OwnShare};
+
+        let start = Instant::now();
+        let (rig, _session) = Rig::connected(Timers::default(), start);
+        let sharing = &rig.client.screen.sharing;
+        sharing.set_state(OwnShare::Sharing { number: 4, fps: 60 });
+        assert_eq!(rig.client.share_deadline(), None);
+        let asked = Instant::now();
+        sharing.answer(Answer::Idr { seen: None });
+        let end = rig
+            .client
+            .share_deadline()
+            .expect("a step when it runs out");
+        assert!(end >= asked + JOINING_FOR && end <= Instant::now() + JOINING_FOR);
+    }
+
     mod answers;
     mod sound;
 }
