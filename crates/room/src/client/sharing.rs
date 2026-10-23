@@ -819,6 +819,7 @@ impl Client {
             own_sound: OwnSound {
                 on: self.own_sound.is_on(self.screen.sharing.number()),
                 unavailable: (!self.link.sound_read).then_some(NoSound::OldHost),
+                lost: self.own_sound.lost(self.screen.sharing.number()),
             },
         }
     }

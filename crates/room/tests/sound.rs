@@ -1135,11 +1135,15 @@ fn lost_pc_sound_comes_back_by_itself_or_turns_share_sound_off() {
     fake.unplug("pc");
     let (_, told) = listen(&mut ana, Duration::from_millis(300));
     assert_eq!(told, [(share, false)]);
-    assert!(host.view().share.own_sound.on);
+    let own = host.view().share.own_sound;
+    assert!(own.on);
+    let lost = own.lost.expect("why the sound stopped, under the switch");
+    assert!(lost.contains("stopped"), "{lost}");
     fake.plug("pc", "Test PC sound");
     let (back, told) = listen(&mut ana, Duration::from_millis(1500));
     assert_eq!(told, [(share, true)]);
     assert!(back.len() >= 25 && back[0].first, "{:?}", flags(&back));
+    assert_eq!(host.view().share.own_sound.lost, None);
 
     fake.fail_opens(Some(AudioError::PcSound {
         code: 0x8889_0008,

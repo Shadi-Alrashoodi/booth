@@ -555,6 +555,9 @@ pub(crate) struct Switch {
     opened: bool,
     // The sound goes out: the capture opened and was not lost since.
     flowing: bool,
+    // Why the capture is lost, in its own words, while it waits to open
+    // again: the line under the switch, and the log's once an outage.
+    lost: Option<String>,
     // The watchers were told it is on.
     told: bool,
     // Which sessions and addresses the capture's links have now.
@@ -572,6 +575,7 @@ impl Switch {
             captures: 0,
             opened: false,
             flowing: false,
+            lost: None,
             told: false,
             published: Vec::new(),
         }
@@ -580,6 +584,12 @@ impl Switch {
     // On for `live`, the share this PC shares now.
     pub(crate) fn is_on(&self, live: Option<u32>) -> bool {
         self.on.is_some() && self.on == live
+    }
+
+    // Why its capture is lost, while it is on for `live` and waits to open
+    // again.
+    pub(crate) fn lost(&self, live: Option<u32>) -> Option<String> {
+        self.lost.clone().filter(|_| self.is_on(live))
     }
 
     // The panel's switch for `share`, pressed at `press`. False when it was
@@ -598,6 +608,7 @@ impl Switch {
             self.out.close();
         }
         self.flowing = false;
+        self.lost = None;
         log!(
             self.log,
             "share {share}: share sound {}",
@@ -615,6 +626,7 @@ impl Switch {
             self.out.close();
             self.on = None;
             self.flowing = false;
+            self.lost = None;
             self.told = false;
         }
     }
@@ -657,12 +669,15 @@ impl Switch {
                     );
                     self.opened = true;
                     self.flowing = true;
+                    self.lost = None;
                 }
+                // The capture tries again every second, and each try that
+                // fails says so again: the log has the first of an outage.
                 Event::Lost(err) | Event::Gone(err) => {
-                    log!(
-                        self.log,
-                        "share {share}: pc sound lost, it opens again in a moment: {err}"
-                    );
+                    if self.lost.is_none() {
+                        log!(self.log, "share {share}: {err}");
+                    }
+                    self.lost = Some(err.to_string());
                     self.flowing = false;
                 }
                 Event::Failed(err) => {
@@ -677,6 +692,7 @@ impl Switch {
                     self.out.close();
                     self.on = None;
                     self.flowing = false;
+                    self.lost = None;
                 }
             }
         }
@@ -696,6 +712,7 @@ impl Switch {
                 "share {share}: pc sound let go, nothing more is read until the share goes on"
             );
             self.end_capture();
+            self.lost = None;
         }
     }
 

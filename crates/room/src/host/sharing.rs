@@ -1933,6 +1933,7 @@ impl Host {
             own_sound: OwnSound {
                 on: self.own_sound.is_on(self.own_live_share()),
                 unavailable: None,
+                lost: self.own_sound.lost(self.own_live_share()),
             },
         }
     }

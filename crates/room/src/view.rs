@@ -84,11 +84,14 @@ pub struct ShareView {
 }
 
 // Off at the start of every share, and never saved.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OwnSound {
     pub on: bool,
     // Why it cannot go on.
     pub unavailable: Option<NoSound>,
+    // While it is on and its capture was lost: what happened, a sentence that
+    // ends with Booth trying again, until the capture opens again.
+    pub lost: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

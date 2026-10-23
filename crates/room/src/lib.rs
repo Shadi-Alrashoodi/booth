@@ -439,11 +439,12 @@ impl Room {
     /// friend's goes to the host while anyone watches, older copies too,
     /// and the host passes it only to those who can hear it. Off at the
     /// start of every share and never saved; `share.own_sound` says whether
-    /// it is on and why it cannot be. On, the capture opens, and the watchers
-    /// hear it is on once it has; it runs while the share is not paused. A
-    /// capture that cannot start, or stops on an error, turns it off with a
-    /// problem line, and the share goes on. Nothing captured after the press
-    /// that turns it off, pauses the share or stops it goes out.
+    /// it is on, why it cannot be, and why its capture is lost while it
+    /// tries again. On, the capture opens, and the watchers hear it is on
+    /// once it has; it runs while the share is not paused. A capture that
+    /// cannot start, or stops on an error, turns it off with a problem line,
+    /// and the share goes on. Nothing captured after the press that turns it
+    /// off, pauses the share or stops it goes out.
     pub fn share_sound(&self, on: bool) {
         self.threads.share_sound(on);
     }
