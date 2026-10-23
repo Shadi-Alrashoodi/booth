@@ -564,8 +564,31 @@ pub fn row_menu(name: &str) -> String {
     format!("{name}, Enter opens the row menu")
 }
 
+// Each reason a sentence, one after another, or None when there are none.
+pub fn sentences<const N: usize>(reasons: [Option<String>; N]) -> Option<String> {
+    let said: Vec<String> = reasons
+        .iter()
+        .flatten()
+        .map(|reason| sentence(reason))
+        .collect();
+    (!said.is_empty()).then(|| said.join(" "))
+}
+
 pub fn volume_label(name: &str) -> String {
     format!("Volume for {name}")
+}
+
+// The sharer's row menu while this PC watches: a slider for their voice and
+// one for their share's PC sound, each with its label over it.
+pub const VOICE: &str = "Voice";
+pub const PC_SOUND: &str = "PC sound";
+
+pub fn voice_volume_label(name: &str) -> String {
+    format!("Voice volume for {name}")
+}
+
+pub fn pc_sound_volume_label(name: &str) -> String {
+    format!("PC sound volume for {name}")
 }
 
 // In the sharer's row menu while this PC watches: what it asks the share to
@@ -859,6 +882,24 @@ mod tests {
         );
         assert_eq!(sentence("no code was pasted"), "No code was pasted.");
         assert_eq!(sentence("Already a sentence."), "Already a sentence.");
+    }
+
+    // Both volume files can fail at once, and both reasons show.
+    #[test]
+    fn reasons_one_after_another() {
+        assert_eq!(
+            sentences([
+                Some(String::from(
+                    "could not read volumes.txt; voice volumes are not saved"
+                )),
+                None,
+                Some(String::from("could not read sound-volumes.txt")),
+            ]),
+            Some(String::from(
+                "Could not read volumes.txt. Voice volumes are not saved. Could not read sound-volumes.txt."
+            ))
+        );
+        assert_eq!(sentences::<2>([None, None]), None);
     }
 
     #[test]

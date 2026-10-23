@@ -77,10 +77,10 @@ pub struct InRoom {
     switch_wait: SwitchWait,
     decline: Decline,
     menu: RowMenu,
-    // How loud this PC plays each person, set in their row's menu and
-    // written when it closes.
+    // How loud this PC plays each person, and the PC sound of their
+    // shares, set in their row's menu and written when it closes.
     volumes: Volumes,
-    volume_error: Option<String>,
+    sound_volumes: Volumes,
 }
 
 // Hold to talk as the room was last told, and whether the button was drawn
@@ -147,8 +147,7 @@ impl InRoom {
         devices: [Choice; 2],
         target: Target,
         panic: PanicKey,
-        volumes: Volumes,
-        volume_error: Option<String>,
+        [volumes, sound_volumes]: [Volumes; 2],
     ) -> InRoom {
         InRoom {
             room,
@@ -175,7 +174,7 @@ impl InRoom {
             decline: Decline::default(),
             menu: RowMenu::default(),
             volumes,
-            volume_error,
+            sound_volumes,
         }
     }
 
@@ -1388,10 +1387,16 @@ impl InRoom {
             let mut percent = u32::from(was);
             let volume = Some((&mut percent, person.name.as_str()));
             let watched = view.share.watching && current.is_some_and(|c| c.key == person.key);
+            // Their share's sound while this PC watches it, whatever their
+            // switch says, so nothing appears under the focus when they turn
+            // it on.
+            let sound_was = self.sound_volumes.get(&person.key);
+            let mut sound_percent = u32::from(sound_was);
+            let sound = watched.then_some(&mut sound_percent);
             let mut cap = view.share.cap;
             let asked = watched.then_some((&mut cap, view.share.cap_unheard));
             if let Some(MenuItem::EndControl) =
-                self.menu.show(ui, person.key, volume, asked, &items)
+                self.menu.show(ui, person.key, volume, sound, asked, &items)
             {
                 self.room.end_control();
             }
@@ -1403,18 +1408,25 @@ impl InRoom {
                 self.volumes.set(person.key, percent);
                 self.room.set_volume(person.key, percent);
             }
+            let sound_percent = u8::try_from(sound_percent).unwrap_or(MOST_VOLUME);
+            if sound_percent != sound_was {
+                self.sound_volumes.set(person.key, sound_percent);
+                self.room.set_sound_volume(person.key, sound_percent);
+            }
             // An open menu ends with space of its own under its button.
             if ui.cursor().top() > before {
                 row_last = false;
             }
         }
-        // Written once the menu closes, not at each step of a drag.
-        if !self.menu.is_open()
-            && let Err(err) = self.volumes.save()
-        {
-            self.volume_error = Some(messages::sentence(&err.to_string()));
+        // Written once the menu closes, not at each step of a drag. Each
+        // keeps what went wrong with it, which the line below says.
+        if !self.menu.is_open() {
+            let _ = self.volumes.save();
+            let _ = self.sound_volumes.save();
         }
-        if let Some(error) = &self.volume_error {
+        let problems = [&self.volumes, &self.sound_volumes]
+            .map(|volumes| volumes.problem().map(str::to_owned));
+        if let Some(error) = &messages::sentences(problems) {
             row_last = false;
             controls::gutter(ui, 0.0, STEP, |ui| {
                 controls::prose(ui, error.as_str(), theme::caption(), BAD);

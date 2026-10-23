@@ -22,7 +22,9 @@ use room::view::{LinkState, Person, Role, Unheard, View, WatchCap};
 use crate::controls::{self, Button};
 use crate::messages;
 use crate::remote::Flags;
-use crate::theme::{self, ASH, CHALK, CONTROL_HEIGHT, HALF_STEP, PANEL, ROW_HEIGHT, SIDE, STEP};
+use crate::theme::{
+    self, ASH, CHALK, CONTROL_HEIGHT, FIELD_GAP, HALF_STEP, PANEL, ROW_HEIGHT, SIDE, STEP,
+};
 
 // Allow waits this long after a request first shows, and again after
 // another takes its place. The room already refuses an answer to a request
@@ -395,11 +397,15 @@ impl RowMenu {
     // the row's items. Esc closes it and gives the focus back to the row;
     // picking an item closes it, and so does the row losing all it had (the
     // control it would end has ended). A cap stays open for the next pick.
+    // `sound`: the PC sound volume of their share, while this PC watches
+    // it. With it, each slider has its label over it, as Settings labels
+    // its own.
     pub fn show(
         &mut self,
         ui: &mut Ui,
         key: [u8; 32],
         volume: Option<(&mut u32, &str)>,
+        sound: Option<&mut u32>,
         cap: Option<(&mut WatchCap, Option<Unheard>)>,
         items: &[MenuItem],
     ) -> Option<MenuItem> {
@@ -429,16 +435,37 @@ impl RowMenu {
             .inner_margin(margin)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                let most = u32::from(MOST_VOLUME);
+                let grouped = volume.is_some() && sound.is_some();
                 if let Some((percent, name)) = volume {
                     let id = ui.id().with(("volume", key));
-                    let most = u32::from(MOST_VOLUME);
-                    let label = messages::volume_label(name);
+                    let sound_id = ui.id().with(("pc sound volume", key));
+                    let label = if sound.is_some() {
+                        ui.add_space(HALF_STEP);
+                        controls::text(ui, messages::VOICE, theme::body(), ASH);
+                        messages::voice_volume_label(name)
+                    } else {
+                        messages::volume_label(name)
+                    };
                     let response = controls::slider(ui, id, percent, 0..=most, "%", &label);
-                    if std::mem::take(&mut self.focus) {
+                    // PC sound goes when the watch ends, and its focus comes
+                    // here rather than to the top of the panel.
+                    let gone = sound.is_none() && ui.memory(|memory| memory.has_focus(sound_id));
+                    if std::mem::take(&mut self.focus) || gone {
                         response.request_focus();
+                    }
+                    if let Some(percent) = sound {
+                        ui.add_space(FIELD_GAP);
+                        controls::text(ui, messages::PC_SOUND, theme::body(), ASH);
+                        let label = messages::pc_sound_volume_label(name);
+                        controls::slider(ui, sound_id, percent, 0..=most, "%", &label);
                     }
                 }
                 if let Some((cap, unheard)) = cap {
+                    // The same gap after the two sliders as between them.
+                    if grouped {
+                        ui.add_space(FIELD_GAP - HALF_STEP);
+                    }
                     watch_at(ui, ui.id().with(("cap", key)), cap, unheard);
                 }
                 if items.is_empty() {
@@ -930,7 +957,7 @@ mod tests {
         let (rect, _) = ui.allocate_exact_size(vec2(360.0, ROW_HEIGHT), Sense::hover());
         let row = ui.interact(rect, ui.id().with("tom's row"), Sense::click());
         menu.follow_row(ui, &row, TOM, "Tom");
-        menu.show(ui, TOM, None, None, &[MenuItem::EndControl])
+        menu.show(ui, TOM, None, None, None, &[MenuItem::EndControl])
     }
 
     fn secondary(at: Pos2, pressed: bool) -> Event {
@@ -1010,7 +1037,7 @@ mod tests {
                 let (rect, _) = ui.allocate_exact_size(vec2(360.0, ROW_HEIGHT), Sense::hover());
                 let row = ui.interact(rect, ui.id().with("tom's row"), Sense::click());
                 menu.follow_row(ui, &row, TOM, "Tom");
-                menu.show(ui, TOM, None, Some((cap, older)), &[]);
+                menu.show(ui, TOM, None, None, Some((cap, older)), &[]);
             });
         };
         let tab = || vec![key(Key::Tab, Modifiers::NONE)];
@@ -1051,7 +1078,7 @@ mod tests {
                 let (rect, _) = ui.allocate_exact_size(vec2(360.0, ROW_HEIGHT), Sense::hover());
                 let row = ui.interact(rect, ui.id().with("tom's row"), Sense::click());
                 menu.follow_row(ui, &row, TOM, "Tom");
-                menu.show(ui, TOM, Some((percent, "Tom")), None, &[]);
+                menu.show(ui, TOM, Some((percent, "Tom")), None, None, &[]);
                 row.id
             });
             row
@@ -1089,6 +1116,97 @@ mod tests {
         assert!(menu.is_open());
     }
 
+    // While this PC watches their share, a person's row menu holds two
+    // sliders, each with its label over it and a screen reader's name that
+    // says which: Voice first, then PC sound, which Tab reaches next and the
+    // arrows move, and whose focus goes to Voice when the watch ends. Not
+    // watching, the one slider is as it was.
+    #[test]
+    fn row_menu_pc_sound() {
+        let ctx = context();
+        let mut menu = RowMenu::default();
+        let (mut percent, mut sound) = (100, 100);
+        let mut draw = |events: Vec<Event>, watched: bool| {
+            frame(&ctx, events, |ui| {
+                let (rect, _) = ui.allocate_exact_size(vec2(360.0, ROW_HEIGHT), Sense::hover());
+                let row = ui.interact(rect, ui.id().with("tom's row"), Sense::click());
+                menu.follow_row(ui, &row, TOM, "Tom");
+                let sound = watched.then_some(&mut sound);
+                menu.show(ui, TOM, Some((&mut percent, "Tom")), sound, None, &[]);
+            })
+            .1
+        };
+        // What a screen reader names, or a label shows, with where its top
+        // edge is.
+        let names = |output: eframe::egui::PlatformOutput| -> Vec<(String, f64)> {
+            let nodes = output.accesskit_update.expect("a tree").nodes;
+            nodes
+                .iter()
+                .filter_map(|(_, node)| {
+                    let name = node.label().or(node.value())?;
+                    Some((name.to_owned(), node.bounds()?.y0))
+                })
+                .collect()
+        };
+        draw(Vec::new(), true);
+        draw(vec![key(Key::Tab, Modifiers::NONE)], true);
+        draw(vec![key(Key::Enter, Modifiers::NONE)], true);
+        let shown = names(draw(Vec::new(), true));
+        let top = |name: &str| {
+            shown
+                .iter()
+                .find(|(have, _)| have == name)
+                .map(|&(_, top)| top)
+                .unwrap_or_else(|| panic!("{name}: {shown:?}"))
+        };
+        let tops = [
+            "Voice",
+            "Voice volume for Tom",
+            "PC sound",
+            "PC sound volume for Tom",
+        ]
+        .map(top);
+        assert!(tops.is_sorted(), "{shown:?}");
+        draw(vec![key(Key::Tab, Modifiers::NONE)], true);
+        draw(vec![key(Key::ArrowLeft, Modifiers::NONE)], true);
+        draw(Vec::new(), true);
+        // The watch ends while PC sound has the focus: Voice takes it.
+        draw(Vec::new(), false);
+        let update = draw(Vec::new(), false).accesskit_update.expect("a tree");
+        let focused = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == update.focus)
+            .and_then(|(_, node)| node.label());
+        assert_eq!(focused, Some("Volume for Tom"));
+        assert_eq!((percent, sound), (100, 99));
+
+        let mut menu = RowMenu::default();
+        let mut alone = |events: Vec<Event>| {
+            frame(&ctx, events, |ui| {
+                let (rect, _) = ui.allocate_exact_size(vec2(360.0, ROW_HEIGHT), Sense::hover());
+                let row = ui.interact(rect, ui.id().with("tom's row"), Sense::click());
+                menu.follow_row(ui, &row, TOM, "Tom");
+                menu.show(ui, TOM, Some((&mut percent, "Tom")), None, None, &[]);
+            })
+            .1
+        };
+        alone(Vec::new());
+        alone(vec![key(Key::Tab, Modifiers::NONE)]);
+        alone(vec![key(Key::Enter, Modifiers::NONE)]);
+        let shown = names(alone(Vec::new()));
+        assert!(
+            shown.iter().any(|(name, _)| name == "Volume for Tom"),
+            "{shown:?}"
+        );
+        assert!(
+            !shown
+                .iter()
+                .any(|(name, _)| name == "Voice" || name.starts_with("PC sound")),
+            "{shown:?}"
+        );
+    }
+
     #[test]
     fn a_menu_with_nothing_left_in_it_closes() {
         let ctx = context();
@@ -1096,7 +1214,9 @@ mod tests {
             open: Some(TOM),
             ..RowMenu::default()
         };
-        let (picked, _) = frame(&ctx, Vec::new(), |ui| menu.show(ui, TOM, None, None, &[]));
+        let (picked, _) = frame(&ctx, Vec::new(), |ui| {
+            menu.show(ui, TOM, None, None, None, &[])
+        });
         assert_eq!(picked, None);
         assert_ne!(menu.open, Some(TOM));
     }

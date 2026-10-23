@@ -1,50 +1,101 @@
 // How loud this PC plays each person, in volumes.txt beside settings.txt:
 // one line for each person turned up or down, their key in hex and the
 // percent. Someone at 100 has no line, and a line Booth cannot read is
-// skipped. Nothing in it leaves this PC.
+// skipped. Nothing in it leaves this PC. The PC sound of their shares has
+// sound-volumes.txt, the same way: a third column in volumes.txt would have
+// a copy from before PC sound skip the whole line.
 
+use std::fs::File;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use room::MOST_VOLUME;
 
 use crate::settings::{self, SaveError};
 
-const FILE: &str = "volumes.txt";
 // The most people the file keeps; the ones changed longest ago go first.
 const MOST_PEOPLE: usize = 256;
+// What Booth writes is at most MOST_PEOPLE lines of 70 bytes; a file much
+// bigger is not its own, and is not read whole.
+const MOST_BYTES: u64 = 64 * 1024;
+
+// Which file: each person's voice, or the PC sound of their shares.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Kind {
+    #[default]
+    Voice,
+    PcSound,
+}
+
+impl Kind {
+    fn file(self) -> &'static str {
+        match self {
+            Kind::Voice => "volumes.txt",
+            Kind::PcSound => "sound-volumes.txt",
+        }
+    }
+
+    // What is not saved when the file cannot be read or written.
+    fn what(self) -> &'static str {
+        match self {
+            Kind::Voice => "voice volumes",
+            Kind::PcSound => "PC sound volumes",
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct Volumes {
+    kind: Kind,
     // None for a panel with no data folder, or a file it could not read,
     // which saves nothing.
     dir: Option<PathBuf>,
     // The last one changed first.
     people: Vec<([u8; 32], u8)>,
     unsaved: bool,
+    // Why the file could not be read, which holds for the room, or why the
+    // last save failed, until one goes through.
+    problem: Option<String>,
 }
 
 impl Volumes {
     // Unreadable, it is as if no one was turned up or down, with the reason,
     // and nothing is written over the people in it.
-    pub fn load(dir: &Path) -> (Volumes, Option<String>) {
-        let path = dir.join(FILE);
-        match settings::read(&path) {
-            Ok(bytes) => {
-                let volumes = Volumes {
-                    dir: Some(dir.to_owned()),
-                    people: parse(&bytes),
-                    unsaved: false,
+    pub fn load(dir: &Path, kind: Kind) -> Volumes {
+        let path = dir.join(kind.file());
+        match read(&path) {
+            Ok(bytes) => Volumes {
+                kind,
+                dir: Some(dir.to_owned()),
+                people: parse(&bytes),
+                unsaved: false,
+                problem: None,
+            },
+            Err(err) => {
+                // Deleted, it is read again at the next room's start.
+                let step = if err.kind() == io::ErrorKind::FileTooLarge {
+                    "; delete the file, and the next room starts them all at 100"
+                } else {
+                    ""
                 };
-                (volumes, None)
+                Volumes {
+                    kind,
+                    dir: None,
+                    people: Vec::new(),
+                    unsaved: false,
+                    problem: Some(format!(
+                        "could not read {}: {err}; {} changed now are not saved{step}",
+                        path.display(),
+                        kind.what()
+                    )),
+                }
             }
-            Err(err) => (
-                Volumes::default(),
-                Some(format!(
-                    "could not read {}: {err}; volumes changed now are not saved",
-                    path.display()
-                )),
-            ),
         }
+    }
+
+    // What the panel says while it holds.
+    pub fn problem(&self) -> Option<&str> {
+        self.problem.as_deref()
     }
 
     pub fn get(&self, key: &[u8; 32]) -> u8 {
@@ -85,7 +136,14 @@ impl Volumes {
             }
             text.push_str(&format!(" {percent}\r\n"));
         }
-        settings::replace(dir, &dir.join(FILE), text.as_bytes())
+        let saved = settings::replace(dir, &dir.join(self.kind.file()), text.as_bytes());
+        self.problem = saved.as_ref().err().map(|err| {
+            format!(
+                "{err}; {} are not saved, and Booth tries again at the next change",
+                self.kind.what()
+            )
+        });
+        saved
     }
 }
 
@@ -94,6 +152,24 @@ impl Drop for Volumes {
     fn drop(&mut self) {
         let _ = self.save();
     }
+}
+
+// Nothing there reads as an empty file.
+fn read(path: &Path) -> io::Result<Vec<u8>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let mut bytes = Vec::new();
+    file.take(MOST_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MOST_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            "it is over 64 KB, more than Booth ever writes",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn parse(bytes: &[u8]) -> Vec<([u8; 32], u8)> {
@@ -147,21 +223,21 @@ mod tests {
     #[test]
     fn kept_across_a_restart() {
         let dir = folder("kept");
-        let (mut volumes, problem) = Volumes::load(&dir);
-        assert_eq!(problem, None);
+        let mut volumes = Volumes::load(&dir, Kind::Voice);
+        assert_eq!(volumes.problem(), None);
         assert_eq!(volumes.get(&[7; 32]), 100);
         volumes.set([7; 32], 40);
         volumes.set([9; 32], 0);
         volumes.set([3; 32], 200);
         volumes.set([3; 32], 100);
         volumes.save().unwrap();
-        let text = std::fs::read_to_string(dir.join(FILE)).unwrap();
+        let text = std::fs::read_to_string(dir.join("volumes.txt")).unwrap();
         assert_eq!(text.lines().count(), 2, "{text}");
         assert!(
             text.starts_with(&format!("{} 0\r\n", "09".repeat(32))),
             "{text}"
         );
-        let (again, _) = Volumes::load(&dir);
+        let again = Volumes::load(&dir, Kind::Voice);
         assert_eq!(
             (
                 again.get(&[7; 32]),
@@ -176,10 +252,38 @@ mod tests {
     #[test]
     fn written_when_the_room_goes_with_a_menu_open() {
         let dir = folder("left");
-        let (mut volumes, _) = Volumes::load(&dir);
+        let mut volumes = Volumes::load(&dir, Kind::Voice);
         volumes.set([5; 32], 80);
         drop(volumes);
-        assert_eq!(Volumes::load(&dir).0.get(&[5; 32]), 80);
+        assert_eq!(Volumes::load(&dir, Kind::Voice).get(&[5; 32]), 80);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A person's PC sound volume has a file of its own, which their voice's
+    // never reads: the same key in both keeps both.
+    #[test]
+    fn pc_sound_has_its_own_file() {
+        let dir = folder("sound");
+        let mut voice = Volumes::load(&dir, Kind::Voice);
+        let mut sound = Volumes::load(&dir, Kind::PcSound);
+        assert_eq!(sound.problem(), None);
+        voice.set([7; 32], 40);
+        sound.set([7; 32], 0);
+        voice.save().unwrap();
+        sound.save().unwrap();
+        let text = std::fs::read_to_string(dir.join("sound-volumes.txt")).unwrap();
+        assert_eq!(text, format!("{} 0\r\n", "07".repeat(32)));
+        let voice = Volumes::load(&dir, Kind::Voice);
+        let sound = Volumes::load(&dir, Kind::PcSound);
+        assert_eq!((voice.get(&[7; 32]), sound.get(&[7; 32])), (40, 0));
+        std::fs::remove_file(dir.join("sound-volumes.txt")).unwrap();
+        std::fs::create_dir(dir.join("sound-volumes.txt")).unwrap();
+        let unreadable = Volumes::load(&dir, Kind::PcSound);
+        let problem = unreadable.problem().expect("a reason");
+        assert!(
+            problem.ends_with("; PC sound volumes changed now are not saved"),
+            "{problem}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -211,32 +315,88 @@ mod tests {
         let dir = folder("unreadable");
         // Windows will not open a folder as a file, which stands in for a
         // file another program holds open without sharing.
-        std::fs::create_dir(dir.join(FILE)).unwrap();
-        let (mut volumes, problem) = Volumes::load(&dir);
-        let problem = problem.expect("a reason");
+        std::fs::create_dir(dir.join("volumes.txt")).unwrap();
+        let mut volumes = Volumes::load(&dir, Kind::Voice);
+        let problem = volumes.problem().expect("a reason").to_owned();
         assert!(
-            problem.ends_with("; volumes changed now are not saved"),
+            problem.ends_with("; voice volumes changed now are not saved"),
             "{problem}"
         );
         volumes.set([7; 32], 40);
         assert_eq!(volumes.get(&[7; 32]), 40);
         volumes.save().unwrap();
+        assert_eq!(volumes.problem(), Some(problem.as_str()), "it holds");
         drop(volumes);
-        assert!(dir.join(FILE).is_dir());
+        assert!(dir.join("volumes.txt").is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A file far bigger than Booth writes is not read, and nothing is
+    // written over it.
+    #[test]
+    fn a_file_too_big_is_kept() {
+        let dir = folder("big");
+        let line = format!("{} 50\r\n", "ab".repeat(32));
+        let big = line.repeat(30_000);
+        std::fs::write(dir.join("sound-volumes.txt"), &big).unwrap();
+        let mut volumes = Volumes::load(&dir, Kind::PcSound);
+        let problem = volumes.problem().expect("a reason");
+        assert!(problem.contains("over 64 KB"), "{problem}");
+        assert!(
+            problem.ends_with("; delete the file, and the next room starts them all at 100"),
+            "{problem}"
+        );
+        assert_eq!(volumes.get(&[0xab; 32]), 100);
+        volumes.set([7; 32], 40);
+        volumes.save().unwrap();
+        drop(volumes);
+        let kept = std::fs::read_to_string(dir.join("sound-volumes.txt")).unwrap();
+        assert!(kept == big, "written over");
+        let at_most = line.repeat(256);
+        std::fs::write(dir.join("sound-volumes.txt"), &at_most).unwrap();
+        assert_eq!(Volumes::load(&dir, Kind::PcSound).problem(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A save that fails says so, with which volumes, until one goes
+    // through.
+    #[test]
+    fn a_failed_save_says_so_until_one_goes_through() {
+        let dir = folder("failed");
+        let mut volumes = Volumes::load(&dir, Kind::PcSound);
+        volumes.set([7; 32], 40);
+        // A folder where the file goes: the rename over it fails.
+        std::fs::create_dir(dir.join("sound-volumes.txt")).unwrap();
+        assert!(volumes.save().is_err());
+        let problem = volumes.problem().expect("a reason");
+        assert!(
+            problem.ends_with(
+                "; PC sound volumes are not saved, and Booth tries again at the next change"
+            ),
+            "{problem}"
+        );
+        // As the room asks each frame while the menu is closed.
+        volumes.save().unwrap();
+        assert!(volumes.problem().is_some(), "it holds");
+        std::fs::remove_dir(dir.join("sound-volumes.txt")).unwrap();
+        volumes.set([7; 32], 50);
+        volumes.save().unwrap();
+        assert_eq!(volumes.problem(), None);
+        drop(volumes);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn at_most_256_people() {
         let dir = folder("most");
-        let (mut volumes, _) = Volumes::load(&dir);
+        let mut volumes = Volumes::load(&dir, Kind::Voice);
         for n in 0..=300u16 {
             let mut key = [0u8; 32];
             key[..2].copy_from_slice(&n.to_le_bytes());
             volumes.set(key, 50);
         }
         volumes.save().unwrap();
-        let (again, _) = Volumes::load(&dir);
+        let again = Volumes::load(&dir, Kind::Voice);
         assert_eq!(again.each().count(), MOST_PEOPLE);
         let mut newest = [0u8; 32];
         newest[..2].copy_from_slice(&300u16.to_le_bytes());

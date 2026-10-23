@@ -39,7 +39,7 @@ use crate::strip::{self, Sweep};
 use crate::theme::{self, WINDOW};
 use crate::tray::{self, Tray};
 use crate::update::{self, Update};
-use crate::volumes::Volumes;
+use crate::volumes::{Kind, Volumes};
 use crate::{Args, controls, messages, monitors, win, winver};
 
 const STATS_KEY: KeyboardShortcut =
@@ -456,13 +456,18 @@ impl App {
             flags: Arc::clone(&self.flags),
         };
         // Before anyone is heard, so each is heard at their own volume
-        // from the first word.
-        let (volumes, volume_error) = match &self.setup {
-            Ok(setup) => Volumes::load(&setup.config.data_dir),
-            Err(_) => (Volumes::default(), None),
+        // from the first word, and their share's sound from its first frame.
+        let load = |kind| match &self.setup {
+            Ok(setup) => Volumes::load(&setup.config.data_dir, kind),
+            Err(_) => Volumes::default(),
         };
+        let volumes = load(Kind::Voice);
         for (key, percent) in volumes.each() {
             room.set_volume(key, percent);
+        }
+        let sound_volumes = load(Kind::PcSound);
+        for (key, percent) in sound_volumes.each() {
+            room.set_sound_volume(key, percent);
         }
         let room = Arc::new(room);
         self.target.enter(Arc::clone(&room));
@@ -474,8 +479,7 @@ impl App {
             devices,
             self.target.clone(),
             panic,
-            volumes,
-            volume_error.map(|error| messages::sentence(&error)),
+            [volumes, sound_volumes],
         )));
         self.sweep = Sweep::default();
     }
