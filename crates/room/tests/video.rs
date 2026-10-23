@@ -968,23 +968,42 @@ fn at_5_percent(hevc: bool) {
     assert!(frames > 800, "{frames} frames");
     // The same target in either codec: each frame's parity follows the loss
     // the watcher reports, so a frame of any size is lost for good under 1
-    // time in 100. On this mostly still pattern NVENC's HEVC frames come out
+    // time in 100. On this mostly still pattern NVENC's HEVC frames came out
     // at three to five data shards, which the floor alone gave one parity
-    // shard and 5 percent beat 1.4 to 3.3 times in 100; H.264's one or two
-    // shards were already under.
+    // shard and 5 percent beat 1.4 to 3.3 times in 100; now they come out at
+    // about seven, which the floor gives two; H.264's one or two shards were
+    // already under. The count of one run is a sample of what the rule
+    // expects at the knob's loss, which the packets meet whatever a 2 s
+    // reading says: at seven shards about 10 of 1,200, and 12 or more comes
+    // about 1 run in 3, so the count is held to the expectation with room
+    // for chance, four times its spread, not to 1 in 100 itself. Frames go a
+    // shard either side of the average, and the chance climbs with the size
+    // until parity steps up a shard, then falls, so the worst of them is
+    // expected. Frames the sharer's pacer let go were never sent.
     let bytes = f64::from(shared.video_kbps) * 125.0 / f64::from(shared.encoded_fps.max(1));
     let data = data_shards_on_the_lan(bytes);
-    let parity = channels::video::parity_for_loss(data, Some(loss));
+    let at = knobbed.percent;
+    let lost_at = |data: u16| {
+        let parity = channels::video::parity_for_loss(data, Some(at as f32));
+        channels::video::lost_for_good(data, parity, at / 100.0)
+    };
+    let rate = (data.saturating_sub(1).max(1)..=data + 1)
+        .map(lost_at)
+        .fold(0.0, f64::max);
+    let lost = numbers.dropped.saturating_sub(shared.let_go);
     println!(
-        "frames of {bytes:.0} bytes, {data} data shards, get {parity} parity shards at {loss:.1} \
-         percent and lose {:.2} in 100 for good; {} of {frames} were",
-        channels::video::lost_for_good(data, parity, f64::from(loss) / 100.0) * 100.0,
-        numbers.dropped
+        "frames of {bytes:.0} bytes, {data} data shards; at the knob's {at}% they get {} parity \
+         shards and lose at most {:.2} in 100 for good within a shard either side; {lost} of \
+         {frames} were, {} let go by the sharer",
+        channels::video::parity_for_loss(data, Some(at as f32)),
+        rate * 100.0,
+        shared.let_go
     );
+    assert!(rate < 0.01, "the rule loses {:.2} in 100", rate * 100.0);
+    let expected = rate * frames as f64;
     assert!(
-        numbers.dropped * 100 < frames,
-        "{} dropped of {frames}",
-        numbers.dropped
+        lost as f64 <= expected + 4.0 * expected.sqrt().max(1.0),
+        "{lost} lost of {frames}, {expected:.1} expected"
     );
     assert_eq!(numbers.decode_failed, 0);
     host.room().stop_sharing();
