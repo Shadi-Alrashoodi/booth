@@ -5,9 +5,9 @@ use eframe::egui::text::LayoutJob;
 use eframe::egui::{Color32, FontId, Label, Rect, ScrollArea, Sense, TextFormat, Ui, pos2, vec2};
 use net::firewall::FirewallState;
 use room::view::{
-    AddressChange, ControlNumbers, Latency, Level, MappingWord, NameAnswer, NameView, Numbers,
-    PresentPath, Role, RouterState, SharingNumbers, Source, SteppedDown, View, VoiceLoss,
-    WatchingNumbers,
+    AddressChange, AfterPicture, ControlNumbers, Latency, Level, MappingWord, NameAnswer, NameView,
+    Numbers, PresentPath, Role, RouterState, SharingNumbers, SoundNumbers, Source, SteppedDown,
+    View, VoiceLoss, WatchingNumbers,
 };
 use voice::audio::Microphone;
 
@@ -314,11 +314,20 @@ impl Lines {
     // Two readings that belong together, the second on the row under the
     // first.
     fn two_rows(&mut self, label: &'static str, value: Option<(String, String)>) {
+        self.two_rows_level(label, value, Level::Good);
+    }
+
+    fn two_rows_level(
+        &mut self,
+        label: &'static str,
+        value: Option<(String, String)>,
+        level: Level,
+    ) {
         if let Some((first, second)) = value {
             self.push(Line {
                 label,
                 value: first,
-                level: Level::Good,
+                level,
                 hidden: false,
                 name: false,
                 under: Some(second),
@@ -493,6 +502,14 @@ fn build(
         video_in(&mut out, watching);
     }
     video_counts(&mut out, n);
+    out.group(Some("PC sound"));
+    if let Some(sound) = &n.sound {
+        sound_in(&mut out, sound);
+    }
+    out.add(
+        "Dropped, PC sound",
+        (n.sound_dropped > 0).then(|| n.sound_dropped.to_string()),
+    );
     out.group(None);
     if showing.control {
         control(&mut out, &n.control);
@@ -624,6 +641,42 @@ fn video_in(out: &mut Lines, w: &WatchingNumbers) {
             )
         }),
     );
+}
+
+// While this PC hears the PC sound of the share it watches. How far the
+// sound is from the picture needs no clock offset, so it is never "about".
+fn sound_in(out: &mut Lines, s: &SoundNumbers) {
+    out.add("Capture to ear", s.capture_to_ear.map(latency));
+    out.two_rows_level(
+        "Sound after picture",
+        s.after_picture.map(|after| {
+            (
+                format!("{:+.1} ms", after.median_ms),
+                format!("p5 {:+.1} ms, p95 {:+.1} ms", after.p5_ms, after.p95_ms),
+            )
+        }),
+        s.after_picture.map_or(Level::Good, after_level),
+    );
+    out.add("Sound buffer", Some(format!("{} ms", s.depth_ms)));
+    out.level(
+        "Sound loss",
+        Some(percent(s.loss_pct)),
+        loss_level(s.loss_pct),
+    );
+    out.add("Sound frames made up", Some(s.made_up.to_string()));
+}
+
+// The bounds sound and picture are held to, positive when the sound comes
+// after the picture: the median from -20 to +60 ms, the 5th percentile from
+// -45 and the 95th to +100. Each is taken as it is shown, to a tenth, so a
+// number on a bound is never in warn; in f64, since in f32 the product can
+// round up past the tenth the value prints as.
+fn after_level(after: AfterPicture) -> Level {
+    let shown = |ms: f32| (f64::from(ms) * 10.0).round() / 10.0;
+    let inside = (-20.0..=60.0).contains(&shown(after.median_ms))
+        && shown(after.p5_ms) >= -45.0
+        && shown(after.p95_ms) <= 100.0;
+    if inside { Level::Good } else { Level::Warn }
 }
 
 // Counters that only a friend's program, a busy PC or a stalled viewer make
@@ -1256,6 +1309,169 @@ mod tests {
             ..Numbers::default()
         };
         assert_eq!(video(&early)[0], line("Decode, GPU", "H.264", good));
+    }
+
+    // The PC sound group's lines, wherever the group falls.
+    fn sound_lines(n: &Numbers) -> Vec<Line> {
+        let ours = |line: &Line| {
+            [
+                "Capture to ear",
+                "Sound after picture",
+                "Sound buffer",
+                "Sound loss",
+                "Sound frames made up",
+                "Dropped, PC sound",
+            ]
+            .contains(&line.label)
+        };
+        lines(Role::Client, n, "allowed", false, 0, None, SHOWING)
+            .into_iter()
+            .filter(ours)
+            .collect()
+    }
+
+    // While you hear a share's sound, under the PC sound head after the
+    // video lines: capture to ear, how far the sound is from the picture,
+    // signed, with its spread under it, the buffer, the loss and the frames
+    // made up; frames dropped once there are any, heard now or not.
+    #[test]
+    fn pc_sound_group_while_hearing() {
+        let sound = SoundNumbers {
+            capture_to_ear: Some(Latency {
+                median_ms: 21.4,
+                p95_ms: 24.0,
+                about: true,
+            }),
+            depth_ms: 20,
+            loss_pct: 0.0,
+            made_up: 3,
+            after_picture: Some(AfterPicture {
+                median_ms: 14.0,
+                p5_ms: 6.0,
+                p95_ms: 22.5,
+                pictures: 1180,
+            }),
+        };
+        let n = Numbers {
+            sound: Some(sound),
+            sound_dropped: 2,
+            ..Numbers::default()
+        };
+        let good = Level::Good;
+        assert_eq!(
+            sound_lines(&n),
+            [
+                line("Capture to ear", "about 21.4 ms, p95 24.0 ms", good),
+                Line {
+                    under: Some(String::from("p5 +6.0 ms, p95 +22.5 ms")),
+                    ..line("Sound after picture", "+14.0 ms", good)
+                },
+                line("Sound buffer", "20 ms", good),
+                line("Sound loss", "0.0%", good),
+                line("Sound frames made up", "3", good),
+                line("Dropped, PC sound", "2", good),
+            ]
+        );
+        let out = build(Role::Client, &n, "allowed", false, 0, None, SHOWING);
+        let at = out
+            .lines
+            .iter()
+            .position(|line| line.label == "Capture to ear");
+        let head = out.starts.iter().find(|(start, _)| Some(*start) == at);
+        assert_eq!(
+            head.map(|(_, start)| *start),
+            Some(Start::Group(Some("PC sound")))
+        );
+        // Right after the video lines, and before what the router check found.
+        let both = Numbers {
+            watching: Some(watching()),
+            sound: Some(sound),
+            mapping: Some(MappingWord::Easy),
+            ..Numbers::default()
+        };
+        let out = build(Role::Client, &both, "allowed", false, 0, None, SHOWING);
+        let place = |label| {
+            let at = out.lines.iter().position(|line| line.label == label);
+            at.unwrap_or_else(|| panic!("no {label} line"))
+        };
+        assert_eq!(place("Capture to ear"), place("Present path") + 1);
+        assert!(place("Sound frames made up") < place("NAT mapping"));
+
+        // In warn past any of the bounds, never on one as shown.
+        let level = |median_ms, p5_ms, p95_ms| {
+            let after = AfterPicture {
+                median_ms,
+                p5_ms,
+                p95_ms,
+                pictures: 300,
+            };
+            let n = Numbers {
+                sound: Some(SoundNumbers {
+                    after_picture: Some(after),
+                    ..sound
+                }),
+                ..Numbers::default()
+            };
+            let line = sound_lines(&n)
+                .into_iter()
+                .find(|line| line.label == "Sound after picture")
+                .unwrap();
+            (line.value, line.level)
+        };
+        let warn = Level::Warn;
+        assert_eq!(level(-25.0, -40.0, -10.0), (String::from("-25.0 ms"), warn));
+        assert_eq!(level(61.0, 30.0, 90.0).1, warn);
+        assert_eq!(level(10.0, -46.0, 30.0).1, warn);
+        assert_eq!(level(10.0, 0.0, 101.0).1, warn);
+        assert_eq!(level(-20.0, -45.0, 100.0).1, good);
+        assert_eq!(
+            level(60.04, -45.04, 100.04),
+            (String::from("+60.0 ms"), good)
+        );
+        // 60.05 is a little under it in f32 and prints as 60.0; 60.06 prints
+        // as 60.1, past the bound.
+        assert_eq!(
+            level(60.05, -45.05, 100.0),
+            (String::from("+60.0 ms"), good)
+        );
+        assert_eq!(level(60.06, 0.0, 90.0), (String::from("+60.1 ms"), warn));
+
+        // Loss by the strip's thresholds.
+        let loss = |loss_pct| {
+            let n = Numbers {
+                sound: Some(SoundNumbers { loss_pct, ..sound }),
+                ..Numbers::default()
+            };
+            let lines = sound_lines(&n);
+            lines
+                .into_iter()
+                .find(|line| line.label == "Sound loss")
+                .unwrap()
+                .level
+        };
+        assert_eq!((loss(1.0), loss(3.0)), (warn, Level::Bad));
+
+        // Dropped frames with nothing heard now still have the group.
+        let dropped = Numbers {
+            sound_dropped: 2,
+            ..Numbers::default()
+        };
+        assert_eq!(
+            sound_lines(&dropped),
+            [line("Dropped, PC sound", "2", good)]
+        );
+        let out = build(Role::Client, &dropped, "allowed", false, 0, None, SHOWING);
+        let at = out
+            .lines
+            .iter()
+            .position(|line| line.label == "Dropped, PC sound");
+        let head = out.starts.iter().find(|(start, _)| Some(*start) == at);
+        assert_eq!(
+            head.map(|(_, start)| *start),
+            Some(Start::Group(Some("PC sound")))
+        );
+        // Nothing heard and nothing dropped: no group.
+        assert!(sound_lines(&Numbers::default()).is_empty());
     }
 
     #[test]
