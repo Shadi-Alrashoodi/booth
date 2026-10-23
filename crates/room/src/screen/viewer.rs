@@ -16,8 +16,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use share::{
-    Control, ControlOut, Inbox, Line, LinkNumbers, LinkState, PathWord, PresentPath, Report,
-    Screen, Second, ViewerNumbers, Watch, end_to_end_level, spread, stage_level,
+    Control, ControlOut, Inbox, Line, LinkNumbers, LinkState, PathWord, PcSound, PresentPath,
+    Report, Screen, Second, ViewerNumbers, Watch, end_to_end_level, spread, stage_level,
 };
 use stats::TraceSample;
 
@@ -428,11 +428,6 @@ pub(crate) fn control_for(view: &View) -> Option<Control> {
 // this PC's link to the host, or on the host its worst link.
 pub(crate) fn link_numbers(view: &View) -> LinkNumbers {
     let strip = &view.strip;
-    let stats_level = |level: view::Level| match level {
-        view::Level::Good => stats::Level::Good,
-        view::Level::Warn => stats::Level::Warn,
-        view::Level::Bad => stats::Level::Bad,
-    };
     LinkNumbers {
         state: match strip.state {
             view::LinkState::Alone => LinkState::Alone,
@@ -467,7 +462,35 @@ pub(crate) fn link_numbers(view: &View) -> LinkNumbers {
             view::ShareState::Paused => share::ShareState::Paused,
             view::ShareState::Away => share::ShareState::Away,
         },
+        pc_sound: pc_sound(view),
     }
+}
+
+fn stats_level(level: view::Level) -> stats::Level {
+    match level {
+        view::Level::Good => stats::Level::Good,
+        view::Level::Warn => stats::Level::Warn,
+        view::Level::Bad => stats::Level::Bad,
+    }
+}
+
+// The share's PC sound while this PC hears it: capture to ear, coloured by
+// how far it is from the picture while enough pictures over the last 10 s
+// say, or muted while this PC plays it at 0. Nothing while deafened, when
+// the room's numbers go on for the stats panel.
+fn pc_sound(view: &View) -> Option<PcSound> {
+    if view.voice.deafened {
+        return None;
+    }
+    let sound = view.numbers.sound.as_ref()?;
+    if sound.muted {
+        return Some(PcSound::Muted);
+    }
+    let heard = sound.capture_to_ear?;
+    Some(PcSound::Heard {
+        ms: heard.median_ms,
+        level: sound.after_picture.map(|after| stats_level(after.level())),
+    })
 }
 
 // Over the internet, capture to display's thresholds are later by the
@@ -527,6 +550,95 @@ mod tests {
             }),
             ..ShareView::default()
         }
+    }
+
+    // The strip's snd while this PC hears the share's PC sound: capture to
+    // ear, with no level while fewer than 100 pictures say how far it is
+    // from the picture, good inside the bounds and warn outside; muted while
+    // this PC plays it at 0, with a number or without; nothing before a
+    // number and nothing while deafened.
+    #[test]
+    fn pc_sound_for_the_strip() {
+        let mut view = crate::testing::empty_view(Role::Client);
+        assert_eq!(pc_sound(&view), None);
+        let heard = view::SoundNumbers {
+            capture_to_ear: Some(Latency {
+                median_ms: 19.4,
+                p95_ms: 23.0,
+                about: false,
+            }),
+            depth_ms: 20,
+            loss_pct: 0.0,
+            made_up: 0,
+            after_picture: None,
+            muted: false,
+        };
+        let with = |sound| {
+            let mut view = view.clone();
+            view.numbers.sound = Some(sound);
+            pc_sound(&view)
+        };
+        assert_eq!(
+            with(heard),
+            Some(PcSound::Heard {
+                ms: 19.4,
+                level: None
+            })
+        );
+        let in_step = view::AfterPicture {
+            median_ms: 14.0,
+            p5_ms: 6.0,
+            p95_ms: 22.5,
+            pictures: 1180,
+        };
+        assert_eq!(
+            with(view::SoundNumbers {
+                after_picture: Some(in_step),
+                ..heard
+            }),
+            Some(PcSound::Heard {
+                ms: 19.4,
+                level: Some(stats::Level::Good)
+            })
+        );
+        let late = view::AfterPicture {
+            median_ms: 75.0,
+            p5_ms: 50.0,
+            p95_ms: 90.0,
+            pictures: 300,
+        };
+        assert_eq!(
+            with(view::SoundNumbers {
+                after_picture: Some(late),
+                ..heard
+            }),
+            Some(PcSound::Heard {
+                ms: 19.4,
+                level: Some(stats::Level::Warn)
+            })
+        );
+        let unmeasured = view::SoundNumbers {
+            capture_to_ear: None,
+            ..heard
+        };
+        assert_eq!(with(unmeasured), None, "nothing measured yet");
+        let muted = view::SoundNumbers {
+            muted: true,
+            ..unmeasured
+        };
+        assert_eq!(with(muted), Some(PcSound::Muted));
+        let muted = view::SoundNumbers {
+            muted: true,
+            ..heard
+        };
+        assert_eq!(with(muted), Some(PcSound::Muted), "muted, with a number");
+
+        view.numbers.sound = Some(muted);
+        assert_eq!(link_numbers(&view).pc_sound, Some(PcSound::Muted));
+        view.voice.deafened = true;
+        assert_eq!(link_numbers(&view).pc_sound, None, "deafened");
+        view.numbers.sound = Some(heard);
+        assert_eq!(link_numbers(&view).pc_sound, None, "deafened, heard");
     }
 
     // A client 30 ms from the host watching a friend 50 ms from it: the

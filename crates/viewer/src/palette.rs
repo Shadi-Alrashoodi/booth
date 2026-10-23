@@ -10,7 +10,9 @@ pub(crate) struct Colour(pub u32);
 // The window tone: the bars around the picture, the strip's band and the
 // title bar.
 pub(crate) const WINDOW: Colour = Colour(0x141412);
-// The title bar's text while the window is active; ash while it is not.
+// The title bar's text while the window is active, ash while it is not;
+// and the strip's snd while nothing has judged how far it is from the
+// picture.
 pub(crate) const CHALK: Colour = Colour(0xE4E2DD);
 pub(crate) const ASH: Colour = Colour(0x9A978E);
 pub(crate) const AMBER: Colour = Colour(0xE8912F);

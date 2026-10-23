@@ -47,8 +47,8 @@ pub use capture::{
 };
 pub use encode::{Codec, Kind, Preset, Settings};
 pub use viewer::{
-    Capturing, ControlOut, LinkState, MouseButton, MouseMode, PathWord, Pointing, PresentPath,
-    ShareState, Show,
+    Capturing, ControlOut, LinkState, MouseButton, MouseMode, PathWord, PcSound, Pointing,
+    PresentPath, ShareState, Show,
 };
 
 // A datagram of 1200 bytes less the session's 32, the channel byte and the

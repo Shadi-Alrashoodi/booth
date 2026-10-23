@@ -367,6 +367,10 @@ impl Sound {
             loss_pct: stats.loss_percent,
             made_up: stats.concealed,
             after_picture: self.after,
+            muted: self
+                .volumes
+                .get(&listening.sharer)
+                .is_some_and(|&gain| gain <= 0.0),
         })
     }
 }

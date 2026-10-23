@@ -1,6 +1,6 @@
 // The strip along the viewer's bottom edge: the panel's strip with the video
-// numbers and the present path added, drawn with Direct2D over the back
-// buffer. The 24 point band in window tone with no line over it, Plex Mono
+// numbers, the share's PC sound and the present path added, drawn with
+// Direct2D over the back buffer. The 24 point band in window tone with no line over it, Plex Mono
 // at 12 points for every word and number, the 16 point sides, the 12 point
 // gaps, the trace's geometry, the colours and the way numbers keep their
 // slots are the panel's (crates/app/src/strip.rs), in points scaled by the
@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Direct2D::{
 };
 
 use crate::error::ViewerError;
-use crate::palette::{self, AMBER, ASH, BAD, Colour, WARN, WINDOW};
+use crate::palette::{self, AMBER, ASH, BAD, CHALK, Colour, WARN, WINDOW};
 use crate::text::Text;
 
 pub(crate) const HEIGHT: f32 = 24.0;
@@ -61,6 +61,8 @@ pub struct Strip {
     // While this PC watches: the sharer paused the share, or Windows has
     // their screen. The reason no frames come.
     pub share_state: ShareState,
+    // While this PC hears the share's PC sound and is not deafened.
+    pub pc_sound: Option<PcSound>,
 }
 
 impl Default for Strip {
@@ -85,6 +87,7 @@ impl Default for Strip {
             control_paused: false,
             cap_set: false,
             share_state: ShareState::Live,
+            pc_sound: None,
         }
     }
 }
@@ -113,6 +116,15 @@ pub enum ShareState {
     Live,
     Paused,
     Away,
+}
+
+// The share's PC sound as this PC hears it: capture to ear, its level how
+// far the sound is from the picture while enough pictures over the last 10 s
+// say, or that this PC plays it at 0.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PcSound {
+    Heard { ms: f32, level: Option<Level> },
+    Muted,
 }
 
 // room::view::PathWord, plus the word for booth.exe --loopback, where the
@@ -210,6 +222,8 @@ enum Part {
     Encode,
     Decode,
     EndToEnd,
+    Sound,
+    Muted,
     Present,
 }
 
@@ -220,6 +234,7 @@ impl Part {
             Part::Encode => Some("enc "),
             Part::Decode => Some("dec "),
             Part::EndToEnd => Some("e2e "),
+            Part::Sound => Some("snd "),
             _ => None,
         }
     }
@@ -231,7 +246,7 @@ impl Part {
     // e2e in the same place from one session to the next.
     fn widest(self) -> &'static [&'static str] {
         match self {
-            Part::RoundTrip | Part::EndToEnd => &["100 ms", "<1 ms"],
+            Part::RoundTrip | Part::EndToEnd | Part::Sound => &["100 ms", "<1 ms"],
             Part::Jitter => &["\u{b1}99"],
             Part::Loss => &["10.0%"],
             Part::Encode | Part::Decode => &["99.9 ms"],
@@ -241,6 +256,7 @@ impl Part {
             | Part::Cap
             | Part::Control
             | Part::Paused
+            | Part::Muted
             | Part::Present => &[],
         }
     }
@@ -252,10 +268,13 @@ impl Part {
 // and a still screen look alike without the word, "relayed" is the reason a link is
 // slow, the control words say this PC's keys go to another, and "composed"
 // is the reason a windowed viewer is a frame behind. When they still do not
-// fit, the control words take their short forms. "cap set" is a reminder of
-// this PC's own choice, and goes first.
-const DROP_ORDER: [Part; 7] = [
+// fit, the control words take their short forms. "cap set" and "sound
+// muted" are reminders of this PC's own choices and go first; then snd, the
+// one reading about the sound rather than the link or the picture.
+const DROP_ORDER: [Part; 9] = [
     Part::Cap,
+    Part::Muted,
+    Part::Sound,
     Part::Jitter,
     Part::Loss,
     Part::Encode,
@@ -381,6 +400,21 @@ fn words(strip: &Strip, present: Option<PresentPath>) -> Vec<Word> {
             colour(strip.end_to_end_level),
             !stale,
         );
+    }
+    match strip.pc_sound {
+        Some(PcSound::Heard { ms, level }) => {
+            // Chalk while too few pictures over the last 10 s say how far the
+            // sound is from them, at the start of a watch and on a still or
+            // slow screen: a level's colour would be a verdict nothing made.
+            let shade = match level {
+                Some(level) => colour(level),
+                None if stale => ASH,
+                None => CHALK,
+            };
+            push(Part::Sound, milliseconds(ms), shade, !stale);
+        }
+        Some(PcSound::Muted) => push(Part::Muted, String::from("sound muted"), ASH, false),
+        None => {}
     }
     // Measured here, never stale. Flip is a word like the path word. Composed
     // is in warn, as relayed is: the path that is slower than it could be,
@@ -1149,6 +1183,98 @@ mod tests {
         assert_eq!(row_span(slot_top, 3.0, 15.0, 1.5), (1011.0, 1031.0));
         assert_eq!(row_span(1004.0, 15.0, 15.0, 1.0), (1019.0, 1020.0));
         assert_eq!(row_span(1008.0, 15.0, 15.0, 2.0), (1038.0, 1040.0));
+    }
+
+    // While this PC hears the share's PC sound, "snd" and its capture to ear
+    // follow e2e, in the colour of how far the sound is from the picture,
+    // chalk before that is known, and ash while reconnecting; "sound muted"
+    // stands in their place while this PC plays it at 0. Narrow, either goes
+    // right after "cap set".
+    #[test]
+    fn pc_sound_follows_e2e() {
+        let heard = |level| Strip {
+            pc_sound: Some(PcSound::Heard { ms: 19.4, level }),
+            ..live()
+        };
+        let good = words(&heard(Some(Level::Good)), None);
+        let at = good
+            .iter()
+            .position(|word| word.part == Part::Sound)
+            .expect("snd");
+        assert_eq!(good[at - 1].part, Part::EndToEnd);
+        assert_eq!(good[at].text, "19 ms");
+        assert_eq!(good[at].colour, palette::level(Level::Good));
+        assert!(good[at].slot);
+        assert_eq!(Part::Sound.label(), Some("snd "));
+        let sound = |strip: &Strip| {
+            words(strip, None)
+                .into_iter()
+                .find(|word| word.part == Part::Sound)
+                .expect("snd")
+        };
+        assert_eq!(sound(&heard(Some(Level::Warn))).colour, WARN);
+        assert_eq!(sound(&heard(None)).colour, CHALK, "not measured yet");
+        for level in [Some(Level::Warn), None] {
+            let stale = sound(&Strip {
+                state: LinkState::Reconnecting,
+                ..heard(level)
+            });
+            assert_eq!((stale.colour, stale.slot), (ASH, false), "{level:?}");
+        }
+
+        let muted = words(
+            &Strip {
+                pc_sound: Some(PcSound::Muted),
+                ..live()
+            },
+            None,
+        );
+        let at = muted
+            .iter()
+            .position(|word| word.part == Part::Muted)
+            .expect("sound muted");
+        assert_eq!(muted[at - 1].part, Part::EndToEnd);
+        let word = &muted[at];
+        assert_eq!((word.text.as_str(), word.colour), ("sound muted", ASH));
+        assert_eq!(Part::Muted.label(), None);
+        assert!(!muted.iter().any(|word| word.part == Part::Sound));
+        assert!(
+            !words(&live(), None)
+                .iter()
+                .any(|word| matches!(word.part, Part::Sound | Part::Muted))
+        );
+
+        for (pc_sound, part) in [
+            (
+                PcSound::Heard {
+                    ms: 19.4,
+                    level: None,
+                },
+                Part::Sound,
+            ),
+            (PcSound::Muted, Part::Muted),
+        ] {
+            let strip = Strip {
+                cap_set: true,
+                pc_sound: Some(pc_sound),
+                ..live()
+            };
+            let widths: Vec<(Part, f32)> = words(&strip, None)
+                .iter()
+                .map(|word| (word.part, 50.0))
+                .collect();
+            let all = widths.len() as f32 * (50.0 + GAP);
+            let kept = fit(&widths, all - 60.0);
+            assert!(
+                !kept.contains(&Part::Cap) && kept.contains(&part),
+                "{part:?}"
+            );
+            let kept = fit(&widths, all - 120.0);
+            assert!(
+                !kept.contains(&part) && kept.contains(&Part::Jitter),
+                "{part:?}"
+            );
+        }
     }
 
     #[test]

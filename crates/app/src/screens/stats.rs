@@ -5,9 +5,9 @@ use eframe::egui::text::LayoutJob;
 use eframe::egui::{Color32, FontId, Label, Rect, ScrollArea, Sense, TextFormat, Ui, pos2, vec2};
 use net::firewall::FirewallState;
 use room::view::{
-    AddressChange, AfterPicture, ControlNumbers, Latency, Level, MappingWord, NameAnswer, NameView,
-    Numbers, PresentPath, Role, RouterState, SharingNumbers, SoundNumbers, Source, SteppedDown,
-    View, VoiceLoss, WatchingNumbers,
+    AddressChange, ControlNumbers, Latency, Level, MappingWord, NameAnswer, NameView, Numbers,
+    PresentPath, Role, RouterState, SharingNumbers, SoundNumbers, Source, SteppedDown, View,
+    VoiceLoss, WatchingNumbers,
 };
 use voice::audio::Microphone;
 
@@ -655,7 +655,7 @@ fn sound_in(out: &mut Lines, s: &SoundNumbers) {
                 format!("p5 {:+.1} ms, p95 {:+.1} ms", after.p5_ms, after.p95_ms),
             )
         }),
-        s.after_picture.map_or(Level::Good, after_level),
+        s.after_picture.map_or(Level::Good, |after| after.level()),
     );
     out.add("Sound buffer", Some(format!("{} ms", s.depth_ms)));
     out.level(
@@ -664,19 +664,6 @@ fn sound_in(out: &mut Lines, s: &SoundNumbers) {
         loss_level(s.loss_pct),
     );
     out.add("Sound frames made up", Some(s.made_up.to_string()));
-}
-
-// The bounds sound and picture are held to, positive when the sound comes
-// after the picture: the median from -20 to +60 ms, the 5th percentile from
-// -45 and the 95th to +100. Each is taken as it is shown, to a tenth, so a
-// number on a bound is never in warn; in f64, since in f32 the product can
-// round up past the tenth the value prints as.
-fn after_level(after: AfterPicture) -> Level {
-    let shown = |ms: f32| (f64::from(ms) * 10.0).round() / 10.0;
-    let inside = (-20.0..=60.0).contains(&shown(after.median_ms))
-        && shown(after.p5_ms) >= -45.0
-        && shown(after.p95_ms) <= 100.0;
-    if inside { Level::Good } else { Level::Warn }
 }
 
 // Counters that only a friend's program, a busy PC or a stalled viewer make
@@ -975,7 +962,7 @@ fn mapping(word: MappingWord) -> &'static str {
 mod tests {
     use super::*;
     use net::firewall::Profiles;
-    use room::view::{Codec, KnobNumbers, NameMatch};
+    use room::view::{AfterPicture, Codec, KnobNumbers, NameMatch};
     use std::net::Ipv4Addr;
 
     // As the panel shows the lines outside a share, once it offers control.
@@ -1345,6 +1332,7 @@ mod tests {
             depth_ms: 20,
             loss_pct: 0.0,
             made_up: 3,
+            muted: false,
             after_picture: Some(AfterPicture {
                 median_ms: 14.0,
                 p5_ms: 6.0,

@@ -14,8 +14,8 @@ use encode::Codec as ShareCodec;
 use net::Timer;
 use stats::{Level, Thresholds, TraceSample};
 use viewer::{
-    ControlOut, Cursor, ErrorKind, LinkState, MouseMode, Options, PathWord, ShareState, Show,
-    Strip, Video, Viewer,
+    ControlOut, Cursor, ErrorKind, LinkState, MouseMode, Options, PathWord, PcSound, ShareState,
+    Show, Strip, Video, Viewer,
 };
 
 use crate::cursor::pointer;
@@ -111,6 +111,8 @@ pub struct LinkNumbers {
     pub cap_set: bool,
     // The share as its sharer says it is (the room's ShareState).
     pub share_state: ShareState,
+    // Its PC sound as this PC hears it, from the room's sound numbers.
+    pub pc_sound: Option<PcSound>,
 }
 
 impl Default for LinkNumbers {
@@ -128,6 +130,7 @@ impl Default for LinkNumbers {
             one_way_ms: None,
             cap_set: false,
             share_state: ShareState::Live,
+            pc_sound: None,
         }
     }
 }
@@ -1109,6 +1112,7 @@ fn show_link(strip: &mut Strip, link: LinkNumbers) -> bool {
     strip.trace = link.trace;
     strip.cap_set = link.cap_set;
     strip.share_state = link.share_state;
+    strip.pc_sound = link.pc_sound;
     match link.loss_pct {
         Some(pct) => {
             strip.loss_pct = Some(pct);
@@ -1361,6 +1365,7 @@ mod tests {
             loss_level: Level::Warn,
             path: Some(PathWord::Lan),
             trace: vec![TraceSample::Rtt(4.0), TraceSample::Lost],
+            pc_sound: Some(PcSound::Muted),
             ..LinkNumbers::default()
         };
         assert!(show_link(&mut strip, room));
@@ -1369,6 +1374,9 @@ mod tests {
             (Some(4.0), Some(1.5), Level::Warn)
         );
         assert_eq!(strip.trace.len(), 2);
+        assert_eq!(strip.pc_sound, Some(PcSound::Muted));
+        show_link(&mut strip, LinkNumbers::default());
+        assert_eq!(strip.pc_sound, None, "and gone again");
     }
 
     // A room's viewer keeps a second's times at most, however long the

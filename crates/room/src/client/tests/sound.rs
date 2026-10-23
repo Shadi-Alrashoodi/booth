@@ -301,7 +301,8 @@ fn ears_made_fast_stop_while_the_speakers_are_away() {
 }
 
 // A PC sound volume set before any of Bo's sound came holds from his first
-// frame: at 0 not a sample of it plays, and turned back up it does.
+// frame: at 0 not a sample of it plays and the numbers say it is muted, and
+// turned back up it plays.
 #[test]
 fn a_pc_sound_volume_holds_from_the_first_frame() {
     let start = Instant::now();
@@ -321,8 +322,26 @@ fn a_pc_sound_volume_holds_from_the_first_frame() {
         } else if seq >= 16 {
             assert!(heard > 0.1, "frame {seq}: {heard}");
         }
+        if seq == 11 {
+            let sound = rig.client.view(start, 0).numbers.sound;
+            assert_eq!(sound.map(|sound| sound.muted), Some(true), "at 0");
+        }
     }
-    assert!(rig.client.view(start, 0).numbers.sound.is_some());
+    let sound = rig.client.view(start, 0).numbers.sound;
+    assert_eq!(sound.map(|sound| sound.muted), Some(false));
+    for percent in [1, 150] {
+        rig.client.set_sound_volume(BO, percent);
+        let sound = rig.client.view(start, 0).numbers.sound;
+        assert_eq!(sound.map(|sound| sound.muted), Some(false), "{percent}");
+    }
+    rig.client.set_sound_volume(BO, 100);
+    rig.client.set_sound_volume([7; 32], 0);
+    let sound = rig.client.view(start, 0).numbers.sound;
+    assert_eq!(
+        sound.map(|sound| sound.muted),
+        Some(false),
+        "someone else's"
+    );
 }
 
 // How far the sound is from the picture needs no clock offsets, so it shows

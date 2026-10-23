@@ -793,6 +793,8 @@ pub struct SoundNumbers {
     // None while fewer than 100 pictures were set beside the sound over the
     // last 10 s.
     pub after_picture: Option<AfterPicture>,
+    // This PC plays the sharer's PC sound at 0 (Room::set_sound_volume).
+    pub muted: bool,
 }
 
 // How far the PC sound is from the picture over the last 10 s: for each
@@ -806,6 +808,22 @@ pub struct AfterPicture {
     pub p5_ms: f32,
     pub p95_ms: f32,
     pub pictures: u32,
+}
+
+impl AfterPicture {
+    // Against the bounds sound and picture are held to, positive when the
+    // sound comes after the picture: the median from -20 to +60 ms, the 5th
+    // percentile from -45 and the 95th to +100. Each is taken as the stats
+    // panel shows it, to a tenth, so a number on a bound is never in warn; in
+    // f64, since in f32 the product can round up past the tenth the value
+    // prints as.
+    pub fn level(&self) -> Level {
+        let shown = |ms: f32| (f64::from(ms) * 10.0).round() / 10.0;
+        let inside = (-20.0..=60.0).contains(&shown(self.median_ms))
+            && shown(self.p5_ms) >= -45.0
+            && shown(self.p95_ms) <= 100.0;
+        if inside { Level::Good } else { Level::Warn }
+    }
 }
 
 // A share's video codec: HEVC when every watcher's GPU decodes it and the
