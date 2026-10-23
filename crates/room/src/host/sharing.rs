@@ -5,6 +5,7 @@
 // further, and is held to the limits in screen.rs.
 
 use std::collections::VecDeque;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -49,6 +50,12 @@ const MOST_KEPT: usize = 16;
 // the upload setting, a second of it at once: a share keeping to its cap
 // sends about 112 percent of it with the parity, and IDRs a quarter more.
 const RELAY_SHARE: f64 = 2.0;
+// What a share's sharer says of it, how it stands and whether its PC sound
+// goes out, goes on to every watcher at most this often, the first change
+// in a while at once: a sharer can say it faster than a far watcher's
+// reliable stream drains, which then drops everything else queued for that
+// watcher.
+pub(super) const WORDS_EVERY: Duration = Duration::from_millis(250);
 
 pub(super) fn relay_per_second(upload_kbps: u32) -> f64 {
     f64::from(upload_kbps) * 1000.0 / 8.0 * RELAY_SHARE
@@ -83,6 +90,11 @@ pub(super) struct Live {
     // out.
     state: ShareState,
     sound: bool,
+    // The two as the watchers were last told them, when, and when words that
+    // changed since may go (WORDS_EVERY).
+    told_words: (ShareState, bool),
+    words_told_at: Option<Instant>,
+    words_due: Option<Instant>,
 }
 
 // The shape the sharer is sending, as its first chunk gave it.
@@ -335,7 +347,7 @@ impl Host {
         let said = self.own_sound.step(self.own_live_share());
         let changed = said.tell.is_some() || said.problem.is_some();
         if let Some(on) = said.tell {
-            self.share_sound(on, now, socket);
+            self.share_sound(on, None, now, socket);
         }
         if let Some(line) = said.problem {
             self.problem_line(line);
@@ -476,7 +488,7 @@ impl Host {
             }
             ShareNews::State { share, state } => {
                 if self.live.as_ref().is_some_and(|live| ours(live, share)) {
-                    self.share_state(state, now, socket);
+                    self.share_state(state, None, now, socket);
                 }
                 return false;
             }
@@ -859,10 +871,10 @@ impl Host {
             // From the live share's sharer only; one from a share of theirs
             // that ended was on its way.
             Message::ShareState { share, state } => {
-                let key = self.peers[i].key;
+                let (key, ip) = (self.peers[i].key, self.peers[i].addr.ip());
                 match self.live.as_ref() {
                     Some(live) if live.sharer == key && live.number == share => {
-                        self.share_state(state, now, socket);
+                        self.share_state(state, Some(ip), now, socket);
                     }
                     Some(live) if live.sharer == key => {}
                     _ => {
@@ -873,10 +885,10 @@ impl Host {
             }
             // From the live share's sharer only, as its state is.
             Message::ShareSound { share, on } => {
-                let key = self.peers[i].key;
+                let (key, ip) = (self.peers[i].key, self.peers[i].addr.ip());
                 match self.live.as_ref() {
                     Some(live) if live.sharer == key && live.number == share => {
-                        self.share_sound(on, now, socket);
+                        self.share_sound(on, Some(ip), now, socket);
                     }
                     Some(live) if live.sharer == key => {}
                     _ => {
@@ -1174,6 +1186,9 @@ impl Host {
             control: None,
             state: ShareState::Live,
             sound: false,
+            told_words: (ShareState::Live, false),
+            words_told_at: None,
+            words_due: None,
         });
         log!(
             self.log,
@@ -1289,7 +1304,9 @@ impl Host {
         let Some(live) = self.live.as_ref() else {
             return;
         };
-        let (number, state, sound) = (live.number, live.state, live.sound);
+        // What the other watchers were told, so a word held back reaches the
+        // new one with them when the gap ends.
+        let (number, (state, sound)) = (live.number, live.told_words);
         // A new watcher of a share whose PC sound goes out hears so at once:
         // a quiet stretch and no sound at all sound alike.
         if sound && self.version >= crate::peer::PC_SOUND_SINCE {
@@ -1325,10 +1342,16 @@ impl Host {
         }
     }
 
-    // How the live share stands, from its sharer: to every watcher whose
-    // copy reads it (peer::SHARE_STATE_SINCE) and to this host's viewer.
-    // A room standing for an older copy passes nothing on.
-    fn share_state(&mut self, state: ShareState, now: Instant, socket: &Socket) {
+    // How the live share stands, from its sharer, `from` a friend's address
+    // or this host's own: it goes on by tell_words. A room standing for an
+    // older copy passes nothing on.
+    fn share_state(
+        &mut self,
+        state: ShareState,
+        from: Option<IpAddr>,
+        now: Instant,
+        socket: &Socket,
+    ) {
         if self.version < crate::peer::SHARE_STATE_SINCE {
             return;
         }
@@ -1337,33 +1360,25 @@ impl Host {
         };
         live.state = state;
         let number = live.number;
-        log!(
-            self.log,
-            "share {number}: {}",
-            match state {
-                ShareState::Live => "live again",
-                ShareState::Paused => "paused by the sharer",
-                ShareState::Away => "away while Windows has the sharer's screen",
-            }
-        );
-        if self.screen.watched == Some(number) {
-            self.screen.watching.set_share_state(state);
+        // Within the per-source limit for a friend, who can say it with
+        // every packet.
+        if self.log.is_on() && from.is_none_or(|ip| self.booth_lines.allow(ip, now, &self.log)) {
+            log!(
+                self.log,
+                "share {number}: {}",
+                match state {
+                    ShareState::Live => "live again",
+                    ShareState::Paused => "paused by the sharer",
+                    ShareState::Away => "away while Windows has the sharer's screen",
+                }
+            );
         }
-        for peer in &mut self.peers {
-            if peer.share.watching == Some(number) && peer.link.state_read {
-                peer.link.queue(&Message::ShareState {
-                    share: number,
-                    state,
-                });
-                peer.flush(socket, now);
-            }
-        }
+        self.tell_words(now, socket);
     }
 
-    // Whether the live share's PC sound goes out, from its sharer: to every
-    // watcher whose copy reads it (peer::PC_SOUND_SINCE) and to this host's
-    // viewer. A room standing for an older copy passes nothing on.
-    fn share_sound(&mut self, on: bool, now: Instant, socket: &Socket) {
+    // Whether the live share's PC sound goes out, from its sharer, as its
+    // state is. A room standing for an older copy passes nothing on.
+    fn share_sound(&mut self, on: bool, from: Option<IpAddr>, now: Instant, socket: &Socket) {
         if self.version < crate::peer::PC_SOUND_SINCE {
             return;
         }
@@ -1372,17 +1387,72 @@ impl Host {
         };
         live.sound = on;
         let number = live.number;
-        log!(
-            self.log,
-            "share {number}: pc sound {}",
-            if on { "on" } else { "off" }
-        );
+        if self.log.is_on() && from.is_none_or(|ip| self.booth_lines.allow(ip, now, &self.log)) {
+            log!(
+                self.log,
+                "share {number}: pc sound {}",
+                if on { "on" } else { "off" }
+            );
+        }
+        self.tell_words(now, socket);
+    }
+
+    // What the live share's sharer said that the watchers were not told yet:
+    // how it stands to every watcher whose copy reads it
+    // (peer::SHARE_STATE_SINCE), whether its PC sound goes out to every one
+    // whose copy reads that (peer::PC_SOUND_SINCE), and both to this host's
+    // viewer, at most every WORDS_EVERY. A word held back goes at the gap's
+    // end as it stands then; one that changed back meanwhile does not go.
+    fn tell_words(&mut self, now: Instant, socket: &Socket) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let (state, sound) = (live.state, live.sound);
+        if live.told_words == (state, sound) {
+            live.words_due = None;
+            return;
+        }
+        if let Some(due) = live
+            .words_told_at
+            .map(|at| at + WORDS_EVERY)
+            .filter(|due| now < *due)
+        {
+            live.words_due = Some(due);
+            return;
+        }
+        let state_changed = live.told_words.0 != state;
+        let sound_changed = live.told_words.1 != sound;
+        live.told_words = (state, sound);
+        live.words_told_at = Some(now);
+        live.words_due = None;
+        let number = live.number;
         if self.screen.watched == Some(number) {
-            self.sound.said(number, on, now);
+            if state_changed {
+                self.screen.watching.set_share_state(state);
+            }
+            if sound_changed {
+                self.sound.said(number, sound, now);
+            }
         }
         for peer in &mut self.peers {
-            if peer.share.watching == Some(number) && peer.link.sound_read {
-                peer.link.queue(&Message::ShareSound { share: number, on });
+            if peer.share.watching != Some(number) {
+                continue;
+            }
+            let state_goes = state_changed && peer.link.state_read;
+            let sound_goes = sound_changed && peer.link.sound_read;
+            if state_goes {
+                peer.link.queue(&Message::ShareState {
+                    share: number,
+                    state,
+                });
+            }
+            if sound_goes {
+                peer.link.queue(&Message::ShareSound {
+                    share: number,
+                    on: sound,
+                });
+            }
+            if state_goes || sound_goes {
                 peer.flush(socket, now);
             }
         }
@@ -1775,6 +1845,7 @@ impl Host {
     // watching whose copy is out of date, and this host's own viewer's.
     pub(super) fn share_step(&mut self, now: Instant, socket: &Socket) {
         self.tell_facts(now, socket);
+        self.tell_words(now, socket);
         self.own_shape(now, socket);
         self.tell_clocks(false, now, socket);
         self.join_idrs(now, socket);
@@ -1812,6 +1883,7 @@ impl Host {
         [
             self.live.as_ref().and_then(|live| live.facts_due),
             self.live.as_ref().and_then(|live| live.limits_due),
+            self.live.as_ref().and_then(|live| live.words_due),
             self.screen.shape_due(),
         ]
         .into_iter()
