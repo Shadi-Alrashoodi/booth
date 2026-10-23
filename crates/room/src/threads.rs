@@ -691,7 +691,10 @@ impl Threads {
         self.with_side(|side, now, socket| side.share(fps, now, socket));
     }
 
+    // The share's PC sound stops at the press, as Share sound turned off
+    // does.
     pub(crate) fn stop_sharing(&self) {
+        self.sharing.sound().end_share(Instant::now());
         self.with_side(|side, now, socket| side.stop_sharing(now, socket));
     }
 

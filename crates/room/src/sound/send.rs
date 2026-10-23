@@ -418,6 +418,17 @@ mod tests {
         assert!(again[0].2 && !again[1].2);
     }
 
+    // Stop sharing's stop holds whatever the switch does before the room
+    // takes it in: Share sound turned on again opens nothing.
+    #[test]
+    fn stop_sharing_holds_against_the_switch() {
+        let start = Instant::now();
+        let bench = Bench::new(start, start);
+        bench.out.end_share(start);
+        bench.out.open(SHARE, start + Duration::from_millis(1));
+        assert!(bench.out.shut());
+    }
+
     // A gap drops the part of a frame from before it, and the frame after it
     // starts a spell; while nobody who can hear watches nothing is encoded,
     // and the first frame once someone can starts one too.

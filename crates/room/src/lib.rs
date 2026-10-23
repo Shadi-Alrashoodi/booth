@@ -441,7 +441,7 @@ impl Room {
     /// is on once it has; it runs while the share is not paused. A capture
     /// that cannot start, or stops on an error, turns it off with a problem
     /// line, and the share goes on. Nothing captured after the press that
-    /// turns it off or pauses the share goes out.
+    /// turns it off, pauses the share or stops it goes out.
     pub fn share_sound(&self, on: bool) {
         self.threads.share_sound(on);
     }

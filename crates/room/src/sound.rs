@@ -256,8 +256,8 @@ struct Gate {
     share: u32,
     // The switch going on, or the share going on after a pause or a rest.
     since: Instant,
-    // A pause by hand, the secure desktop, the switch going off, or the
-    // share resting with nobody watching.
+    // A pause by hand, the secure desktop, the switch going off, Stop
+    // sharing, or the share resting with nobody watching.
     stop: Option<Instant>,
 }
 
@@ -269,6 +269,9 @@ struct Gates {
     held: bool,
     away: bool,
     off: bool,
+    // Stop sharing was pressed: nothing more of the share goes out, whatever
+    // the switch does before the room takes the stop in.
+    ended: bool,
     // The share rested with nobody watching, and its capture, or a window
     // share's look, has not answered since: nothing looked at the desktop
     // meanwhile, and it can be the secure one by now. The capture runs on,
@@ -279,7 +282,7 @@ struct Gates {
 impl Gates {
     // The capture is let go.
     fn paused(&self) -> bool {
-        self.held || self.away || self.off
+        self.held || self.away || self.off || self.ended
     }
 
     fn shut(&self) -> bool {
@@ -414,6 +417,13 @@ impl Outgoing {
     pub(crate) fn stop(&self, press: Instant) {
         let mut gates = lock(&self.gates);
         gates.off = true;
+        gates.follow(press);
+    }
+
+    // Stop sharing pressed at `press`, before the room takes it in.
+    pub(crate) fn end_share(&self, press: Instant) {
+        let mut gates = lock(&self.gates);
+        gates.ended = true;
         gates.follow(press);
     }
 
