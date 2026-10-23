@@ -432,6 +432,52 @@ fn sound_after_the_picture_ages_and_is_logged_with_no_pictures() {
     );
 }
 
+// Until the host's Hello says what it runs, nothing says the host is too old
+// for PC sound: every new session waits for it again, and the panel's switch
+// would show the old-host line meanwhile. This rig's host says the version
+// of this build first, older than PC_SOUND_SINCE until "move to 1.3.0", and
+// 1.2.0 on the second session.
+#[test]
+fn the_old_host_line_waits_for_the_hosts_hello() {
+    let start = Instant::now();
+    let rig = Rig::new(Timers::default(), start);
+    assert_eq!(rig.client.share_view().own_sound.unavailable, None);
+    let (mut rig, _) = Rig::joined(rig, start);
+    let older = invite::VERSION < peer::PC_SOUND_SINCE;
+    let hello_says = older.then_some(crate::view::NoSound::OldHost);
+    assert_eq!(rig.client.share_view().own_sound.unavailable, hello_says);
+
+    // Asleep long enough to join again at the wake: a new session, on which
+    // the host has said nothing yet.
+    let woke = start + Duration::from_secs(20);
+    assert!(rig.client.slept(Duration::from_secs(20), woke, &rig.socket));
+    rig.tick(woke);
+    let (_, mut session, response) = rig.host.answer_all(woke).pop().expect("a try");
+    rig.deliver(&response, woke);
+    assert!(rig.host.open_all(&mut session) > 0);
+    assert_eq!(
+        rig.client.share_view().own_sound.unavailable,
+        None,
+        "a new session"
+    );
+    rig.host.reliable = Reliable::new();
+    let hello = Message::Hello {
+        version: Version {
+            major: 1,
+            minor: 2,
+            patch: 0,
+        },
+        name: String::from("Mara"),
+        reached: None,
+    };
+    let hello = rig.host.say(&mut session, &hello, woke);
+    rig.deliver(&hello, woke);
+    assert_eq!(
+        rig.client.share_view().own_sound.unavailable,
+        Some(crate::view::NoSound::OldHost)
+    );
+}
+
 // A client standing for a copy older than PC_SOUND_SINCE counts channel 8
 // bad, as such a copy does, and plays none of it.
 #[test]

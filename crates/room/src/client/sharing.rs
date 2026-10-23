@@ -819,7 +819,9 @@ impl Client {
                 .is_some_and(|share| self.sound.says_on(share)),
             own_sound: OwnSound {
                 on: self.own_sound.is_on(self.screen.sharing.number()),
-                unavailable: (!self.link.sound_read).then_some(NoSound::OldHost),
+                // Only once the host's Hello said what it runs: a new
+                // session reads nothing yet, and would say so meanwhile.
+                unavailable: (self.host_hello && !self.link.sound_read).then_some(NoSound::OldHost),
                 lost: self.own_sound.lost(self.screen.sharing.number()),
             },
         }

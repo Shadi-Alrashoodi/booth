@@ -188,7 +188,7 @@ impl fmt::Display for AudioError {
                 lost: false,
                 ..
             } => f.write_str(
-                "could not start PC sound: Windows says access is denied (0x80070005). Allow microphone access for desktop apps in Settings, Privacy and security, Microphone, then turn it on again",
+                "could not start PC sound: Windows says access is denied (0x80070005). Allow microphone access for desktop apps in Settings, Privacy and security, Microphone, then turn Share PC sound on again",
             ),
             AudioError::PcSound { code, text, lost } => {
                 let code = if *code == 0 {

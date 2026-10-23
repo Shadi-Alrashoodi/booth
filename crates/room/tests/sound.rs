@@ -629,7 +629,7 @@ fn a_client_sends_no_pc_sound_through_a_host_on_1_2_0() {
     assert_eq!(own.unavailable, Some(NoSound::OldHost));
     assert_eq!(
         NoSound::OldHost.sentence(),
-        "The host needs Booth 1.3.0 or later for sound."
+        "The host needs Booth 1.3.0 or later for PC sound."
     );
     thread::sleep(Duration::from_millis(500));
     assert_eq!(host.view().numbers.dropped_bad, 0);
@@ -1157,7 +1157,7 @@ fn lost_pc_sound_comes_back_by_itself_or_turns_share_sound_off() {
     assert_eq!(
         view.share.problem.as_deref(),
         Some(
-            "PC sound stopped: Windows would not give its sound as 48 kHz stereo (0x88890008). Turn Share sound on to try again."
+            "PC sound stopped: Windows would not give its sound as 48 kHz stereo (0x88890008). Turn Share PC sound on to try again."
         )
     );
     let (_, told) = listen(&mut ana, Duration::from_millis(200));

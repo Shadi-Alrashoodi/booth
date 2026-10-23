@@ -1103,6 +1103,9 @@ impl eframe::App for App {
             Screen::Room(in_room) => {
                 let view = in_room.room.view();
                 in_room.decline_unshown(&view, self.control_offered);
+                if minimized(ctx) {
+                    in_room.out_of_sight();
+                }
                 Some(view)
             }
             Screen::Checking | Screen::Firewall(_) | Screen::Start(_) | Screen::Settings { .. } => {

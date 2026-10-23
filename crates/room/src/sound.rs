@@ -835,7 +835,7 @@ impl Switch {
                     let why = clause(&err);
                     said.problem = Some(if self.opened {
                         log!(self.log, "share {share}: pc sound stopped: {why}");
-                        format!("PC sound stopped: {why}. Turn Share sound on to try again.")
+                        stopped(&why)
                     } else {
                         could_not_start(share, &why, &self.log)
                     });
@@ -926,6 +926,16 @@ impl Switch {
     }
 }
 
+// Access denied says itself to turn Share PC sound on again once access is
+// allowed, so the line does not say it twice.
+fn stopped(why: &str) -> String {
+    if why.ends_with("turn Share PC sound on again") {
+        format!("PC sound stopped: {why}.")
+    } else {
+        format!("PC sound stopped: {why}. Turn Share PC sound on to try again.")
+    }
+}
+
 fn could_not_start(share: u32, why: &str, log: &Log) -> String {
     log!(log, "share {share}: pc sound could not start: {why}");
     format!("PC sound could not start: {why}. The share goes on without it.")
@@ -946,4 +956,33 @@ fn clause(err: &AudioError) -> String {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Access denied already says to turn Share PC sound on again, so its
+    // stopped line says it once; any other says it after the reason.
+    #[test]
+    fn a_stopped_line_says_what_to_do_once() {
+        let denied = AudioError::PcSound {
+            code: 0x8007_0005,
+            text: String::new(),
+            lost: false,
+        };
+        assert_eq!(
+            stopped(&clause(&denied)),
+            "PC sound stopped: Windows says access is denied (0x80070005). Allow microphone access for desktop apps in Settings, Privacy and security, Microphone, then turn Share PC sound on again."
+        );
+        let format = AudioError::PcSound {
+            code: 0x8889_0008,
+            text: String::from("Windows would not give its sound as 48 kHz stereo"),
+            lost: false,
+        };
+        assert_eq!(
+            stopped(&clause(&format)),
+            "PC sound stopped: Windows would not give its sound as 48 kHz stereo (0x88890008). Turn Share PC sound on to try again."
+        );
+    }
 }

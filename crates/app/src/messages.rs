@@ -515,6 +515,13 @@ pub fn region_too_small(width: u32, height: u32) -> String {
 }
 
 pub const SHARE_PAUSED: &str = "Sharing is paused. Nothing of your screen is sent until you resume.";
+pub const SHARE_PAUSED_WITH_SOUND: &str =
+    "Sharing is paused. Nothing of your screen or PC sound is sent until you resume.";
+
+// The switch in the block under the title row while you share, and what it
+// sends, written under it while it can go on.
+pub const SHARE_PC_SOUND: &str = "Share PC sound";
+pub const SHARE_PC_SOUND_NOTE: &str = "Sends everything this PC plays, except Booth.";
 pub const HOTKEYS_PAUSED: &str = "Hotkeys paused while an administrator window has focus.";
 pub const PRESS_NEW_KEY: &str = "Press the new key, or Esc to keep the old one.";
 

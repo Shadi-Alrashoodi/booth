@@ -3,10 +3,10 @@ use std::ops::RangeInclusive;
 use eframe::egui::emath::GuiRounding;
 use eframe::egui::text::LayoutJob;
 use eframe::egui::{
-    Align, Color32, Context, CursorIcon, Event, EventFilter, FontId, Frame, Id, Key,
-    KeyboardShortcut, Label, LayerId, Layout, Margin, Modifiers, Order, Painter, Rect, Response,
-    RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextBuffer, TextEdit, Ui, UiBuilder,
-    Vec2, WidgetInfo, WidgetType, accesskit, pos2, vec2,
+    Align, Color32, Context, CursorIcon, Event, EventFilter, FontId, FontSelection, Frame, Id, Key,
+    KeyboardShortcut, Label, LayerId, Layout, Margin, Modifiers, Order, Painter, PointerButton,
+    Rect, Response, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextBuffer, TextEdit,
+    TextWrapMode, Ui, UiBuilder, Vec2, WidgetInfo, WidgetText, WidgetType, accesskit, pos2, vec2,
 };
 
 use crate::theme::{
@@ -796,9 +796,104 @@ pub fn choice_row(
     note: Option<&str>,
     kind: WidgetType,
 ) -> Response {
+    choice(ui, id, selected, name, note, kind, true)
+}
+
+// A checkbox that can be off limits, as Share is while someone else shares:
+// its name in ash and its clicks ignored, still a Tab stop that says it is
+// disabled. `description` is what a screen reader says after the name: the
+// line under the row. True when a click, a screen reader or Space turned it.
+// Space only on its own, not as it repeats, and only while the ring shows:
+// egui takes Space or Enter with any keys held for a click, so a hotkey such
+// as Ctrl+Shift+Space, which shows or hides the panel, would turn it as well,
+// and it keeps the focus after a click, where no ring says Space goes.
+pub fn checkbox_row(
+    ui: &mut Ui,
+    id: Id,
+    checked: bool,
+    name: &str,
+    enabled: bool,
+    description: &str,
+) -> bool {
+    let response = choice(ui, id, checked, name, None, WidgetType::Checkbox, enabled);
+    let description = description.to_owned();
+    ui.ctx()
+        .accesskit_node_builder(response.id, |node| node.set_description(description));
+    // egui places a press on the last frame's layout, so the row as the last
+    // frame drew it is what the press was aimed at, and egui gives the click
+    // to the control the press began on, even when it has moved by the
+    // release. A click is one only if the row was never off limits from then
+    // on, or the wait after it appears would be a press shorter, and is
+    // checked as it was then: not one during which it turned by itself,
+    // which would turn it back.
+    let drawn = Drawn {
+        off_limits: !enabled,
+        checked,
+    };
+    let (last, press) = ui.ctx().data_mut(|data| {
+        let last = data
+            .get_temp::<Drawn>(response.id.with("drawn"))
+            .unwrap_or(drawn);
+        data.insert_temp(response.id.with("drawn"), drawn);
+        let key = response.id.with("press");
+        let before = data.get_temp::<Drawn>(key);
+        if response.is_pointer_button_down_on() {
+            let began = before.unwrap_or(last);
+            let off_limits = began.off_limits || !enabled;
+            data.insert_temp(
+                key,
+                Drawn {
+                    off_limits,
+                    ..began
+                },
+            );
+        } else {
+            data.remove::<Drawn>(key);
+        }
+        (last, before)
+    });
+    let began = press.unwrap_or(last);
+    let click = response.clicked_by(PointerButton::Primary)
+        && !began.off_limits
+        && began.checked == checked;
+    let space = response.has_focus()
+        && keyboard_focus(ui)
+        && ui.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(event, Event::Key {
+                    key: Key::Space,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                    ..
+                } if modifiers.is_none())
+            })
+        });
+    let reader =
+        ui.input(|input| input.has_accesskit_action_request(response.id, accesskit::Action::Click));
+    enabled && (click || space || reader)
+}
+
+// A checkbox row as a frame drew it. For a press while it is held: off
+// limits at any time since the frame it was aimed at, and checked as then.
+#[derive(Clone, Copy)]
+struct Drawn {
+    off_limits: bool,
+    checked: bool,
+}
+
+fn choice(
+    ui: &mut Ui,
+    id: Id,
+    selected: bool,
+    name: &str,
+    note: Option<&str>,
+    kind: WidgetType,
+    enabled: bool,
+) -> Response {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::hover());
     let response = ui.interact(rect, id, Sense::click());
-    response.widget_info(|| WidgetInfo::selected(kind, true, selected, name));
+    response.widget_info(|| WidgetInfo::selected(kind, enabled, selected, name));
     if !ui.is_rect_visible(rect) {
         return response;
     }
@@ -845,14 +940,19 @@ pub fn choice_row(
             .max_rect(text)
             .layout(Layout::left_to_right(Align::Center)),
     );
-    one_line(&mut row, name, theme::body(), CHALK);
+    let color = if enabled { CHALK } else { ASH };
+    one_line(&mut row, name, theme::body(), color);
     if let Some(note) = note {
         one_line(&mut row, note, theme::caption(), ASH);
     }
     if response.has_focus() && keyboard_focus(ui) {
         ring(ui, rect);
     }
-    response.on_hover_cursor(CursorIcon::PointingHand)
+    if enabled {
+        response.on_hover_cursor(CursorIcon::PointingHand)
+    } else {
+        response
+    }
 }
 
 fn field_frame(vertical: i8) -> Frame {
@@ -1057,6 +1157,24 @@ pub fn text(ui: &mut Ui, text: impl Into<String>, font: FontId, color: Color32) 
     )
 }
 
+// How tall text() lays these words out in the room left on this line.
+pub fn text_height(ui: &Ui, text: &str, font: FontId) -> f32 {
+    let line_height = line_height(&font);
+    WidgetText::from(
+        RichText::new(text)
+            .font(font)
+            .line_height(Some(line_height)),
+    )
+    .into_galley(
+        ui,
+        Some(TextWrapMode::Wrap),
+        ui.available_width(),
+        FontSelection::Default,
+    )
+    .size()
+    .y
+}
+
 // A sentence or two, wrapped at about 60 characters however wide the window
 // is: short lines are read at a glance, beside a game.
 pub fn prose(ui: &mut Ui, words: impl Into<String>, font: FontId, color: Color32) -> Response {
@@ -1129,8 +1247,18 @@ pub(crate) mod tests {
         events: Vec<Event>,
         run: impl FnOnce(&mut Ui) -> R,
     ) -> (R, eframe::egui::PlatformOutput) {
+        frame_at(ctx, vec2(360.0, 640.0), events, run)
+    }
+
+    // The same in a window of `size`.
+    pub(crate) fn frame_at<R>(
+        ctx: &Context,
+        size: Vec2,
+        events: Vec<Event>,
+        run: impl FnOnce(&mut Ui) -> R,
+    ) -> (R, eframe::egui::PlatformOutput) {
         let input = RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(360.0, 640.0))),
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)),
             events,
             ..RawInput::default()
         };

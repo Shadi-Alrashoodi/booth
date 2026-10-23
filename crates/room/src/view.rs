@@ -104,7 +104,7 @@ impl NoSound {
     // What the line under the switch says.
     pub fn sentence(self) -> &'static str {
         match self {
-            NoSound::OldHost => "The host needs Booth 1.3.0 or later for sound.",
+            NoSound::OldHost => "The host needs Booth 1.3.0 or later for PC sound.",
         }
     }
 }
