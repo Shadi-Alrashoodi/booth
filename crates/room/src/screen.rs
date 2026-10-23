@@ -1040,7 +1040,16 @@ pub struct Watching {
     // Whether this PC controls the share watched, as the viewer was last
     // told, and a new viewer is told at its start.
     control: Mutex<Option<share::Control>>,
+    // Pictures the viewer showed, (share, Cv, Pv): each capture stamp on the
+    // sharer's clock as sent and when it was shown on this PC's ping clock,
+    // handed over once a second for the room to set beside the share's
+    // sound (sound\pairing.rs).
+    shown: Mutex<VecDeque<(u32, u64, u64)>>,
 }
+
+// Two seconds of pictures at the fastest share, should the room not take
+// them in time.
+pub(crate) const MOST_SHOWN: usize = 512;
 
 // What the panel gives the room to be called when someone clicks the
 // viewer's strip, which brings the panel forward with the stats panel open.
@@ -1123,7 +1132,31 @@ impl Watching {
             cap: Mutex::default(),
             share_state: Mutex::default(),
             control: Mutex::default(),
+            shown: Mutex::new(VecDeque::with_capacity(MOST_SHOWN)),
         })
+    }
+
+    // On the viewer's thread, once a second.
+    pub(crate) fn shown(&self, share: u32, shown: &[(u64, Instant)]) {
+        let mut list = lock(&self.shown);
+        for &(stamp, at) in shown {
+            if list.len() == MOST_SHOWN {
+                list.pop_front();
+            }
+            list.push_back((share, stamp, self.clock.micros(at)));
+        }
+    }
+
+    // The pictures of `share` shown since the last call, (Cv, Pv), into
+    // `out`; those of any other share go.
+    pub(crate) fn take_shown(&self, share: Option<u32>, out: &mut Vec<(u64, u64)>) {
+        out.clear();
+        out.extend(
+            lock(&self.shown)
+                .drain(..)
+                .filter(|&(of, _, _)| Some(of) == share)
+                .map(|(_, cv, pv)| (cv, pv)),
+        );
     }
 
     // After every change of the view, under the state lock: the viewer
@@ -2098,6 +2131,30 @@ mod tests {
 
     fn screen(now: Instant) -> Screen {
         Screen::new(Clock::new(now), false, quiet_screen(), now)
+    }
+
+    // The pictures the viewer showed reach the room for the share they are
+    // of alone, and no more than MOST_SHOWN of them wait to be taken.
+    #[test]
+    fn pictures_shown_go_by_share_and_are_held_to_a_number() {
+        let now = Instant::now();
+        let screen = screen(now);
+        let watching = &screen.watching;
+        watching.shown(1, &[(10, now), (11, now)]);
+        watching.shown(2, &[(20, now)]);
+        let mut out = Vec::new();
+        watching.take_shown(Some(1), &mut out);
+        let pv = watching.micros(now);
+        assert_eq!(out, [(10, pv), (11, pv)]);
+        watching.take_shown(Some(2), &mut out);
+        assert!(out.is_empty(), "gone with the first");
+        let many: Vec<(u64, Instant)> = (0..MOST_SHOWN as u64 + 10)
+            .map(|stamp| (stamp, now))
+            .collect();
+        watching.shown(1, &many);
+        watching.take_shown(Some(1), &mut out);
+        assert_eq!(out.len(), MOST_SHOWN);
+        assert_eq!(out[0].0, 10);
     }
 
     fn color(side: u16) -> Shape {

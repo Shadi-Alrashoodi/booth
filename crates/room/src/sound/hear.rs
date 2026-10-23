@@ -18,14 +18,19 @@ use crate::talk::{AHEAD_US, LONGEST_US, Shared, WINDOW_US};
 const STAMPS: usize = 64;
 // 10 s of 10 ms frames, with room to spare.
 pub(super) const SAMPLES_KEPT: usize = 1024;
+// The frames played lately, for setting beside the pictures shown, which
+// the viewer hands over once a second.
+pub(super) const PLAYED_KEPT: usize = 256;
 const LOOKAHEAD_US: u64 = LOOKAHEAD as u64 * 1_000_000 / SAMPLE_RATE as u64;
 
+// Both moved back by the codec's lookahead: when what the frame's first
+// decoded sample holds was captured, on the sharer's ping clock as sent,
+// and on this PC's once the offsets are known.
 #[derive(Clone, Copy)]
 struct Stamp {
     seq: u16,
-    // On this PC's ping clock, already moved back by the codec's lookahead:
-    // when what the frame's first decoded sample holds was captured.
-    captured_us: u64,
+    sent_us: u64,
+    captured_us: Option<u64>,
     about: bool,
 }
 
@@ -40,6 +45,9 @@ pub(crate) struct Ear {
     buffer: Buffer,
     stamps: [Option<Stamp>; STAMPS],
     samples: VecDeque<Sample>,
+    // Each frame played lately: its stamp as sent, and when it left for the
+    // speakers on this PC's ping clock.
+    played: VecDeque<(u64, u64)>,
     // The render thread took it from its orders (Stream::new).
     taken: bool,
 }
@@ -50,6 +58,7 @@ impl Ear {
             buffer: Buffer::new()?,
             stamps: [None; STAMPS],
             samples: VecDeque::with_capacity(SAMPLES_KEPT),
+            played: VecDeque::with_capacity(PLAYED_KEPT),
             taken: false,
         })
     }
@@ -62,13 +71,12 @@ impl Ear {
     // whether it is only about right, once the offsets are known. False
     // when the buffer would not take it.
     pub(crate) fn push(&mut self, frame: &SoundFrame, captured: Option<(u64, bool)>) -> bool {
-        if let Some((at_us, about)) = captured {
-            self.stamps[usize::from(frame.seq) % STAMPS] = Some(Stamp {
-                seq: frame.seq,
-                captured_us: at_us.saturating_sub(LOOKAHEAD_US),
-                about,
-            });
-        }
+        self.stamps[usize::from(frame.seq) % STAMPS] = Some(Stamp {
+            seq: frame.seq,
+            sent_us: frame.captured.saturating_sub(LOOKAHEAD_US),
+            captured_us: captured.map(|(at_us, _)| at_us.saturating_sub(LOOKAHEAD_US)),
+            about: captured.is_some_and(|(_, about)| about),
+        });
         self.buffer
             .push(SoundPacket {
                 seq: frame.seq,
@@ -93,9 +101,16 @@ impl Ear {
         else {
             return;
         };
+        if self.played.len() == PLAYED_KEPT {
+            self.played.pop_front();
+        }
+        self.played.push_back((stamp.sent_us, ear_us));
+        let Some(captured_us) = stamp.captured_us else {
+            return;
+        };
         // The capture time came from the sharer's PC: one this far off is a
         // clock or a peer that is wrong, and counts for nothing.
-        let took = ear_us.wrapping_sub(stamp.captured_us) as i64;
+        let took = ear_us.wrapping_sub(captured_us) as i64;
         if !(-AHEAD_US..=LONGEST_US).contains(&took) {
             return;
         }
@@ -107,6 +122,13 @@ impl Ear {
             ms: took.max(0) as f32 / 1000.0,
             about: stamp.about,
         });
+    }
+
+    // The frames played lately, copied into `out` under the ear's lock, as
+    // heard copies its times.
+    pub(crate) fn played_lately(&self, out: &mut Vec<(u64, u64)>) {
+        out.clear();
+        out.extend(self.played.iter().copied());
     }
 
     // The times over the last 10 s, copied into `recent`, and whether any of
@@ -220,5 +242,32 @@ mod tests {
         // Out of the window 10 s later.
         assert!(!ear.heard(now_us + WINDOW_US, &mut recent));
         assert!(recent.is_empty());
+    }
+
+    // Every frame played is kept to be set beside the pictures, with its
+    // stamp as sent less the lookahead, those from before the offsets were
+    // known too, and only the last PLAYED_KEPT of them.
+    #[test]
+    fn frames_played_keep_their_stamps_as_sent() {
+        let bytes = opus_frame();
+        let mut ear = Ear::new().unwrap();
+        let count = PLAYED_KEPT as u64 + 10;
+        for seq in 0..count {
+            let sent = SoundFrame {
+                captured: 100_000 + seq * 10_000,
+                ..frame(seq as u16, &bytes)
+            };
+            ear.push(&sent, (seq % 2 == 0).then_some((5_000_000, false)));
+            ear.played(seq as u16, 7_000_000 + seq);
+        }
+        let mut played = Vec::new();
+        ear.played_lately(&mut played);
+        assert_eq!(played.len(), PLAYED_KEPT);
+        assert_eq!(played[0], (100_000 + 10 * 10_000 - 2_500, 7_000_010));
+        let last = count - 1;
+        assert_eq!(
+            played.last(),
+            Some(&(100_000 + last * 10_000 - 2_500, 7_000_000 + last))
+        );
     }
 }

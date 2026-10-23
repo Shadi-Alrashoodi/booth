@@ -236,6 +236,7 @@ impl Client {
             return false;
         }
         let mut changed = self.screen.sharing.take_fresh() | self.screen.watching.take_fresh();
+        self.sound.pair(&self.screen.watching, now);
         for news in self.screen.sharing.take_news() {
             changed |= self.share_news(news, now, socket);
         }

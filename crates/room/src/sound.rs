@@ -18,6 +18,7 @@
 // holding the ear's own lock for one frame, as voice's ears are (talk.rs).
 
 mod hear;
+mod pairing;
 mod send;
 mod wire;
 
@@ -34,13 +35,15 @@ use voice::audio::{AudioError, Event, PcSound};
 use crate::limit::Bucket;
 use crate::log::{Log, log};
 use crate::peer::{Clock, MEDIA_FLOWS_FOR};
+use crate::screen::{MOST_SHOWN, Watching};
 use crate::socket::Socket;
 use crate::talk::{MOST_VOLUME, Outlet, RETIRED_FOR, ToSpeaker};
-use crate::view::{Latency, Numbers, SoundNumbers};
+use crate::view::{AfterPicture, Latency, Numbers, SoundNumbers};
 
 pub(crate) use hear::{Ear, Stream};
 pub(crate) use wire::{MAX_SOUND, SoundFrame, read_relayed, read_sent, relay_in_place};
 
+use pairing::Pairing;
 use send::Feed;
 
 // A sharer sends 100 frames a second, 10 ms each. Past this rate the host
@@ -58,6 +61,11 @@ pub(crate) const SOUND_LEVEL: f32 = 0.5;
 // frame, which only a hostile one does, would otherwise make one per frame.
 const NEW_EARS_PER_SECOND: f64 = 2.0;
 const NEW_EAR_BURST: f64 = 4.0;
+// How often the log hears how the sound of the share watched goes, while
+// this PC has an ear for it.
+const LINE_EVERY: Duration = Duration::from_secs(10);
+// The viewer hands its pictures over once a second.
+const AGE_EVERY: Duration = Duration::from_secs(1);
 // The render thread takes its orders every period, a few to some tens of ms;
 // an ear still waiting there this long after it was made means it is away.
 const TAKEN_WITHIN: Duration = Duration::from_secs(1);
@@ -95,6 +103,19 @@ pub(crate) struct Sound {
     // not 1.0: set from the panel, kept for people not in the room yet, and
     // never sent anywhere. Their voice has its own (talk.rs).
     volumes: HashMap<[u8; 32], f32>,
+    // The pictures shown set beside the sound played with them, and the two
+    // lists it reads, kept between rounds and made whole at the start, so
+    // nothing grows under the lock of the list it is copied from.
+    pairing: Pairing,
+    pictures: Vec<(u64, u64)>,
+    played: Vec<(u64, u64)>,
+    // Their spread as the last round that worked it out left it, and when:
+    // sorted there, once a second, and not at every view build under the
+    // state lock.
+    after: Option<AfterPicture>,
+    aged: Option<Instant>,
+    // When the log next hears how the sound goes, while an ear plays.
+    next_line: Option<Instant>,
 }
 
 impl Sound {
@@ -111,6 +132,12 @@ impl Sound {
             told: None,
             dropped: 0,
             volumes: HashMap::new(),
+            pairing: Pairing::default(),
+            pictures: Vec::with_capacity(MOST_SHOWN),
+            played: Vec::with_capacity(hear::PLAYED_KEPT),
+            after: None,
+            aged: None,
+            next_line: None,
         }
     }
 
@@ -248,6 +275,49 @@ impl Sound {
             let _ = self.speaker.send(ToSpeaker::RemoveStream(listening.sharer));
             self.retired.push((listening.ear, now + RETIRED_FOR));
         }
+        self.pairing.clear();
+        self.after = None;
+        self.aged = None;
+        self.next_line = None;
+    }
+
+    // On the timer thread at each of its screen rounds, not in fill, which
+    // every view build runs: sets the pictures the viewer handed over beside
+    // the sound frames played (pairing.rs), ages the spread, and every
+    // LINE_EVERY tells the log how the sound goes.
+    pub(crate) fn pair(&mut self, watching: &Watching, now: Instant) {
+        let share = self.listening.as_ref().map(|listening| listening.share);
+        watching.take_shown(share, &mut self.pictures);
+        let (Some(share), Some(listening)) = (share, &self.listening) else {
+            return;
+        };
+        // The timer thread wakes for more than the pictures. A round without
+        // them pairs nothing, since that would end the wait of those carried
+        // before their sound came, and works the spread out again at most
+        // once AGE_EVERY, as often as pictures come.
+        let pictures = !self.pictures.is_empty();
+        if pictures {
+            lock(&listening.ear).played_lately(&mut self.played);
+            self.pairing.pair(&self.pictures, &mut self.played);
+        }
+        if pictures || self.aged.is_none_or(|aged| now >= aged + AGE_EVERY) {
+            let now_us = self.clock.micros(now);
+            self.pairing.prune(now_us);
+            self.after = self.pairing.apart(now_us);
+            self.aged = Some(now);
+        }
+        let due = *self.next_line.get_or_insert(now + LINE_EVERY);
+        if now < due {
+            return;
+        }
+        self.next_line = Some(now + LINE_EVERY);
+        if let Some(numbers) = self.numbers(now) {
+            log!(
+                self.log,
+                "watch {share}: pc sound: {}",
+                sound_line(&numbers)
+            );
+        }
     }
 
     // The sharer of `share` said its sound goes out.
@@ -272,17 +342,22 @@ impl Sound {
     // The numbers the stats panel shows about the PC sound this PC hears.
     pub(crate) fn fill(&self, numbers: &mut Numbers, now: Instant) {
         numbers.sound_dropped = self.dropped;
-        let Some(listening) = &self.listening else {
-            return;
-        };
+        if let Some(sound) = self.numbers(now) {
+            numbers.sound = Some(sound);
+        }
+    }
+
+    fn numbers(&self, now: Instant) -> Option<SoundNumbers> {
+        let listening = self.listening.as_ref()?;
+        let now_us = self.clock.micros(now);
         // Made before the lock, so the render thread never waits on an
         // allocation, and sorted after it.
         let mut recent = Vec::with_capacity(hear::SAMPLES_KEPT);
         let (stats, about) = {
             let ear = lock(&listening.ear);
-            (ear.stats(), ear.heard(self.clock.micros(now), &mut recent))
+            (ear.stats(), ear.heard(now_us, &mut recent))
         };
-        numbers.sound = Some(SoundNumbers {
+        Some(SoundNumbers {
             capture_to_ear: share::spread(&mut recent).map(|(median_ms, p95_ms)| Latency {
                 median_ms,
                 p95_ms,
@@ -291,8 +366,36 @@ impl Sound {
             depth_ms: stats.depth_ms,
             loss_pct: stats.loss_percent,
             made_up: stats.concealed,
-        });
+            after_picture: self.after,
+        })
     }
+}
+
+fn sound_line(numbers: &SoundNumbers) -> String {
+    let ear = numbers.capture_to_ear.map_or_else(
+        || String::from("not measured"),
+        |latency| {
+            format!(
+                "median {:.2} ms, p95 {:.2} ms{}",
+                latency.median_ms,
+                latency.p95_ms,
+                if latency.about { " (about)" } else { "" }
+            )
+        },
+    );
+    let after = numbers.after_picture.map_or_else(
+        || String::from("not measured yet"),
+        |after| {
+            format!(
+                "median {:.2} ms, p5 {:.2} ms, p95 {:.2} ms over {} pictures",
+                after.median_ms, after.p5_ms, after.p95_ms, after.pictures
+            )
+        },
+    );
+    format!(
+        "depth {} ms, capture to ear {ear}, after the picture {after}, loss {:.1}%, {} made up",
+        numbers.depth_ms, numbers.loss_pct, numbers.made_up
+    )
 }
 
 // One share's gate: made when Share sound goes on for it, never handed to

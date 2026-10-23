@@ -790,6 +790,22 @@ pub struct SoundNumbers {
     pub loss_pct: f32,
     // Frames made up for ones that never came, since the sound began.
     pub made_up: u64,
+    // None while fewer than 100 pictures were set beside the sound over the
+    // last 10 s.
+    pub after_picture: Option<AfterPicture>,
+}
+
+// How far the PC sound is from the picture over the last 10 s: for each
+// picture shown, how many ms after it the sound captured with it left the
+// speakers, negative when the sound came first. Each difference in it is
+// taken on one clock, so it is never "about", and it shows before the
+// offsets are known.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AfterPicture {
+    pub median_ms: f32,
+    pub p5_ms: f32,
+    pub p95_ms: f32,
+    pub pictures: u32,
 }
 
 // A share's video codec: HEVC when every watcher's GPU decodes it and the

@@ -214,6 +214,7 @@ fn watch(
         Report::Back(back) => watching.back(room_back(share, back)),
         Report::Line(line) => said(log, share, line),
         Report::Second(second) => {
+            watching.shown(share, &second.window.shown);
             let about = watching.sharer_clock(share).is_some_and(|(_, about)| about);
             let (fps, one_way_ms) = watching.pace(share).unwrap_or((start.fps, None));
             let numbers =

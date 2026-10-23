@@ -323,6 +323,113 @@ fn a_pc_sound_volume_holds_from_the_first_frame() {
     assert!(rig.client.view(start, 0).numbers.sound.is_some());
 }
 
+// How far the sound is from the picture needs no clock offsets, so it shows
+// before they are known, while capture to ear cannot: Bo's sound played
+// here, beside pictures of his share the viewer showed, each captured 3 ms
+// into a sound frame.
+#[test]
+fn sound_after_the_picture_needs_no_clock_offset() {
+    let start = Instant::now();
+    let (mut rig, mut session, mut speaker) = watching(peer::PC_SOUND_SINCE, start);
+    let frames = stereo_frames(140);
+    let stamp = |seq: u16| 1_000_000 + u64::from(seq) * 10_000 + 3_000;
+    let mut play = |rig: &mut Rig, session: &mut Session, seq: u16| {
+        let frame = &frames[usize::from(seq)];
+        let packet = relayed(session, BO_SLOT, SHARE, seq, seq == 0, frame);
+        rig.deliver(&packet, start);
+        loudest(&mut speaker);
+    };
+    let mut shown = Vec::new();
+    for seq in 0..130 {
+        play(&mut rig, &mut session, seq);
+        shown.push((stamp(seq), Instant::now()));
+    }
+    // Five pictures whose sound has not come yet wait for it.
+    for seq in 130..135 {
+        shown.push((stamp(seq), Instant::now()));
+    }
+    rig.client.screen.watching.shown(SHARE, &shown);
+    let now = Instant::now();
+    rig.client.screen_work(now, &rig.socket);
+    let sound = rig.client.view(now, 0).numbers.sound.expect("sound heard");
+    assert!(sound.capture_to_ear.is_none(), "no clock offsets yet");
+    let after = sound.after_picture.expect("how far apart");
+    assert!(after.pictures >= 120, "{after:?}");
+    // 3 ms into the frame and the codec's 2.5 ms lookahead, less the moment
+    // between the frame leaving and the picture's time being taken.
+    assert!((4.0..6.0).contains(&after.median_ms), "{after:?}");
+
+    // The timer thread wakes with no pictures too: the five keep waiting
+    // for the next handover, by when their sound has played.
+    rig.client.screen_work(now, &rig.socket);
+    for seq in 130..140 {
+        play(&mut rig, &mut session, seq);
+    }
+    rig.client
+        .screen
+        .watching
+        .shown(SHARE, &[(stamp(136), Instant::now())]);
+    let now = Instant::now();
+    rig.client.screen_work(now, &rig.socket);
+    let sound = rig.client.view(now, 0).numbers.sound.expect("sound heard");
+    assert_eq!(sound.after_picture.map(|after| after.pictures), Some(136));
+
+    // Off lets the ear and its numbers go: the next sound starts afresh,
+    // before the timer thread's next round too.
+    bo_says(&mut rig, &mut session, false, now);
+    let again = stereo_frames(1);
+    let packet = relayed(&mut session, BO_SLOT, SHARE, 200, true, &again[0]);
+    rig.deliver(&packet, now);
+    loudest(&mut speaker);
+    let sound = rig.client.view(now, 0).numbers.sound.expect("sound again");
+    assert_eq!(sound.after_picture, None);
+    rig.client.screen_work(now, &rig.socket);
+    let sound = rig.client.view(now, 0).numbers.sound.expect("sound again");
+    assert_eq!(sound.after_picture, None);
+}
+
+// With no more pictures, as from a still screen, how far the sound is from
+// the picture still ages out of the numbers, and the log hears how the
+// sound goes every 10 s from the first round that had an ear.
+#[test]
+fn sound_after_the_picture_ages_and_is_logged_with_no_pictures() {
+    let start = Instant::now();
+    let (mut rig, mut session, _) = watching(peer::PC_SOUND_SINCE, start);
+    let (orders_in, orders) = crossbeam_channel::unbounded();
+    let clock = rig.client.clock();
+    let (log, lines) = Log::capture(16);
+    rig.client.sound = Sound::new(orders_in, clock, log, start);
+    let mut speaker = Speaker::new(orders, Arc::clone(rig.client.talk.shared()), clock);
+    let mut shown = Vec::new();
+    for (seq, frame) in stereo_frames(120).iter().enumerate() {
+        let seq = seq as u16;
+        let packet = relayed(&mut session, BO_SLOT, SHARE, seq, seq == 0, frame);
+        rig.deliver(&packet, start);
+        loudest(&mut speaker);
+        shown.push((1_000_000 + u64::from(seq) * 10_000 + 3_000, Instant::now()));
+    }
+    rig.client.screen.watching.shown(SHARE, &shown);
+    let now = Instant::now();
+    let at = |secs: u64| now + Duration::from_secs(secs);
+    let after = |rig: &Rig, secs: u64| {
+        let numbers = rig.client.view(at(secs), 0).numbers;
+        numbers.sound.expect("sound heard").after_picture
+    };
+    rig.client.screen_work(now, &rig.socket);
+    assert!(after(&rig, 0).is_some());
+    rig.client.screen_work(at(9), &rig.socket);
+    assert!(after(&rig, 9).is_some(), "still inside the window");
+    assert!(lines.lines().is_empty(), "no line before 10 s");
+    rig.client.screen_work(at(10), &rig.socket);
+    assert_eq!(after(&rig, 10), None, "out of the window");
+    let said = lines.lines();
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(
+        said[0].starts_with(&format!("watch {SHARE}: pc sound: depth ")),
+        "{said:?}"
+    );
+}
+
 // A client standing for a copy older than PC_SOUND_SINCE counts channel 8
 // bad, as such a copy does, and plays none of it.
 #[test]
