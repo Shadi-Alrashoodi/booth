@@ -286,6 +286,11 @@ pub struct Screen {
     settled: Vec<Settled>,
     numbers: ViewerNumbers,
     shown_this_wake: bool,
+    // When the last wake took a packet: a moving share whose pictures stop
+    // showing still sends them. And when the strip's numbers were last
+    // worked out.
+    packet_at: Instant,
+    ticked_at: Instant,
     // Each frame's own capture to encoded, on the sharer's clock, for the
     // strip's "enc" when the caller hands no encode times over: the room
     // has none but what the frames carry. It includes capture's colour
@@ -518,6 +523,8 @@ impl Screen {
             settled: Vec::new(),
             numbers: ViewerNumbers::default(),
             shown_this_wake: false,
+            packet_at: Instant::now(),
+            ticked_at: Instant::now(),
             framed_encode_ms: Vec::new(),
             times: Times::new(watch.keep_times),
             out,
@@ -567,6 +574,9 @@ impl Screen {
 
             self.shown_this_wake = false;
             let taken = self.inbox.take(&mut batch);
+            if !batch.is_empty() {
+                self.packet_at = Instant::now();
+            }
             if let Some(fps) = taken.fps.filter(|&fps| fps > 0) {
                 self.interval = Duration::from_secs(1) / fps;
                 reassembler.set_interval(self.interval);
@@ -598,19 +608,35 @@ impl Screen {
                 self.event(event, report)?;
             }
             self.after_events(&reassembler, report);
-            if ((moved || controlled) && !self.shown_this_wake) || self.viewer.needs_redraw() {
+            let now = Instant::now();
+            if now >= next_strip {
+                next_strip = now + STRIP_EVERY;
+                let loss = reassembler.loss(now).percent();
+                self.update_strip(loss, now);
+            }
+            // The strip alone only when nothing was shown this wake and the
+            // viewer says it is due, and only while no packet was taken this
+            // wake or for STILL, no picture waits to be whole and none waits in
+            // the inbox (last, as it takes the inbox's lock), so its present
+            // does not go ahead of a picture whose packets have come.
+            let strip_alone = || {
+                !self.shown_this_wake
+                    && self.viewer.strip_due(now)
+                    && batch.is_empty()
+                    && reassembler.next_deadline().is_none()
+                    && now.saturating_duration_since(self.packet_at) >= viewer::STILL
+                    && !self.inbox.has_packets()
+            };
+            if ((moved || controlled) && !self.shown_this_wake)
+                || self.viewer.needs_redraw()
+                || strip_alone()
+            {
                 self.redraw()?;
             }
             if self.viewer.strip_clicked() {
                 report(Report::StripClicked);
             }
 
-            let now = Instant::now();
-            if now >= next_strip {
-                next_strip = now + STRIP_EVERY;
-                let loss = reassembler.loss(now).percent();
-                self.update_strip(loss);
-            }
             if now >= next_second {
                 next_second += SECOND;
                 self.gauge();
@@ -1004,11 +1030,18 @@ impl Screen {
         }
     }
 
-    fn update_strip(&mut self, loss: Option<f32>) {
+    fn update_strip(&mut self, loss: Option<f32>, now: Instant) {
+        let before = self.strip.clone();
+        let fresh = self.packet_at > self.ticked_at;
+        self.ticked_at = now;
+        self.update_numbers(loss, fresh);
+        self.note_strip(&before);
+    }
+
+    // `fresh`: packets came since the last update.
+    fn update_numbers(&mut self, loss: Option<f32>, fresh: bool) {
         if !self.link_loss {
-            self.strip.loss_pct = loss;
-            self.strip.loss_level =
-                loss.map_or(Level::Good, |pct| Thresholds::default().loss_level(pct));
+            video_loss(&mut self.strip, loss, fresh);
         }
         // A still screen decodes nothing, and the last picture's time would
         // wait for the next.
@@ -1040,8 +1073,20 @@ impl Screen {
     }
 
     fn set_link(&mut self, link: LinkNumbers) {
+        let before = self.strip.clone();
         self.one_way_ms = link.one_way_ms.unwrap_or(0.0);
-        self.link_loss = show_link(&mut self.strip, link);
+        self.link_loss = show_link(&mut self.strip, link, self.link_loss);
+        self.note_strip(&before);
+    }
+
+    // A still screen shows no pictures to draw the strip with: the viewer is
+    // told when the strip has something new, and the loop presents it alone
+    // when Viewer::strip_due says so and nothing is arriving, so "paused"
+    // shows on the share it is for.
+    fn note_strip(&mut self, before: &Strip) {
+        if self.strip != *before {
+            self.viewer.strip_changed();
+        }
     }
 
     fn gauge(&self) {
@@ -1101,8 +1146,10 @@ fn mouse_mode(pointer: Option<&Cursor>) -> MouseMode {
 }
 
 // The caller's link numbers into the strip. True when they carry a loss
-// number, which then shows instead of the video's.
-fn show_link(strip: &mut Strip, link: LinkNumbers) -> bool {
+// number, which then shows instead of the video's. A link that had one and
+// has none now, a new worst link on the host or a new session, takes its old
+// one away with it.
+fn show_link(strip: &mut Strip, link: LinkNumbers, had_loss: bool) -> bool {
     strip.state = link.state;
     strip.rtt_ms = link.rtt_ms;
     strip.rtt_level = link.rtt_level;
@@ -1119,7 +1166,24 @@ fn show_link(strip: &mut Strip, link: LinkNumbers) -> bool {
             strip.loss_level = link.loss_level;
             true
         }
-        None => false,
+        None => {
+            if had_loss {
+                strip.loss_pct = None;
+                strip.loss_level = Level::Good;
+            }
+            false
+        }
+    }
+}
+
+// Without the link's loss, the video's own over 2 s, taken only when
+// packets came since the last time (`fresh`): a still screen keeps the
+// figure the whole 2 s gave, as its other numbers keep theirs, rather than
+// one its last repeat's two packets make, or none.
+fn video_loss(strip: &mut Strip, loss: Option<f32>, fresh: bool) {
+    if fresh && let Some(pct) = loss {
+        strip.loss_pct = Some(pct);
+        strip.loss_level = Thresholds::default().loss_level(pct);
     }
 }
 
@@ -1345,6 +1409,9 @@ mod tests {
         assert_eq!(mouse_mode(Some(&hidden)), MouseMode::Relative);
     }
 
+    // The caller's link numbers go into the strip, its loss figure in place
+    // of the video's; a link that had one and has none now takes it away,
+    // while the loopback's link, which never has one, leaves the video's.
     #[test]
     fn the_callers_link_fills_the_strip() {
         let mut strip = Strip::default();
@@ -1353,11 +1420,13 @@ mod tests {
             path: Some(PathWord::Loop),
             ..LinkNumbers::default()
         };
-        assert!(!show_link(&mut strip, looped));
+        strip.loss_pct = Some(3.0);
+        assert!(!show_link(&mut strip, looped, false));
         assert_eq!(
             (strip.state, strip.path, strip.rtt_ms),
             (LinkState::Live, Some(PathWord::Loop), None)
         );
+        assert_eq!(strip.loss_pct, Some(3.0), "the video's own");
         let room = LinkNumbers {
             state: LinkState::Live,
             rtt_ms: Some(4.0),
@@ -1368,15 +1437,35 @@ mod tests {
             pc_sound: Some(PcSound::Muted),
             ..LinkNumbers::default()
         };
-        assert!(show_link(&mut strip, room));
+        assert!(show_link(&mut strip, room, false));
         assert_eq!(
             (strip.rtt_ms, strip.loss_pct, strip.loss_level),
             (Some(4.0), Some(1.5), Level::Warn)
         );
         assert_eq!(strip.trace.len(), 2);
         assert_eq!(strip.pc_sound, Some(PcSound::Muted));
-        show_link(&mut strip, LinkNumbers::default());
+        assert!(!show_link(&mut strip, LinkNumbers::default(), true));
         assert_eq!(strip.pc_sound, None, "and gone again");
+        assert_eq!(
+            (strip.loss_pct, strip.loss_level),
+            (None, Level::Good),
+            "a figure that went"
+        );
+    }
+
+    // Without the link's loss, the video's own goes in only when packets
+    // came since the last time: a still screen keeps the figure it had.
+    #[test]
+    fn a_still_screen_keeps_the_videos_loss() {
+        let mut strip = Strip::default();
+        video_loss(&mut strip, Some(4.0), true);
+        assert_eq!((strip.loss_pct, strip.loss_level), (Some(4.0), Level::Bad));
+        video_loss(&mut strip, Some(50.0), false);
+        assert_eq!(strip.loss_pct, Some(4.0), "no packets since");
+        video_loss(&mut strip, None, true);
+        assert_eq!(strip.loss_pct, Some(4.0), "no figure");
+        video_loss(&mut strip, Some(0.0), true);
+        assert_eq!((strip.loss_pct, strip.loss_level), (Some(0.0), Level::Good));
     }
 
     // A room's viewer keeps a second's times at most, however long the

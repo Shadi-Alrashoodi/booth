@@ -30,7 +30,7 @@ const FONT_SIZE: f32 = 12.0;
 // (room::view::Strip, field for field) and the video's from the decode
 // loop. Levels are worked out by the caller, as the room does for the
 // panel, from the thresholds in crates/stats.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Strip {
     pub state: LinkState,
     pub rtt_ms: Option<f32>,

@@ -55,11 +55,19 @@ pub use crate::strip::{LinkState, PathWord, PcSound, PresentPath, ShareState, St
 const BUFFERS: u32 = 2;
 
 // needs_redraw asks for the still picture again, for the present path word,
-// only once nothing has been presented for this long. A share that is
-// sending frames brings the word back with them, and a present of the same
-// picture between two of theirs would only cost GPU time and, with vsync, a
-// place in the queue ahead of the next one.
+// only once nothing has been presented for this long, and strip_due as well.
+// A share that is sending frames brings the word back with them, and a
+// present of the same picture between two of theirs would only cost GPU time
+// and, with vsync or while composed, a place in the queue ahead of the next
+// one.
 const QUIET: Duration = Duration::from_millis(100);
+
+// A share that shows a picture at least this often draws new strip numbers
+// with its pictures. Only a still screen, a paused share, a slower one, or
+// one whose pictures stopped showing (held for a key frame) gets a present
+// of the strip alone (strip_due); the caller also waits this long after
+// the last packet, so only the first three do.
+pub const STILL: Duration = Duration::from_millis(500);
 
 // The setting that hides the strip in fullscreen until the mouse moves. One
 // for every viewer in the process, set by the panel as a room opens, since
@@ -195,8 +203,14 @@ pub struct Viewer {
     // Fullscreen and Shared::output_changes as the last present found them.
     was_fullscreen: bool,
     output_changes: u32,
-    // When the last call to present() returned.
+    // When the last call to present() returned, and when the last one that
+    // showed a new picture did.
     presented_at: Instant,
+    pictured_at: Instant,
+    // The strip has something the last present did not draw. A present
+    // while minimized or with the strip hidden clears it as well: the
+    // restore and the strip coming back redraw everything.
+    strip_new: bool,
     // Where the last present put the strip.
     band: Band,
     // The controller's mouse on the picture as the last present found it,
@@ -241,6 +255,8 @@ impl Viewer {
             was_fullscreen: false,
             output_changes: 0,
             presented_at: Instant::now(),
+            pictured_at: Instant::now(),
+            strip_new: false,
             band: Band::Below,
             local: None,
             rested: false,
@@ -357,6 +373,26 @@ impl Viewer {
         self.scene.gauge();
     }
 
+    // Something the strip draws changed: a number, a word, the trace. A
+    // share that shows pictures draws it with its next one.
+    pub fn strip_changed(&mut self) {
+        self.strip_new = true;
+    }
+
+    // Whether the strip wants a present of its own, with the still picture,
+    // at `now`: it has something new, no picture has been shown for STILL,
+    // nothing was presented for QUIET, and the strip is not hidden, where it
+    // would show nothing new. A still screen and a paused share send no
+    // pictures to draw it with. The caller presents for it only at a wake
+    // with no picture already arriving, so this present is never ahead of
+    // one.
+    pub fn strip_due(&self, now: Instant) -> bool {
+        self.strip_new
+            && self.band_now() != Band::Hidden
+            && now.saturating_duration_since(self.pictured_at) >= STILL
+            && now.saturating_duration_since(self.presented_at) >= QUIET
+    }
+
     pub fn present(&mut self, frame: &Frame) -> Result<Presented, ViewerError> {
         let started = Instant::now();
         if self.window.shared().closed() {
@@ -370,6 +406,7 @@ impl Viewer {
         if shared.minimized() || size.0 == 0 || size.1 == 0 {
             self.scene.hold(frame.video.as_ref(), frame.cursor)?;
             self.presented_at = Instant::now();
+            self.strip_new = false;
             return Ok(Presented {
                 took: started.elapsed(),
                 path: self.path.word(),
@@ -423,6 +460,10 @@ impl Viewer {
         }
         self.read_path();
         self.presented_at = Instant::now();
+        if frame.video.is_some() {
+            self.pictured_at = self.presented_at;
+        }
+        self.strip_new = false;
         Ok(Presented {
             took,
             path: self.path.word(),
@@ -788,5 +829,41 @@ mod tests {
         assert!(presented.shown);
         assert!(viewer.swap.target.is_some());
         assert!(viewer.present(&still).is_ok());
+    }
+
+    // New numbers in the strip of a still picture want a present of their
+    // own once no picture has been shown for STILL and nothing presented for
+    // QUIET, and a present puts them away.
+    #[test]
+    fn new_strip_numbers_want_a_present_on_a_still_screen() {
+        let _screen = one_at_a_time();
+        let Some(mut viewer) = hidden("Booth viewer strip test") else {
+            return;
+        };
+        let strip = Strip::default();
+        let still = Frame {
+            video: None,
+            cursor: None,
+            strip: &strip,
+        };
+        viewer.present(&still).unwrap();
+        let now = Instant::now();
+        viewer.pictured_at = now - STILL;
+        viewer.presented_at = now - QUIET;
+        assert!(!viewer.strip_due(now), "nothing new");
+        viewer.strip_changed();
+        assert!(viewer.strip_due(now), "still, with new numbers");
+        viewer.pictured_at = now;
+        assert!(!viewer.strip_due(now), "a picture shown just now");
+        viewer.pictured_at = now - STILL;
+        viewer.presented_at = now;
+        assert!(!viewer.strip_due(now), "a present just now");
+        viewer.presented_at = now - QUIET;
+        assert!(viewer.strip_due(now));
+        viewer.present(&still).unwrap();
+        let now = Instant::now();
+        viewer.pictured_at = now - STILL;
+        viewer.presented_at = now - QUIET;
+        assert!(!viewer.strip_due(now), "drawn");
     }
 }

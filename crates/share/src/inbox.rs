@@ -120,6 +120,12 @@ impl Inbox {
         }
     }
 
+    // Whether packets came that the viewer has not taken: one that came after
+    // its last take can be a picture's first.
+    pub(crate) fn has_packets(&self) -> bool {
+        !self.lock().packets.is_empty()
+    }
+
     // The strip's link numbers from now on; they show at its next update.
     pub fn set_link(&self, link: LinkNumbers) {
         self.lock().link = Some(link);
@@ -287,6 +293,12 @@ mod tests {
         assert!(taken.link.is_some());
         let again = inbox.take(&mut VecDeque::new());
         assert!(again.fps.is_none() && again.link.is_none() && again.clock.is_none());
+        // Packets wait until a take; nothing else does.
+        assert!(!inbox.has_packets());
+        inbox.packet(&[1, 2, 3]);
+        assert!(inbox.has_packets());
+        inbox.take(&mut VecDeque::new());
+        assert!(!inbox.has_packets());
         // Control's start and end are each taken once, the newest winning.
         inbox.set_control(Some(Control { paused: false }));
         inbox.set_control(Some(Control { paused: true }));
