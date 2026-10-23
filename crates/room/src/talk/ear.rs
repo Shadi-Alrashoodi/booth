@@ -587,6 +587,43 @@ mod tests {
         assert!(after.iter().all(|&s| s == 0.0));
     }
 
+    // PC sound turned to nothing while its frames stopped coming, for longer
+    // than its buffer waits on them, plays nothing at the old volume when
+    // they come again, though its buffer brings them back mid-waveform.
+    #[test]
+    fn pc_sound_turned_down_through_an_outage_comes_back_silent() {
+        let shared = Shared::new(&VoiceConfig::default(), None, false);
+        let clock = Clock::new(Instant::now());
+        let (orders_in, orders) = crossbeam_channel::unbounded();
+        let mut speaker = Speaker::new(orders, Arc::clone(&shared), clock);
+        let ear = Arc::new(Mutex::new(sound::Ear::new().unwrap()));
+        orders_in
+            .send(ToSpeaker::AddStream([2; 32], Arc::clone(&ear), 1.0))
+            .unwrap();
+        let frames = stereo_frames(30);
+        let mut out = [0.0f32; 960];
+        let mut heard = 0.0f32;
+        for (seq, bytes) in frames.iter().enumerate().take(10) {
+            assert!(lock(&ear).push(&sound_frame(seq as u16, bytes), None));
+            speaker.fill(&mut out);
+            heard = heard.max(out.iter().fold(0.0, |most, s| most.max(s.abs())));
+        }
+        assert!(heard > 0.1, "{heard}");
+        // 100 ms with nothing.
+        for _ in 0..10 {
+            speaker.fill(&mut out);
+        }
+        orders_in
+            .send(ToSpeaker::StreamVolume([2; 32], 0.0))
+            .unwrap();
+        for (seq, bytes) in frames.iter().enumerate().skip(20) {
+            assert!(lock(&ear).push(&sound_frame(seq as u16, bytes), None));
+            speaker.fill(&mut out);
+            assert!(out.iter().all(|&s| s == 0.0), "frame {seq}");
+        }
+        assert!(lock(&ear).stats().held_frames <= 1);
+    }
+
     // PC sound added at a volume of 0 plays nothing from its first callback:
     // a stream that has not played takes its volume whole, where a ramp
     // down from 100 percent would let its start through.

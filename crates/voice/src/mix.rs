@@ -89,10 +89,15 @@ struct Voice<K, S> {
     len: usize,
     // This talker's own volume, which moves to `wanted` over FADE samples
     // so a slider dragged mid-word does not click. A talker who has not
-    // played yet starts at it.
+    // played yet starts at `wanted`. One coming back from idle starts at no
+    // more than `wanted`, so a volume turned down meanwhile lets nothing of
+    // the old one through; turned up, it still ramps, as not every source
+    // fades its start in.
     gain: f32,
     wanted: f32,
     played: bool,
+    // The last pull gave nothing, or the mixer paused it.
+    idle: bool,
 }
 
 impl<K, S: FrameSource> Voice<K, S> {
@@ -111,8 +116,15 @@ impl<K, S: FrameSource> Voice<K, S> {
                         self.start = 0;
                         self.len = len.min(MAX_FRAME);
                         self.played = true;
+                        if self.idle {
+                            self.gain = self.gain.min(self.wanted);
+                            self.idle = false;
+                        }
                     }
-                    _ => return,
+                    _ => {
+                        self.idle = true;
+                        return;
+                    }
                 }
             }
             let take = self.len.min(out.len() - done);
@@ -140,6 +152,7 @@ struct Stream<K, T> {
     gain: f32,
     wanted: f32,
     played: bool,
+    idle: bool,
 }
 
 impl<K, T: StereoSource> Stream<K, T> {
@@ -156,8 +169,15 @@ impl<K, T: StereoSource> Stream<K, T> {
                         self.start = 0;
                         self.len = len.min(MAX_FRAME);
                         self.played = true;
+                        if self.idle {
+                            self.gain = self.gain.min(self.wanted);
+                            self.idle = false;
+                        }
                     }
-                    _ => return done > 0,
+                    _ => {
+                        self.idle = true;
+                        return done > 0;
+                    }
                 }
             }
             let take = self.len.min(frames - done);
@@ -228,6 +248,7 @@ impl<K: PartialEq, S: FrameSource, T: StereoSource> Mixer<K, S, T> {
             gain: 1.0,
             wanted: 1.0,
             played: false,
+            idle: false,
         });
         replaced
     }
@@ -280,6 +301,7 @@ impl<K: PartialEq, S: FrameSource, T: StereoSource> Mixer<K, S, T> {
             gain: 1.0,
             wanted: 1.0,
             played: false,
+            idle: false,
         });
         replaced
     }
@@ -453,12 +475,14 @@ impl<K: PartialEq, S: FrameSource, T: StereoSource> Mixer<K, S, T> {
         for voice in &mut self.voices {
             voice.len = 0;
             voice.source.pause();
+            voice.idle = true;
         }
         self.stream_tail = [0.0; 2 * FADE];
         self.stream_tail_left = 0;
         for stream in &mut self.streams {
             stream.len = 0;
             stream.source.pause();
+            stream.idle = true;
         }
     }
 }

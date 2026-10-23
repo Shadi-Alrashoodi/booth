@@ -57,10 +57,27 @@ impl FrameSource for Quiet {
     }
 }
 
+// A level that gives nothing while `gap` is set, as a talker between spells.
+struct Gap {
+    level: f32,
+    gap: bool,
+}
+
+impl FrameSource for Gap {
+    fn next_frame(&mut self, out: &mut [f32]) -> Option<usize> {
+        if self.gap {
+            return None;
+        }
+        out[..240].fill(self.level);
+        Some(240)
+    }
+}
+
 enum Talker {
     Counter(Counter),
     Level(Level),
     Quiet(Quiet),
+    Gap(Gap),
 }
 
 impl FrameSource for Talker {
@@ -69,6 +86,7 @@ impl FrameSource for Talker {
             Talker::Counter(source) => source.next_frame(out),
             Talker::Level(source) => source.next_frame(out),
             Talker::Quiet(source) => source.next_frame(out),
+            Talker::Gap(source) => source.next_frame(out),
         }
     }
 }
@@ -485,12 +503,75 @@ fn each_talker_has_a_volume_of_their_own() {
     mixer.set_gain(&9, 0.0);
 }
 
+// A talker turned down while idle, between spells or while this PC was
+// deafened, comes back at the new volume from the first sample. Turned up
+// while idle, they still ramp up from where they were, and once back, a
+// volume changed mid-word ramps as ever. One turned down while idle and
+// taken out plays its last 2.5 ms at the new volume.
+#[test]
+fn a_volume_turned_down_while_idle_holds_from_the_first_sample() {
+    let mut mixer: Mixer<u32, Talker> = Mixer::new();
+    mixer.add(
+        1,
+        Talker::Gap(Gap {
+            level: 0.2,
+            gap: false,
+        }),
+    );
+    let gap = |mixer: &mut Mixer<u32, Talker>, on: bool| match mixer.source_mut(&1) {
+        Some(Talker::Gap(source)) => source.gap = on,
+        _ => panic!("talker 1 is not a gap"),
+    };
+    let mut out = [0.0f32; 240];
+    mixer.render(&mut out);
+    gap(&mut mixer, true);
+    mixer.render(&mut out);
+    mixer.set_gain(&1, 0.0);
+    gap(&mut mixer, false);
+    mixer.render(&mut out);
+    assert!(out.iter().all(|&s| s == 0.0), "{out:?}");
+
+    gap(&mut mixer, true);
+    mixer.render(&mut out);
+    mixer.set_gain(&1, 1.0);
+    gap(&mut mixer, false);
+    mixer.render(&mut out);
+    assert!(out[0] > 0.0 && out[0] <= 0.2 / 120.0 + 1e-6, "{}", out[0]);
+    assert!(out[120..].iter().all(|&s| (s - 0.2).abs() < 1e-6));
+    mixer.set_gain(&1, 0.0);
+    mixer.render(&mut out);
+    assert!((out[0] - 0.2 * 119.0 / 120.0).abs() < 1e-6, "{}", out[0]);
+    assert!(out[120..].iter().all(|&s| s == 0.0));
+
+    mixer.set_gain(&1, 1.0);
+    mixer.render(&mut out);
+    mixer.set_deafened(true);
+    mixer.render(&mut out);
+    mixer.render(&mut out);
+    mixer.set_gain(&1, 0.0);
+    mixer.set_deafened(false);
+    mixer.render(&mut out);
+    assert!(out.iter().all(|&s| s == 0.0), "{out:?}");
+
+    mixer.set_gain(&1, 1.0);
+    mixer.render(&mut out);
+    gap(&mut mixer, true);
+    mixer.render(&mut out);
+    mixer.set_gain(&1, 0.0);
+    gap(&mut mixer, false);
+    assert!(mixer.remove(&1).is_some());
+    mixer.render(&mut out);
+    assert!(out.iter().all(|&s| s == 0.0), "{out:?}");
+}
+
 // A stereo stream that plays the same pair in every frame.
 struct Pair {
     left: f32,
     right: f32,
     frame: usize,
     paused: u64,
+    // Gives nothing while set, as PC sound between spells.
+    gap: bool,
 }
 
 impl Pair {
@@ -500,12 +581,16 @@ impl Pair {
             right,
             frame: 480,
             paused: 0,
+            gap: false,
         }
     }
 }
 
 impl StereoSource for Pair {
     fn next_frame(&mut self, out: &mut [f32]) -> Option<usize> {
+        if self.gap {
+            return None;
+        }
         let (frames, _) = out[..2 * self.frame].as_chunks_mut::<2>();
         for frame in frames {
             *frame = [self.left, self.right];
@@ -669,4 +754,55 @@ fn a_stream_volume_ramps_without_a_step() {
         before = *left;
     }
     assert_eq!(ramp[239], [0.0, 0.0]);
+}
+
+// As for a talker: a stream turned down while idle, between spells or
+// while this PC was deafened, comes back at the new volume from its first
+// frame, and one turned up while idle still ramps, as does a change once it
+// is back.
+#[test]
+fn a_stream_turned_down_while_idle_holds_from_its_first_frame() {
+    let mut mixer: Both = Mixer::with_streams();
+    mixer.add_stream(1, Pair::new(0.4, -0.4));
+    let gap = |mixer: &mut Both, on: bool| mixer.stream_mut(&1).unwrap().gap = on;
+    rendered(&mut mixer, 480);
+    gap(&mut mixer, true);
+    rendered(&mut mixer, 480);
+    mixer.set_stream_gain(&1, 0.0);
+    gap(&mut mixer, false);
+    let back = rendered(&mut mixer, 480);
+    assert!(back.iter().all(|&frame| frame == [0.0, 0.0]), "{back:?}");
+
+    gap(&mut mixer, true);
+    rendered(&mut mixer, 480);
+    mixer.set_stream_gain(&1, 1.0);
+    gap(&mut mixer, false);
+    let up = rendered(&mut mixer, 480);
+    assert!(
+        up[0][0] > 0.0 && up[0][0] <= 0.4 / 120.0 + 1e-6,
+        "{:?}",
+        up[0]
+    );
+    assert!((up[479][0] - 0.4).abs() < 1e-6);
+    mixer.set_stream_gain(&1, 0.0);
+    let down = rendered(&mut mixer, 480);
+    assert!(
+        (down[0][0] - 0.4 * 119.0 / 120.0).abs() < 1e-6,
+        "{:?}",
+        down[0]
+    );
+    assert_eq!(down[479], [0.0, 0.0]);
+
+    mixer.set_stream_gain(&1, 1.0);
+    rendered(&mut mixer, 480);
+    mixer.set_deafened(true);
+    rendered(&mut mixer, 480);
+    rendered(&mut mixer, 480);
+    mixer.set_stream_gain(&1, 0.0);
+    mixer.set_deafened(false);
+    let undeafened = rendered(&mut mixer, 480);
+    assert!(
+        undeafened.iter().all(|&frame| frame == [0.0, 0.0]),
+        "{undeafened:?}"
+    );
 }
