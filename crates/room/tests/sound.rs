@@ -13,8 +13,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use capture::PauseReason;
 use channels::Channel;
 use common::voiced::{RATE, Voiced, alone, silence, sine, talking, voiced};
+use common::window::Window;
 use common::{Hand, code_to_invite, loopback, poll, timers, wall_clock_us};
 use invite::Version;
 use room::view::{LineKind, NoSound, OwnShare, View};
@@ -369,6 +371,14 @@ fn watch(share: u32) -> Vec<u8> {
     let mut out = vec![12];
     out.extend_from_slice(&share.to_le_bytes());
     out.extend_from_slice(&[1, 0]);
+    out
+}
+
+// Watch, kind 12, off.
+fn stop_watching(share: u32) -> Vec<u8> {
+    let mut out = vec![12];
+    out.extend_from_slice(&share.to_le_bytes());
+    out.extend_from_slice(&[0, 0]);
     out
 }
 
@@ -741,17 +751,103 @@ fn a_new_watcher_hears_nothing_until_the_share_has_seen_the_desktop() {
     let (unseen, told) = listen(&mut ana, Duration::from_millis(400));
     assert!(unseen.is_empty(), "{:?}", flags(&unseen));
     assert_eq!(told, [(share, true)]);
-    sharing.set_away(true);
+    sharing.set_away(share, true);
     captures_open(&fake, 1, 0);
     let (locked, _) = listen(&mut ana, Duration::from_millis(300));
     assert!(locked.is_empty(), "{:?}", flags(&locked));
     // The first picture after the secure desktop, and so the capture's
     // first answer since the rest.
-    sharing.set_away(false);
+    sharing.set_away(share, false);
     sharing.set_unseen(share, false);
     let (back, told) = listen(&mut ana, Duration::from_millis(400));
     assert!(back.len() >= 25 && back[0].first, "{:?}", flags(&back));
     assert!(told.is_empty(), "{told:?}");
+}
+
+// What a window share's looks at the desktop find, from the test, until it
+// is dropped and they ask Windows again.
+struct Looks;
+
+impl Looks {
+    fn find(away: Option<PauseReason>) -> Looks {
+        Looks::set(away);
+        Looks
+    }
+
+    fn set(away: Option<PauseReason>) {
+        capture::fault::set_desktop(away, Duration::ZERO);
+    }
+}
+
+impl Drop for Looks {
+    fn drop(&mut self) {
+        capture::fault::clear();
+    }
+}
+
+// A shared window's capture says nothing of the lock screen, a UAC prompt or
+// a lost session, so its share looks at the desktop itself, told here what
+// it finds. Away, the PC sound ends with a LAST and the capture is let go;
+// back, it comes again from a FIRST. After a rest with nobody watching, a
+// new watcher hears nothing while the desktop is away, even while the look
+// takes its time. Skipped where no monitor is attached, as on the runner.
+#[test]
+fn a_shared_window_sends_no_pc_sound_while_the_desktop_is_away() {
+    let _alone = alone();
+    if share::monitors().map_or(true, |monitors| monitors.is_empty()) {
+        println!("skipped: no monitor is attached to the desktop");
+        return;
+    }
+    let _looks = Looks::find(None);
+    let fake = pc_sound(left_and_right, Duration::ZERO);
+    let mut config = sharer("Mara", PC_SOUND_SINCE, silence, &fake);
+    config.0.video.source = VideoSource::Screen;
+    let (host, code, to_host) = hosting(config);
+    let mut ana = hand_watcher(&code, to_host);
+    let window = Window::open(640, 360);
+    host.room().share_window(60, window.id());
+    let view = host.member.wait_for(WAIT, "the window share running", |v| {
+        own_share(v).is_some() && v.share.running.is_some()
+    });
+    let share = own_share(&view).expect("granted");
+    host.room().share_sound(true);
+    ana.say(&watch(share));
+    watched_by(&host, 1);
+    let (sound, _) = listen(&mut ana, Duration::from_millis(400));
+    assert!(sound.len() >= 25 && sound[0].first, "{:?}", flags(&sound));
+    let mut opens = 1;
+    for away in [PauseReason::SecureDesktop, PauseReason::Disconnected] {
+        Looks::set(Some(away.clone()));
+        captures_open(&fake, opens, 0);
+        let (gone, _) = listen(&mut ana, Duration::from_millis(300));
+        let last = gone.iter().position(|packet| packet.last);
+        assert_eq!(last, Some(gone.len() - 1), "{away}: {:?}", flags(&gone));
+        Looks::set(None);
+        opens += 1;
+        captures_open(&fake, opens, 1);
+        let (back, _) = listen(&mut ana, Duration::from_millis(400));
+        assert!(
+            back.len() >= 25 && back[0].first,
+            "{away}: {:?}",
+            flags(&back)
+        );
+    }
+    ana.say(&stop_watching(share));
+    watched_by(&host, 0);
+    // Long enough for the facts to say nobody watches, so the share rests.
+    listen(&mut ana, Duration::from_millis(1500));
+    // While the look takes its time, only the rest holds the sound back.
+    capture::fault::set_desktop(Some(PauseReason::SecureDesktop), Duration::from_millis(300));
+    ana.say(&watch(share));
+    watched_by(&host, 1);
+    let (locked, _) = listen(&mut ana, Duration::from_millis(400));
+    assert!(locked.is_empty(), "{:?}", flags(&locked));
+    captures_open(&fake, opens, 0);
+    Looks::set(None);
+    opens += 1;
+    captures_open(&fake, opens, 1);
+    let (back, _) = listen(&mut ana, Duration::from_millis(400));
+    assert!(back.len() >= 25 && back[0].first, "{:?}", flags(&back));
 }
 
 // Share after share with a tone playing: Share sound is off at the start of

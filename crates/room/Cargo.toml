@@ -25,6 +25,8 @@ unicode-bidi.workspace = true
 proptest.workspace = true
 # tests/video.rs makes NVENC fail a frame during a share.
 encode = { workspace = true, features = ["fault"] }
+# tests/sound.rs says what a window share's look at the desktop finds.
+capture = { workspace = true, features = ["fault"] }
 # tests/common/window.rs makes the windows tests/video.rs shares;
 # examples/share_numbers.rs reads a window's bounds from DWM.
 windows = { workspace = true, features = [

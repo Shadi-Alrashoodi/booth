@@ -269,10 +269,10 @@ struct Gates {
     held: bool,
     away: bool,
     off: bool,
-    // The share rested with nobody watching, and its capture has not
-    // answered since: nothing looked at the desktop meanwhile, and it can be
-    // the secure one by now. The capture runs on, as it does while nobody
-    // can hear.
+    // The share rested with nobody watching, and its capture, or a window
+    // share's look, has not answered since: nothing looked at the desktop
+    // meanwhile, and it can be the secure one by now. The capture runs on,
+    // as it does while nobody can hear.
     unseen: bool,
 }
 
@@ -404,6 +404,12 @@ impl Outgoing {
         lock(&self.gates).paused()
     }
 
+    // Paused, or rested and not looked at since.
+    #[cfg(test)]
+    pub(crate) fn shut(&self) -> bool {
+        lock(&self.gates).shut()
+    }
+
     // Share sound turned off at `press`, before the room takes the press in.
     pub(crate) fn stop(&self, press: Instant) {
         let mut gates = lock(&self.gates);
@@ -425,12 +431,17 @@ impl Outgoing {
         }
     }
 
-    // The share's capture paused on the secure desktop or a disconnected
-    // session, or came back from it: the PC may be left alone then, and
-    // what it plays is not the sharer's to send.
-    pub(crate) fn set_away(&self, away: bool, at: Instant) {
+    // Share `share`'s capture, or a window share's own look at the desktop,
+    // found the secure desktop or a disconnected session, or it is back from
+    // it: the PC may be left alone then, and what it plays is not the
+    // sharer's to send. Named, as set_unseen is: a share that ended can
+    // still be reporting.
+    pub(crate) fn set_away(&self, share: u32, away: bool, at: Instant) {
         let gated = {
             let mut gates = lock(&self.gates);
+            if self.live.load(Ordering::Acquire) != share {
+                return;
+            }
             gates.away = away;
             gates.follow(at);
             gates.gate.is_some()
@@ -441,10 +452,11 @@ impl Outgoing {
     }
 
     // Share `share` rested with nobody watching, or its capture answered
-    // after the rest, unpaused. Nothing looks at the desktop while it rests,
-    // so a friend who starts watching while the PC is on the lock screen
-    // hears nothing before the capture has looked and reported it. Named,
-    // since the share's thread can still be on a share the room has ended.
+    // after the rest, unpaused, or for a window its look at the desktop
+    // found it the sharer's. Nothing looks at the desktop while it rests, so
+    // a friend who starts watching while the PC is on the lock screen hears
+    // nothing before the share has looked and reported it. Named, since the
+    // share's thread can still be on a share the room has ended.
     pub(crate) fn set_unseen(&self, share: u32, unseen: bool, at: Instant) {
         let mut gates = lock(&self.gates);
         if self.live.load(Ordering::Acquire) == share {

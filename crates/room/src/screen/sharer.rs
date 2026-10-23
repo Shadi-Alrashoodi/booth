@@ -200,7 +200,7 @@ fn share(
     announce_fps(sharing, number, &sharer);
 
     let ran = |why: String| Failed { ran: true, why };
-    let mut watchers = Watchers::new(sharing, log, number);
+    let mut watchers = Watchers::new(sharing, log, number, window.is_some());
     let mut rate = Rate::new(allowed);
     let mut applied = facts;
     let mut applied_limits = None;
@@ -212,9 +212,10 @@ fn share(
     let mut rest = Rest::new(log, number);
     let mut told_state = ShareState::Live;
     let mut first_picture = FirstPicture::default();
-    // The share rested with nobody watching, and its capture has not
-    // answered since.
+    // The share rested with nobody watching, and its capture, or a window
+    // share's own look at the desktop, has not answered since.
     let mut unseen = false;
+    let mut desktop = window.map(|_| Desktop::new(sharing, log, number));
     loop {
         if sharing.closing() {
             break;
@@ -311,9 +312,9 @@ fn share(
         if sharer.held() || (nobody && !sharing.answers_waiting()) {
             // Nothing looks at the desktop while the share rests, and the
             // lock screen can come up meanwhile: the PC sound waits until
-            // the capture has looked again. A window's capture never
-            // reports the secure desktop, so it is not waited for.
-            if nobody && window.is_none() && !std::mem::replace(&mut unseen, true) {
+            // the capture, or for a window the share itself, has looked
+            // again.
+            if nobody && !std::mem::replace(&mut unseen, true) {
                 sharing.set_unseen(number, true);
             }
             rest.until(sharing, next_second);
@@ -323,15 +324,25 @@ fn share(
                 return Err(ran(String::from(WINDOW_CLOSED)));
             }
         } else {
+            // Before each wait for a picture, up to 100 ms on a still window.
+            // The sound after a rest waits for this look only, and stops at
+            // the next look after the desktop goes, which comes later than
+            // one wait only when the encoder or the capture opens again in
+            // between. A session lost outside the console can take up to
+            // 100 ms more: capture keeps the session manager's answer that
+            // long.
+            if let Some(desktop) = &mut desktop {
+                desktop.follow(&mut unseen, share::desktop_away);
+            }
             let asked = Instant::now();
             let late = sharer.numbers().held;
             sharer.next(&mut watchers).map_err(ran)?;
-            // A capture that is not paused saw the desktop as it is now: a
-            // monitor's loses its duplication when the secure desktop comes
+            // A monitor's capture that is not paused saw the desktop as it
+            // is now: it loses its duplication when the secure desktop comes
             // up, so even a still screen's answer says it is the sharer's. A
             // picture the fps cap held says nothing: it can be from before
             // the rest.
-            if unseen && !sharer.paused() && sharer.numbers().held == late {
+            if unseen && desktop.is_none() && !sharer.paused() && sharer.numbers().held == late {
                 unseen = false;
                 sharing.set_unseen(number, false);
             }
@@ -642,6 +653,67 @@ impl FirstPicture {
     }
 }
 
+// A window's capture goes on through the lock screen, a UAC prompt and a
+// disconnected session without a word, where a monitor's pauses, and what
+// the PC plays then is not the sharer's to send. So a window share looks at
+// the desktop itself while it is watched, a few microseconds on this PC's
+// own screen, and while it is away the PC sound stops as on a monitor's
+// pause for it, until a look finds the desktop the sharer's again. A
+// minimized window keeps its sound.
+struct Desktop<'a> {
+    sharing: &'a Sharing,
+    log: &'a Log,
+    number: u32,
+    away: Option<PauseReason>,
+}
+
+impl<'a> Desktop<'a> {
+    fn new(sharing: &'a Sharing, log: &'a Log, number: u32) -> Desktop<'a> {
+        Desktop {
+            sharing,
+            log,
+            number,
+            away: None,
+        }
+    }
+
+    // `look` says why the desktop is away, if it is, or that Windows could
+    // not say. `unseen` is the share's: after a rest the sound waits for a
+    // look that finds the desktop the sharer's, which takes it.
+    fn follow(&mut self, unseen: &mut bool, look: impl FnOnce() -> Option<PauseReason>) {
+        let away = look();
+        if away != self.away {
+            self.sharing.set_away(self.number, away.is_some());
+            match &away {
+                Some(PauseReason::Disconnected) => log!(
+                    self.log,
+                    "share {}: this Windows session is disconnected, so no pc sound goes out until it is back",
+                    self.number
+                ),
+                Some(PauseReason::Changing(why)) => log!(
+                    self.log,
+                    "share {}: {why}, so no pc sound goes out until Windows says it is",
+                    self.number
+                ),
+                Some(_) => log!(
+                    self.log,
+                    "share {}: Windows shows another desktop than the window's, such as the lock screen or a UAC prompt, so no pc sound goes out until it is back",
+                    self.number
+                ),
+                None => log!(
+                    self.log,
+                    "share {}: the window's desktop is back",
+                    self.number
+                ),
+            }
+            self.away = away;
+        }
+        if self.away.is_none() && std::mem::take(unseen) {
+            self.sharing.set_unseen(self.number, false);
+        }
+    }
+}
+
 // While nobody watches, the share's thread waits for the room's signal,
 // which new facts, a new state and the room closing all set, or for the
 // next second's numbers. Without a waitable timer it looks every REST_POLL.
@@ -809,6 +881,9 @@ struct Watchers<'a> {
     outbox: Outbox,
     log: &'a Log,
     number: u32,
+    // A window's pictures say nothing of the desktop, which the share looks
+    // at itself (Desktop).
+    window: bool,
     // Someone started watching since the sharer last asked: the next frame
     // is an IDR for them, which the floor between IDRs never holds.
     started: bool,
@@ -833,12 +908,13 @@ struct Watchers<'a> {
 const SHARD_LOSS_FOR: Duration = Duration::from_secs(2);
 
 impl<'a> Watchers<'a> {
-    fn new(sharing: &'a Arc<Sharing>, log: &'a Log, number: u32) -> Watchers<'a> {
+    fn new(sharing: &'a Arc<Sharing>, log: &'a Log, number: u32, window: bool) -> Watchers<'a> {
         Watchers {
             sharing,
             outbox: sharing.outbox(),
             log,
             number,
+            window,
             started: false,
             shape: None,
             pointer: None,
@@ -962,7 +1038,11 @@ impl Audience for Watchers<'_> {
     }
 
     fn resumed(&mut self) {
-        self.sharing.set_away(false);
+        // A window back from minimized on the lock screen keeps its sound
+        // stopped: only the share's next look at the desktop lets it go.
+        if !self.window {
+            self.sharing.set_away(self.number, false);
+        }
         log!(self.log, "share {}: capture back", self.number);
         self.sharing
             .set_running(self.sharing.running().map(|running| RunningShare {
@@ -983,7 +1063,7 @@ impl Audience for Watchers<'_> {
             reason,
             PauseReason::SecureDesktop | PauseReason::Disconnected
         ) {
-            self.sharing.set_away(true);
+            self.sharing.set_away(self.number, true);
         }
         log!(self.log, "share {}: capture paused: {reason}", self.number);
         let paused = match reason {
@@ -1269,14 +1349,16 @@ mod tests {
     // The lock screen, a UAC prompt and a disconnected session stop the
     // share's PC sound as a pause by hand does, and it comes back with the
     // picture, not with another pause. A minimized window and the monitor's
-    // own pauses keep it.
+    // own pauses keep it. A share that ended can still report a pause: it
+    // stops nothing of the next.
     #[test]
     fn the_secure_desktop_and_a_lost_session_stop_pc_sound() {
         let wake = net::pace::Signal::new().expect("create an event");
         let clock = crate::peer::Clock::new(Instant::now());
         let sharing = Sharing::new(clock, false, None, 1000, wake);
+        sharing.set_state(OwnShare::Sharing { number: 1, fps: 60 });
         let log = Log::off();
-        let mut watchers = Watchers::new(&sharing, &log, 1);
+        let mut watchers = Watchers::new(&sharing, &log, 1, false);
         let sound = Arc::clone(sharing.sound());
         for (reason, stops) in [
             (PauseReason::Minimized, false),
@@ -1303,6 +1385,61 @@ mod tests {
         assert!(sound.paused());
         sharing.set_held(false);
         assert!(!sound.paused());
+        let mut ended = Watchers::new(&sharing, &log, 2, false);
+        ended.paused(&PauseReason::SecureDesktop);
+        assert!(!sound.paused(), "another share's pause");
+    }
+
+    // A window's capture says nothing of the lock screen or a lost session,
+    // so the share looks at the desktop itself before each wait for a
+    // picture. Away, the PC sound stops, and only a look that finds the
+    // desktop the sharer's lets it go on, not the window's picture back from
+    // minimized, which by itself keeps the sound. After a rest the sound
+    // waits for a look that finds the desktop. The last share's thread can
+    // still be looking when the next share starts: it shuts nothing of it.
+    #[test]
+    fn a_window_share_looks_at_the_desktop_for_its_pc_sound() {
+        let wake = net::pace::Signal::new().expect("create an event");
+        let clock = crate::peer::Clock::new(Instant::now());
+        let sharing = Sharing::new(clock, false, None, 1000, wake);
+        sharing.set_state(OwnShare::Sharing { number: 1, fps: 60 });
+        let log = Log::off();
+        let mut watchers = Watchers::new(&sharing, &log, 1, true);
+        let mut desktop = Desktop::new(&sharing, &log, 1);
+        let sound = Arc::clone(sharing.sound());
+        let mut unseen = false;
+        desktop.follow(&mut unseen, || None);
+        watchers.paused(&PauseReason::Minimized);
+        assert!(!sound.shut(), "minimized");
+        watchers.resumed();
+        desktop.follow(&mut unseen, || Some(PauseReason::SecureDesktop));
+        assert!(sound.shut(), "the lock screen");
+        watchers.paused(&PauseReason::Minimized);
+        watchers.resumed();
+        assert!(sound.shut(), "the window's picture let the sound go");
+        desktop.follow(&mut unseen, || Some(PauseReason::Disconnected));
+        assert!(sound.shut(), "disconnected");
+        desktop.follow(&mut unseen, || None);
+        assert!(!sound.shut(), "back");
+
+        // A rest, as the share's thread marks one.
+        let rest = |unseen: &mut bool| {
+            *unseen = true;
+            sharing.set_unseen(1, true);
+        };
+        rest(&mut unseen);
+        assert!(sound.shut(), "resting");
+        desktop.follow(&mut unseen, || Some(PauseReason::SecureDesktop));
+        assert!(unseen && sound.shut(), "locked during the rest");
+        desktop.follow(&mut unseen, || None);
+        assert!(!unseen && !sound.shut(), "back after the rest");
+        rest(&mut unseen);
+        desktop.follow(&mut unseen, || None);
+        assert!(!unseen && !sound.shut(), "a rest on the sharer's desktop");
+
+        sharing.set_state(OwnShare::Sharing { number: 2, fps: 60 });
+        desktop.follow(&mut unseen, || Some(PauseReason::SecureDesktop));
+        assert!(!sound.shut(), "the last share's look");
     }
 
     // The source can answer with a pointer update, or with nothing new,
@@ -1395,7 +1532,7 @@ mod tests {
         };
         let mut sharer =
             Sharer::open(setup, |_: &[u8]| {}, &mut |_| {}).unwrap_or_else(|err| panic!("{err}"));
-        let mut watchers = Watchers::new(&sharing, &log, 1);
+        let mut watchers = Watchers::new(&sharing, &log, 1, false);
         let began = Instant::now();
         let first = next_frame(&mut sharer, &mut watchers);
         assert!(first.idr);

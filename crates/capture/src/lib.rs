@@ -5,9 +5,12 @@
 mod border;
 mod cap;
 mod convert;
+mod desktop;
 mod device;
 mod duplication;
 mod error;
+#[cfg(feature = "fault")]
+pub mod fault;
 mod missing;
 mod monitors;
 mod pattern;
@@ -24,6 +27,7 @@ use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
 pub use border::Border;
 pub use convert::{Plan, Region, SMALLEST_SIDE, output_size};
+pub use desktop::desktop_away;
 pub use device::device_on;
 pub use duplication::{Capture, make_process_dpi_aware};
 pub use error::{CaptureError, ErrorKind};
@@ -150,8 +154,9 @@ pub enum PauseReason {
     Taken,
     // The Windows session is disconnected or locked from Remote Desktop.
     Disconnected,
-    // Anything else Windows answered while the desktop was changing; the
-    // text says what.
+    // Anything else Windows answered while the desktop was changing, or a
+    // window share's look that could not ask whether the session is
+    // connected; the text says what.
     Changing(String),
     // The monitor is not on the desktop: turned off, asleep with the PC, or
     // unplugged. Sharing stops if it is not back within about 30 s.

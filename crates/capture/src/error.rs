@@ -135,6 +135,13 @@ pub(crate) fn meaning(err: &windows::core::Error) -> String {
     if let Some((_, text)) = known.iter().find(|(known, _)| *known == code) {
         return (*text).to_string();
     }
+    windows_words(err)
+}
+
+// Windows' own message for the error, worded as meaning() words the rest:
+// lower case first, no full stop, the code after it.
+pub(crate) fn windows_words(err: &windows::core::Error) -> String {
+    let code = err.code();
     let text = err.message();
     let text = text.trim_end_matches(['.', ' ', '\r', '\n']);
     if text.is_empty() {
