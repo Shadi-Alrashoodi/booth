@@ -40,6 +40,8 @@ pub(crate) struct Ear {
     buffer: Buffer,
     stamps: [Option<Stamp>; STAMPS],
     samples: VecDeque<Sample>,
+    // The render thread took it from its orders (Stream::new).
+    taken: bool,
 }
 
 impl Ear {
@@ -48,7 +50,12 @@ impl Ear {
             buffer: Buffer::new()?,
             stamps: [None; STAMPS],
             samples: VecDeque::with_capacity(SAMPLES_KEPT),
+            taken: false,
         })
+    }
+
+    pub(crate) fn taken(&self) -> bool {
+        self.taken
     }
 
     // `captured` is the frame's capture time on this PC's ping clock, and
@@ -128,7 +135,9 @@ pub(crate) struct Stream {
 }
 
 impl Stream {
+    // On the render thread, once for each ear it takes.
     pub(crate) fn new(ear: Arc<Mutex<Ear>>, shared: Arc<Shared>) -> Stream {
+        lock(&ear).taken = true;
         Stream {
             ear,
             shared,

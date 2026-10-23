@@ -23,8 +23,8 @@ mod wire;
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use voice::audio::fake::Fake;
@@ -57,6 +57,9 @@ pub(crate) const SOUND_LEVEL: f32 = 0.5;
 // frame, which only a hostile one does, would otherwise make one per frame.
 const NEW_EARS_PER_SECOND: f64 = 2.0;
 const NEW_EAR_BURST: f64 = 4.0;
+// The render thread takes its orders every period, a few to some tens of ms;
+// an ear still waiting there this long after it was made means it is away.
+const TAKEN_WITHIN: Duration = Duration::from_secs(1);
 
 // The ear of the share watched.
 struct Listening {
@@ -75,6 +78,9 @@ pub(crate) struct Sound {
     listening: Option<Listening>,
     retired: Vec<(Arc<Mutex<Ear>>, Instant)>,
     new_ears: Bucket,
+    // The oldest ear made that the speakers have not taken, and when,
+    // while anything still holds it: see listen.
+    made: Option<(Weak<Mutex<Ear>>, Instant)>,
     // The share whose sharer said its sound is off. Frames captured before
     // the press can come after the word, and make no ear: only a frame that
     // starts a spell from a reset encoder does, or the sharer saying on.
@@ -95,6 +101,7 @@ impl Sound {
             listening: None,
             retired: Vec::new(),
             new_ears: Bucket::full(now, NEW_EAR_BURST),
+            made: None,
             off: None,
             told: None,
             dropped: 0,
@@ -137,6 +144,17 @@ impl Sound {
             self.dropped += 1;
             return false;
         }
+        // The oldest ear made and not taken by the speakers TAKEN_WITHIN on: the
+        // render thread is away, as while Windows has no output to play on,
+        // and an ear made now would wait in its orders with every one after
+        // it until the speakers are back. Nothing would play it meanwhile.
+        if let Some((ear, at)) = &self.made
+            && now.saturating_duration_since(*at) >= TAKEN_WITHIN
+            && ear.upgrade().is_some_and(|ear| !lock(&ear).taken())
+        {
+            self.dropped += 1;
+            return false;
+        }
         if !self.new_ears.take(now, NEW_EARS_PER_SECOND, NEW_EAR_BURST) {
             self.dropped += 1;
             return false;
@@ -155,6 +173,15 @@ impl Sound {
         let _ = self
             .speaker
             .send(ToSpeaker::AddStream(sharer, Arc::clone(&ear), 1.0));
+        // The oldest ear the speakers have not taken stays the one timed, so
+        // ears made faster than TAKEN_WITHIN cannot keep it young.
+        let waiting = self
+            .made
+            .as_ref()
+            .is_some_and(|(made, _)| made.upgrade().is_some_and(|made| !lock(&made).taken()));
+        if !waiting {
+            self.made = Some((Arc::downgrade(&ear), now));
+        }
         self.off = None;
         self.listening = Some(Listening {
             share: frame.share,

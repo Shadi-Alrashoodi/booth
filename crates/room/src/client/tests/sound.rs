@@ -245,6 +245,59 @@ fn off_lets_the_ear_go_and_a_first_frame_brings_it_back() {
     assert_eq!(rig.client.drops.bad, bad);
 }
 
+// While the speakers take nothing from their orders, as while Windows has no
+// output to play on, the oldest ear they never took stops new ones being
+// made: each would wait there with its decoder until the speakers came
+// back. Once they take it, a frame makes one again.
+#[test]
+fn speakers_away_make_no_ears() {
+    let start = Instant::now();
+    let (mut rig, mut session, mut speaker) = watching(peer::PC_SOUND_SINCE, start);
+    let frames = stereo_frames(3);
+    let from_bo = |rig: &mut Rig, session: &mut Session, seq: u16, at: Instant| {
+        let frame = &frames[usize::from(seq)];
+        let packet = relayed(session, BO_SLOT, SHARE, seq, true, frame);
+        rig.deliver(&packet, at);
+    };
+    bo_says(&mut rig, &mut session, true, start);
+    from_bo(&mut rig, &mut session, 0, start);
+    assert!(rig.client.view(start, 0).numbers.sound.is_some());
+    bo_says(&mut rig, &mut session, false, start);
+    let later = start + Duration::from_secs(1);
+    bo_says(&mut rig, &mut session, true, later);
+    from_bo(&mut rig, &mut session, 1, later);
+    let view = rig.client.view(later, 0);
+    assert!(
+        view.numbers.sound.is_none(),
+        "an ear the speakers cannot take"
+    );
+    assert_eq!(view.numbers.sound_dropped, 1);
+    loudest(&mut speaker);
+    from_bo(&mut rig, &mut session, 2, later);
+    assert!(rig.client.view(later, 0).numbers.sound.is_some());
+}
+
+// Ears made every 500 ms, faster than TAKEN_WITHIN, while the speakers take
+// nothing, here by watching again each time: the oldest ear they have not
+// taken is the one timed, so once it is a second old no more are made.
+#[test]
+fn ears_made_fast_stop_while_the_speakers_are_away() {
+    let start = Instant::now();
+    let (mut rig, mut session, _speaker) = watching(peer::PC_SOUND_SINCE, start);
+    let frames = stereo_frames(7);
+    for step in 0..7u16 {
+        let at = start + Duration::from_millis(500) * u32::from(step);
+        rig.client.watch(SHARE, false, at, &rig.socket);
+        rig.client.watch(SHARE, true, at, &rig.socket);
+        let frame = &frames[usize::from(step)];
+        let packet = relayed(&mut session, BO_SLOT, SHARE, step, true, frame);
+        rig.deliver(&packet, at);
+    }
+    // Ears at 0 and 0.5 s; from 1 s on the first is a second old and waits.
+    let view = rig.client.view(start + Duration::from_secs(3), 0);
+    assert_eq!(view.numbers.sound_dropped, 5);
+}
+
 // A client standing for a copy older than PC_SOUND_SINCE counts channel 8
 // bad, as such a copy does, and plays none of it.
 #[test]
