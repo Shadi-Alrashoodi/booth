@@ -329,11 +329,14 @@ const LEFT_SPEAKERS: u32 = 0x1 | 0x10 | 0x40 | 0x200 | 0x1000 | 0x8000;
 const RIGHT_SPEAKERS: u32 = 0x2 | 0x20 | 0x80 | 0x400 | 0x4000 | 0x2_0000;
 
 fn side_of(format: &Format, channel: usize) -> Side {
+    // One speaker plays both sides, whichever speaker its mask names.
+    if format.channels == 1 {
+        return Side::Middle;
+    }
     if format.channel_mask == 0 {
-        return match (format.channels, channel) {
-            (1, _) => Side::Middle,
-            (_, 0) => Side::Left,
-            (_, 1) => Side::Right,
+        return match channel {
+            0 => Side::Left,
+            1 => Side::Right,
             _ => Side::Middle,
         };
     }

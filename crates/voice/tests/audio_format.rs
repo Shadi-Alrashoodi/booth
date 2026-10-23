@@ -236,6 +236,9 @@ fn each_speaker_gets_its_side_of_the_mix() {
     let middle = (left + right) * 0.5;
     for ((channels, channel_mask), expected) in [
         ((1, 0), vec![middle]),
+        // One speaker plays both sides, whichever its mask names.
+        ((1, 0x1), vec![middle]),
+        ((1, 0x4), vec![middle]),
         ((2, 0), vec![left, right]),
         ((4, 0), vec![left, right, middle, middle]),
         ((2, 0x3), vec![left, right]),
