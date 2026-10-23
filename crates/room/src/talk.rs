@@ -135,6 +135,7 @@ pub struct VoiceConfig {
 }
 
 pub use detect::QUIETEST_VOICE_DB as DEFAULT_SENSITIVITY_DB;
+pub(crate) use detect::random;
 pub const SENSITIVITY_DB: RangeInclusive<i8> = -60..=-20;
 
 impl Default for VoiceConfig {

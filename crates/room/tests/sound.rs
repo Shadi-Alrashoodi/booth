@@ -1067,9 +1067,9 @@ fn tone_until_quiet(frame: u64, channel: u16) -> f32 {
     }
 }
 
-// 200 ms of silence ends a spell: 20 silent frames go out, the 20th with
-// LAST, and nothing more while it lasts. The next sound starts a spell from
-// a FIRST.
+// Silence ends a spell after a drawn 200 to 800 ms: 20 to 80 silent frames
+// go out, the last with LAST, and nothing more while it lasts. The next
+// sound starts a spell from a FIRST.
 #[test]
 fn silence_ends_a_spell_and_the_next_sound_starts_one() {
     let _alone = alone();
@@ -1077,13 +1077,13 @@ fn silence_ends_a_spell_and_the_next_sound_starts_one() {
     let fake = pc_sound(tone_until_quiet, Duration::ZERO);
     let (_host, mut ana, _, _) = hand_watches(&fake);
     QUIET_NOW.store(true, Ordering::Relaxed);
-    let (quiet, _) = listen(&mut ana, Duration::from_millis(600));
+    let (quiet, _) = listen(&mut ana, Duration::from_millis(1200));
     QUIET_NOW.store(false, Ordering::Relaxed);
     let (back, _) = listen(&mut ana, Duration::from_millis(300));
     let last = quiet.iter().position(|packet| packet.last);
     assert_eq!(last, Some(quiet.len() - 1), "{:?}", flags(&quiet));
     // The frame the silence began in, and one more of the tone at most.
-    assert!((20..=22).contains(&quiet.len()), "{}", quiet.len());
+    assert!((20..=82).contains(&quiet.len()), "{}", quiet.len());
     assert!(back.len() >= 15 && back[0].first, "{:?}", flags(&back));
 }
 

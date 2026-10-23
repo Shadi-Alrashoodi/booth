@@ -147,7 +147,7 @@ fn level_db(block: &[f32]) -> f32 {
     (10.0 * power.log10()).max(SILENCE_DB)
 }
 
-fn random() -> u32 {
+pub(crate) fn random() -> u32 {
     let mut bytes = [0u8; 4];
     // getrandom's Windows 10+ backend is ProcessPrng, which cannot fail. A
     // tail that is always the shortest would still hide the pause lengths

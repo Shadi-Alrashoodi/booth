@@ -19,9 +19,13 @@ use crate::talk::HOST_SLOT;
 // -90 dBFS. Under it on both channels a frame is silence, which a program's
 // output is exactly while nothing plays.
 const QUIET: f32 = 3.162_278e-5;
-// 200 ms of it ends a spell, the last of them with LAST, and nothing goes
-// out until a louder frame starts the next one.
-const QUIET_FRAMES: u32 = 20;
+// After the sound stops a spell goes on in silence for a random 200 to 800
+// ms, 20 to 80 frames, the last of them with LAST, so that when spells end
+// does not trace the pauses in what plays, a call in another program
+// included (RFC 6562, as open mic's tail). Nothing goes out after it until
+// a louder frame starts the next one.
+const TAIL_SHORTEST: u32 = 20;
+const TAIL_LONGEST: u32 = 80;
 const FRAME_TIME: Duration = Duration::from_millis(10);
 
 pub(crate) struct Feed {
@@ -37,8 +41,12 @@ pub(crate) struct Feed {
     // A spell is under way: its first frame went out from a reset encoder,
     // and its last has not.
     spell: bool,
-    // Silent frames in a row within it.
+    // Silent frames in a row within it, and how many of them end it.
     quiet: u32,
+    tail: u32,
+    // Uniform over 0..=u32::MAX; the operating system's generator outside
+    // the tests.
+    random: fn() -> u32,
     opus: [u8; PACKET_BYTES],
     payload: Vec<u8>,
     plain: Vec<u8>,
@@ -48,6 +56,13 @@ pub(crate) struct Feed {
 impl Feed {
     // Off the capture thread: the encoder allocates.
     pub(crate) fn new(out: Arc<Outgoing>) -> Result<Feed, StereoError> {
+        Feed::with_random(out, crate::talk::random)
+    }
+
+    pub(crate) fn with_random(
+        out: Arc<Outgoing>,
+        random: fn() -> u32,
+    ) -> Result<Feed, StereoError> {
         Ok(Feed {
             encoder: Encoder::new()?,
             out,
@@ -57,6 +72,8 @@ impl Feed {
             first: None,
             spell: false,
             quiet: 0,
+            tail: TAIL_SHORTEST,
+            random,
             opus: [0; PACKET_BYTES],
             payload: Vec::with_capacity(MAX_SOUND),
             plain: Vec::with_capacity(MAX_SOUND + 1),
@@ -159,7 +176,11 @@ impl Feed {
                 return;
             }
             self.quiet += 1;
-            self.quiet == QUIET_FRAMES
+            if self.quiet == 1 {
+                let spread = u64::from(TAIL_LONGEST - TAIL_SHORTEST) + 1;
+                self.tail = TAIL_SHORTEST + ((u64::from((self.random)()) * spread) >> 32) as u32;
+            }
+            self.quiet == self.tail
         } else {
             self.quiet = 0;
             false
@@ -250,6 +271,7 @@ mod tests {
     use crate::talk::Outlet;
     use crate::testing::{Wire, session_pair};
     use session::Session;
+    use std::sync::atomic::AtomicU32;
 
     const SHARE: u32 = 3;
 
@@ -274,7 +296,7 @@ mod tests {
             out.share_changed(Some(SHARE));
             out.open(SHARE, since);
             let bench = Bench {
-                feed: Feed::new(Arc::clone(&out)).unwrap(),
+                feed: Feed::with_random(Arc::clone(&out), || 0).unwrap(),
                 out,
                 socket,
                 near,
@@ -351,8 +373,9 @@ mod tests {
         }
     }
 
-    // 200 ms of silence ends a spell, its 20th frame with LAST, and nothing
-    // goes out until a louder frame starts the next from a reset encoder.
+    // At the bench's draw of 0, 200 ms of silence ends a spell, its 20th
+    // frame with LAST, and nothing goes out until a louder frame starts the
+    // next from a reset encoder.
     #[test]
     fn silence_ends_a_spell_and_sound_starts_the_next() {
         let start = Instant::now();
@@ -365,7 +388,7 @@ mod tests {
         hear(&mut bench, tone(FRAME * 5, 0));
         hear(&mut bench, vec![0.0; FRAME * CHANNELS * 30]);
         let spell = bench.sent();
-        assert_eq!(spell.len(), 5 + QUIET_FRAMES as usize);
+        assert_eq!(spell.len(), 5 + TAIL_SHORTEST as usize);
         assert!(spell[0].2 && !spell[0].3);
         assert!(spell[1..spell.len() - 1].iter().all(|f| !f.2 && !f.3));
         assert!(spell.last().unwrap().3, "the 20th quiet frame says LAST");
@@ -377,6 +400,52 @@ mod tests {
         assert_eq!(next.len(), 3);
         assert!(next[0].2 && !next[0].3);
         assert_eq!(next[0].0, spell.last().unwrap().0.wrapping_add(1));
+    }
+
+    // The silence a spell ends with runs from the shortest tail at the
+    // lowest draw to the longest at the highest, drawn at each end.
+    #[test]
+    fn a_spell_ends_after_a_drawn_tail() {
+        let draws: [(fn() -> u32, u32); 3] = [
+            (|| 0, TAIL_SHORTEST),
+            (|| u32::MAX / 2, 50),
+            (|| u32::MAX, TAIL_LONGEST),
+        ];
+        for (random, tail) in draws {
+            let start = Instant::now();
+            let mut bench = Bench::new(start, start);
+            bench.feed = Feed::with_random(Arc::clone(&bench.out), random).unwrap();
+            let mut at = start;
+            for samples in [tone(FRAME * 5, 0), vec![0.0; FRAME * CHANNELS * 100]] {
+                bench.feed.hear(&samples, at, false);
+                at += frames_to_time(samples.len() / CHANNELS);
+            }
+            let spell = bench.sent();
+            assert_eq!(spell.len(), 5 + tail as usize, "{tail}");
+            assert!(spell.last().unwrap().3, "{tail}");
+        }
+        // Drawn again at each end: one feed, two ends, two tails.
+        fn alternate() -> u32 {
+            static DRAWS: AtomicU32 = AtomicU32::new(0);
+            if DRAWS.fetch_add(1, Ordering::Relaxed).is_multiple_of(2) {
+                0
+            } else {
+                u32::MAX
+            }
+        }
+        let start = Instant::now();
+        let mut bench = Bench::new(start, start);
+        bench.feed = Feed::with_random(Arc::clone(&bench.out), alternate).unwrap();
+        let mut at = start;
+        let mut tails = Vec::new();
+        for _ in 0..2 {
+            for samples in [tone(FRAME * 5, 0), vec![0.0; FRAME * CHANNELS * 100]] {
+                bench.feed.hear(&samples, at, false);
+                at += frames_to_time(samples.len() / CHANNELS);
+            }
+            tails.push(bench.sent().len() - 5);
+        }
+        assert_eq!(tails, [TAIL_SHORTEST as usize, TAIL_LONGEST as usize]);
     }
 
     // Nothing captured before the switch went on goes out, and the first
