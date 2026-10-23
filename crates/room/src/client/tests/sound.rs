@@ -298,6 +298,31 @@ fn ears_made_fast_stop_while_the_speakers_are_away() {
     assert_eq!(view.numbers.sound_dropped, 5);
 }
 
+// A PC sound volume set before any of Bo's sound came holds from his first
+// frame: at 0 not a sample of it plays, and turned back up it does.
+#[test]
+fn a_pc_sound_volume_holds_from_the_first_frame() {
+    let start = Instant::now();
+    let (mut rig, mut session, mut speaker) = watching(peer::PC_SOUND_SINCE, start);
+    rig.client.set_sound_volume(BO, 0);
+    let frames = stereo_frames(24);
+    for seq in 0..24u16 {
+        if seq == 12 {
+            rig.client.set_sound_volume(BO, 100);
+        }
+        let frame = &frames[usize::from(seq)];
+        let packet = relayed(&mut session, BO_SLOT, SHARE, seq, seq == 0, frame);
+        rig.deliver(&packet, start);
+        let heard = loudest(&mut speaker);
+        if seq < 12 {
+            assert_eq!(heard, 0.0, "frame {seq}");
+        } else if seq >= 16 {
+            assert!(heard > 0.1, "frame {seq}: {heard}");
+        }
+    }
+    assert!(rig.client.view(start, 0).numbers.sound.is_some());
+}
+
 // A client standing for a copy older than PC_SOUND_SINCE counts channel 8
 // bad, as such a copy does, and plays none of it.
 #[test]

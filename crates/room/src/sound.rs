@@ -21,6 +21,7 @@ mod hear;
 mod send;
 mod wire;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
@@ -34,7 +35,7 @@ use crate::limit::Bucket;
 use crate::log::{Log, log};
 use crate::peer::{Clock, MEDIA_FLOWS_FOR};
 use crate::socket::Socket;
-use crate::talk::{Outlet, RETIRED_FOR, ToSpeaker};
+use crate::talk::{MOST_VOLUME, Outlet, RETIRED_FOR, ToSpeaker};
 use crate::view::{Latency, Numbers, SoundNumbers};
 
 pub(crate) use hear::{Ear, Stream};
@@ -90,6 +91,10 @@ pub(crate) struct Sound {
     // Frames of the share watched that no ear took: past the new-ear limit,
     // or after off.
     dropped: u64,
+    // The volume this PC plays each sharer's PC sound at, by key, where it is
+    // not 1.0: set from the panel, kept for people not in the room yet, and
+    // never sent anywhere. Their voice has its own (talk.rs).
+    volumes: HashMap<[u8; 32], f32>,
 }
 
 impl Sound {
@@ -105,6 +110,7 @@ impl Sound {
             off: None,
             told: None,
             dropped: 0,
+            volumes: HashMap::new(),
         }
     }
 
@@ -170,9 +176,10 @@ impl Sound {
                 return false;
             }
         };
+        let gain = self.volumes.get(&sharer).copied().unwrap_or(1.0);
         let _ = self
             .speaker
-            .send(ToSpeaker::AddStream(sharer, Arc::clone(&ear), 1.0));
+            .send(ToSpeaker::AddStream(sharer, Arc::clone(&ear), gain));
         // The oldest ear the speakers have not taken stays the one timed, so
         // ears made faster than TAKEN_WITHIN cannot keep it young.
         let waiting = self
@@ -210,6 +217,20 @@ impl Sound {
             self.retire(now);
         }
         self.off = Some(share);
+    }
+
+    // Under the state lock, as the ears are made, so the speakers get a
+    // volume and a new ear in the order they happened. A sharer with no ear
+    // now gets it with the next one.
+    pub(crate) fn set_volume(&mut self, key: [u8; 32], percent: u8) {
+        let percent = percent.min(MOST_VOLUME);
+        let gain = f32::from(percent) / 100.0;
+        if percent == 100 {
+            self.volumes.remove(&key);
+        } else {
+            self.volumes.insert(key, gain);
+        }
+        let _ = self.speaker.send(ToSpeaker::StreamVolume(key, gain));
     }
 
     // The watch is over, or the share is.

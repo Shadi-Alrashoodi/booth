@@ -1347,6 +1347,10 @@ impl Host {
         self.talk.set_volume(key, percent);
     }
 
+    pub(crate) fn set_sound_volume(&mut self, key: [u8; 32], percent: u8) {
+        self.sound.set_volume(key, percent);
+    }
+
     // The host is in the room too. Its line shows here at once and goes to
     // everyone else in the same order as what clients say. `text` has been
     // through chat::clean_text.
@@ -7153,6 +7157,58 @@ mod tests {
         let view = rig.host.view(later, 0);
         assert!(view.numbers.sound.is_none());
         assert_eq!(view.numbers.sound_dropped, 1);
+        assert_eq!(rig.host.drops.bad, 0);
+    }
+
+    // The volume this host plays a friend's PC sound at goes with every ear
+    // made for it. Set before any sound came, it goes with the first ear. A
+    // change reaches the speakers at once. An ear that a FIRST frame makes
+    // after the friend said off gets it too, and once the volume is back at
+    // 100 the next ear goes at 1.0.
+    #[test]
+    fn a_pc_sound_volume_goes_with_every_ear() {
+        let start = Instant::now();
+        let mut rig = Rig::new(start);
+        rig.host.version = peer::PC_SOUND_SINCE;
+        let (speaker, orders) = crossbeam_channel::unbounded();
+        rig.host.sound = Sound::new(speaker, rig.host.clock, Log::off(), start);
+        let mut ana = Guest::new();
+        ana.join_as(&mut rig, "Ana", peer::PC_SOUND_SINCE, None, start);
+        let ana_key = *ana.identity.public();
+        let share = granted(&mut rig, &mut ana, start);
+        let frame = stereo_frame();
+        let from = ana.wire.addr();
+        let told = || -> Vec<(&str, f32)> {
+            orders
+                .try_iter()
+                .map(|order| match order {
+                    ToSpeaker::AddStream(key, _, gain) if key == ana_key => ("add", gain),
+                    ToSpeaker::StreamVolume(key, gain) if key == ana_key => ("volume", gain),
+                    ToSpeaker::RemoveStream(key) if key == ana_key => ("remove", 0.0),
+                    _ => ("other", 0.0),
+                })
+                .collect()
+        };
+
+        rig.host.set_sound_volume(ana_key, 40);
+        assert!(rig.host.watch(share, true, start, &rig.socket));
+        rig.deliver(&sent_sound(&mut ana, share, 1, &frame), from, start);
+        assert_eq!(told(), [("volume", 0.4), ("add", 0.4)]);
+        ana.say(&mut rig, &Message::ShareSound { share, on: true }, start);
+        rig.host.set_sound_volume(ana_key, 150);
+        assert_eq!(told(), [("volume", 1.5)]);
+
+        // Frame 0 is the one that starts a spell.
+        let later = start + sharing::WORDS_EVERY;
+        ana.say(&mut rig, &Message::ShareSound { share, on: false }, later);
+        rig.deliver(&sent_sound(&mut ana, share, 0, &frame), from, later);
+        assert_eq!(told(), [("remove", 0.0), ("add", 1.5)]);
+
+        rig.host.set_sound_volume(ana_key, 100);
+        assert!(rig.host.watch(share, false, later, &rig.socket));
+        assert!(rig.host.watch(share, true, later, &rig.socket));
+        rig.deliver(&sent_sound(&mut ana, share, 2, &frame), from, later);
+        assert_eq!(told(), [("volume", 1.0), ("remove", 0.0), ("add", 1.0)]);
         assert_eq!(rig.host.drops.bad, 0);
     }
 

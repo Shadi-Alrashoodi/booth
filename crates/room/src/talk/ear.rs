@@ -225,10 +225,6 @@ pub(crate) enum ToSpeaker {
     // of what was captured.
     AddStream([u8; 32], Arc<Mutex<sound::Ear>>, f32),
     RemoveStream([u8; 32]),
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "nothing sets a pc sound volume yet")
-    )]
     StreamVolume([u8; 32], f32),
 }
 
@@ -589,6 +585,28 @@ mod tests {
         assert!(peak(&gone[100..], 0) < 0.04 && peak(&gone[100..], 1) < 0.04);
         assert!(gone[120..].iter().all(|&[l, r]| l == 0.0 && r == 0.0));
         assert!(after.iter().all(|&s| s == 0.0));
+    }
+
+    // PC sound added at a volume of 0 plays nothing from its first callback:
+    // a stream that has not played takes its volume whole, where a ramp
+    // down from 100 percent would let its start through.
+    #[test]
+    fn pc_sound_at_no_volume_plays_nothing_from_the_start() {
+        let shared = Shared::new(&VoiceConfig::default(), None, false);
+        let clock = Clock::new(Instant::now());
+        let (orders_in, orders) = crossbeam_channel::unbounded();
+        let mut speaker = Speaker::new(orders, Arc::clone(&shared), clock);
+        let ear = Arc::new(Mutex::new(sound::Ear::new().unwrap()));
+        orders_in
+            .send(ToSpeaker::AddStream([2; 32], Arc::clone(&ear), 0.0))
+            .unwrap();
+        for (seq, bytes) in stereo_frames(10).iter().enumerate() {
+            assert!(lock(&ear).push(&sound_frame(seq as u16, bytes), None));
+            let mut out = [0.0f32; 960];
+            speaker.fill(&mut out);
+            assert!(out.iter().all(|&s| s == 0.0), "callback {seq}");
+        }
+        assert!(lock(&ear).stats().held_frames <= 1);
     }
 
     // Deafened, the speakers play silence, the share cue included, and a

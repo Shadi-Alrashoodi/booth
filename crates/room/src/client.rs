@@ -1117,6 +1117,10 @@ impl Client {
         self.talk.set_volume(key, percent);
     }
 
+    pub(crate) fn set_sound_volume(&mut self, key: [u8; 32], percent: u8) {
+        self.sound.set_volume(key, percent);
+    }
+
     // The line shows here at once, before the host has it. While the host is
     // only quiet it waits in the stream and goes out when the host is heard
     // again, or on the next session if the host is lost first (on_response

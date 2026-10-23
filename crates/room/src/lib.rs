@@ -374,6 +374,15 @@ impl Room {
         self.threads.set_volume(key, percent.min(MOST_VOLUME));
     }
 
+    /// How loud this PC plays the PC sound that comes with shares by the
+    /// person with `key`, apart from their voice: 0 is not at all, 100 the
+    /// level Booth plays PC sound at, up to MOST_VOLUME. Kept for the rest
+    /// of the room, for someone who joins later too; nothing about it
+    /// leaves this PC.
+    pub fn set_sound_volume(&self, key: [u8; 32], percent: u8) {
+        self.threads.set_sound_volume(key, percent.min(MOST_VOLUME));
+    }
+
     /// Asks to share this PC's screen at `fps` frames a second: `monitor`,
     /// from room::monitors, or the primary one with None. A host decides at
     /// once; a client asks its host, and the view's `share.own` says when
