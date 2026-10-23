@@ -93,7 +93,9 @@ fn relayed(
     seal(session, Channel::Sound, &payload)
 }
 
-// Bo's word on whether his sound goes out, as the host passes it on.
+// Bo's word on whether his sound goes out, as the host passes it on. Say it
+// at the rig's start: the host here never reads Ana's acks, so asked once its
+// earlier frames are 200 ms old it would send one of them again instead.
 fn bo_says(rig: &mut Rig, session: &mut Session, on: bool, now: Instant) {
     let word = Message::ShareSound { share: SHARE, on };
     let packet = rig.host.say(session, &word, now);
@@ -264,7 +266,7 @@ fn speakers_away_make_no_ears() {
     assert!(rig.client.view(start, 0).numbers.sound.is_some());
     bo_says(&mut rig, &mut session, false, start);
     let later = start + Duration::from_secs(1);
-    bo_says(&mut rig, &mut session, true, later);
+    bo_says(&mut rig, &mut session, true, start);
     from_bo(&mut rig, &mut session, 1, later);
     let view = rig.client.view(later, 0);
     assert!(
@@ -376,7 +378,7 @@ fn sound_after_the_picture_needs_no_clock_offset() {
 
     // Off lets the ear and its numbers go: the next sound starts afresh,
     // before the timer thread's next round too.
-    bo_says(&mut rig, &mut session, false, now);
+    bo_says(&mut rig, &mut session, false, start);
     let again = stereo_frames(1);
     let packet = relayed(&mut session, BO_SLOT, SHARE, 200, true, &again[0]);
     rig.deliver(&packet, now);
