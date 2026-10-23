@@ -3,8 +3,9 @@
 // working set and private bytes, every gauge the crates set (stats::mem),
 // the heap Booth's own code holds by the name of the thread that took it,
 // and the sizes of egui's caches. --fake-audio swaps the microphone for a
-// tone that comes and goes, the speakers for a sink and PC sound for
-// silence, so voice runs on a PC with no microphone.
+// tone that comes and goes, the speakers for a sink and PC sound for two
+// steady tones, so voice and Share sound run on a PC with no microphone and
+// two copies on one PC never capture each other's playback.
 //
 // The heap counts come from a global allocator that puts a small header in
 // front of every block with the thread it was taken on, so a block freed on
@@ -59,12 +60,14 @@ pub fn devices() -> Option<Devices> {
             signal: tone,
             ..Setup::default()
         };
+        let tones = Setup {
+            signal: pc_tones,
+            ..Setup::default()
+        };
         (
             Fake::unrecorded(tone, &[("tone", "Tone")], Some("tone")),
             Fake::unrecorded(Setup::default(), &[("sink", "Sink")], Some("sink")),
-            // Silence in place of what this PC plays: Share sound sends
-            // nothing.
-            Fake::unrecorded(Setup::default(), &[("quiet", "Quiet")], Some("quiet")),
+            Fake::unrecorded(tones, &[("tones", "Tones")], Some("tones")),
         )
     });
     Some(Devices::Fake {
@@ -84,6 +87,16 @@ fn tone(frame: u64, _channel: u16) -> f32 {
     }
     let at = (frame % 48_000) as f32 / 48_000.0;
     (at * 440.0 * std::f32::consts::TAU).sin() * 0.25
+}
+
+// Share sound's stand-in: 600 Hz on the left and 900 Hz on the right, apart
+// from the microphone's 440, at 0.2 and never stopping, so a share with its
+// sound on sends one spell for as long as it lasts. Whole cycles a second
+// too.
+fn pc_tones(frame: u64, channel: u16) -> f32 {
+    let hz = if channel == 0 { 600.0 } else { 900.0 };
+    let at = (frame % 48_000) as f32 / 48_000.0;
+    (at * hz * std::f32::consts::TAU).sin() * 0.2
 }
 
 pub fn start(data_dir: &Path) {
