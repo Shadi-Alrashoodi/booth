@@ -174,6 +174,11 @@ pub struct Window {
     // in this window. A still screen sends nothing, so on a desktop a long
     // one is not always a stall.
     pub longest_gap: Option<Duration>,
+    // Each frame shown, as its capture to display settles: its capture
+    // stamp on the sharer's clock as sent, and when it was on the screen.
+    // Kept whether or not the sharer's clock is known, to set beside the
+    // share's sound, whose stamps are on the same clock.
+    pub shown: Vec<(u64, Instant)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -216,6 +221,13 @@ impl Times {
         if let Some(run) = &mut self.run {
             run.times(stage).push(ms);
         }
+    }
+
+    fn settled(&mut self, settled: Settled) {
+        if let Some(end_to_end) = settled.end_to_end {
+            self.add(Stage::EndToEnd, end_to_end);
+        }
+        self.second.shown.push((settled.stamp, settled.end));
     }
 
     // `gap` is the wait since the frame shown before, None for the first.
@@ -267,9 +279,8 @@ pub struct Screen {
     back: Vec<Back>,
     gpu_times: Vec<GpuTime>,
     waiting: Waiting,
-    // Capture to display of the frames `waiting` let go, on their way to
-    // the numbers.
-    settled: Vec<f32>,
+    // The frames `waiting` let go, on their way to the numbers.
+    settled: Vec<Settled>,
     numbers: ViewerNumbers,
     shown_this_wake: bool,
     // Each frame's own capture to encoded, on the sharer's clock, for the
@@ -289,23 +300,39 @@ pub struct Screen {
 // A frame presented, before its GPU time came in.
 struct Shown {
     unit: u64,
+    // Its capture stamp on the sharer's clock, and the moment on this PC's
+    // clock it stands for, once the sharer's clock is known.
+    stamp: u64,
     captured: Option<Instant>,
     returned: Instant,
 }
 
+// A frame shown whose time is in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Settled {
+    stamp: u64,
+    end: Instant,
+    end_to_end: Option<f32>,
+}
+
 impl Shown {
-    // Capture to display: to the present returning, or to the picture being
-    // done on the GPU when that came later. With the decoder's GPU timing
-    // the present returns before the video engine is done, and the GPU
-    // waits for the picture before it draws (decode's timing.rs). The
-    // picture's end, began + took, is early by as long as a GPU busy with a
-    // game kept the first timestamp waiting, so under load this reads low.
-    // None when the sharer's clock is not known yet, or reads a moment this
-    // PC's clock cannot reach back to.
-    fn end_to_end(&self, done: Option<Instant>) -> Option<f32> {
-        let captured = self.captured?;
+    // On the screen when the present returned, or when the picture was done
+    // on the GPU if that came later. With the decoder's GPU timing the
+    // present returns before the video engine is done, and the GPU waits for
+    // the picture before it draws (decode's timing.rs). The picture's end,
+    // began + took, is early by as long as a GPU busy with a game kept the
+    // first timestamp waiting, so under load capture to display reads low.
+    // Capture to display is None when the sharer's clock is not known yet,
+    // or reads a moment this PC's clock cannot reach back to.
+    fn settle(&self, done: Option<Instant>) -> Settled {
         let end = done.map_or(self.returned, |done| done.max(self.returned));
-        Some(ms(end.saturating_duration_since(captured)))
+        Settled {
+            stamp: self.stamp,
+            end,
+            end_to_end: self
+                .captured
+                .map(|captured| ms(end.saturating_duration_since(captured))),
+        }
     }
 }
 
@@ -316,27 +343,27 @@ struct Waiting(VecDeque<Shown>);
 
 impl Waiting {
     // Past MOST_WAITING the oldest counts with its present alone.
-    fn presented(&mut self, shown: Shown, settled: &mut Vec<f32>) {
+    fn presented(&mut self, shown: Shown, settled: &mut Vec<Settled>) {
         self.0.push_back(shown);
         if self.0.len() > MOST_WAITING
             && let Some(oldest) = self.0.pop_front()
         {
-            settled.extend(oldest.end_to_end(None));
+            settled.push(oldest.settle(None));
         }
     }
 
     // The GPU's time for `unit` came in, its picture done at `done`. A
     // frame before it whose time never came counts with its present alone.
-    fn gpu_time(&mut self, unit: u64, done: Instant, settled: &mut Vec<f32>) {
+    fn gpu_time(&mut self, unit: u64, done: Instant, settled: &mut Vec<Settled>) {
         while self.0.front().is_some_and(|shown| shown.unit <= unit)
             && let Some(shown) = self.0.pop_front()
         {
-            settled.extend(shown.end_to_end((shown.unit == unit).then_some(done)));
+            settled.push(shown.settle((shown.unit == unit).then_some(done)));
         }
     }
 
-    fn give_up(&mut self, settled: &mut Vec<f32>) {
-        settled.extend(self.0.drain(..).filter_map(|shown| shown.end_to_end(None)));
+    fn give_up(&mut self, settled: &mut Vec<Settled>) {
+        settled.extend(self.0.drain(..).map(|shown| shown.settle(None)));
     }
 }
 
@@ -767,6 +794,7 @@ impl Screen {
             self.numbers.last_present = Some(returned);
             let shown = Shown {
                 unit: decoded.unit,
+                stamp: frame.facts.captured,
                 captured: self
                     .clock
                     .and_then(|clock| clock.instant(frame.facts.captured)),
@@ -793,8 +821,8 @@ impl Screen {
     }
 
     fn settle(&mut self) {
-        for end_to_end in self.settled.drain(..) {
-            self.times.add(Stage::EndToEnd, end_to_end);
+        for settled in self.settled.drain(..) {
+            self.times.settled(settled);
         }
     }
 
@@ -1177,8 +1205,15 @@ mod tests {
         let at = |ms: u64| captured + Duration::from_millis(ms);
         let shown = |unit: u64, returned: u64| Shown {
             unit,
+            stamp: 1000 + unit,
             captured: Some(captured),
             returned: at(returned),
+        };
+        let ms = |settled: &[Settled]| -> Vec<f32> {
+            settled
+                .iter()
+                .map(|settled| settled.end_to_end.unwrap())
+                .collect()
         };
         let (mut waiting, mut settled) = (Waiting::default(), Vec::new());
         waiting.presented(shown(1, 3), &mut settled);
@@ -1188,11 +1223,13 @@ mod tests {
         // Unit 1's time never came; unit 2's picture was done after its
         // present returned.
         waiting.gpu_time(2, at(6), &mut settled);
-        assert_eq!(settled, [3.0, 6.0]);
+        assert_eq!(ms(&settled), [3.0, 6.0]);
+        assert_eq!((settled[1].stamp, settled[1].end), (1002, at(6)));
         settled.clear();
         // Done before the present returned: the present counts.
         waiting.gpu_time(3, at(4), &mut settled);
-        assert_eq!(settled, [5.0]);
+        assert_eq!(ms(&settled), [5.0]);
+        assert_eq!(settled[0].end, at(5));
         settled.clear();
         // A time for a frame never presented settles nothing.
         waiting.gpu_time(9, at(9), &mut settled);
@@ -1203,15 +1240,32 @@ mod tests {
         for unit in 10..10 + MOST_WAITING as u64 + 2 {
             waiting.presented(shown(unit, 7), &mut settled);
         }
-        assert_eq!(settled, [7.0, 7.0]);
+        assert_eq!(ms(&settled), [7.0, 7.0]);
         settled.clear();
         waiting.give_up(&mut settled);
         assert_eq!(settled.len(), MOST_WAITING);
+        // Before the sharer's clock is known a frame has no capture to
+        // display, and still settles with its stamp and when it was shown.
         let unknown = Shown {
             captured: None,
             ..shown(0, 1)
         };
-        assert_eq!(unknown.end_to_end(Some(at(2))), None);
+        let settled = unknown.settle(Some(at(2)));
+        assert_eq!(
+            settled,
+            Settled {
+                stamp: 1000,
+                end: at(2),
+                end_to_end: None
+            }
+        );
+        let mut times = Times::new(false);
+        times.settled(settled);
+        times.settled(shown(4, 3).settle(None));
+        let second = std::mem::take(&mut times.second);
+        assert_eq!(second.end_to_end_ms, [3.0]);
+        assert_eq!(second.shown, [(1000, at(2)), (1004, at(3))]);
+        assert!(times.quarter.shown.is_empty());
     }
 
     // A share's first HEVC IDR, a change to H.264 and a fallback right after
