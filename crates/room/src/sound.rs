@@ -12,10 +12,11 @@
 // whatever the room is doing.
 //
 // A watcher hears it through one ear (hear.rs), the share watched's: made by
-// the first frame of it that comes, and let go with the watch, the share, or
-// the sharer saying its sound is off. The receive thread pushes into it under
-// the state lock and the render thread pulls from it through the mixer, each
-// holding the ear's own lock for one frame, as voice's ears are (talk.rs).
+// the first frame of it that comes, and let go with the watch, the share, a
+// new session, or the sharer saying its sound is off. The receive thread
+// pushes into it under the state lock and the render thread pulls from it
+// through the mixer, each holding the ear's own lock for one frame, as
+// voice's ears are (talk.rs).
 
 mod hear;
 mod pairing;
@@ -79,7 +80,8 @@ struct Listening {
 }
 
 // The room's side of PC sound on a watcher, under the state lock: the ear of
-// the share it watches, those lately let go, and what its sharer last said.
+// the share it watches, those lately let go, and what the host last said of
+// its sound.
 pub(crate) struct Sound {
     speaker: Sender<ToSpeaker>,
     clock: Clock,
@@ -90,11 +92,13 @@ pub(crate) struct Sound {
     // The oldest ear made that the speakers have not taken, and when,
     // while anything still holds it: see listen.
     made: Option<(Weak<Mutex<Ear>>, Instant)>,
-    // The share whose sharer said its sound is off. Frames captured before
-    // the press can come after the word, and make no ear: only a frame that
-    // starts a spell from a reset encoder does, or the sharer saying on.
+    // The share whose sharer said its sound is off after the first word
+    // since the watch began, or since a new session asked for it again.
+    // Frames captured before the press can come after the word and make no
+    // ear: until the on, only a frame that starts a spell from a reset
+    // encoder does.
     off: Option<u32>,
-    // What the sharer of the share watched last said: on or off.
+    // What the host last said of the sound of the share watched: on or off.
     told: Option<(u32, bool)>,
     // Frames of the share watched that no ear took: past the new-ear limit,
     // or after off.
@@ -225,11 +229,18 @@ impl Sound {
         true
     }
 
-    // The sharer of `share`, which this PC watches, says whether its sound
-    // goes out, for the panel's words. Its frames never wait for the word,
-    // which can come after the first of them; off lets the ear go.
+    // The host says whether the sound of the share this PC watches goes
+    // out, for the panel's words. Its frames do not wait for an on, which
+    // can come after the first of them, except after an off: until the on,
+    // only a frame that starts a spell makes a new ear. The first word since
+    // the watch began, or a new session asked for it again, only sets the
+    // word, since frames can come before it.
     pub(crate) fn said(&mut self, share: u32, on: bool, now: Instant) {
+        let first = self.word(share).is_none();
         self.told = Some((share, on));
+        if first {
+            return;
+        }
         if on {
             if self.off == Some(share) {
                 self.off = None;
@@ -243,6 +254,8 @@ impl Sound {
         {
             self.retire(now);
         }
+        // Whether or not the off let an ear go: frames captured before the
+        // press can still come after it.
         self.off = Some(share);
     }
 
@@ -260,7 +273,7 @@ impl Sound {
         let _ = self.speaker.send(ToSpeaker::StreamVolume(key, gain));
     }
 
-    // The watch is over, or the share is.
+    // The watch is over, or the share is, or a new session asks for it again.
     pub(crate) fn stop(&mut self, now: Instant) {
         self.retire(now);
         self.off = None;
@@ -320,9 +333,13 @@ impl Sound {
         }
     }
 
-    // The sharer of `share` said its sound goes out.
-    pub(crate) fn says_on(&self, share: u32) -> bool {
-        self.told == Some((share, true))
+    // What the host last said of the sound of `share` since this watch
+    // began, or since a new session asked for it again: None until it has,
+    // and off for a sharer that has said nothing.
+    pub(crate) fn word(&self, share: u32) -> Option<bool> {
+        self.told
+            .filter(|&(told, _)| told == share)
+            .map(|(_, on)| on)
     }
 
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
@@ -708,7 +725,10 @@ pub(crate) struct Switch {
     // A capture opened since the switch went on, so one that fails after it
     // stopped rather than could not start.
     opened: bool,
-    // The sound goes out: the capture opened and was not lost since.
+    // What step tells the watchers while the switch is on, that the sound
+    // goes out: the capture opened and was not lost since, or the switch
+    // went on during a pause, which opens nothing until the share goes on
+    // again.
     flowing: bool,
     // Why the capture is lost, in its own words, while it waits to open
     // again: the line under the switch, and the log's once an outage.
@@ -762,7 +782,12 @@ impl Switch {
             self.on = None;
             self.out.close();
         }
-        self.flowing = false;
+        // Turned on during a pause, it says it goes out, as one whose
+        // capture opened before the pause keeps saying so through it: the
+        // pause holds it back, and its watchers hear the share is paused. If
+        // the capture cannot start when the share goes on again, they hear
+        // it is off then.
+        self.flowing = on && self.out.paused();
         self.lost = None;
         log!(
             self.log,

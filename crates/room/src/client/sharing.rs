@@ -751,6 +751,13 @@ impl Client {
         // session it was given in; a rekey does not come through here.
         self.control_over(ControlEnd::SessionLost);
         self.end_own_share();
+        // The host passes on nothing of the share before it reads the Watch
+        // below, so the old ear has nothing more to play, and the host says
+        // the sharer's word again at that Watch. That word is the first,
+        // which only sets the word, so an off kept from the old session
+        // would drop the frames of a spell under way whichever way it goes:
+        // after an on, until the next spell starts.
+        self.sound.stop(Instant::now());
         if let Some(share) = self.screen.watched {
             self.link.queue(&Message::Watch {
                 share,
@@ -813,10 +820,7 @@ impl Client {
             cap: self.screen.watching.cap(),
             cap_unheard: self.cap_unheard(),
             watched_state: self.screen.watching.share_state(),
-            watched_sound: self
-                .screen
-                .watched
-                .is_some_and(|share| self.sound.says_on(share)),
+            watched_sound: self.screen.watched.and_then(|share| self.sound.word(share)),
             own_sound: OwnSound {
                 on: self.own_sound.is_on(self.screen.sharing.number()),
                 // Only once the host's Hello said what it runs: a new

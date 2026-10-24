@@ -1308,20 +1308,21 @@ impl Host {
         // What the other watchers were told, so a word held back reaches the
         // new one with them when the gap ends.
         let (number, (state, sound)) = (live.number, live.told_words);
-        // A new watcher of a share whose PC sound goes out hears so at once:
-        // a quiet stretch and no sound at all sound alike.
-        if sound && self.version >= crate::peer::PC_SOUND_SINCE {
+        // A new watcher hears at once whether the share's PC sound goes out,
+        // either way: a quiet stretch and no sound at all sound alike, and a
+        // word it never got would say nothing.
+        if self.version >= crate::peer::PC_SOUND_SINCE {
             match by {
                 By::Peer(i) if self.peers[i].link.sound_read => {
                     let peer = &mut self.peers[i];
                     peer.link.queue(&Message::ShareSound {
                         share: number,
-                        on: true,
+                        on: sound,
                     });
                     peer.flush(socket, now);
                 }
                 By::Peer(_) => {}
-                By::Host => self.sound.said(number, true, now),
+                By::Host => self.sound.said(number, sound, now),
             }
         }
         // And of a share that is not live: a paused picture and a still one
@@ -1999,10 +2000,7 @@ impl Host {
             cap: self.screen.watching.cap(),
             cap_unheard: self.cap_unheard(),
             watched_state: self.screen.watching.share_state(),
-            watched_sound: self
-                .screen
-                .watched
-                .is_some_and(|share| self.sound.says_on(share)),
+            watched_sound: self.screen.watched.and_then(|share| self.sound.word(share)),
             own_sound: OwnSound {
                 on: self.own_sound.is_on(self.own_live_share()),
                 unavailable: None,

@@ -6841,10 +6841,10 @@ mod tests {
 
     // PC sound, and ShareSound, go from the sharer to each watcher whose
     // Hello says PC_SOUND_SINCE or later: never to an older one, to someone
-    // who does not watch, or back to the sharer. A new watcher hears "on" at
-    // once, and the sound goes on whatever ShareSound says. A room standing
-    // for an older copy passes none of it on and counts each sound packet
-    // bad, as such a copy does.
+    // who does not watch, or back to the sharer. A new watcher hears at once
+    // whether the sound is on, and the sound goes on whatever ShareSound
+    // says. A room standing for an older copy passes none of it on and
+    // counts each sound packet bad, as such a copy does.
     #[test]
     fn pc_sound_goes_only_to_watchers_that_read_it() {
         let older = Version {
@@ -6874,8 +6874,10 @@ mod tests {
             };
             bo.say(&mut rig, &watch, start);
             cy.say(&mut rig, &watch, start);
-            for guest in [&mut bo, &mut cy, &mut dee] {
-                sound_to(guest, start);
+            let told_off = if passes { vec![(share, false)] } else { vec![] };
+            assert_eq!(sound_to(&mut cy, start), (vec![], told_off), "{host}");
+            for guest in [&mut bo, &mut dee] {
+                assert_eq!(sound_to(guest, start), (vec![], vec![]), "{host}");
             }
             let on = Message::ShareSound { share, on: true };
             ana.say(&mut rig, &on, start);
@@ -6989,6 +6991,30 @@ mod tests {
         ana.say(&mut rig, &stands(Paused), at + gap * 3 / 10);
         rig.tick(at + gap);
         assert_eq!(states(&mut dan, share, at + gap), [Paused]);
+
+        // And so with the sound: a watcher who starts while an on waits is
+        // told off, as the others were. An on taken back meanwhile never
+        // reaches it, and one that stands does with the others when the gap
+        // ends.
+        let mut eve = Guest::new();
+        let at = start + gap * 7;
+        eve.join_as(&mut rig, "Eve", peer::PC_SOUND_SINCE, None, at);
+        ana.say(&mut rig, &stands(Live), at);
+        ana.say(&mut rig, &said(true), at + gap / 10);
+        eve.say(&mut rig, &watch, at + gap / 5);
+        ana.say(&mut rig, &said(false), at + gap * 3 / 10);
+        rig.tick(at + gap);
+        assert_eq!(sound_to(&mut eve, at + gap).1, [(share, false)]);
+        let mut fay = Guest::new();
+        let at = start + gap * 9;
+        fay.join_as(&mut rig, "Fay", peer::PC_SOUND_SINCE, None, at);
+        ana.say(&mut rig, &stands(Paused), at);
+        ana.say(&mut rig, &said(true), at + gap / 10);
+        fay.say(&mut rig, &watch, at + gap / 5);
+        rig.tick(at + gap);
+        let told = sound_to(&mut fay, at + gap).1;
+        assert_eq!(told, [(share, false), (share, true)]);
+        assert_eq!(sound_to(&mut eve, at + gap).1, [(share, true)]);
         assert_eq!(rig.host.drops.bad, 0);
     }
 
@@ -7097,9 +7123,11 @@ mod tests {
     }
 
     // This host, watching a friend's share, hears its PC sound from where it
-    // passes it on, and only then. The friend's word that it is off lets the
-    // ear go, a frame that starts a spell brings it back, and the end of the
-    // watch lets it go for good.
+    // passes it on, and only then. Told at its watch that the sound is off,
+    // as the friend has not said on, it hears the first frame that comes all
+    // the same: the first word of a watch only sets the word. The friend's
+    // word that it is off lets the ear go, a frame that starts a spell
+    // brings it back, and the end of the watch lets it go for good.
     #[test]
     fn the_host_hears_the_share_it_watches() {
         let start = Instant::now();
@@ -7117,6 +7145,7 @@ mod tests {
         assert!(orders.try_recv().is_err(), "heard before watching");
 
         assert!(rig.host.watch(share, true, start, &rig.socket));
+        assert_eq!(rig.host.view(start, 0).share.watched_sound, Some(false));
         rig.deliver(&sent_sound(&mut ana, share, 1, &frame), from, start);
         match orders.try_recv() {
             Ok(ToSpeaker::AddStream(key, ear, gain)) => {
@@ -7127,7 +7156,7 @@ mod tests {
         }
         assert!(rig.host.view(start, 0).numbers.sound.is_some());
         ana.say(&mut rig, &Message::ShareSound { share, on: true }, start);
-        assert!(rig.host.view(start, 0).share.watched_sound);
+        assert_eq!(rig.host.view(start, 0).share.watched_sound, Some(true));
 
         let later = start + sharing::WORDS_EVERY;
         ana.say(&mut rig, &Message::ShareSound { share, on: false }, later);
@@ -7136,7 +7165,7 @@ mod tests {
             Ok(ToSpeaker::RemoveStream(key)) if key == ana_key
         ));
         let view = rig.host.view(later, 0);
-        assert!(!view.share.watched_sound);
+        assert_eq!(view.share.watched_sound, Some(false));
         assert!(view.numbers.sound.is_none());
         rig.deliver(&sent_sound(&mut ana, share, 2, &frame), from, later);
         assert!(orders.try_recv().is_err(), "a frame from before off");
@@ -7157,6 +7186,56 @@ mod tests {
         let view = rig.host.view(later, 0);
         assert!(view.numbers.sound.is_none());
         assert_eq!(view.numbers.sound_dropped, 1);
+        assert_eq!(rig.host.drops.bad, 0);
+    }
+
+    // A friend turns PC sound on just after their share goes on again, and
+    // the word waits out the gap. This host, starting to watch meanwhile, is
+    // told off and still hears at once a frame from the middle of a spell:
+    // the first word of a watch only sets the word. The on that goes when
+    // the gap ends keeps the ear.
+    #[test]
+    fn the_host_hears_at_once_while_the_on_waits() {
+        use crate::view::ShareState::{Live, Paused};
+        let start = Instant::now();
+        let gap = sharing::WORDS_EVERY;
+        let mut rig = Rig::new(start);
+        rig.host.version = peer::PC_SOUND_SINCE;
+        let (speaker, orders) = crossbeam_channel::unbounded();
+        rig.host.sound = Sound::new(speaker, rig.host.clock, Log::off(), start);
+        let mut ana = Guest::new();
+        ana.join_as(&mut rig, "Ana", peer::PC_SOUND_SINCE, None, start);
+        let ana_key = *ana.identity.public();
+        let share = granted(&mut rig, &mut ana, start);
+        let frame = stereo_frame();
+        let from = ana.wire.addr();
+        let stands = |state| Message::ShareState { share, state };
+        ana.say(&mut rig, &stands(Paused), start);
+        let resumed = start + gap;
+        ana.say(&mut rig, &stands(Live), resumed);
+        let on = Message::ShareSound { share, on: true };
+        ana.say(&mut rig, &on, resumed + gap / 10);
+        assert_eq!(rig.host.share_deadline(), Some(resumed + gap));
+
+        let at = resumed + gap / 5;
+        assert!(rig.host.watch(share, true, at, &rig.socket));
+        assert_eq!(rig.host.view(at, 0).share.watched_sound, Some(false));
+        rig.deliver(&sent_sound(&mut ana, share, 7, &frame), from, at);
+        match orders.try_recv() {
+            Ok(ToSpeaker::AddStream(key, ear, _)) => {
+                assert_eq!(key, ana_key);
+                assert_eq!(ear.lock().unwrap().stats().held_frames, 1);
+            }
+            _ => panic!("nothing for the speakers"),
+        }
+        assert_eq!(rig.host.view(at, 0).share.watched_sound, Some(false));
+
+        rig.tick(resumed + gap);
+        assert!(orders.try_recv().is_err(), "the on let the ear go");
+        let view = rig.host.view(resumed + gap, 0);
+        assert_eq!(view.share.watched_sound, Some(true));
+        assert!(view.numbers.sound.is_some());
+        assert_eq!(view.numbers.sound_dropped, 0);
         assert_eq!(rig.host.drops.bad, 0);
     }
 
@@ -7191,7 +7270,11 @@ mod tests {
         };
 
         rig.host.set_sound_volume(ana_key, 40);
+        // Told off at each watch, the host's viewer makes an ear from the
+        // first frame that comes: the first word of a watch only sets the
+        // word.
         assert!(rig.host.watch(share, true, start, &rig.socket));
+        assert_eq!(rig.host.view(start, 0).share.watched_sound, Some(false));
         rig.deliver(&sent_sound(&mut ana, share, 1, &frame), from, start);
         assert_eq!(told(), [("volume", 0.4), ("add", 0.4)]);
         ana.say(&mut rig, &Message::ShareSound { share, on: true }, start);
@@ -7207,6 +7290,7 @@ mod tests {
         rig.host.set_sound_volume(ana_key, 100);
         assert!(rig.host.watch(share, false, later, &rig.socket));
         assert!(rig.host.watch(share, true, later, &rig.socket));
+        assert_eq!(rig.host.view(later, 0).share.watched_sound, Some(false));
         rig.deliver(&sent_sound(&mut ana, share, 2, &frame), from, later);
         assert_eq!(told(), [("volume", 1.0), ("remove", 0.0), ("add", 1.0)]);
         assert_eq!(rig.host.drops.bad, 0);

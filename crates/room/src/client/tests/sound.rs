@@ -13,8 +13,8 @@ const BO_SLOT: u8 = 2;
 const SHARE: u32 = 4;
 
 // Ana's client, standing for `version`, in a room where Bo shares from his
-// slot and Ana watches, with her speakers driven by hand.
-fn watching(version: Version, start: Instant) -> (Rig, Session, Speaker) {
+// slot and Ana has pressed Watch, with her speakers driven by hand.
+fn watch_pressed(version: Version, start: Instant) -> (Rig, Session, Speaker) {
     let (mut rig, mut session) = Rig::connected(Timers::default(), start);
     rig.client.version = version;
     let (orders_in, orders) = crossbeam_channel::unbounded();
@@ -51,6 +51,17 @@ fn watching(version: Version, start: Instant) -> (Rig, Session, Speaker) {
     let packet = rig.host.say(&mut session, &roster, start);
     rig.deliver(&packet, start);
     assert!(rig.client.watch(SHARE, true, start, &rig.socket));
+    (rig, session, speaker)
+}
+
+// And told at her Watch what a host on 1.3.0 tells a client on it, that
+// Bo's sound is off, as he has not said otherwise. An older client is told
+// nothing.
+fn watching(version: Version, start: Instant) -> (Rig, Session, Speaker) {
+    let (mut rig, mut session, speaker) = watch_pressed(version, start);
+    if version >= peer::PC_SOUND_SINCE {
+        bo_says(&mut rig, &mut session, false, start);
+    }
     (rig, session, speaker)
 }
 
@@ -194,7 +205,7 @@ fn off_lets_the_ear_go_and_a_first_frame_brings_it_back() {
         rig.deliver(&packet, start);
     };
     bo_says(&mut rig, &mut session, true, start);
-    assert!(rig.client.view(start, 0).share.watched_sound);
+    assert_eq!(rig.client.view(start, 0).share.watched_sound, Some(true));
     for seq in 0..10 {
         from_bo(&mut rig, &mut session, seq, seq == 0);
         loudest(&mut speaker);
@@ -202,7 +213,7 @@ fn off_lets_the_ear_go_and_a_first_frame_brings_it_back() {
     from_bo(&mut rig, &mut session, 10, false);
     bo_says(&mut rig, &mut session, false, start);
     let view = rig.client.view(start, 0);
-    assert!(!view.share.watched_sound);
+    assert_eq!(view.share.watched_sound, Some(false));
     assert!(view.numbers.sound.is_none());
     let mut out = [0.0f32; 960];
     speaker.fill(&mut out);
@@ -241,9 +252,108 @@ fn off_lets_the_ear_go_and_a_first_frame_brings_it_back() {
     }
     assert!(heard > 0.15, "{heard}");
     let view = rig.client.view(start, 0);
-    assert!(view.share.watched_sound);
+    assert_eq!(view.share.watched_sound, Some(true));
     assert!(view.numbers.sound.is_some());
     assert_eq!(view.numbers.sound_dropped, 5);
+    assert_eq!(rig.client.drops.bad, bad);
+}
+
+// Told at her Watch that Bo's sound is off, as while his on waits at the
+// host, Ana hears the frames that come meanwhile though none starts a spell
+// for her: the first word of a watch only sets the word.
+#[test]
+fn an_off_at_the_watch_holds_no_frame_back() {
+    let start = Instant::now();
+    let (mut rig, mut session, mut speaker) = watching(peer::PC_SOUND_SINCE, start);
+    let frames = stereo_frames(15);
+    let bad = rig.client.drops.bad;
+    assert_eq!(rig.client.view(start, 0).share.watched_sound, Some(false));
+    let mut heard = 0.0f32;
+    for seq in 5..15u16 {
+        let frame = &frames[usize::from(seq)];
+        let packet = relayed(&mut session, BO_SLOT, SHARE, seq, false, frame);
+        rig.deliver(&packet, start);
+        heard = heard.max(loudest(&mut speaker));
+    }
+    assert!(heard > 0.0, "{heard}");
+    let view = rig.client.view(start, 0);
+    assert_eq!(view.share.watched_sound, Some(false));
+    assert!(view.numbers.sound.is_some());
+    assert_eq!(view.numbers.sound_dropped, 0);
+    assert_eq!(rig.client.drops.bad, bad);
+}
+
+// The word Ana is told at her Watch can come after the first frames, its
+// datagram lost or overtaken. They make an ear, and that word, off while
+// Bo's on waits at the host, does not let it go: the first word of a watch
+// only sets the word.
+#[test]
+fn an_off_at_the_watch_lets_no_ear_go() {
+    let start = Instant::now();
+    let (mut rig, mut session, mut speaker) = watch_pressed(peer::PC_SOUND_SINCE, start);
+    let frames = stereo_frames(15);
+    let bad = rig.client.drops.bad;
+    let mut from_bo = |rig: &mut Rig, session: &mut Session, seq: u16| {
+        let frame = &frames[usize::from(seq)];
+        let packet = relayed(session, BO_SLOT, SHARE, seq, false, frame);
+        rig.deliver(&packet, start);
+        loudest(&mut speaker)
+    };
+    let mut heard = 0.0f32;
+    for seq in 5..10 {
+        heard = heard.max(from_bo(&mut rig, &mut session, seq));
+    }
+    assert!(heard > 0.1, "{heard}");
+    assert_eq!(rig.client.view(start, 0).share.watched_sound, None);
+    bo_says(&mut rig, &mut session, false, start);
+    for seq in 10..15 {
+        let heard = from_bo(&mut rig, &mut session, seq);
+        assert!(heard > 0.1, "frame {seq}: {heard}");
+    }
+    let view = rig.client.view(start, 0);
+    assert_eq!(view.share.watched_sound, Some(false));
+    assert!(view.numbers.sound.is_some());
+    assert_eq!(view.numbers.sound_dropped, 0);
+    assert_eq!(rig.client.drops.bad, bad);
+}
+
+// Bo turns his sound on and off before any frame of it reaches Ana, so his
+// off finds no ear to let go. The frames captured before his press that
+// come after it still make none, each counted with the sound dropped and
+// not as bad, until a frame that starts a spell from a reset encoder does.
+#[test]
+fn an_off_that_finds_no_ear_still_holds_frames_back() {
+    let start = Instant::now();
+    let (mut rig, mut session, mut speaker) = watching(peer::PC_SOUND_SINCE, start);
+    let frames = stereo_frames(30);
+    let bad = rig.client.drops.bad;
+    let from_bo = |rig: &mut Rig, session: &mut Session, seq: u16, first: bool| {
+        let frame = &frames[usize::from(seq)];
+        let packet = relayed(session, BO_SLOT, SHARE, seq, first, frame);
+        rig.deliver(&packet, start);
+    };
+    bo_says(&mut rig, &mut session, true, start);
+    bo_says(&mut rig, &mut session, false, start);
+    assert_eq!(rig.client.view(start, 0).share.watched_sound, Some(false));
+    for seq in 5..15 {
+        from_bo(&mut rig, &mut session, seq, false);
+        assert_eq!(loudest(&mut speaker), 0.0, "frame {seq}");
+    }
+    let view = rig.client.view(start, 0);
+    assert!(view.numbers.sound.is_none());
+    assert_eq!(view.numbers.sound_dropped, 10);
+
+    from_bo(&mut rig, &mut session, 15, true);
+    assert!(rig.client.view(start, 0).numbers.sound.is_some());
+    let mut heard = loudest(&mut speaker);
+    for seq in 16..30 {
+        from_bo(&mut rig, &mut session, seq, false);
+        heard = heard.max(loudest(&mut speaker));
+    }
+    assert!(heard > 0.15, "{heard}");
+    let view = rig.client.view(start, 0);
+    assert!(view.numbers.sound.is_some());
+    assert_eq!(view.numbers.sound_dropped, 10);
     assert_eq!(rig.client.drops.bad, bad);
 }
 
@@ -495,6 +605,79 @@ fn the_old_host_line_waits_for_the_hosts_hello() {
         rig.client.share_view().own_sound.unavailable,
         Some(crate::view::NoSound::OldHost)
     );
+}
+
+// A new session forgets what the sharer said on the old one: the host forgot
+// the watch, which this PC asks for again, and says the word again when the
+// Watch comes; a word said meanwhile went with the old session.
+#[test]
+fn a_new_session_forgets_the_sharers_word() {
+    let start = Instant::now();
+    let (mut rig, mut session, _speaker) = watching(peer::PC_SOUND_SINCE, start);
+    bo_says(&mut rig, &mut session, true, start);
+    assert_eq!(rig.client.view(start, 0).share.watched_sound, Some(true));
+    let woke = start + Duration::from_secs(20);
+    assert!(rig.client.slept(Duration::from_secs(20), woke, &rig.socket));
+    rig.tick(woke);
+    let (_, mut session, response) = rig.host.answer_all(woke).pop().expect("a try");
+    rig.deliver(&response, woke);
+    // A new session starts the stream over, on the host's side too.
+    rig.host.reliable = Reliable::new();
+    let said = told_host(&mut rig.host, &mut session);
+    let watch = |message: &Message| match message {
+        Message::Watch { share, on, .. } => *share == SHARE && *on,
+        _ => false,
+    };
+    assert!(said.iter().any(watch), "{said:?}");
+    assert_eq!(rig.client.view(woke, 0).share.watched_sound, None);
+    let hello = rig.host.hello(&mut session, woke);
+    rig.deliver(&hello, woke);
+    bo_says(&mut rig, &mut session, false, woke);
+    assert_eq!(rig.client.view(woke, 0).share.watched_sound, Some(false));
+}
+
+// Bo's off on the old session holds no frame back on the new one: told off
+// at the Watch asked for again, as while his on waits at the host, Ana
+// hears the frames that come after it though none starts a spell for her.
+#[test]
+fn an_off_on_the_old_session_holds_no_frame_back() {
+    let start = Instant::now();
+    let (mut rig, mut session, mut speaker) = watching(peer::PC_SOUND_SINCE, start);
+    let frames = stereo_frames(16);
+    bo_says(&mut rig, &mut session, true, start);
+    let packet = relayed(&mut session, BO_SLOT, SHARE, 0, true, &frames[0]);
+    rig.deliver(&packet, start);
+    loudest(&mut speaker);
+    bo_says(&mut rig, &mut session, false, start);
+    assert!(rig.client.view(start, 0).numbers.sound.is_none());
+    // Its last 2.5 ms fade out.
+    loudest(&mut speaker);
+
+    let woke = start + Duration::from_secs(20);
+    assert!(rig.client.slept(Duration::from_secs(20), woke, &rig.socket));
+    rig.tick(woke);
+    let (_, mut session, response) = rig.host.answer_all(woke).pop().expect("a try");
+    rig.deliver(&response, woke);
+    assert!(rig.host.open_all(&mut session) > 0);
+    // A new session starts the stream over, on the host's side too.
+    rig.host.reliable = Reliable::new();
+    let hello = rig.host.hello(&mut session, woke);
+    rig.deliver(&hello, woke);
+    bo_says(&mut rig, &mut session, false, woke);
+    let bad = rig.client.drops.bad;
+    let mut heard = 0.0f32;
+    for seq in 5..16u16 {
+        let frame = &frames[usize::from(seq)];
+        let packet = relayed(&mut session, BO_SLOT, SHARE, seq, false, frame);
+        rig.deliver(&packet, woke);
+        heard = heard.max(loudest(&mut speaker));
+    }
+    assert!(heard > 0.15, "{heard}");
+    let view = rig.client.view(woke, 0);
+    assert_eq!(view.share.watched_sound, Some(false));
+    assert!(view.numbers.sound.is_some());
+    assert_eq!(view.numbers.sound_dropped, 0);
+    assert_eq!(rig.client.drops.bad, bad);
 }
 
 // A client standing for a copy older than PC_SOUND_SINCE counts channel 8

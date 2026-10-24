@@ -198,7 +198,7 @@ fn a_friends_pc_sound_reaches_its_watchers_on_their_sides() {
         bo.send(Channel::Sound, &packet);
     }
     let heard = |view: &View| {
-        view.share.watched_sound
+        view.share.watched_sound == Some(true)
             && view
                 .numbers
                 .sound
@@ -241,14 +241,14 @@ fn a_friends_pc_sound_reaches_its_watchers_on_their_sides() {
     for (who, member) in [("Cy", &cy), ("Dee", &dee)] {
         let view = member.view();
         assert!(view.numbers.sound.is_none(), "{who}");
-        assert!(!view.share.watched_sound, "{who}");
+        assert_eq!(view.share.watched_sound, None, "{who}");
         assert_eq!(view.numbers.dropped_bad, 0, "{who}");
         assert!(loudest(&member.speakers) < 1e-3, "{who} heard it");
     }
 
     bo.say(&share_sound(share, false));
     ana.member.wait_for(WAIT, "Ana's ear gone", |v| {
-        !v.share.watched_sound && v.numbers.sound.is_none()
+        v.share.watched_sound == Some(false) && v.numbers.sound.is_none()
     });
 }
 
@@ -512,7 +512,7 @@ fn the_hosts_pc_sound_reaches_its_watchers_on_their_sides() {
     host.room().share_sound(true);
     assert!(host.view().share.own_sound.on);
     let view = ana.member.wait_for(WAIT, "Ana hearing the pc sound", |v| {
-        v.share.watched_sound
+        v.share.watched_sound == Some(true)
             && v.numbers
                 .sound
                 .is_some_and(|sound| sound.capture_to_ear.is_some())
@@ -556,7 +556,7 @@ fn the_hosts_pc_sound_reaches_its_watchers_on_their_sides() {
     for (who, member) in [("Cy", &cy), ("Dee", &dee)] {
         let view = member.view();
         assert!(view.numbers.sound.is_none(), "{who}");
-        assert!(!view.share.watched_sound, "{who}");
+        assert_eq!(view.share.watched_sound, None, "{who}");
         assert_eq!(view.numbers.dropped_bad, 0, "{who}");
         let pc_sound =
             most_played(&member.speakers, 0, 500.0).max(most_played(&member.speakers, 1, 700.0));
@@ -592,7 +592,7 @@ fn a_friends_pc_sound_goes_through_the_host() {
     assert!(own.on && own.unavailable.is_none(), "{own:?}");
     for (who, member) in [("Ana", &ana), ("the host", &host)] {
         let view = member.member.wait_for(WAIT, "the pc sound heard", |v| {
-            v.share.watched_sound && v.numbers.sound.is_some()
+            v.share.watched_sound == Some(true) && v.numbers.sound.is_some()
         });
         thread::sleep(Duration::from_millis(600));
         let (left, right) = sides(&member.speakers).expect("pc sound on the speakers");
@@ -655,7 +655,8 @@ fn hand_watches(fake: &Fake) -> (Voiced, Hand, u32, Vec<Passed>) {
             .iter()
             .all(|packet| packet.share == share && !packet.last)
     );
-    assert_eq!(told, [(share, true)]);
+    // Told off at its Watch, then on.
+    assert_eq!(told, [(share, false), (share, true)]);
     (host, ana, share, sound)
 }
 
@@ -678,6 +679,31 @@ fn a_pause_ends_the_sound_and_resume_brings_it_back() {
     assert!(resumed.len() >= 25, "{}", resumed.len());
     assert!(resumed[0].first, "{:?}", flags(&resumed));
     assert!(told.is_empty(), "{told:?}");
+}
+
+// Share PC sound turned on while the share is paused by hand says on at
+// once and opens nothing, as one whose capture opened before the pause
+// keeps saying on through it: the pause holds the sound back, and the
+// watcher hears the share is paused. A new watcher of a share whose sound
+// is off hears off at its Watch.
+#[test]
+fn turned_on_during_a_pause_it_says_on() {
+    let _alone = alone();
+    let fake = pc_sound(left_and_right, Duration::ZERO);
+    let (host, code, to_host) = hosting(sharer("Mara", PC_SOUND_SINCE, silence, &fake));
+    let mut ana = hand_watcher(&code, to_host);
+    let share = shares(&host);
+    ana.say(&watch(share));
+    watched_by(&host, 1);
+    let (_, told) = listen(&mut ana, Duration::from_millis(300));
+    assert_eq!(told, [(share, false)], "off at the Watch");
+    host.room().pause_share(true);
+    assert!(host.room().share_paused());
+    host.room().share_sound(true);
+    let (sound, told) = listen(&mut ana, Duration::from_millis(400));
+    assert!(sound.is_empty(), "{:?}", flags(&sound));
+    assert_eq!(told, [(share, true)]);
+    assert_eq!(fake.record().most_at_once, 0, "opened during the pause");
 }
 
 static MARK: AtomicBool = AtomicBool::new(false);
@@ -771,7 +797,12 @@ fn a_new_watcher_hears_nothing_until_the_share_has_seen_the_desktop() {
     watched_by(&host, 1);
     let (unseen, told) = listen(&mut ana, Duration::from_millis(400));
     assert!(unseen.is_empty(), "{:?}", flags(&unseen));
-    assert_eq!(told, [(share, true)]);
+    // The Watch can reach the host before the room has taken the capture's
+    // Opened in: its word is then off, and the on follows.
+    assert!(
+        told == [(share, true)] || told == [(share, false), (share, true)],
+        "{told:?}"
+    );
     sharing.set_away(share, true);
     captures_open(&fake, 1, 0);
     let (locked, _) = listen(&mut ana, Duration::from_millis(300));
@@ -1088,7 +1119,8 @@ fn silence_ends_a_spell_and_the_next_sound_starts_one() {
 }
 
 // PC sound that cannot open turns Share sound off with a line that says
-// why, and the share goes on; its watcher never hears that the sound is on.
+// why, and the share goes on; turned on while the share is not paused, its
+// watcher never hears that the sound is on.
 #[test]
 fn a_capture_that_cannot_start_turns_share_sound_off() {
     let _alone = alone();
@@ -1115,12 +1147,50 @@ fn a_capture_that_cannot_start_turns_share_sound_off() {
             .any(|said| said.kind == LineKind::Problem && said.text == line)
     );
     assert_eq!(own_share(&view), Some(share));
+    ana.member.wait_for(WAIT, "Ana told off at her Watch", |v| {
+        v.share.watched_sound == Some(false)
+    });
     ana.member.holds_for(
         Duration::from_millis(300),
         "Ana told the sound is on",
-        |v| !v.share.watched_sound,
+        |v| v.share.watched_sound != Some(true),
     );
     assert_eq!(ana.view().numbers.dropped_bad, 0);
+}
+
+// Turned on during a pause, Share sound says on at once and opens nothing
+// until the share goes on again. PC sound that cannot open then turns it
+// off with the same line, and its watcher hears that the sound is off.
+#[test]
+fn a_capture_that_cannot_start_after_a_pause_says_off() {
+    let _alone = alone();
+    let fake = pc_sound(left_and_right, Duration::ZERO);
+    fake.fail_opens(Some(AudioError::PcSound {
+        code: 0x8889_0008,
+        text: String::from("Windows would not give its sound as 48 kHz stereo"),
+        lost: false,
+    }));
+    let (host, code, to_host) = hosting(sharer("Mara", PC_SOUND_SINCE, silence, &fake));
+    let ana = joins(member("Ana", PC_SOUND_SINCE), &code, to_host, 2);
+    let share = shares(&host);
+    watches(&ana, share);
+    watched_by(&host, 1);
+    host.room().pause_share(true);
+    assert!(host.room().share_paused());
+    host.room().share_sound(true);
+    ana.member.wait_for(WAIT, "Ana told the sound is on", |v| {
+        v.share.watched_sound == Some(true)
+    });
+    assert_eq!(fake.record().most_at_once, 0, "opened during the pause");
+    host.room().pause_share(false);
+    let view = host.member.wait_for(WAIT, "Share sound off and why", |v| {
+        !v.share.own_sound.on && v.share.problem.is_some()
+    });
+    let line = "PC sound could not start: Windows would not give its sound as 48 kHz stereo (0x88890008). The share goes on without it.";
+    assert_eq!(view.share.problem.as_deref(), Some(line));
+    ana.member.wait_for(WAIT, "Ana told the sound is off", |v| {
+        v.share.watched_sound == Some(false)
+    });
 }
 
 // Lost while it runs, PC sound opens again by itself a second later: its

@@ -75,10 +75,12 @@ pub struct ShareView {
     // While this PC watches: the share as its sharer says it is, Live when
     // the sharer or the host is older than 1.3.0.
     pub watched_state: ShareState,
-    // While this PC watches: its sharer says the share's PC sound goes out
-    // with it, so the panel can say "sharing with sound". False when the
-    // sharer or the host is older than 1.3.0.
-    pub watched_sound: bool,
+    // While this PC watches: whether its sharer says the share's PC sound
+    // goes out. None until the host has said it since this watch began, or
+    // since a new session asked for it again, and always through a host
+    // older than 1.3.0, which never says it; Some(false) for a sharer older
+    // than 1.3.0, which never says on.
+    pub watched_sound: Option<bool>,
     // Share sound on this PC's own share (Room::share_sound).
     pub own_sound: OwnSound,
 }
