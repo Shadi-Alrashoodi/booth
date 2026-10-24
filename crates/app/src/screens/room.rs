@@ -22,7 +22,9 @@ use crate::messages;
 use crate::monitors::{self, Pick};
 use crate::region::{self, Picked};
 use crate::screens::chat::{Chat, Composer};
-use crate::screens::control::{self, AllowWait, Answer, Decline, MenuItem, PanicKey, RowMenu};
+use crate::screens::control::{
+    self, AllowWait, Answer, Decline, MenuItem, PanicKey, RowMenu, SoundWord,
+};
 use crate::screens::stats;
 use crate::sound::PeriodsAsk;
 use crate::strip;
@@ -1387,12 +1389,12 @@ impl InRoom {
             let mut percent = u32::from(was);
             let volume = Some((&mut percent, person.name.as_str()));
             let watched = view.share.watching && current.is_some_and(|c| c.key == person.key);
-            // Their share's sound while this PC watches it, whatever their
-            // switch says, so nothing appears under the focus when they turn
-            // it on.
+            // Their share's sound while this PC watches it, whether or not
+            // it has any, so the slider is there to set before the sound
+            // comes and nothing appears under the focus when it does.
             let sound_was = self.sound_volumes.get(&person.key);
             let mut sound_percent = u32::from(sound_was);
-            let sound = watched.then_some(&mut sound_percent);
+            let sound = watched.then_some((&mut sound_percent, SoundWord::of(&view.share)));
             let mut cap = view.share.cap;
             let asked = watched.then_some((&mut cap, view.share.cap_unheard));
             if let Some(MenuItem::EndControl) =

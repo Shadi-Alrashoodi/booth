@@ -2000,6 +2000,9 @@ impl Host {
             cap_unheard: self.cap_unheard(),
             watched_state: self.screen.watching.share_state(),
             watched_sound: self.screen.watched.and_then(|share| self.sound.word(share)),
+            // This room's own copy: one older than 1.3.0 passes no PC
+            // sound on.
+            sound_unheard: self.version < crate::peer::PC_SOUND_SINCE,
             own_sound: OwnSound {
                 on: self.own_sound.is_on(self.own_live_share()),
                 unavailable: self.own_sound.unavailable(),

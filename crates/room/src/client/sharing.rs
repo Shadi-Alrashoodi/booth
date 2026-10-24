@@ -852,6 +852,9 @@ impl Client {
                     .map(|facts| facts.watchers),
             }
         });
+        // Only once the host's Hello said what it runs: a new session reads
+        // nothing yet, and would say so meanwhile.
+        let sound_unheard = self.host_hello && !self.link.sound_read;
         ShareView {
             watching: current
                 .as_ref()
@@ -866,16 +869,15 @@ impl Client {
             cap_unheard: self.cap_unheard(),
             watched_state: self.screen.watching.share_state(),
             watched_sound: self.screen.watched.and_then(|share| self.sound.word(share)),
+            sound_unheard,
             own_sound: OwnSound {
                 on: self.own_sound.is_on(self.screen.sharing.number()),
                 // This PC's Windows first: it holds from the start, and no
-                // host can change it. Only once the host's Hello said what
-                // it runs: a new session reads nothing yet, and would say so
-                // meanwhile.
+                // host can change it.
                 unavailable: self
                     .own_sound
                     .unavailable()
-                    .or((self.host_hello && !self.link.sound_read).then_some(NoSound::OldHost)),
+                    .or(sound_unheard.then_some(NoSound::OldHost)),
                 lost: self.own_sound.lost(self.screen.sharing.number()),
             },
         }

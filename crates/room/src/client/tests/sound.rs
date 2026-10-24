@@ -597,18 +597,24 @@ fn sound_after_the_picture_ages_and_is_logged_with_no_pictures() {
 
 // Until the host's Hello says what it runs, nothing says the host is too old
 // for PC sound: every new session waits for it again, and the panel's switch
-// would show the old-host line meanwhile. This rig's host says the version
-// of this build first, older than PC_SOUND_SINCE until "move to 1.3.0", and
-// 1.2.0 on the second session.
+// and the line under a watched sharer's PC sound slider would show the
+// old-host line meanwhile. This rig's host says the version of this build
+// first, older than PC_SOUND_SINCE until "move to 1.3.0", and 1.2.0 on the
+// second session.
 #[test]
 fn the_old_host_line_waits_for_the_hosts_hello() {
+    // The switch's line, then whether a sharer's line says the host.
+    let said = |rig: &Rig| {
+        let share = rig.client.share_view();
+        (share.own_sound.unavailable, share.sound_unheard)
+    };
     let start = Instant::now();
     let rig = Rig::new(Timers::default(), start);
-    assert_eq!(rig.client.share_view().own_sound.unavailable, None);
+    assert_eq!(said(&rig), (None, false));
     let (mut rig, _) = Rig::joined(rig, start);
     let older = invite::VERSION < peer::PC_SOUND_SINCE;
     let hello_says = older.then_some(crate::view::NoSound::OldHost);
-    assert_eq!(rig.client.share_view().own_sound.unavailable, hello_says);
+    assert_eq!(said(&rig), (hello_says, older));
 
     // Asleep long enough to join again at the wake: a new session, on which
     // the host has said nothing yet.
@@ -618,11 +624,7 @@ fn the_old_host_line_waits_for_the_hosts_hello() {
     let (_, mut session, response) = rig.host.answer_all(woke).pop().expect("a try");
     rig.deliver(&response, woke);
     assert!(rig.host.open_all(&mut session) > 0);
-    assert_eq!(
-        rig.client.share_view().own_sound.unavailable,
-        None,
-        "a new session"
-    );
+    assert_eq!(said(&rig), (None, false), "a new session");
     rig.host.reliable = Reliable::new();
     let hello = Message::Hello {
         version: Version {
@@ -635,15 +637,14 @@ fn the_old_host_line_waits_for_the_hosts_hello() {
     };
     let hello = rig.host.say(&mut session, &hello, woke);
     rig.deliver(&hello, woke);
-    assert_eq!(
-        rig.client.share_view().own_sound.unavailable,
-        Some(crate::view::NoSound::OldHost)
-    );
+    assert_eq!(said(&rig), (Some(crate::view::NoSound::OldHost), true));
 }
 
 // This PC's Windows is older than voice::audio::PC_SOUND_BUILD: its line
 // shows before the host's Hello, and stays through a new session and a host
-// on 1.2.0, which would otherwise show the old-host line. The steps are those of
+// on 1.2.0, which would otherwise show the old-host line. Windows stops only
+// what this PC sends, so the line under a sharer's PC sound slider still says
+// the host is too old. The steps are those of
 // the_old_host_line_waits_for_the_hosts_hello.
 #[test]
 fn the_windows_line_holds_from_the_start() {
@@ -683,11 +684,9 @@ fn the_windows_line_holds_from_the_start() {
     };
     let hello = rig.host.say(&mut session, &hello, woke);
     rig.deliver(&hello, woke);
-    assert_eq!(
-        rig.client.share_view().own_sound.unavailable,
-        windows,
-        "a host on 1.2.0"
-    );
+    let share = rig.client.share_view();
+    assert_eq!(share.own_sound.unavailable, windows, "a host on 1.2.0");
+    assert!(share.sound_unheard, "a host on 1.2.0");
 }
 
 // A new session forgets what the sharer said on the old one: the host forgot

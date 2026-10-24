@@ -17,7 +17,7 @@ use eframe::egui::{
     Event, Frame, Id, Key, Margin, Modifiers, Response, Ui, WidgetInfo, WidgetType,
 };
 use room::MOST_VOLUME;
-use room::view::{LinkState, Person, Role, Unheard, View, WatchCap};
+use room::view::{LinkState, NoSound, Person, Role, ShareView, Unheard, View, WatchCap};
 
 use crate::controls::{self, Button};
 use crate::messages;
@@ -328,6 +328,59 @@ fn choices<T: Copy + PartialEq>(
     }
 }
 
+// What the line under a sharer's PC sound slider says: Unsaid until the host
+// answers this watch, so a word not heard yet never reads as off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SoundWord {
+    Unsaid,
+    OldHost,
+    On,
+    Off,
+}
+
+impl SoundWord {
+    pub fn of(share: &ShareView) -> SoundWord {
+        if share.sound_unheard {
+            return SoundWord::OldHost;
+        }
+        match share.watched_sound {
+            None => SoundWord::Unsaid,
+            Some(true) => SoundWord::On,
+            Some(false) => SoundWord::Off,
+        }
+    }
+}
+
+// Always in the room of the tallest of its three sentences for this name,
+// measured at prose's width, so Watch at under it never moves when the word
+// comes or changes.
+fn pc_sound_line(ui: &mut Ui, slider: Id, name: &str, word: SoundWord) {
+    let on = messages::share_has_pc_sound(name);
+    let off = messages::share_has_no_pc_sound(name);
+    let old_host = NoSound::OldHost.sentence();
+    ui.add_space(HALF_STEP);
+    let room = [on.as_str(), off.as_str(), old_host]
+        .map(|words| controls::prose_height(ui, words, theme::caption()))
+        .into_iter()
+        .fold(0.0, f32::max);
+    let line = match word {
+        SoundWord::Unsaid => None,
+        SoundWord::OldHost => Some(old_host.to_owned()),
+        SoundWord::On => Some(on),
+        SoundWord::Off => Some(off),
+    };
+    ui.scope(|ui| {
+        ui.set_min_height(room);
+        if let Some(line) = &line {
+            controls::prose(ui, line.as_str(), theme::caption(), ASH);
+        }
+    });
+    if let Some(line) = line {
+        ui.ctx()
+            .accesskit_node_builder(slider, |node| node.set_description(line));
+    }
+}
+
 // Which row's menu is open. It opens under its row rather than floating
 // over the list, so nothing covers the names, and it reads in Tab order
 // right after the row it belongs to.
@@ -397,15 +450,15 @@ impl RowMenu {
     // the row's items. Esc closes it and gives the focus back to the row;
     // picking an item closes it, and so does the row losing all it had (the
     // control it would end has ended). A cap stays open for the next pick.
-    // `sound`: the PC sound volume of their share, while this PC watches
-    // it. With it, each slider has its label over it, as Settings labels
-    // its own.
+    // `sound`: the PC sound volume of their share while this PC watches it,
+    // and what the line under that slider says. With it, each slider has its
+    // label over it, as Settings labels its own.
     pub fn show(
         &mut self,
         ui: &mut Ui,
         key: [u8; 32],
         volume: Option<(&mut u32, &str)>,
-        sound: Option<&mut u32>,
+        sound: Option<(&mut u32, SoundWord)>,
         cap: Option<(&mut WatchCap, Option<Unheard>)>,
         items: &[MenuItem],
     ) -> Option<MenuItem> {
@@ -454,15 +507,17 @@ impl RowMenu {
                     if std::mem::take(&mut self.focus) || gone {
                         response.request_focus();
                     }
-                    if let Some(percent) = sound {
+                    if let Some((percent, word)) = sound {
                         ui.add_space(FIELD_GAP);
                         controls::text(ui, messages::PC_SOUND, theme::body(), ASH);
                         let label = messages::pc_sound_volume_label(name);
-                        controls::slider(ui, sound_id, percent, 0..=most, "%", &label);
+                        let slider = controls::slider(ui, sound_id, percent, 0..=most, "%", &label);
+                        pc_sound_line(ui, slider.id, name, word);
                     }
                 }
                 if let Some((cap, unheard)) = cap {
-                    // The same gap after the two sliders as between them.
+                    // 16 px from the line's room to Watch at, as between the
+                    // two sliders.
                     if grouped {
                         ui.add_space(FIELD_GAP - HALF_STEP);
                     }
@@ -493,9 +548,9 @@ impl RowMenu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controls::tests::{frame, press, release};
-    use eframe::egui::{Context, PointerButton, Pos2, Rect, Sense, pos2, vec2};
-    use room::view::{ControlRequest, ControlView, CurrentShare, Party, ShareView, Strip};
+    use crate::controls::tests::{frame, frame_at, press, release};
+    use eframe::egui::{Context, PointerButton, Pos2, Rect, Sense, accesskit, pos2, vec2};
+    use room::view::{ControlRequest, ControlView, CurrentShare, Party, Strip};
 
     const MARA: [u8; 32] = [7; 32];
     const TOM: [u8; 32] = [9; 32];
@@ -1116,23 +1171,48 @@ mod tests {
         assert!(menu.is_open());
     }
 
+    // The node a screen reader names, or a label shows, as this, from a
+    // frame with accesskit on.
+    fn named(output: &eframe::egui::PlatformOutput, name: &str) -> accesskit::Node {
+        output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit is on")
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label().or(node.value()) == Some(name))
+            .map(|(_, node)| node.clone())
+            .unwrap_or_else(|| panic!("nothing called {name}"))
+    }
+
+    fn bounds(node: &accesskit::Node) -> accesskit::Rect {
+        node.bounds().expect("placed")
+    }
+
     // While this PC watches their share, a person's row menu holds two
     // sliders, each with its label over it and a screen reader's name that
     // says which: Voice first, then PC sound, which Tab reaches next and the
-    // arrows move, and whose focus goes to Voice when the watch ends. Not
+    // arrows move, and whose focus goes to Voice when the watch ends. A line
+    // 4 px under PC sound says what the host said of the share's sound, and
+    // a screen reader hears it with the slider; until the host has said,
+    // nothing, and no description. Watch at is 16 px under the line. Not
     // watching, the one slider is as it was.
     #[test]
     fn row_menu_pc_sound() {
         let ctx = context();
         let mut menu = RowMenu::default();
         let (mut percent, mut sound) = (100, 100);
-        let mut draw = |events: Vec<Event>, watched: bool| {
+        let mut cap = WatchCap::default();
+        // `word`: what the line under PC sound says, while this PC watches.
+        let mut draw = |events: Vec<Event>, word: Option<SoundWord>| {
             frame(&ctx, events, |ui| {
                 let (rect, _) = ui.allocate_exact_size(vec2(360.0, ROW_HEIGHT), Sense::hover());
                 let row = ui.interact(rect, ui.id().with("tom's row"), Sense::click());
                 menu.follow_row(ui, &row, TOM, "Tom");
-                let sound = watched.then_some(&mut sound);
-                menu.show(ui, TOM, Some((&mut percent, "Tom")), sound, None, &[]);
+                let watched = word.is_some();
+                let sound = word.map(|word| (&mut sound, word));
+                let asked = watched.then_some((&mut cap, None));
+                menu.show(ui, TOM, Some((&mut percent, "Tom")), sound, asked, &[]);
             })
             .1
         };
@@ -1148,10 +1228,11 @@ mod tests {
                 })
                 .collect()
         };
-        draw(Vec::new(), true);
-        draw(vec![key(Key::Tab, Modifiers::NONE)], true);
-        draw(vec![key(Key::Enter, Modifiers::NONE)], true);
-        let shown = names(draw(Vec::new(), true));
+        let on = Some(SoundWord::On);
+        draw(Vec::new(), on);
+        draw(vec![key(Key::Tab, Modifiers::NONE)], on);
+        draw(vec![key(Key::Enter, Modifiers::NONE)], on);
+        let shown = names(draw(Vec::new(), on));
         let top = |name: &str| {
             shown
                 .iter()
@@ -1167,12 +1248,58 @@ mod tests {
         ]
         .map(top);
         assert!(tops.is_sorted(), "{shown:?}");
-        draw(vec![key(Key::Tab, Modifiers::NONE)], true);
-        draw(vec![key(Key::ArrowLeft, Modifiers::NONE)], true);
-        draw(Vec::new(), true);
+
+        // Each line, On last: one node shows it and none of the others.
+        let lines = [
+            (SoundWord::OldHost, NoSound::OldHost.sentence().to_owned()),
+            (SoundWord::Off, messages::share_has_no_pc_sound("Tom")),
+            (SoundWord::On, messages::share_has_pc_sound("Tom")),
+        ];
+        let parts = |output: eframe::egui::PlatformOutput| {
+            let slider = named(&output, "PC sound volume for Tom");
+            let watch_at = bounds(&named(&output, messages::WATCH_AT));
+            let nodes = output.accesskit_update.expect("a tree").nodes;
+            let shown: Vec<(String, accesskit::Rect)> = nodes
+                .iter()
+                .filter_map(|(_, node)| {
+                    let value = node.value()?;
+                    lines
+                        .iter()
+                        .any(|(_, line)| line == value)
+                        .then(|| (value.to_owned(), bounds(node)))
+                })
+                .collect();
+            (slider, watch_at, shown)
+        };
+        let mut with_on = None;
+        for (word, line) in &lines {
+            let (slider, watch_at, shown) = parts(draw(Vec::new(), Some(*word)));
+            let [(text, at)] = shown.as_slice() else {
+                panic!("{word:?}: {shown:?}");
+            };
+            assert_eq!(text, line, "{word:?}");
+            assert_eq!(slider.description(), Some(line.as_str()), "{word:?}");
+            let under = bounds(&slider).y1 + 4.0;
+            assert!((at.y0 - under).abs() < 0.5, "{word:?}: {at:?}");
+            let gap = watch_at.y0 - at.y1;
+            assert!((gap - 16.0).abs() < 0.5, "{word:?}: {gap}");
+            if *word == SoundWord::On {
+                with_on = Some(watch_at.y0);
+            }
+        }
+        // Then the host has not said yet: no line in its room, and no
+        // description left from On.
+        let (slider, watch_at, shown) = parts(draw(Vec::new(), Some(SoundWord::Unsaid)));
+        assert!(shown.is_empty(), "{shown:?}");
+        assert_eq!(slider.description(), None);
+        assert_eq!(Some(watch_at.y0), with_on);
+
+        draw(vec![key(Key::Tab, Modifiers::NONE)], on);
+        draw(vec![key(Key::ArrowLeft, Modifiers::NONE)], on);
+        draw(Vec::new(), on);
         // The watch ends while PC sound has the focus: Voice takes it.
-        draw(Vec::new(), false);
-        let update = draw(Vec::new(), false).accesskit_update.expect("a tree");
+        draw(Vec::new(), None);
+        let update = draw(Vec::new(), None).accesskit_update.expect("a tree");
         let focused = update
             .nodes
             .iter()
@@ -1205,6 +1332,68 @@ mod tests {
                 .any(|(name, _)| name == "Voice" || name.starts_with("PC sound")),
             "{shown:?}"
         );
+    }
+
+    // No word from the host yet is not off: the line waits for its answer.
+    // A host too old to pass PC sound on is what the line says, whatever
+    // the word.
+    #[test]
+    fn sound_word_waits_for_the_host() {
+        let of = |watched_sound, sound_unheard| {
+            SoundWord::of(&ShareView {
+                watched_sound,
+                sound_unheard,
+                ..ShareView::default()
+            })
+        };
+        assert_eq!(of(None, false), SoundWord::Unsaid);
+        assert_eq!(of(Some(true), false), SoundWord::On);
+        assert_eq!(of(Some(false), false), SoundWord::Off);
+        assert_eq!(of(None, true), SoundWord::OldHost);
+        assert_eq!(of(Some(true), true), SoundWord::OldHost);
+    }
+
+    // Whatever the line under PC sound says, Watch at stays where it is: for
+    // names of every length up to 32 characters, in wide letters and in
+    // Arabic, and at widths down to 160 px, what Ctrl+= zoom to 200 percent
+    // leaves of the narrowest window. So it never moves under the pointer
+    // when the word comes or changes.
+    #[test]
+    fn watch_at_stays_put_whatever_the_pc_sound_line_says() {
+        let ctx = context();
+        let long = "Tomasz Aleksander Szczepankowski";
+        let mut names: Vec<String> = (1..=long.len()).map(|end| long[..end].to_owned()).collect();
+        names.push("W".repeat(32));
+        names.push(String::from("عبد الرحمن بن عبد العزيز الحسيني"));
+        let words = [
+            SoundWord::Unsaid,
+            SoundWord::OldHost,
+            SoundWord::On,
+            SoundWord::Off,
+        ];
+        let mut menu = RowMenu {
+            open: Some(TOM),
+            ..RowMenu::default()
+        };
+        let (mut percent, mut sound, mut cap) = (100, 100, WatchCap::default());
+        for width in (160..=720).step_by(20) {
+            let size = vec2(width as f32, 2000.0);
+            for name in &names {
+                let tops = words.map(|word| {
+                    let (_, output) = frame_at(&ctx, size, Vec::new(), |ui| {
+                        let volume = Some((&mut percent, name.as_str()));
+                        let sound = Some((&mut sound, word));
+                        let asked = Some((&mut cap, Some(Unheard::Host)));
+                        menu.show(ui, TOM, volume, sound, asked, &[]);
+                    });
+                    bounds(&named(&output, messages::WATCH_AT)).y0
+                });
+                assert!(
+                    tops.iter().all(|top| *top == tops[0]),
+                    "{width} px, {name}: {tops:?}"
+                );
+            }
+        }
     }
 
     #[test]

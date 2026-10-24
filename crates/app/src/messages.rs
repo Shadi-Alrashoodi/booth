@@ -591,6 +591,17 @@ pub fn pc_sound_volume_label(name: &str) -> String {
     format!("PC sound volume for {name}")
 }
 
+// Under that slider while this PC watches: what the host last said of their
+// share's sound. Of the share, not of sending, so it stays true while the
+// share is paused.
+pub fn share_has_pc_sound(name: &str) -> String {
+    format!("{}'s share has PC sound.", isolated(name))
+}
+
+pub fn share_has_no_pc_sound(name: &str) -> String {
+    format!("{}'s share has no PC sound.", isolated(name))
+}
+
 // In the sharer's row menu while this PC watches: what it asks the share to
 // keep to.
 pub const WATCH_AT: &str = "Watch at";
@@ -1690,11 +1701,22 @@ mod tests {
     }
 
     // Under Share PC sound while it cannot go on (screens/room.rs,
-    // sound_line).
+    // sound_line), and under a sharer's PC sound slider while this PC
+    // watches (screens/control.rs, pc_sound_line), with the name isolated.
     #[test]
     fn pc_sound_lines() {
         for why in [NoSound::OldWindows, NoSound::OldHost] {
             assert_sentences(why.sentence());
         }
+        assert_sentences(&share_has_pc_sound("Tom"));
+        assert_sentences(&share_has_no_pc_sound("Tom"));
+        assert_eq!(
+            share_has_pc_sound("Tom"),
+            "\u{2068}Tom\u{2069}'s share has PC sound."
+        );
+        assert_eq!(
+            share_has_no_pc_sound("Tom"),
+            "\u{2068}Tom\u{2069}'s share has no PC sound."
+        );
     }
 }

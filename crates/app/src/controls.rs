@@ -1159,18 +1159,24 @@ pub fn text(ui: &mut Ui, text: impl Into<String>, font: FontId, color: Color32) 
 
 // How tall text() lays these words out in the room left on this line.
 pub fn text_height(ui: &Ui, text: &str, font: FontId) -> f32 {
+    wrapped_height(ui, text, font, ui.available_width())
+}
+
+// How tall prose() lays these words out here: at prose's width, since on a
+// wide window the room left would give one line where prose takes two.
+pub fn prose_height(ui: &Ui, words: &str, font: FontId) -> f32 {
+    let width = ui.available_width().min(prose_width(ui, &font));
+    wrapped_height(ui, words, font, width)
+}
+
+fn wrapped_height(ui: &Ui, text: &str, font: FontId, width: f32) -> f32 {
     let line_height = line_height(&font);
     WidgetText::from(
         RichText::new(text)
             .font(font)
             .line_height(Some(line_height)),
     )
-    .into_galley(
-        ui,
-        Some(TextWrapMode::Wrap),
-        ui.available_width(),
-        FontSelection::Default,
-    )
+    .into_galley(ui, Some(TextWrapMode::Wrap), width, FontSelection::Default)
     .size()
     .y
 }
@@ -1178,13 +1184,17 @@ pub fn text_height(ui: &Ui, text: &str, font: FontId) -> f32 {
 // A sentence or two, wrapped at about 60 characters however wide the window
 // is: short lines are read at a glance, beside a game.
 pub fn prose(ui: &mut Ui, words: impl Into<String>, font: FontId, color: Color32) -> Response {
-    let sample = text_width(ui, SAMPLE, font.clone());
-    let most = PROSE_CHARS * sample / SAMPLE.chars().count() as f32;
+    let most = prose_width(ui, &font);
     ui.scope(|ui| {
         ui.set_max_width(ui.available_width().min(most));
         text(ui, words, font, color)
     })
     .inner
+}
+
+fn prose_width(ui: &Ui, font: &FontId) -> f32 {
+    let sample = text_width(ui, SAMPLE, font.clone());
+    PROSE_CHARS * sample / SAMPLE.chars().count() as f32
 }
 
 // Codes are read from both ends when people compare them, so the cut goes in
@@ -1405,6 +1415,30 @@ pub(crate) mod tests {
                 lines_field(ui, "stun", &mut text, "STUN servers", 2048).rect
             });
             assert_eq!(rect.height(), height, "{text:?}");
+        }
+    }
+
+    // prose_height is as tall as prose() draws the same words, at every
+    // width: on a wide window the room left would give one line where prose
+    // takes two.
+    #[test]
+    fn prose_height_is_what_prose_draws() {
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        let sentences = [
+            crate::messages::SHARE_PAUSED_WITH_SOUND,
+            room::view::NoSound::OldHost.sentence(),
+        ];
+        for width in (160..=720).step_by(40) {
+            let size = vec2(width as f32, 640.0);
+            for words in sentences {
+                let ((measured, drawn), _) = frame_at(&ctx, size, Vec::new(), |ui| {
+                    let measured = prose_height(ui, words, theme::caption());
+                    let drawn = prose(ui, words, theme::caption(), ASH);
+                    (measured, drawn.rect.height())
+                });
+                assert_eq!(measured, drawn, "{width} px: {words}");
+            }
         }
     }
 

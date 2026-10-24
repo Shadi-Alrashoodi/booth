@@ -82,6 +82,10 @@ pub struct ShareView {
     // than 1.3.0, which never says it; Some(false) for a sharer older than
     // 1.3.0, which never says on.
     pub watched_sound: Option<bool>,
+    // While this PC watches: the host runs a Booth older than 1.3.0, which
+    // passes no PC sound on. Known once the host's Hello came, so a new
+    // session says nothing of it meanwhile.
+    pub sound_unheard: bool,
     // Share sound on this PC's own share (Room::share_sound).
     pub own_sound: OwnSound,
 }

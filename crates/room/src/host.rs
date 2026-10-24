@@ -6878,7 +6878,8 @@ mod tests {
     // who does not watch, or back to the sharer. A new watcher hears at once
     // whether the sound is on, and the sound goes on whatever ShareSound
     // says. A room standing for an older copy passes none of it on and
-    // counts each sound packet bad, as such a copy does.
+    // counts each sound packet bad, as such a copy does, and the room's own
+    // view says so.
     #[test]
     fn pc_sound_goes_only_to_watchers_that_read_it() {
         use crate::view::ShareState::Live;
@@ -6893,6 +6894,11 @@ mod tests {
             let start = Instant::now();
             let mut rig = Rig::new(start);
             rig.host.version = host;
+            assert_eq!(
+                rig.host.view(start, 0).share.sound_unheard,
+                !passes,
+                "{host}"
+            );
             let mut ana = Guest::new();
             ana.join_as(&mut rig, "Ana", peer::PC_SOUND_SINCE, None, start);
             let mut bo = Guest::new();

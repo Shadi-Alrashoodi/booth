@@ -572,7 +572,7 @@ fn the_hosts_pc_sound_reaches_its_watchers_on_their_sides() {
 
 // Bo, a friend, shares with Share sound on. The host passes it on to Ana and
 // plays it itself, both watching on 1.3.0: each hears his left on the left
-// and his right on the right.
+// and his right on the right, and neither reads the old-host line.
 #[test]
 fn a_friends_pc_sound_goes_through_the_host() {
     let _alone = alone();
@@ -596,6 +596,7 @@ fn a_friends_pc_sound_goes_through_the_host() {
         let view = member.member.wait_for(WAIT, "the pc sound heard", |v| {
             v.share.watched_sound == Some(true) && v.numbers.sound.is_some()
         });
+        assert!(!view.share.sound_unheard, "{who}");
         thread::sleep(Duration::from_millis(600));
         let (left, right) = sides(&member.speakers).expect("pc sound on the speakers");
         let (left_500, right_700) = (amplitude(&left, 500.0), amplitude(&right, 700.0));

@@ -759,6 +759,8 @@ fn arabic_name_in_an_english_line() {
     for line in [
         messages::wants_control(name),
         messages::controlling_this_pc(name),
+        messages::share_has_pc_sound(name),
+        messages::share_has_no_pc_sound(name),
         format!("{}, 10 ms (2 frames)", messages::isolated(name)),
         format!("{} 10.5%", messages::isolated(name)),
     ] {
