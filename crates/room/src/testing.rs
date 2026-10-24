@@ -163,6 +163,7 @@ pub(crate) fn quiet_screen() -> crate::screen::ScreenSetup {
         injector: None,
         control_wake: net::pace::Signal::new().expect("create an event"),
         pc_sound: Some(quiet_pc_sound()),
+        process_loopback: true,
     }
 }
 

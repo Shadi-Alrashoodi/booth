@@ -449,13 +449,14 @@ impl Room {
     /// older copies too, and the host passes it only to those who can hear
     /// it. Off at the start of every share and never saved;
     /// `share.own_sound` says whether it is on, why it cannot be, and why
-    /// its capture is lost while it tries again. On, the capture opens, and
-    /// the watchers hear it is on once it has, or at once while the share
-    /// is paused; it runs while the share is not paused. A capture that
-    /// cannot start, or stops on an error, turns it off with a problem line,
-    /// the watchers hear it is off, and the share goes on. Nothing captured
-    /// after the press that turns it off, pauses the share or stops it goes
-    /// out.
+    /// its capture is lost while it tries again. With
+    /// VoiceConfig::process_loopback off it never goes on, however it is
+    /// asked. On, the capture opens, and the watchers hear it is on once it
+    /// has, or at once while the share is paused; it runs while the share
+    /// is not paused. A capture that cannot start, or stops on an error,
+    /// turns it off with a problem line, the watchers hear it is off, and
+    /// the share goes on. Nothing captured after the press that turns it
+    /// off, pauses the share or stops it goes out.
     pub fn share_sound(&self, on: bool) {
         self.threads.share_sound(on);
     }
@@ -666,6 +667,7 @@ fn screen_setup(config: &Config, socket: &Arc<Socket>) -> Result<ScreenSetup, Ro
             Devices::Windows => None,
             Devices::Fake { pc_sound, .. } => Some(pc_sound.clone()),
         },
+        process_loopback: config.voice.process_loopback,
     })
 }
 

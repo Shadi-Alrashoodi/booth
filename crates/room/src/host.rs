@@ -527,10 +527,12 @@ impl Host {
         let clock = Clock::new(setup.now);
         let sound = Sound::new(setup.speaker.clone(), clock, setup.log.clone(), setup.now);
         let (pc_sound, upload_kbps) = (setup.screen.pc_sound.clone(), setup.screen.upload_kbps);
+        let loopback = setup.screen.process_loopback;
         let screen = Screen::new(clock, true, setup.screen, setup.now);
         let own_sound = Switch::new(
             Arc::clone(screen.sharing.sound()),
             pc_sound,
+            loopback,
             setup.log.clone(),
         );
         let talk = Talk::new(

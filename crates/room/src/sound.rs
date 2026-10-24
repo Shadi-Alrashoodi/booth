@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use voice::audio::fake::Fake;
-use voice::audio::{AudioError, Event, PcSound};
+use voice::audio::{AudioError, Event, PC_SOUND_BUILD, PcSound};
 
 use crate::limit::Bucket;
 use crate::log::{Log, log};
@@ -39,7 +39,7 @@ use crate::peer::{Clock, MEDIA_FLOWS_FOR};
 use crate::screen::{MOST_SHOWN, Watching};
 use crate::socket::Socket;
 use crate::talk::{MOST_VOLUME, Outlet, RETIRED_FOR, ToSpeaker};
-use crate::view::{AfterPicture, Latency, Numbers, SoundNumbers};
+use crate::view::{AfterPicture, Latency, NoSound, Numbers, SoundNumbers};
 
 pub(crate) use hear::{Ear, Stream};
 pub(crate) use wire::{MAX_SOUND, SoundFrame, read_relayed, read_sent, relay_in_place};
@@ -717,6 +717,8 @@ pub(crate) struct Switch {
     out: Arc<Outgoing>,
     // Windows' process loopback, or this fake's, so no test captures this PC.
     fake: Option<Fake>,
+    // VoiceConfig::process_loopback: off, the switch never goes on.
+    loopback: bool,
     log: Log,
     // The share it is on for; off at every new one.
     on: Option<u32>,
@@ -740,10 +742,19 @@ pub(crate) struct Switch {
 }
 
 impl Switch {
-    pub(crate) fn new(out: Arc<Outgoing>, fake: Option<Fake>, log: Log) -> Switch {
+    pub(crate) fn new(out: Arc<Outgoing>, fake: Option<Fake>, loopback: bool, log: Log) -> Switch {
+        // The switch shows disabled, so no press would put the reason in the
+        // log.
+        if !loopback {
+            log!(
+                log,
+                "pc sound: this pc's windows is older than build {PC_SOUND_BUILD}, so share sound stays off"
+            );
+        }
         Switch {
             out,
             fake,
+            loopback,
             log,
             on: None,
             capture: None,
@@ -767,9 +778,22 @@ impl Switch {
         self.lost.clone().filter(|_| self.is_on(live))
     }
 
+    pub(crate) fn unavailable(&self) -> Option<NoSound> {
+        (!self.loopback).then_some(NoSound::OldWindows)
+    }
+
     // The panel's switch for `share`, pressed at `press`. False when it was
-    // already so.
+    // already so or cannot go on.
     pub(crate) fn turn(&mut self, on: bool, share: u32, press: Instant) -> bool {
+        // Every way on comes through here, so with process loopback off no
+        // capture opens.
+        if on && !self.loopback {
+            log!(
+                self.log,
+                "share {share}: share sound left off, this pc's windows is older than build {PC_SOUND_BUILD}"
+            );
+            return false;
+        }
         if on == (self.on == Some(share)) {
             return false;
         }
@@ -990,6 +1014,38 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::quiet_pc_sound;
+
+    // Without process loopback the switch never goes on, paused or not: no
+    // capture starts and the watchers are never told it is on. The log says
+    // why at the room's start and at each press.
+    #[test]
+    fn the_switch_stays_off_without_process_loopback() {
+        const SHARE: u32 = 1;
+        let start = Instant::now();
+        let out = Arc::new(Outgoing::new(Clock::new(start), false, None));
+        out.share_changed(Some(SHARE));
+        let (log, lines) = Log::capture(16);
+        let mut switch = Switch::new(Arc::clone(&out), Some(quiet_pc_sound()), false, log);
+        assert_eq!(switch.unavailable(), Some(NoSound::OldWindows));
+        let quiet = |said: Said| said.tell.is_none() && said.problem.is_none();
+        assert!(!switch.turn(true, SHARE, start));
+        assert!(quiet(switch.step(Some(SHARE))));
+        out.set_held(true, start);
+        assert!(!switch.turn(true, SHARE, start), "paused");
+        assert!(quiet(switch.step(Some(SHARE))), "paused");
+        out.set_held(false, start);
+        assert!(quiet(switch.step(Some(SHARE))), "resumed");
+        assert!(!switch.is_on(Some(SHARE)));
+        assert_eq!(switch.captures, 0);
+        let opened = format!(
+            "pc sound: this pc's windows is older than build {PC_SOUND_BUILD}, so share sound stays off"
+        );
+        let refused = format!(
+            "share {SHARE}: share sound left off, this pc's windows is older than build {PC_SOUND_BUILD}"
+        );
+        assert_eq!(lines.lines(), [opened, refused.clone(), refused]);
+    }
 
     // Access denied already says to turn Share PC sound on again, so its
     // stopped line says it once; any other says it after the reason.

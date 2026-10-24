@@ -55,6 +55,17 @@ pub fn leaves_out_of_captures() -> bool {
     this_pc().is_some_and(|version| version.build >= LEAVE_OUT_BUILD)
 }
 
+// Whether Booth offers Share PC sound here: only from the build Windows
+// documents process loopback in, so on every Windows 11 and no Windows 10,
+// nor when Windows would not say which it is.
+pub fn shares_pc_sound() -> bool {
+    shares_pc_sound_on(this_pc())
+}
+
+fn shares_pc_sound_on(version: Option<WindowsVersion>) -> bool {
+    version.is_some_and(|version| version.build >= voice::audio::PC_SOUND_BUILD)
+}
+
 // None if Windows would not say, and then Booth goes on and finds out.
 pub fn this_pc() -> Option<WindowsVersion> {
     real(shared_page(), reported())
@@ -177,6 +188,19 @@ mod tests {
         assert!(refused(6, 3, 9600).ends_with("This PC runs Windows 8.1."));
         assert!(refused(6, 1, 7601).ends_with("This PC runs Windows 7."));
         assert!(refused(5, 1, 2600).ends_with("This PC runs Windows 5.1 build 2600."));
+    }
+
+    #[test]
+    fn pc_sound_on_windows_11_not_windows_10() {
+        let shares = |build| shares_pc_sound_on(Some(windows(10, 0, build)));
+        let gate = voice::audio::PC_SOUND_BUILD;
+        for build in [19041, 19042, 19045, gate - 1] {
+            assert!(!shares(build), "build {build}");
+        }
+        for build in [gate, 22000, 22631, 26100, 26200] {
+            assert!(shares(build), "build {build}");
+        }
+        assert!(!shares_pc_sound_on(None), "windows would not say");
     }
 
     #[test]

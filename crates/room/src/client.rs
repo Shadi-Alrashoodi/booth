@@ -496,10 +496,12 @@ impl Client {
             setup.joined,
         );
         let pc_sound = setup.screen.pc_sound.clone();
+        let loopback = setup.screen.process_loopback;
         let screen = Screen::new(clock, false, setup.screen, setup.joined);
         let own_sound = Switch::new(
             Arc::clone(screen.sharing.sound()),
             pc_sound,
+            loopback,
             setup.log.clone(),
         );
         let talk = Talk::new(

@@ -868,9 +868,14 @@ impl Client {
             watched_sound: self.screen.watched.and_then(|share| self.sound.word(share)),
             own_sound: OwnSound {
                 on: self.own_sound.is_on(self.screen.sharing.number()),
-                // Only once the host's Hello said what it runs: a new
-                // session reads nothing yet, and would say so meanwhile.
-                unavailable: (self.host_hello && !self.link.sound_read).then_some(NoSound::OldHost),
+                // This PC's Windows first: it holds from the start, and no
+                // host can change it. Only once the host's Hello said what
+                // it runs: a new session reads nothing yet, and would say so
+                // meanwhile.
+                unavailable: self
+                    .own_sound
+                    .unavailable()
+                    .or((self.host_hello && !self.link.sound_read).then_some(NoSound::OldHost)),
                 lost: self.own_sound.lost(self.screen.sharing.number()),
             },
         }

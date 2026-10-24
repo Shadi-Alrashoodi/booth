@@ -836,7 +836,7 @@ mod tests {
     }
 
     use super::*;
-    use room::view::NameMatch;
+    use room::view::{NameMatch, NoSound};
 
     #[test]
     fn key_in_use() {
@@ -1686,6 +1686,15 @@ mod tests {
             assert!(text.ends_with('.') && !text.contains('!'), "{text}");
             assert!(!seen.contains(&text), "{shown:?} says the same as another");
             seen.push(text);
+        }
+    }
+
+    // Under Share PC sound while it cannot go on (screens/room.rs,
+    // sound_line).
+    #[test]
+    fn pc_sound_lines() {
+        for why in [NoSound::OldWindows, NoSound::OldHost] {
+            assert_sentences(why.sentence());
         }
     }
 }

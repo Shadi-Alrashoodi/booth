@@ -134,6 +134,7 @@ impl Setup {
             constant_rate: self.settings.constant_rate(),
             sensitivity_db: self.settings.sensitivity_db(),
             echo_cancellation: self.settings.echo_cancellation() && winver::cancels_echo(),
+            process_loopback: winver::shares_pc_sound(),
             noise_suppression: self.settings.noise_suppression(),
             automatic_volume: self.settings.automatic_volume(),
             #[cfg(feature = "memstats")]

@@ -19,7 +19,7 @@ use common::voiced::{RATE, Voiced, alone, silence, sine, talking, voiced};
 use common::window::Window;
 use common::{Hand, code_to_invite, loopback, poll, timers, wall_clock_us};
 use invite::Version;
-use room::view::{LineKind, NoSound, OwnShare, View};
+use room::view::{LineKind, NoSound, OwnShare, OwnSound, View};
 use room::{Config, Devices, Show, TalkMode, VideoConfig, VideoSource};
 use voice::audio::AudioError;
 use voice::audio::fake::{Fake, Setup};
@@ -637,6 +637,86 @@ fn a_client_sends_no_pc_sound_through_a_host_on_1_2_0() {
     assert_eq!(host.view().numbers.dropped_bad, 0);
     assert!(fake.record().opens.is_empty(), "the pc sound opened");
     assert!(ana.view().numbers.sound.is_none());
+}
+
+// Mara's Windows is older than voice::audio::PC_SOUND_BUILD, though her PC
+// sound would open: Share sound never goes on, however it is asked, paused
+// or not, and says why. Ana, watching by hand, gets none of it and is only
+// told off, at her Watch.
+#[test]
+fn without_process_loopback_share_sound_stays_off() {
+    let _alone = alone();
+    let fake = pc_sound(left_and_right, Duration::ZERO);
+    let mut config = sharer("Mara", PC_SOUND_SINCE, silence, &fake);
+    config.0.voice.process_loopback = false;
+    let (host, code, to_host) = hosting(config);
+    let mut ana = hand_watcher(&code, to_host);
+    let share = shares(&host);
+    ana.say(&watch(share));
+    watched_by(&host, 1);
+    let (_, told) = listen(&mut ana, Duration::from_millis(300));
+    assert_eq!(told, [(share, false)], "off at the Watch");
+    host.room().share_sound(true);
+    let (sound, told) = listen(&mut ana, Duration::from_millis(400));
+    assert!(sound.is_empty(), "{:?}", flags(&sound));
+    assert!(told.is_empty(), "{told:?}");
+    host.room().pause_share(true);
+    host.room().share_sound(true);
+    let (sound, told) = listen(&mut ana, Duration::from_millis(400));
+    assert!(sound.is_empty(), "paused: {:?}", flags(&sound));
+    assert!(told.is_empty(), "paused: {told:?}");
+    host.room().pause_share(false);
+    let (sound, told) = listen(&mut ana, Duration::from_millis(400));
+    assert!(sound.is_empty(), "resumed: {:?}", flags(&sound));
+    assert!(told.is_empty(), "resumed: {told:?}");
+    let view = host.view();
+    assert_eq!(
+        view.share.own_sound,
+        OwnSound {
+            on: false,
+            unavailable: Some(NoSound::OldWindows),
+            lost: None,
+        }
+    );
+    assert_eq!(view.share.problem, None);
+    assert!(!view.chat.iter().any(|said| said.kind == LineKind::Problem));
+    let record = fake.record();
+    assert!(record.opens.is_empty(), "the pc sound opened");
+    assert_eq!(record.most_at_once, 0, "the pc sound was opened");
+    assert_eq!(
+        NoSound::OldWindows.sentence(),
+        "This PC needs Windows 11 to share PC sound."
+    );
+}
+
+// Bo, a friend whose Windows is older than voice::audio::PC_SOUND_BUILD,
+// shares through a host on 1.3.0: his Share sound stays off and says why,
+// his PC sound never opens, and Ana, who watches, is never told it is on.
+#[test]
+fn a_friend_without_process_loopback_sends_no_pc_sound() {
+    let _alone = alone();
+    let fake = pc_sound(left_and_right, Duration::ZERO);
+    let (_host, code, to_host) = hosting(member("Mara", PC_SOUND_SINCE));
+    let ana = joins(member("Ana", PC_SOUND_SINCE), &code, to_host, 2);
+    let mut config = sharer("Bo", PC_SOUND_SINCE, silence, &fake);
+    config.0.voice.process_loopback = false;
+    let bo = joins(config, &code, to_host, 3);
+    let share = shares(&bo);
+    watches(&ana, share);
+    watched_by(&bo, 1);
+    ana.member.wait_for(WAIT, "Ana told off at her Watch", |v| {
+        v.share.watched_sound == Some(false)
+    });
+    bo.room().share_sound(true);
+    let own = bo.view().share.own_sound;
+    assert!(!own.on, "{own:?}");
+    assert_eq!(own.unavailable, Some(NoSound::OldWindows));
+    ana.member.holds_for(
+        Duration::from_millis(300),
+        "Ana told the sound is on",
+        |v| v.share.watched_sound != Some(true),
+    );
+    assert!(fake.record().opens.is_empty(), "the pc sound opened");
 }
 
 // A watcher played by hand watches Mara's share with Share sound on: the

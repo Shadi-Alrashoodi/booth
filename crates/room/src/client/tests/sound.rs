@@ -641,6 +641,55 @@ fn the_old_host_line_waits_for_the_hosts_hello() {
     );
 }
 
+// This PC's Windows is older than voice::audio::PC_SOUND_BUILD: its line
+// shows before the host's Hello, and stays through a new session and a host
+// on 1.2.0, which would otherwise show the old-host line. The steps are those of
+// the_old_host_line_waits_for_the_hosts_hello.
+#[test]
+fn the_windows_line_holds_from_the_start() {
+    let start = Instant::now();
+    let mut rig = Rig::new(Timers::default(), start);
+    rig.client.own_sound = Switch::new(
+        Arc::clone(rig.client.screen.sharing.sound()),
+        Some(crate::testing::quiet_pc_sound()),
+        false,
+        Log::off(),
+    );
+    let windows = Some(crate::view::NoSound::OldWindows);
+    assert_eq!(rig.client.share_view().own_sound.unavailable, windows);
+    let (mut rig, _) = Rig::joined(rig, start);
+    assert_eq!(rig.client.share_view().own_sound.unavailable, windows);
+
+    let woke = start + Duration::from_secs(20);
+    assert!(rig.client.slept(Duration::from_secs(20), woke, &rig.socket));
+    rig.tick(woke);
+    let (_, mut session, response) = rig.host.answer_all(woke).pop().expect("a try");
+    rig.deliver(&response, woke);
+    assert!(rig.host.open_all(&mut session) > 0);
+    assert_eq!(
+        rig.client.share_view().own_sound.unavailable,
+        windows,
+        "a new session"
+    );
+    rig.host.reliable = Reliable::new();
+    let hello = Message::Hello {
+        version: Version {
+            major: 1,
+            minor: 2,
+            patch: 0,
+        },
+        name: String::from("Mara"),
+        reached: None,
+    };
+    let hello = rig.host.say(&mut session, &hello, woke);
+    rig.deliver(&hello, woke);
+    assert_eq!(
+        rig.client.share_view().own_sound.unavailable,
+        windows,
+        "a host on 1.2.0"
+    );
+}
+
 // A new session forgets what the sharer said on the old one: the host forgot
 // the watch, which this PC asks for again, and says the word again in its
 // answer to that Watch; a word said meanwhile went with the old session.

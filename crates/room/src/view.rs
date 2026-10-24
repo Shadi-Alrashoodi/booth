@@ -99,6 +99,9 @@ pub struct OwnSound {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoSound {
+    // This PC's Windows is older than voice::audio::PC_SOUND_BUILD, the first
+    // in which Windows documents process loopback: every Windows 10.
+    OldWindows,
     // The host runs a Booth older than 1.3.0, which passes no PC sound on.
     OldHost,
 }
@@ -107,6 +110,7 @@ impl NoSound {
     // What the line under the switch says.
     pub fn sentence(self) -> &'static str {
         match self {
+            NoSound::OldWindows => "This PC needs Windows 11 to share PC sound.",
             NoSound::OldHost => "The host needs Booth 1.3.0 or later for PC sound.",
         }
     }

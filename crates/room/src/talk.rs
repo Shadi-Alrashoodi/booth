@@ -127,6 +127,10 @@ pub struct VoiceConfig {
     // Windows' echo cancellation asked of the microphone (see voice's
     // wasapi.rs). Off here; the app asks for it where Windows can do it.
     pub echo_cancellation: bool,
+    // Share PC sound captures with Windows' process loopback, documented
+    // from build voice::audio::PC_SOUND_BUILD. Off, it never goes on and the
+    // panel says why. On here; the app turns it off where Windows is older.
+    pub process_loopback: bool,
     // RNNoise on the microphone, off by default: it adds 10 to 20 ms.
     pub noise_suppression: bool,
     // A quiet microphone brought up to a steady level, on by default.
@@ -147,6 +151,7 @@ impl Default for VoiceConfig {
             constant_rate: true,
             sensitivity_db: DEFAULT_SENSITIVITY_DB,
             echo_cancellation: false,
+            process_loopback: true,
             noise_suppression: false,
             automatic_volume: true,
             devices: Devices::Windows,

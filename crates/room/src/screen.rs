@@ -1723,6 +1723,8 @@ pub(crate) struct ScreenSetup {
     // Where the share's PC sound is captured: the fake of Devices::Fake, or
     // Windows' own with None.
     pub pc_sound: Option<voice::audio::fake::Fake>,
+    // VoiceConfig::process_loopback.
+    pub process_loopback: bool,
 }
 
 // The room's side of sharing that both roles keep, under the state lock.

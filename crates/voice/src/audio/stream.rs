@@ -25,7 +25,7 @@ const WAIT: Duration = Duration::from_millis(20);
 // and come back in about this time when they switch profiles, and Windows
 // needs a moment to pick the next default.
 pub const REOPEN_AFTER: Duration = Duration::from_secs(1);
-// Windows' process loopback, which PC sound needs, comes with this build.
+// Windows documents process loopback, which PC sound needs, from this build.
 pub const PC_SOUND_BUILD: u32 = 20348;
 // A device chosen in settings that is away is tried again whenever Windows
 // says the devices changed, and at least this often: a format change in the
@@ -505,8 +505,8 @@ pub struct PcSound(Handle);
 
 impl PcSound {
     // From Windows' process loopback (see wasapi.rs), which leaves this
-    // process and every process it started out. Builds before PC_SOUND_BUILD
-    // have none, and the open fails there.
+    // process and every process it started out. Windows documents it from
+    // PC_SOUND_BUILD; an older build may refuse the open.
     pub fn start(
         audio: impl FnMut(&[f32], Instant, bool) + Send + 'static,
         events: impl FnMut(Event) + Send + 'static,

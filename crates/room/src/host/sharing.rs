@@ -1996,7 +1996,7 @@ impl Host {
             watched_sound: self.screen.watched.and_then(|share| self.sound.word(share)),
             own_sound: OwnSound {
                 on: self.own_sound.is_on(self.own_live_share()),
-                unavailable: None,
+                unavailable: self.own_sound.unavailable(),
                 lost: self.own_sound.lost(self.own_live_share()),
             },
         }
