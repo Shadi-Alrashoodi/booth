@@ -5,12 +5,14 @@
 
 use super::*;
 use crate::control::EntryShare;
+use crate::screen::WatchEvent;
 use crate::sound::SoundFrame;
 use crate::talk::Speaker;
 use crate::view::{ShareState, WatchCap};
 use voice::stereo::{Encoder, FRAME, MAX_PACKET};
 
 const BO: [u8; 32] = [9; 32];
+const CY: [u8; 32] = [11; 32];
 const BO_SLOT: u8 = 2;
 const SHARE: u32 = 4;
 
@@ -31,6 +33,18 @@ fn watch_pressed(version: Version, start: Instant) -> (Rig, Session, Speaker) {
 // The host's roster: Mara hosts, and Bo shares `share` from his slot, or
 // nothing.
 fn bo_shares(rig: &mut Rig, session: &mut Session, share: Option<u32>, now: Instant) {
+    roster_of(rig, session, (BO, "Bo"), share, now);
+}
+
+// The same with `sharer` in Bo's slot, which a new run of the host can give
+// to someone else.
+fn roster_of(
+    rig: &mut Rig,
+    session: &mut Session,
+    sharer: ([u8; 32], &str),
+    share: Option<u32>,
+    now: Instant,
+) {
     let entry = |key: [u8; 32], slot: u8, name: &str, share| control::Entry {
         key,
         slot,
@@ -48,9 +62,9 @@ fn bo_shares(rig: &mut Rig, session: &mut Session, share: Option<u32>, now: Inst
             entry(*rig.host.identity.public(), 0, "Mara", None),
             entry(*rig.client.identity.public(), 1, "Ana", None),
             entry(
-                BO,
+                sharer.0,
                 BO_SLOT,
-                "Bo",
+                sharer.1,
                 share.map(|number| EntryShare { number, fps: 60 }),
             ),
         ],
@@ -152,6 +166,43 @@ fn loudest(speaker: &mut Speaker) -> f32 {
     let mut out = [0.0f32; 960];
     speaker.fill(&mut out);
     out.iter().fold(0.0, |most, s| most.max(s.abs()))
+}
+
+// Ana's PC sleeps 20 s, long enough to join again at `woke` on a new session,
+// which asks again for the share she watched right behind its Hello, and the
+// host says its own Hello on it. Have the host say the rest at `woke` too,
+// for the reason bo_says gives.
+fn new_session(rig: &mut Rig, woke: Instant) -> Session {
+    assert!(rig.client.slept(Duration::from_secs(20), woke, &rig.socket));
+    rig.tick(woke);
+    let (_, mut session, response) = rig.host.answer_all(woke).pop().expect("a try");
+    rig.deliver(&response, woke);
+    // A new session starts the stream over, on the host's side too.
+    rig.host.reliable = Reliable::new();
+    let said = told_host(&mut rig.host, &mut session);
+    let asked = |message: &Message| {
+        matches!(
+            message,
+            Message::Watch {
+                share: SHARE,
+                on: true,
+                ..
+            }
+        )
+    };
+    assert!(said.iter().any(asked), "{said:?}");
+    let hello = rig.host.hello(&mut session, woke);
+    rig.deliver(&hello, woke);
+    session
+}
+
+// The chat's system lines, oldest first.
+fn system_lines(rig: &Rig) -> Vec<String> {
+    let chat = rig.client.history.shared();
+    chat.iter()
+        .filter(|line| line.kind == LineKind::System)
+        .map(|line| line.text.clone())
+        .collect()
 }
 
 // Only Bo's slot and his share's number play. Sound from another slot or for
@@ -1009,6 +1060,121 @@ fn a_watch_of_a_share_numbered_again_waits_for_its_own_answer() {
     assert_eq!(words(&rig), (Paused, Some(true)));
     bo_says(&mut rig, &mut session, false, woke);
     assert_eq!(words(&rig), (Paused, Some(false)));
+}
+
+// Ana's PC sleeps while the host restarts, and the new run gives Cy, in Bo's
+// slot now, the number of the share she watched. The Watch she asks again may
+// have started her watch of Cy's share at the host, so her first roster ends
+// the watch with Watch off: her viewer closes, the chat says Bo stopped and
+// Cy started, and nothing from that slot plays. She keeps her count of Watches
+// due, so the answer to the Watch asked again, before the roster or after
+// it, never passes for the answer to her next press.
+#[test]
+fn someone_elses_share_under_the_number_watched_ends_the_watch() {
+    use crate::view::ShareState::{Away, Live, Paused};
+    for answered_first in [true, false] {
+        let start = Instant::now();
+        let (mut rig, _, mut speaker) = watching(peer::PC_SOUND_SINCE, start);
+        let woke = start + Duration::from_secs(20);
+        let mut session = new_session(&mut rig, woke);
+        if answered_first {
+            answer(&mut rig, &mut session, Away, true, woke);
+        }
+        let (log, logged) = Log::capture(64);
+        rig.client.log = log;
+        let bad = rig.client.drops.bad;
+        roster_of(&mut rig, &mut session, (CY, "Cy"), Some(SHARE), woke);
+        assert_eq!(rig.client.screen.watched, None, "the watch ends");
+        let cy = keys::fingerprint(&CY);
+        let logged = logged.lines();
+        assert!(
+            logged
+                .iter()
+                .any(|line| line.starts_with(&format!("watch {SHARE}: ")) && line.contains(&cy)),
+            "{logged:?}"
+        );
+        let share = rig.client.share_view();
+        assert!(!share.watching);
+        assert_eq!(share.watched_sound, None);
+        let events = rig.client.screen.watching.take_events();
+        assert_eq!(events.last(), Some(&WatchEvent::Ended { share: SHARE }));
+        let said = told_host(&mut rig.host, &mut session);
+        let off = |message: &Message| {
+            matches!(
+                message,
+                Message::Watch {
+                    share: SHARE,
+                    on: false,
+                    ..
+                }
+            )
+        };
+        assert!(said.iter().any(off), "{said:?}");
+        let lines = system_lines(&rig);
+        assert!(
+            lines.ends_with(&[
+                String::from("Bo stopped sharing"),
+                String::from("Cy started sharing")
+            ]),
+            "{lines:?}"
+        );
+        let frames = stereo_frames(10);
+        for seq in 0..10u16 {
+            let frame = &frames[usize::from(seq)];
+            let packet = relayed(&mut session, BO_SLOT, SHARE, seq, seq == 0, frame);
+            rig.deliver(&packet, woke);
+            assert_eq!(loudest(&mut speaker), 0.0, "frame {seq}");
+        }
+        assert_eq!(rig.client.drops.bad, bad);
+
+        assert!(rig.client.watch(SHARE, true, woke, &rig.socket));
+        let started = WatchEvent::Started {
+            share: SHARE,
+            fps: 60,
+            name: String::from("Cy"),
+        };
+        let events = rig.client.screen.watching.take_events();
+        assert_eq!(events.last(), Some(&started));
+        if !answered_first {
+            answer(&mut rig, &mut session, Away, true, woke);
+            assert_eq!(
+                words(&rig),
+                (Live, None),
+                "the answer to the Watch asked again"
+            );
+        }
+        answer(&mut rig, &mut session, Paused, false, woke);
+        assert_eq!(words(&rig), (Paused, Some(false)));
+    }
+}
+
+// The common case: Ana's PC sleeps, and the new session's roster still has
+// Bo sharing under the number she watched. The watch goes on with no Watch
+// off, the chat says nothing, and his sound plays.
+#[test]
+fn a_new_session_keeps_the_watch_of_the_same_sharer() {
+    let start = Instant::now();
+    let (mut rig, _, mut speaker) = watching(peer::PC_SOUND_SINCE, start);
+    let woke = start + Duration::from_secs(20);
+    let mut session = new_session(&mut rig, woke);
+    answer(&mut rig, &mut session, ShareState::Live, true, woke);
+    let lines = system_lines(&rig);
+    bo_shares(&mut rig, &mut session, Some(SHARE), woke);
+    assert_eq!(rig.client.screen.watched, Some(SHARE), "the watch is kept");
+    assert!(rig.client.share_view().watching);
+    let said = told_host(&mut rig.host, &mut session);
+    let off = |message: &Message| matches!(message, Message::Watch { on: false, .. });
+    assert!(!said.iter().any(off), "{said:?}");
+    assert_eq!(system_lines(&rig), lines);
+    let frames = stereo_frames(20);
+    let mut heard = 0.0f32;
+    for seq in 0..20u16 {
+        let frame = &frames[usize::from(seq)];
+        let packet = relayed(&mut session, BO_SLOT, SHARE, seq, seq == 0, frame);
+        rig.deliver(&packet, woke);
+        heard = heard.max(loudest(&mut speaker));
+    }
+    assert!(heard > 0.15, "{heard}");
 }
 
 // A client standing for a copy older than PC_SOUND_SINCE counts channel 8

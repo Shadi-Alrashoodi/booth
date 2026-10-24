@@ -187,8 +187,9 @@ impl Client {
         if current.number != share || entry.key == own || self.screen.watched == Some(share) {
             return false;
         }
-        let name = entry.name.clone();
+        let (name, sharer) = (entry.name.clone(), entry.key);
         self.screen.watched = Some(share);
+        self.watched_sharer = Some(sharer);
         self.screen.problem = None;
         // Live until the host's answer says how the share stands; a host
         // older than 1.3.0 gives none.
@@ -694,40 +695,57 @@ impl Client {
 
     // A new roster: who started and stopped sharing, and whether this PC's
     // own share and the share it watches are still on.
-    pub(super) fn roster_arrived(&mut self, old: &Roster) {
+    pub(super) fn roster_arrived(&mut self, old: &Roster, now: Instant, socket: &Socket) {
         let own = *self.identity.public();
         let was = sharer_of(old).map(|(entry, share)| (entry.key, entry.name.clone(), share));
-        let now =
+        let current =
             sharer_of(&self.roster).map(|(entry, share)| (entry.key, entry.name.clone(), share));
-        let number = |share: &Option<([u8; 32], String, EntryShare)>| {
-            share.as_ref().map(|(_, _, share)| share.number)
+        // By sharer as well as number: after a host restart the old number
+        // can be someone else's share, which started as the other stopped.
+        let sharer_and_number = |share: &Option<([u8; 32], String, EntryShare)>| {
+            share.as_ref().map(|(key, _, share)| (*key, share.number))
         };
         // The first roster of the room says who shares already, not who
         // started.
         let first = old.entries.is_empty();
-        if number(&was) != number(&now) && !first {
+        if sharer_and_number(&was) != sharer_and_number(&current) && !first {
             if let Some((key, name, _)) = was.clone().filter(|(key, _, _)| *key != own) {
                 self.system_line(key, name.clone(), format!("{name} stopped sharing"));
             }
-            if let Some((key, name, _)) = now.clone().filter(|(key, _, _)| *key != own) {
+            if let Some((key, name, _)) = current.clone().filter(|(key, _, _)| *key != own) {
                 self.system_line(key, name.clone(), format!("{name} started sharing"));
             }
         }
         // The host ended this PC's share: it restarted the link, or let it go.
         if let OwnShare::Sharing { number: mine, .. } = self.screen.sharing.state() {
-            let still = now
+            let still = current
                 .as_ref()
                 .is_some_and(|(key, _, share)| *key == own && share.number == mine);
             if !still {
                 log!(self.log, "share {mine}: the host's roster says it is over");
-                self.control_share_ended(Instant::now());
+                self.control_share_ended(now);
                 self.screen.sharing.set_state(OwnShare::Off);
             }
         }
         self.control_roster();
         if let Some(watched) = self.screen.watched {
-            match now.as_ref().filter(|(_, _, share)| share.number == watched) {
+            match current
+                .as_ref()
+                .filter(|(_, _, share)| share.number == watched)
+            {
                 None => self.stop_watching(),
+                // Someone else's share under the number watched, after a host
+                // restart. The Watch asked again may have started this PC's
+                // watch of it at the host, which then keeps sending it here and
+                // answers no later Watch of it until Watch off.
+                Some((key, _, _)) if self.watched_sharer != Some(*key) => {
+                    log!(
+                        self.log,
+                        "watch {watched}: the host's roster says {} shares it now, so this pc stops watching",
+                        keys::fingerprint(key)
+                    );
+                    self.watch(watched, false, now, socket);
+                }
                 Some((_, _, share)) => {
                     let before = was.as_ref().map(|(_, _, share)| share.fps);
                     if before != Some(share.fps) {
@@ -745,9 +763,11 @@ impl Client {
         // Within one run no answer for a share follows the roster that shows
         // it gone: both go on the same ordered stream, and share numbers are
         // never reused.
-        self.answers_due = self
-            .answers_due
-            .filter(|&(asked, _)| number(&now) == Some(asked));
+        // A watch ended above for someone else's share keeps its count: the
+        // host may have taken the Watch asked again, and its answer must not
+        // pass for the answer to a press that follows.
+        let shown = current.as_ref().map(|(_, _, share)| share.number);
+        self.answers_due = self.answers_due.filter(|&(asked, _)| shown == Some(asked));
     }
 
     // Every timer pass: the offset that turns the sharer's capture times
@@ -831,6 +851,7 @@ impl Client {
 
     fn stop_watching(&mut self) {
         self.screen.stop_watching();
+        self.watched_sharer = None;
         self.sound.stop(Instant::now());
         self.sharer_clock = None;
     }

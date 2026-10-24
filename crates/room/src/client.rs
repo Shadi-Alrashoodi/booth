@@ -430,6 +430,9 @@ pub(crate) struct Client {
     // those Watches the host has yet to answer: a word of that share before
     // the last answer was sent to a watch this PC stopped.
     answers_due: Option<(u32, u32)>,
+    // The sharer of the share this PC watches, as the roster had it at the
+    // press: after a host restart the same number can be someone else's.
+    watched_sharer: Option<[u8; 32]>,
     // The frame rate the host has for this PC's share, which its roster
     // shows: the one asked with, then what the share's thread said it runs
     // at. Kept here because the roster copy can be a step behind.
@@ -603,6 +606,7 @@ impl Client {
             sharer_clock: None,
             sharer_unread: None,
             answers_due: None,
+            watched_sharer: None,
             told_fps: None,
             input_events: Vec::with_capacity(crate::remote::MAX_EVENTS),
         }
@@ -2333,7 +2337,7 @@ impl Client {
                     let keys: Vec<[u8; 32]> =
                         self.roster.entries.iter().map(|entry| entry.key).collect();
                     self.talk.keep_only(&keys, now);
-                    self.roster_arrived(&old);
+                    self.roster_arrived(&old, now, socket);
                 }
                 Some(Message::WorstLoss(lost)) => {
                     self.talk.listeners_lost(talk::from_wire(lost), now);
