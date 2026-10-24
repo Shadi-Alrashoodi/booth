@@ -294,9 +294,9 @@ fn open_and_drop_leaks_nothing() {
         let name = encoder.name().to_string();
         let held = usage(&gpu);
         drop(encoder);
+        let held_threads = held.threads - closed.threads;
         println!(
-            "{name}: one open holds {} threads, {} handles, {:.1} MB of GPU memory",
-            held.threads - closed.threads,
+            "{name}: one open holds {held_threads} threads, {} handles, {:.1} MB of GPU memory",
             held.handles - closed.handles,
             held.gpu_mb - closed.gpu_mb
         );
@@ -325,11 +325,14 @@ fn open_and_drop_leaks_nothing() {
             before.private_mb,
             after.private_mb
         );
-        // One thread of slack for Windows' thread pool; a leaked encoder
-        // keeps all of its own, printed above.
+        // Threads Booth does not start can come and go over 30 opens: on the
+        // runner, 30 opens of the software encoder once left 2 more, where one
+        // open holds 5. A leaked encoder keeps all of its own, printed above,
+        // so the limit is one fewer than one open holds, and never under 1.
+        let limit = (held_threads - 1).max(1);
         assert!(
-            after.threads - before.threads <= 1,
-            "{kind} {codec}: {} threads more",
+            after.threads - before.threads <= limit,
+            "{kind} {codec}: {} threads more over {OPENS} opens; one open holds {held_threads}, so the limit is {limit}",
             after.threads - before.threads
         );
         assert!(
