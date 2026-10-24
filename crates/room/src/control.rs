@@ -64,6 +64,8 @@ const SHARE_LIMITS: u8 = 26;
 const SHARE_STATE: u8 = 27;
 // From 1.3.0 on: whether the sharer's PC sound goes out with the share.
 const SHARE_SOUND: u8 = 28;
+// From 1.3.0 on: the host's answer to a Watch that starts a watch.
+const WATCH_ANSWER: u8 = 29;
 
 const IS_HOST: u8 = 1 << 0;
 const JOINED_BY_INVITE: u8 = 1 << 1;
@@ -277,16 +279,25 @@ pub(crate) enum Message {
         limits: Option<ShareLimits>,
     },
     // The sharer to the host whenever it changes, and the host to each
-    // watcher then and when one starts watching a share that is not live.
+    // watcher then; a new watcher hears it in WatchAnswer.
     ShareState {
         share: u32,
         state: ShareState,
     },
     // The sharer to the host whenever it changes, and the host to each
-    // watcher then and when one starts watching a share whose sound is on.
+    // watcher then; a new watcher hears it in WatchAnswer.
     ShareSound {
         share: u32,
         on: bool,
+    },
+    // The host to a watcher, once for each of its Watches that starts a
+    // watch and never otherwise: both words as the other watchers were last
+    // told. The watcher counts on that and takes no ShareState or ShareSound
+    // of the share before the answer to its last Watch.
+    WatchAnswer {
+        share: u32,
+        state: ShareState,
+        sound: bool,
     },
 }
 
@@ -669,16 +680,22 @@ impl Message {
             Message::ShareState { share, state } => {
                 out.push(SHARE_STATE);
                 out.extend_from_slice(&share.to_le_bytes());
-                out.push(match state {
-                    ShareState::Live => 0,
-                    ShareState::Paused => 1,
-                    ShareState::Away => 2,
-                });
+                out.push(state_byte(*state));
             }
             Message::ShareSound { share, on } => {
                 out.push(SHARE_SOUND);
                 out.extend_from_slice(&share.to_le_bytes());
                 out.push(u8::from(*on));
+            }
+            Message::WatchAnswer {
+                share,
+                state,
+                sound,
+            } => {
+                out.push(WATCH_ANSWER);
+                out.extend_from_slice(&share.to_le_bytes());
+                out.push(state_byte(*state));
+                out.push(u8::from(*sound));
             }
         }
         out
@@ -984,16 +1001,16 @@ impl Message {
             }
             SHARE_STATE => Message::ShareState {
                 share: r.share()?,
-                state: match r.u8()? {
-                    0 => ShareState::Live,
-                    1 => ShareState::Paused,
-                    2 => ShareState::Away,
-                    _ => return None,
-                },
+                state: r.share_state()?,
             },
             SHARE_SOUND => Message::ShareSound {
                 share: r.share()?,
                 on: r.yes_no()?,
+            },
+            WATCH_ANSWER => Message::WatchAnswer {
+                share: r.share()?,
+                state: r.share_state()?,
+                sound: r.yes_no()?,
             },
             _ => return None,
         };
@@ -1157,6 +1174,16 @@ impl fmt::Debug for Message {
                 .field("share", share)
                 .field("on", on)
                 .finish(),
+            Message::WatchAnswer {
+                share,
+                state,
+                sound,
+            } => f
+                .debug_struct("WatchAnswer")
+                .field("share", share)
+                .field("state", state)
+                .field("sound", sound)
+                .finish(),
         }
     }
 }
@@ -1167,6 +1194,14 @@ const LONGEST_PERIOD: Duration = Duration::from_secs(1);
 
 fn micros(period: Option<Duration>) -> u32 {
     period.map_or(0, |period| period.min(LONGEST_PERIOD).as_micros() as u32)
+}
+
+fn state_byte(state: ShareState) -> u8 {
+    match state {
+        ShareState::Live => 0,
+        ShareState::Paused => 1,
+        ShareState::Away => 2,
+    }
 }
 
 // The outer None is a period no driver has; the inner one is no stream.
@@ -1375,6 +1410,15 @@ impl<'a> Reader<'a> {
         match self.u8()? {
             0 => Some(false),
             1 => Some(true),
+            _ => None,
+        }
+    }
+
+    fn share_state(&mut self) -> Option<ShareState> {
+        match self.u8()? {
+            0 => Some(ShareState::Live),
+            1 => Some(ShareState::Paused),
+            2 => Some(ShareState::Away),
             _ => None,
         }
     }
@@ -3050,7 +3094,6 @@ mod share_state_tests {
 #[cfg(test)]
 mod share_sound_tests {
     use super::*;
-    use proptest::prelude::*;
 
     fn sound(on: bool) -> Message {
         Message::ShareSound { share: 7, on }
@@ -3080,14 +3123,63 @@ mod share_sound_tests {
             assert!(Message::decode(&bent).is_none(), "{bent:?}");
         }
     }
+}
+
+#[cfg(test)]
+mod watch_answer_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn answer(state: ShareState, sound: bool) -> Message {
+        Message::WatchAnswer {
+            share: 7,
+            state,
+            sound,
+        }
+    }
+
+    #[test]
+    fn watch_answer_bytes() {
+        for (state, byte) in [
+            (ShareState::Live, 0),
+            (ShareState::Paused, 1),
+            (ShareState::Away, 2),
+        ] {
+            for (sound, on) in [(false, 0), (true, 1)] {
+                let bytes = answer(state, sound).encode().to_vec();
+                assert_eq!(bytes, [29, 7, 0, 0, 0, byte, on]);
+                let back = Message::decode(&bytes).expect("decodes");
+                assert_eq!(back.encode().to_vec(), bytes);
+            }
+        }
+    }
+
+    // Share 0, a state this version does not know, a sound byte but 0 and
+    // 1, and a byte too many or too few.
+    #[test]
+    fn bent_watch_answer_refused() {
+        let good = answer(ShareState::Paused, true).encode().to_vec();
+        for bent in [
+            vec![29, 0, 0, 0, 0, 1, 1],
+            vec![29, 7, 0, 0, 0, 3, 1],
+            vec![29, 7, 0, 0, 0, 1, 2],
+            vec![29, 7, 0, 0, 0, 1, 0xFF],
+            [&good[..], &[0]].concat(),
+            good[..good.len() - 1].to_vec(),
+        ] {
+            assert!(Message::decode(&bent).is_none(), "{bent:?}");
+        }
+    }
 
     proptest! {
-        // Whatever gets through encodes back to the same bytes.
+        // Whatever gets through encodes back to the same bytes, for the
+        // sharer's two words and the answer that carries both.
         #[test]
-        fn any_share_sound_bytes_parse_or_refused(
+        fn any_share_word_bytes_parse_or_refused(
+            kind in SHARE_STATE..=WATCH_ANSWER,
             body in prop::collection::vec(any::<u8>(), 0..12),
         ) {
-            let mut sent = vec![SHARE_SOUND];
+            let mut sent = vec![kind];
             sent.extend(body);
             if let Some(message) = Message::decode(&sent) {
                 prop_assert_eq!(message.encode().to_vec(), sent);

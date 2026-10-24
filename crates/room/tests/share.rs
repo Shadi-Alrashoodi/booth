@@ -14,14 +14,17 @@ use std::time::{Duration, Instant};
 
 use channels::Channel;
 use channels::video::{FrameFacts, Packetizer};
-use common::{Forwarder, Hand, Member, code_to_invite, loopback, poll, timers};
+use common::link::Link;
+use common::{
+    Forwarder, Hand, Member, code_to_invite, fresh_log, loopback, poll, read_log, timers,
+};
 use invite::Invite;
-use room::Timers;
 use room::screen::{
     Answer, Back, Batch, OwnShare, Pointer, Refusal, Shape, ShapeKind, Sharing, Video, WatchEvent,
     Watching,
 };
-use room::view::{LineKind, LinkState, Source, View};
+use room::view::{LineKind, LinkState, ShareState, Source, View};
+use room::{Config, Timers};
 
 // What a video packet may carry on a 1200-byte datagram.
 const PAYLOAD: usize = 1200 - 32 - 1 - 2;
@@ -993,5 +996,259 @@ fn video_speeds_up_pings_and_feeds_the_strip() {
     println!(
         "pings back to once a second {:.1} s after the video stopped",
         stopped.elapsed().as_secs_f32()
+    );
+}
+
+// 1.3.0 is the first copy that tells a watcher how the share stands and
+// whether its PC sound goes out: the host in its answer to each Watch that
+// starts a watch, then as either changes.
+const V1_3_0: invite::Version = invite::Version {
+    major: 1,
+    minor: 3,
+    patch: 0,
+};
+
+fn on_1_3_0(name: &str, timers: Timers) -> Config {
+    let mut config = common::config(name, timers);
+    config.version = V1_3_0;
+    config
+}
+
+// Mara hosts, and Bo, a friend's program played by hand, shares, both on
+// 1.3.0. The invite is multi-use, for Ana after him.
+fn bo_shares() -> (Member, Hand, String, u32) {
+    let host = Member::host_with(on_1_3_0("Mara", timers()));
+    host.room().new_invite(true);
+    let code = host
+        .wait_for(WAIT, "a multi-use invite", |v| {
+            v.invite
+                .as_ref()
+                .is_some_and(|i| i.multi_use && !i.code.is_empty())
+        })
+        .invite
+        .expect("an invite")
+        .code;
+    let to_host = loopback(host.port());
+    let mut bo = Hand::join_as(&code_to_invite(&code, to_host), to_host, "Bo", V1_3_0);
+    // ShareStart, kind 9, at 60 fps.
+    bo.say(&[9, 60]);
+    let view = until(&host, &mut bo, "Bo sharing", |v| {
+        v.share.current.as_ref().is_some_and(|c| c.name == "Bo")
+    });
+    let share = view.share.current.expect("a share").number;
+    (host, bo, code, share)
+}
+
+// Ana live with Bo's share in her roster: she and Mara watch it, and the
+// host's answer to her Watch says it is live and its sound off.
+fn both_watch(host: &Member, ana: &Member, bo: &mut Hand, share: u32) {
+    until(ana, bo, "Bo's share in Ana's roster", |v| {
+        v.strip.state == LinkState::Live
+            && v.share.current.as_ref().is_some_and(|c| c.number == share)
+    });
+    ana.room().watch(share, true);
+    host.room().watch(share, true);
+    until(ana, bo, "the answer to Ana's Watch", |v| {
+        v.share.watching && words(v) == (ShareState::Live, Some(false))
+    });
+}
+
+// How the share watched stands and whether its PC sound goes out, as the
+// panel shows them.
+fn words(view: &View) -> (ShareState, Option<bool>) {
+    (view.share.watched_state, view.share.watched_sound)
+}
+
+// ShareState, kind 27, as a sharer says it.
+fn share_state(share: u32, state: ShareState) -> Vec<u8> {
+    let mut out = vec![27];
+    out.extend_from_slice(&share.to_le_bytes());
+    out.push(match state {
+        ShareState::Live => 0,
+        ShareState::Paused => 1,
+        ShareState::Away => 2,
+    });
+    out
+}
+
+// ShareSound, kind 28: whether the share's PC sound goes out.
+fn share_sound(share: u32, on: bool) -> Vec<u8> {
+    let mut out = vec![28];
+    out.extend_from_slice(&share.to_le_bytes());
+    out.push(u8::from(on));
+    out
+}
+
+// As Member::wait_for, with Bo's pings answered meanwhile: a hand keeps its
+// place in the room only while it sends.
+fn until(member: &Member, bo: &mut Hand, what: &str, ok: impl Fn(&View) -> bool) -> View {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        bo.answer_pings();
+        let view = member.view();
+        if ok(&view) {
+            return view;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: not within {WAIT:?}. Last view: {view:#?}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+// As Member::holds_for, with Bo's pings answered meanwhile.
+fn holds(member: &Member, bo: &mut Hand, span: Duration, what: &str, ok: impl Fn(&View) -> bool) {
+    let end = Instant::now() + span;
+    while Instant::now() < end {
+        bo.answer_pings();
+        let view = member.view();
+        assert!(ok(&view), "{what}. View: {view:#?}");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+// Bo answers his pings and says nothing else until `at`.
+fn wait_until(bo: &mut Hand, at: Instant) {
+    while Instant::now() < at {
+        bo.answer_pings();
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+// Ana stops watching Bo's share and watches it again while the pause the
+// host told her first watch is held up on its way to her, and by her second
+// Watch the share is live again. The pause reaches her after that Watch,
+// ahead of the host's answer to it, and only the answer counts.
+#[test]
+fn a_watch_again_takes_no_word_of_the_watch_before() {
+    use ShareState::{Live, Paused};
+    let (host, mut bo, code, share) = bo_shares();
+    let link = Link::new(loopback(host.port()));
+    let ana = Member::join_with(
+        on_1_3_0("Ana", timers()),
+        Arc::new(keys::Identity::generate()),
+        code_to_invite(&code, link.addr),
+    );
+    both_watch(&host, &ana, &mut bo, share);
+    // Toward Ana only, and for well under reconnecting_after, so her link
+    // and its session stay as they are.
+    let held = common::link::Shape {
+        blocked: true,
+        ..Default::default()
+    };
+    link.shape(held, Default::default());
+    let paused = Instant::now();
+    bo.say(&share_state(share, Paused));
+    until(&host, &mut bo, "the pause at the host's viewer", |v| {
+        v.share.watched_state == Paused
+    });
+    ana.room().watch(share, false);
+    until(&host, &mut bo, "Ana's Stop at the host", |v| {
+        v.share
+            .current
+            .as_ref()
+            .is_some_and(|c| c.watchers == Some(1))
+    });
+    // Past the 250 ms the host leaves between two words it passes on, so
+    // this one goes at once.
+    wait_until(&mut bo, paused + Duration::from_millis(300));
+    bo.say(&share_state(share, Live));
+    until(&host, &mut bo, "the live at the host's viewer", |v| {
+        v.share.watched_state == Live
+    });
+    ana.room().watch(share, true);
+    until(&host, &mut bo, "Ana's second Watch at the host", |v| {
+        v.share
+            .current
+            .as_ref()
+            .is_some_and(|c| c.watchers == Some(2))
+    });
+    link.shape(Default::default(), Default::default());
+    until(&ana, &mut bo, "the answer to Ana's second Watch", |v| {
+        v.share.watched_sound == Some(false)
+    });
+    holds(
+        &ana,
+        &mut bo,
+        Duration::from_millis(300),
+        "Ana took the pause told her first watch",
+        |v| v.share.watched_state == Live,
+    );
+}
+
+// Ana's session runs out while Bo's share is paused with its sound on, and
+// while her link is down he says it is live and the sound off: words that
+// go with the old session. Her new session asks for the watch again, and
+// the host's answer says how the share stands now.
+#[test]
+fn a_new_session_hears_that_the_share_is_live_again() {
+    use ShareState::{Live, Paused};
+    let (host, mut bo, code, share) = bo_shares();
+    let forwarder = Forwarder::new(loopback(host.port()));
+    // A session that cannot rekey runs out 600 ms after it began.
+    let short = Timers {
+        rekey_after: Duration::from_millis(300),
+        reject_after: Duration::from_millis(600),
+        ..timers()
+    };
+    let log = fresh_log("share", "new-session", "client");
+    let mut config = on_1_3_0("Ana", short);
+    config.log = Some(log.clone());
+    let ana = Member::join_with(
+        config,
+        Arc::new(keys::Identity::generate()),
+        code_to_invite(&code, forwarder.addr),
+    );
+    both_watch(&host, &ana, &mut bo, share);
+    bo.say(&share_state(share, Paused));
+    bo.say(&share_sound(share, true));
+    until(
+        &ana,
+        &mut bo,
+        "Ana told the share is paused and its sound on",
+        |v| words(v) == (Paused, Some(true)),
+    );
+    // Watch pressed on a panel a step behind, while she watches already: it
+    // is refused, and leaves the share as Bo said.
+    ana.room().watch(share, true);
+    assert_eq!(
+        words(&ana.view()),
+        (Paused, Some(true)),
+        "the refused press changed Bo's words"
+    );
+
+    // Past reject_after, and short of lost_after.
+    forwarder.block(true);
+    let blocked = Instant::now();
+    bo.say(&share_state(share, Live));
+    bo.say(&share_sound(share, false));
+    until(
+        &host,
+        &mut bo,
+        "the live and the off at the host's viewer",
+        |v| words(v) == (Live, Some(false)),
+    );
+    wait_until(&mut bo, blocked + Duration::from_millis(1500));
+    forwarder.block(false);
+    let live_and_off = |v: &View| words(v) == (Live, Some(false));
+    until(
+        &ana,
+        &mut bo,
+        "the answer to the Watch Ana's new session asked again",
+        live_and_off,
+    );
+    holds(
+        &ana,
+        &mut bo,
+        Duration::from_millis(300),
+        "Ana's words changed after the answer",
+        live_and_off,
+    );
+    drop(ana);
+    let text = read_log(&log);
+    assert!(
+        text.contains("the session ran out without a rekey"),
+        "{text}"
     );
 }

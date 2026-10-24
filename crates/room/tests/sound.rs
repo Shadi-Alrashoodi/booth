@@ -435,7 +435,9 @@ fn flags(sound: &[Passed]) -> Vec<(u16, bool, bool)> {
 }
 
 // What came to the hand over `span`, its pings answered as they came: the
-// PC sound passed on, and each ShareSound it was told.
+// PC sound passed on, and each word on it the hand was told, in a
+// ShareSound (kind 28) or in the answer to its Watch (WatchAnswer, kind 29,
+// whose last byte is the sound).
 fn listen(hand: &mut Hand, span: Duration) -> (Vec<Passed>, Vec<(u32, bool)>) {
     let mut sound = Vec::new();
     let mut told = Vec::new();
@@ -448,7 +450,7 @@ fn listen(hand: &mut Hand, span: Duration) -> (Vec<Passed>, Vec<(u32, bool)>) {
             }
         }
         for message in hand.messages() {
-            if let [28, a, b, c, d, on] = message[..] {
+            if let [28, a, b, c, d, on] | [29, a, b, c, d, _, on] = message[..] {
                 told.push((u32::from_le_bytes([a, b, c, d]), on == 1));
             }
         }

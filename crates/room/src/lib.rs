@@ -466,9 +466,6 @@ impl Room {
     /// same as Stop watching, and the share ending closes it.
     pub fn watch(&self, share: u32, on: bool) {
         self.threads.watching().set_cap(view::WatchCap::default());
-        self.threads
-            .watching()
-            .set_share_state(view::ShareState::Live);
         self.threads.watch(share, on);
     }
 

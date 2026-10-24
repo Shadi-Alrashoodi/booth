@@ -6716,9 +6716,36 @@ mod tests {
             .collect()
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Word {
+        State(crate::view::ShareState),
+        Sound(bool),
+        Answer(crate::view::ShareState, bool),
+    }
+
+    // What the host told `guest` of `share` since the last look, in order:
+    // the sharer's words and the answers to its Watches. Like states and
+    // sound_to it takes what came, so each look uses one of the three.
+    fn words(guest: &mut Guest, share: u32, at: Instant) -> Vec<Word> {
+        guest.read(at);
+        messages(&mut guest.reliable)
+            .into_iter()
+            .filter_map(|message| match message {
+                Message::ShareState { share: of, state } if of == share => Some(Word::State(state)),
+                Message::ShareSound { share: of, on } if of == share => Some(Word::Sound(on)),
+                Message::WatchAnswer {
+                    share: of,
+                    state,
+                    sound,
+                } if of == share => Some(Word::Answer(state, sound)),
+                _ => None,
+            })
+            .collect()
+    }
+
     // A share's state goes from its sharer to each watcher whose Hello says
     // SHARE_STATE_SINCE or later, never to an older one, and to a new
-    // watcher of a paused share at once; a room standing for an older copy
+    // watcher in the answer to its Watch; a room standing for an older copy
     // passes none on, and one from someone who does not share is bad.
     #[test]
     fn share_state_goes_only_to_watchers_that_read_it() {
@@ -6752,7 +6779,7 @@ mod tests {
                 state: Paused,
             };
             ana.say(&mut rig, &paused, start);
-            assert!(states(&mut bo, share, start).is_empty(), "{host}");
+            assert!(words(&mut bo, share, start).is_empty(), "{host}");
             let told = states(&mut cy, share, start);
             assert_eq!(told, if passes { vec![Paused] } else { vec![] }, "{host}");
             // Said again, it is no news.
@@ -6761,8 +6788,13 @@ mod tests {
             let mut dan = Guest::new();
             dan.join_as(&mut rig, "Dan", peer::SHARE_STATE_SINCE, None, start);
             dan.say(&mut rig, &watch, start);
-            let told = states(&mut dan, share, start);
-            assert_eq!(told, if passes { vec![Paused] } else { vec![] }, "{host}");
+            let told = words(&mut dan, share, start);
+            let answered = if passes {
+                vec![Word::Answer(Paused, false)]
+            } else {
+                vec![]
+            };
+            assert_eq!(told, answered, "{host}");
             let later = start + sharing::WORDS_EVERY;
             ana.say(&mut rig, &Message::ShareState { share, state: Live }, later);
             for guest in [&mut cy, &mut dan] {
@@ -6847,6 +6879,7 @@ mod tests {
     // counts each sound packet bad, as such a copy does.
     #[test]
     fn pc_sound_goes_only_to_watchers_that_read_it() {
+        use crate::view::ShareState::Live;
         let older = Version {
             major: 1,
             minor: 2,
@@ -6874,8 +6907,12 @@ mod tests {
             };
             bo.say(&mut rig, &watch, start);
             cy.say(&mut rig, &watch, start);
-            let told_off = if passes { vec![(share, false)] } else { vec![] };
-            assert_eq!(sound_to(&mut cy, start), (vec![], told_off), "{host}");
+            let answered = if passes {
+                vec![Word::Answer(Live, false)]
+            } else {
+                vec![]
+            };
+            assert_eq!(words(&mut cy, share, start), answered, "{host}");
             for guest in [&mut bo, &mut dee] {
                 assert_eq!(sound_to(guest, start), (vec![], vec![]), "{host}");
             }
@@ -6902,12 +6939,12 @@ mod tests {
             let mut eve = Guest::new();
             eve.join_as(&mut rig, "Eve", peer::PC_SOUND_SINCE, None, start);
             eve.say(&mut rig, &watch, start);
-            let told = sound_to(&mut eve, start).1;
-            assert_eq!(
-                told,
-                if passes { vec![(share, true)] } else { vec![] },
-                "{host}"
-            );
+            let answered = if passes {
+                vec![Word::Answer(Live, true)]
+            } else {
+                vec![]
+            };
+            assert_eq!(words(&mut eve, share, start), answered, "{host}");
             // Off changes the words, not what is passed on.
             let later = start + sharing::WORDS_EVERY;
             ana.say(&mut rig, &Message::ShareSound { share, on: false }, later);
@@ -6990,7 +7027,10 @@ mod tests {
         dan.say(&mut rig, &watch, at + gap / 5);
         ana.say(&mut rig, &stands(Paused), at + gap * 3 / 10);
         rig.tick(at + gap);
-        assert_eq!(states(&mut dan, share, at + gap), [Paused]);
+        assert_eq!(
+            words(&mut dan, share, at + gap),
+            [Word::Answer(Paused, false)]
+        );
 
         // And so with the sound: a watcher who starts while an on waits is
         // told off, as the others were. An on taken back meanwhile never
@@ -7004,7 +7044,10 @@ mod tests {
         eve.say(&mut rig, &watch, at + gap / 5);
         ana.say(&mut rig, &said(false), at + gap * 3 / 10);
         rig.tick(at + gap);
-        assert_eq!(sound_to(&mut eve, at + gap).1, [(share, false)]);
+        assert_eq!(
+            words(&mut eve, share, at + gap),
+            [Word::Answer(Live, false)]
+        );
         let mut fay = Guest::new();
         let at = start + gap * 9;
         fay.join_as(&mut rig, "Fay", peer::PC_SOUND_SINCE, None, at);
@@ -7012,10 +7055,87 @@ mod tests {
         ana.say(&mut rig, &said(true), at + gap / 10);
         fay.say(&mut rig, &watch, at + gap / 5);
         rig.tick(at + gap);
-        let told = sound_to(&mut fay, at + gap).1;
-        assert_eq!(told, [(share, false), (share, true)]);
+        let told = words(&mut fay, share, at + gap);
+        assert_eq!(told, [Word::Answer(Paused, false), Word::Sound(true)]);
         assert_eq!(sound_to(&mut eve, at + gap).1, [(share, true)]);
         assert_eq!(rig.host.drops.bad, 0);
+    }
+
+    // Each Watch that starts a watch is answered once, with both words as
+    // the other watchers were last told, Live and off included; what the
+    // sharer says after goes as a change. A Stop, a Watch said again or
+    // saying what the viewer decodes, and one for a share that ended get no
+    // answer. A press past the limit gets one, since the watcher waits for
+    // one for each. An answer from a client is bad, and this host's own
+    // viewer takes its answer at its press.
+    #[test]
+    fn each_watch_that_starts_a_watch_is_answered_once() {
+        use crate::view::ShareState::{Live, Paused};
+        // The answer carries the state, and goes to whoever reads PC sound.
+        assert_eq!(peer::SHARE_STATE_SINCE, peer::PC_SOUND_SINCE);
+        let start = Instant::now();
+        let gap = sharing::WORDS_EVERY;
+        let mut rig = Rig::new(start);
+        rig.host.version = peer::PC_SOUND_SINCE;
+        let mut ana = Guest::new();
+        ana.join_as(&mut rig, "Ana", peer::PC_SOUND_SINCE, None, start);
+        let mut cy = Guest::new();
+        cy.join_as(&mut rig, "Cy", peer::PC_SOUND_SINCE, None, start);
+        let share = granted(&mut rig, &mut ana, start);
+        let watch = |on, hevc| Message::Watch { share, on, hevc };
+        let stands = |state| Message::ShareState { share, state };
+        cy.say(&mut rig, &watch(true, true), start);
+        assert_eq!(words(&mut cy, share, start), [Word::Answer(Live, false)]);
+
+        ana.say(&mut rig, &stands(Paused), start);
+        ana.say(&mut rig, &Message::ShareSound { share, on: true }, start);
+        let at = start + gap;
+        rig.tick(at);
+        assert_eq!(
+            words(&mut cy, share, at),
+            [Word::State(Paused), Word::Sound(true)]
+        );
+        cy.say(&mut rig, &watch(false, true), at);
+        cy.say(&mut rig, &watch(true, true), at);
+        assert_eq!(words(&mut cy, share, at), [Word::Answer(Paused, true)]);
+        // What its viewer decodes, then the same Watch again.
+        cy.say(&mut rig, &watch(true, false), at);
+        cy.say(&mut rig, &watch(true, false), at);
+        assert!(words(&mut cy, share, at).is_empty());
+        // Well past WATCH_BURST, at one instant.
+        for _ in 0..8 {
+            cy.say(&mut rig, &watch(false, true), at);
+            cy.say(&mut rig, &watch(true, true), at);
+        }
+        assert_eq!(words(&mut cy, share, at), [Word::Answer(Paused, true); 8]);
+        let answer = Message::WatchAnswer {
+            share,
+            state: Live,
+            sound: false,
+        };
+        cy.say(&mut rig, &answer, at);
+        assert_eq!(rig.host.drops.bad, 1);
+
+        // How the share stood when this host watched, and Live once it is
+        // live again.
+        assert!(rig.host.watch(share, true, at, &rig.socket));
+        let view = rig.host.view(at, 0).share;
+        assert_eq!(
+            (view.watched_state, view.watched_sound),
+            (Paused, Some(true))
+        );
+        assert!(rig.host.watch(share, false, at, &rig.socket));
+        let later = at + gap;
+        ana.say(&mut rig, &stands(Live), later);
+        assert_eq!(words(&mut cy, share, later), [Word::State(Live)]);
+        assert!(rig.host.watch(share, true, later, &rig.socket));
+        assert_eq!(rig.host.view(later, 0).share.watched_state, Live);
+
+        // A share that ended while the Watch was on its way.
+        ana.say(&mut rig, &Message::ShareStop, later);
+        cy.say(&mut rig, &watch(true, true), later);
+        assert!(words(&mut cy, share, later).is_empty());
+        assert_eq!(rig.host.drops.bad, 1);
     }
 
     // Only the sharer of the live share sends its PC sound and says whether

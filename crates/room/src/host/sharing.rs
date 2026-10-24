@@ -388,6 +388,9 @@ impl Host {
         let (fps, sharer) = (live.fps, live.sharer);
         self.screen.watched = Some(share);
         self.screen.problem = None;
+        // Live until the answer below says how the share stands; a room
+        // standing for an older copy gives none.
+        self.screen.watching.set_share_state(ShareState::Live);
         self.screen.watching.event(WatchEvent::Started {
             share,
             fps,
@@ -1062,7 +1065,8 @@ impl Host {
         // watcher would disagree about who watches until the next one. What
         // it causes is held back elsewhere: the IDR by IDR_ASK_EVERY, the
         // facts by FACTS_EVERY. Only the log line is left out, and the view
-        // waits for its next refresh.
+        // waits for its next refresh. Its answer goes too: the watcher waits
+        // for one for each Watch that starts a watch.
         let logged =
             peer.share
                 .limits
@@ -1291,12 +1295,13 @@ impl Host {
         }
     }
 
-    // Someone started watching: the facts that count them, and the IDR for
-    // their first picture. When both go now the ask goes in the facts
-    // (Facts::idr), so that if this watcher cannot take the share's HEVC, the
-    // new encoder's first frame is the one IDR for both. Facts that do not go
-    // now, held back by FACTS_EVERY or no different, cannot be moving the
-    // share to H.264, which never waits, so the ask then goes on its own.
+    // Someone started watching: the facts that count them, the IDR for their
+    // first picture, and the answer to their Watch. When the facts and the
+    // IDR both go now the ask goes in the facts (Facts::idr), so that if this
+    // watcher cannot take the share's HEVC, the new encoder's first frame is
+    // the one IDR for both. Facts that do not go now, held back by
+    // FACTS_EVERY or no different, cannot be moving the share to H.264,
+    // which never waits, so the ask then goes on its own.
     fn started_watching(&mut self, by: By, now: Instant, socket: &Socket) {
         let asks = self.idr_goes(by, None, now).is_some();
         if !self.tell_facts_with(asks, now, socket) && asks {
@@ -1308,39 +1313,27 @@ impl Host {
         // What the other watchers were told, so a word held back reaches the
         // new one with them when the gap ends.
         let (number, (state, sound)) = (live.number, live.told_words);
-        // A new watcher hears at once whether the share's PC sound goes out,
-        // either way: a quiet stretch and no sound at all sound alike, and a
-        // word it never got would say nothing.
-        if self.version >= crate::peer::PC_SOUND_SINCE {
-            match by {
-                By::Peer(i) if self.peers[i].link.sound_read => {
-                    let peer = &mut self.peers[i];
-                    peer.link.queue(&Message::ShareSound {
-                        share: number,
-                        on: sound,
-                    });
-                    peer.flush(socket, now);
-                }
-                By::Peer(_) => {}
-                By::Host => self.sound.said(number, sound, now),
-            }
-        }
-        // And of a share that is not live: a paused picture and a still one
-        // look alike.
-        if state == ShareState::Live || self.version < crate::peer::SHARE_STATE_SINCE {
+        // Each Watch that starts a watch is answered once, Live and off too:
+        // the watcher takes no word of the share before the answer to its
+        // last Watch, since one sent before was for a watch it stopped.
+        if self.version < crate::peer::PC_SOUND_SINCE {
             return;
         }
         match by {
-            By::Peer(i) if self.peers[i].link.state_read => {
+            By::Peer(i) if self.peers[i].link.sound_read => {
                 let peer = &mut self.peers[i];
-                peer.link.queue(&Message::ShareState {
+                peer.link.queue(&Message::WatchAnswer {
                     share: number,
                     state,
+                    sound,
                 });
                 peer.flush(socket, now);
             }
             By::Peer(_) => {}
-            By::Host => self.screen.watching.set_share_state(state),
+            By::Host => {
+                self.screen.watching.set_share_state(state);
+                self.sound.said(number, sound, now);
+            }
         }
     }
 

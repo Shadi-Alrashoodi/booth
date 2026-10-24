@@ -72,14 +72,15 @@ pub struct ShareView {
     // (Room::cap_watch), and who cannot honor that, if anyone.
     pub cap: WatchCap,
     pub cap_unheard: Option<Unheard>,
-    // While this PC watches: the share as its sharer says it is, Live when
-    // the sharer or the host is older than 1.3.0.
+    // While this PC watches: the share as its sharer says it is, Live from
+    // each Watch, and from a new session, until the host's answer; always
+    // Live when the sharer or the host is older than 1.3.0.
     pub watched_state: ShareState,
     // While this PC watches: whether its sharer says the share's PC sound
-    // goes out. None until the host has said it since this watch began, or
-    // since a new session asked for it again, and always through a host
-    // older than 1.3.0, which never says it; Some(false) for a sharer older
-    // than 1.3.0, which never says on.
+    // goes out. None until the host has answered this watch's Watch, or the
+    // one a new session asked for again, and always through a host older
+    // than 1.3.0, which never says it; Some(false) for a sharer older than
+    // 1.3.0, which never says on.
     pub watched_sound: Option<bool>,
     // Share sound on this PC's own share (Room::share_sound).
     pub own_sound: OwnSound,

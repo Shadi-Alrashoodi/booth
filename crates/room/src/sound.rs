@@ -92,8 +92,8 @@ pub(crate) struct Sound {
     // The oldest ear made that the speakers have not taken, and when,
     // while anything still holds it: see listen.
     made: Option<(Weak<Mutex<Ear>>, Instant)>,
-    // The share whose sharer said its sound is off after the first word
-    // since the watch began, or since a new session asked for it again.
+    // The share whose sharer said its sound is off after the host's answer
+    // to this watch's Watch, or to the one a new session asked for again.
     // Frames captured before the press can come after the word and make no
     // ear: until the on, only a frame that starts a spell from a reset
     // encoder does.
@@ -232,9 +232,9 @@ impl Sound {
     // The host says whether the sound of the share this PC watches goes
     // out, for the panel's words. Its frames do not wait for an on, which
     // can come after the first of them, except after an off: until the on,
-    // only a frame that starts a spell makes a new ear. The first word since
-    // the watch began, or a new session asked for it again, only sets the
-    // word, since frames can come before it.
+    // only a frame that starts a spell makes a new ear. The first word, the
+    // host's answer to this watch's Watch (or to the one a new session asked
+    // for again), only sets the word, since frames can come before it.
     pub(crate) fn said(&mut self, share: u32, on: bool, now: Instant) {
         let first = self.word(share).is_none();
         self.told = Some((share, on));
@@ -333,9 +333,9 @@ impl Sound {
         }
     }
 
-    // What the host last said of the sound of `share` since this watch
-    // began, or since a new session asked for it again: None until it has,
-    // and off for a sharer that has said nothing.
+    // What the host last said of the sound of `share` since it answered this
+    // watch's Watch, or the one a new session asked for again: None until it
+    // has, and off for a sharer that has said nothing.
     pub(crate) fn word(&self, share: u32) -> Option<bool> {
         self.told
             .filter(|&(told, _)| told == share)

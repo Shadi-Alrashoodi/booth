@@ -1035,7 +1035,7 @@ pub struct Watching {
     four_k: AtomicBool,
     cap: Mutex<WatchCap>,
     // The share watched, as its sharer last said; Live for an older one,
-    // and again with each Watch.
+    // and again with each Watch and each new session.
     share_state: Mutex<ShareState>,
     // Whether this PC controls the share watched, as the viewer was last
     // told, and a new viewer is told at its start.

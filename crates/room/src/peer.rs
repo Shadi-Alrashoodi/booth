@@ -49,8 +49,9 @@ pub(crate) const SHARE_STATE_SINCE: invite::Version = invite::Version {
     patch: 0,
 };
 
-// PC sound (Channel::Sound and control::Message::ShareSound) goes only to a
-// peer whose Hello says PC_SOUND_SINCE or later.
+// PC sound (Channel::Sound, control::Message::ShareSound and WatchAnswer)
+// goes only to a peer whose Hello says PC_SOUND_SINCE or later. WatchAnswer
+// carries the state too, so SHARE_STATE_SINCE must stay this version.
 pub(crate) const PC_SOUND_SINCE: invite::Version = invite::Version {
     major: 1,
     minor: 3,

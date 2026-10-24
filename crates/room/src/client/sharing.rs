@@ -20,7 +20,7 @@ use crate::socket::Socket;
 use crate::sound;
 use crate::talk::Outlet;
 use crate::view::{
-    ChatLine, CurrentShare, LineKind, LinkState, NoSound, OwnSound, ShareView, Unheard,
+    ChatLine, CurrentShare, LineKind, LinkState, NoSound, OwnSound, ShareState, ShareView, Unheard,
 };
 
 // Who shares in a roster, and their share.
@@ -190,6 +190,9 @@ impl Client {
         let name = entry.name.clone();
         self.screen.watched = Some(share);
         self.screen.problem = None;
+        // Live until the host's answer says how the share stands; a host
+        // older than 1.3.0 gives none.
+        self.screen.watching.set_share_state(ShareState::Live);
         self.screen.watching.event(WatchEvent::Started {
             share,
             fps: current.fps,
@@ -199,6 +202,12 @@ impl Client {
             share,
             on: true,
             hevc: self.screen.watching.takes_hevc(),
+        });
+        // Counted, not set: after Stop and Watch inside a round trip the
+        // answer to the first is still on its way.
+        self.answers_due = Some(match self.answers_due {
+            Some((asked, due)) if asked == share => (share, due + 1),
+            _ => (share, 1),
         });
         self.send_watch_limits();
         self.flush(now, socket);
@@ -572,15 +581,32 @@ impl Client {
             } if self.screen.watched == Some(share) => {
                 self.sharer_unread = Some(share);
             }
-            // One for a share no longer watched was on its way.
+            // One for a share no longer watched was on its way, and so was one
+            // before the host's answer to this PC's last Watch: it was sent to
+            // a watch this PC stopped.
             Message::ShareState { share, state } => {
-                if self.screen.watched == Some(share) {
+                if self.takes_words(share) {
                     self.screen.watching.set_share_state(state);
                 }
             }
             Message::ShareSound { share, on } => {
-                if self.screen.watched == Some(share) {
+                if self.takes_words(share) {
                     self.sound.said(share, on, now);
+                }
+            }
+            // Only the answer to the last Watch counts: the others answered
+            // watches this PC stopped.
+            Message::WatchAnswer {
+                share,
+                state,
+                sound,
+            } => {
+                if let Some((asked, due)) = self.answers_due.filter(|&(asked, _)| asked == share) {
+                    self.answers_due = (due > 1).then_some((asked, due - 1));
+                    if due == 1 && self.screen.watched == Some(share) {
+                        self.screen.watching.set_share_state(state);
+                        self.sound.said(share, sound, now);
+                    }
                 }
             }
             Message::SharerClock {
@@ -611,6 +637,11 @@ impl Client {
                 self.drops.bad(now);
             }
         }
+    }
+
+    fn takes_words(&self, share: u32) -> bool {
+        self.screen.watched == Some(share)
+            && self.answers_due.is_none_or(|(asked, _)| asked != share)
     }
 
     fn answered(&mut self, answer: ShareAnswer) {
@@ -708,6 +739,14 @@ impl Client {
                 }
             }
         }
+        // A host that restarted numbers its shares from 1 again, so a count
+        // left on a share the roster no longer shows would wait for an answer
+        // that never comes. Within one run no answer for a share follows the
+        // roster that shows it gone: both go on the same ordered stream, and
+        // share numbers are never reused.
+        self.answers_due = self
+            .answers_due
+            .filter(|&(asked, _)| number(&now) == Some(asked));
     }
 
     // Every timer pass: the offset that turns the sharer's capture times
@@ -752,13 +791,19 @@ impl Client {
         self.control_over(ControlEnd::SessionLost);
         self.end_own_share();
         // The host passes on nothing of the share before it reads the Watch
-        // below, so the old ear has nothing more to play, and the host says
-        // the sharer's word again at that Watch. That word is the first,
-        // which only sets the word, so an off kept from the old session
-        // would drop the frames of a spell under way whichever way it goes:
-        // after an on, until the next spell starts.
+        // below, so the old ear has nothing more to play, and its answer to
+        // that Watch says the sharer's word again: the first, which only sets
+        // the word, so an off kept from the old session would drop the
+        // frames of a spell under way whichever way it goes: after an on,
+        // until the next spell starts.
         self.sound.stop(Instant::now());
+        // Any answer still due went with the old stream; the Watch below is
+        // answered on the new one.
+        self.answers_due = self.screen.watched.map(|share| (share, 1));
         if let Some(share) = self.screen.watched {
+            // Live until the host's answer says how the share stands, as
+            // after a press.
+            self.screen.watching.set_share_state(ShareState::Live);
             self.link.queue(&Message::Watch {
                 share,
                 on: true,

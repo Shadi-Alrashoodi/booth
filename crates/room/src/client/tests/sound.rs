@@ -1,11 +1,13 @@
 // PC sound on a watcher: what the host passes on reaches the speakers only
 // from the share this PC watches, and the sharer's word on it decides when
-// the ear goes.
+// the ear goes. Neither of the sharer's words counts before the host's
+// answer to this PC's last Watch.
 
 use super::*;
 use crate::control::EntryShare;
 use crate::sound::SoundFrame;
 use crate::talk::Speaker;
+use crate::view::{ShareState, WatchCap};
 use voice::stereo::{Encoder, FRAME, MAX_PACKET};
 
 const BO: [u8; 32] = [9; 32];
@@ -21,6 +23,14 @@ fn watch_pressed(version: Version, start: Instant) -> (Rig, Session, Speaker) {
     let clock = rig.client.clock();
     rig.client.sound = Sound::new(orders_in, clock, Log::off(), start);
     let speaker = Speaker::new(orders, Arc::clone(rig.client.talk.shared()), clock);
+    bo_shares(&mut rig, &mut session, Some(SHARE), start);
+    assert!(rig.client.watch(SHARE, true, start, &rig.socket));
+    (rig, session, speaker)
+}
+
+// The host's roster: Mara hosts, and Bo shares `share` from his slot, or
+// nothing.
+fn bo_shares(rig: &mut Rig, session: &mut Session, share: Option<u32>, now: Instant) {
     let entry = |key: [u8; 32], slot: u8, name: &str, share| control::Entry {
         key,
         slot,
@@ -41,26 +51,21 @@ fn watch_pressed(version: Version, start: Instant) -> (Rig, Session, Speaker) {
                 BO,
                 BO_SLOT,
                 "Bo",
-                Some(EntryShare {
-                    number: SHARE,
-                    fps: 60,
-                }),
+                share.map(|number| EntryShare { number, fps: 60 }),
             ),
         ],
     });
-    let packet = rig.host.say(&mut session, &roster, start);
-    rig.deliver(&packet, start);
-    assert!(rig.client.watch(SHARE, true, start, &rig.socket));
-    (rig, session, speaker)
+    let packet = rig.host.say(session, &roster, now);
+    rig.deliver(&packet, now);
 }
 
-// And told at her Watch what a host on 1.3.0 tells a client on it, that
-// Bo's sound is off, as he has not said otherwise. An older client is told
-// nothing.
+// And answered at her Watch as a host on 1.3.0 answers a client on it: Bo's
+// share is live and his sound off, as he has not said otherwise. An older
+// client is told nothing.
 fn watching(version: Version, start: Instant) -> (Rig, Session, Speaker) {
     let (mut rig, mut session, speaker) = watch_pressed(version, start);
     if version >= peer::PC_SOUND_SINCE {
-        bo_says(&mut rig, &mut session, false, start);
+        answer(&mut rig, &mut session, ShareState::Live, false, start);
     }
     (rig, session, speaker)
 }
@@ -111,6 +116,35 @@ fn bo_says(rig: &mut Rig, session: &mut Session, on: bool, now: Instant) {
     let word = Message::ShareSound { share: SHARE, on };
     let packet = rig.host.say(session, &word, now);
     rig.deliver(&packet, now);
+}
+
+// Bo's word on how his share stands, as the host passes it on, at the same
+// times.
+fn bo_stands(rig: &mut Rig, session: &mut Session, state: ShareState, now: Instant) {
+    let word = Message::ShareState {
+        share: SHARE,
+        state,
+    };
+    let packet = rig.host.say(session, &word, now);
+    rig.deliver(&packet, now);
+}
+
+// The host's answer to a Watch of Bo's share: how it stands and whether his
+// sound goes out, at the same times.
+fn answer(rig: &mut Rig, session: &mut Session, state: ShareState, on: bool, now: Instant) {
+    let told = Message::WatchAnswer {
+        share: SHARE,
+        state,
+        sound: on,
+    };
+    let packet = rig.host.say(session, &told, now);
+    rig.deliver(&packet, now);
+}
+
+// How Ana's panel shows Bo's share standing, and his sound word.
+fn words(rig: &Rig) -> (ShareState, Option<bool>) {
+    let share = rig.client.share_view();
+    (share.watched_state, share.watched_sound)
 }
 
 // The loudest sample of the speakers' next 10 ms.
@@ -305,7 +339,7 @@ fn an_off_at_the_watch_lets_no_ear_go() {
     }
     assert!(heard > 0.1, "{heard}");
     assert_eq!(rig.client.view(start, 0).share.watched_sound, None);
-    bo_says(&mut rig, &mut session, false, start);
+    answer(&mut rig, &mut session, ShareState::Live, false, start);
     for seq in 10..15 {
         let heard = from_bo(&mut rig, &mut session, seq);
         assert!(heard > 0.1, "frame {seq}: {heard}");
@@ -608,8 +642,8 @@ fn the_old_host_line_waits_for_the_hosts_hello() {
 }
 
 // A new session forgets what the sharer said on the old one: the host forgot
-// the watch, which this PC asks for again, and says the word again when the
-// Watch comes; a word said meanwhile went with the old session.
+// the watch, which this PC asks for again, and says the word again in its
+// answer to that Watch; a word said meanwhile went with the old session.
 #[test]
 fn a_new_session_forgets_the_sharers_word() {
     let start = Instant::now();
@@ -632,7 +666,7 @@ fn a_new_session_forgets_the_sharers_word() {
     assert_eq!(rig.client.view(woke, 0).share.watched_sound, None);
     let hello = rig.host.hello(&mut session, woke);
     rig.deliver(&hello, woke);
-    bo_says(&mut rig, &mut session, false, woke);
+    answer(&mut rig, &mut session, ShareState::Live, false, woke);
     assert_eq!(rig.client.view(woke, 0).share.watched_sound, Some(false));
 }
 
@@ -663,7 +697,7 @@ fn an_off_on_the_old_session_holds_no_frame_back() {
     rig.host.reliable = Reliable::new();
     let hello = rig.host.hello(&mut session, woke);
     rig.deliver(&hello, woke);
-    bo_says(&mut rig, &mut session, false, woke);
+    answer(&mut rig, &mut session, ShareState::Live, false, woke);
     let bad = rig.client.drops.bad;
     let mut heard = 0.0f32;
     for seq in 5..16u16 {
@@ -678,6 +712,255 @@ fn an_off_on_the_old_session_holds_no_frame_back() {
     assert!(view.numbers.sound.is_some());
     assert_eq!(view.numbers.sound_dropped, 0);
     assert_eq!(rig.client.drops.bad, bad);
+}
+
+// Words the host told the watch Ana just stopped can come after her next
+// Watch: here a pause and an off said while she heard Bo's sound. Neither
+// counts before the answer to that Watch, so frames from the middle of a
+// spell play, and the answer's off, the first word of the watch, lets no ear
+// go. Bo's next word counts.
+#[test]
+fn a_word_for_the_watch_before_is_not_taken() {
+    let start = Instant::now();
+    let (mut rig, mut session, mut speaker) = watching(peer::PC_SOUND_SINCE, start);
+    let frames = stereo_frames(15);
+    let bad = rig.client.drops.bad;
+    let mut from_bo = |rig: &mut Rig, session: &mut Session, seq: u16| {
+        let frame = &frames[usize::from(seq)];
+        let packet = relayed(session, BO_SLOT, SHARE, seq, seq == 0, frame);
+        rig.deliver(&packet, start);
+        loudest(&mut speaker)
+    };
+    bo_says(&mut rig, &mut session, true, start);
+    let mut heard = 0.0f32;
+    for seq in 0..5 {
+        heard = heard.max(from_bo(&mut rig, &mut session, seq));
+    }
+    assert!(heard > 0.1, "{heard}");
+
+    assert!(rig.client.watch(SHARE, false, start, &rig.socket));
+    assert!(rig.client.watch(SHARE, true, start, &rig.socket));
+    bo_stands(&mut rig, &mut session, ShareState::Paused, start);
+    bo_says(&mut rig, &mut session, false, start);
+    assert_eq!(words(&rig), (ShareState::Live, None));
+    let mut heard = 0.0f32;
+    for seq in 5..10 {
+        heard = heard.max(from_bo(&mut rig, &mut session, seq));
+    }
+    assert!(heard > 0.1, "{heard}");
+    answer(&mut rig, &mut session, ShareState::Live, false, start);
+    assert_eq!(words(&rig), (ShareState::Live, Some(false)));
+    for seq in 10..15 {
+        let heard = from_bo(&mut rig, &mut session, seq);
+        assert!(heard > 0.1, "frame {seq}: {heard}");
+    }
+    assert_eq!(rig.client.view(start, 0).numbers.sound_dropped, 0);
+    assert_eq!(rig.client.drops.bad, bad);
+    bo_says(&mut rig, &mut session, true, start);
+    assert_eq!(words(&rig), (ShareState::Live, Some(true)));
+}
+
+// The host answers Ana's Watches in the order they went, and only the
+// answer to her last one counts: one that comes after a Stop, or while a
+// later Watch waits for its own, answered a watch she stopped.
+#[test]
+fn only_the_answer_to_the_last_watch_counts() {
+    use crate::view::ShareState::{Away, Live, Paused};
+    let start = Instant::now();
+    let (mut rig, mut session, _speaker) = watch_pressed(peer::PC_SOUND_SINCE, start);
+    assert!(rig.client.watch(SHARE, false, start, &rig.socket));
+    answer(&mut rig, &mut session, Away, true, start);
+    assert!(rig.client.watch(SHARE, true, start, &rig.socket));
+    bo_stands(&mut rig, &mut session, Paused, start);
+    assert_eq!(words(&rig), (Live, None));
+    answer(&mut rig, &mut session, Paused, false, start);
+    assert_eq!(words(&rig), (Paused, Some(false)));
+
+    // Stop and Watch twice inside a round trip: the answer to the first
+    // Watch is still on its way when the second goes.
+    for on in [false, true, false, true] {
+        assert!(rig.client.watch(SHARE, on, start, &rig.socket));
+    }
+    answer(&mut rig, &mut session, Away, true, start);
+    assert_eq!(words(&rig), (Live, None));
+    answer(&mut rig, &mut session, Live, false, start);
+    assert_eq!(words(&rig), (Live, Some(false)));
+    bo_says(&mut rig, &mut session, true, start);
+    assert_eq!(words(&rig), (Live, Some(true)));
+}
+
+// Bo's share ends before the host reads Ana's Watch, which goes unanswered,
+// and he shares again. Her Watch of the new share waits for its own answer,
+// not for the one the old share never got.
+#[test]
+fn a_watch_of_the_next_share_waits_for_its_own_answer() {
+    let start = Instant::now();
+    let (mut rig, mut session, _speaker) = watch_pressed(peer::PC_SOUND_SINCE, start);
+    let next = SHARE + 1;
+    bo_shares(&mut rig, &mut session, Some(next), start);
+    assert!(!rig.client.share_view().watching);
+    assert!(rig.client.watch(next, true, start, &rig.socket));
+    let told = Message::WatchAnswer {
+        share: next,
+        state: ShareState::Paused,
+        sound: true,
+    };
+    let packet = rig.host.say(&mut session, &told, start);
+    rig.deliver(&packet, start);
+    assert_eq!(words(&rig), (ShareState::Paused, Some(true)));
+}
+
+// A press refused, here while Ana watches already, sends no Watch, and the
+// Watch that tells the host again what her viewer takes starts no watch.
+// Neither is answered, so neither holds Bo's words back.
+#[test]
+fn a_refused_press_or_an_hevc_re_send_waits_for_nothing() {
+    let start = Instant::now();
+    let (mut rig, mut session, _speaker) = watching(peer::PC_SOUND_SINCE, start);
+    // The host here reads nothing Ana sends, so every Watch stays unacked.
+    let watches = |rig: &Rig| {
+        rig.client
+            .link
+            .reliable
+            .unacked()
+            .filter(|message| {
+                matches!(
+                    Message::decode(message),
+                    Some(Message::Watch {
+                        share: SHARE,
+                        on: true,
+                        ..
+                    })
+                )
+            })
+            .count()
+    };
+    assert_eq!(watches(&rig), 1);
+    assert!(!rig.client.watch(SHARE, true, start, &rig.socket));
+    rig.client.screen.watching.set_cap(WatchCap {
+        height: Some(1080),
+        ..WatchCap::default()
+    });
+    rig.client.screen_work(start, &rig.socket);
+    assert_eq!(watches(&rig), 2, "the viewer's Watch again");
+    bo_stands(&mut rig, &mut session, ShareState::Paused, start);
+    bo_says(&mut rig, &mut session, true, start);
+    assert_eq!(words(&rig), (ShareState::Paused, Some(true)));
+}
+
+// Only a press that starts a watch shows the share live until the host's
+// answer. One refused, as from a panel a step behind while Ana watches
+// already, leaves it as Bo last said.
+#[test]
+fn only_a_press_that_starts_a_watch_shows_the_share_live() {
+    use crate::view::ShareState::{Live, Paused};
+    let start = Instant::now();
+    let (mut rig, mut session, _speaker) = watch_pressed(peer::PC_SOUND_SINCE, start);
+    answer(&mut rig, &mut session, Paused, true, start);
+    assert!(!rig.client.watch(SHARE, true, start, &rig.socket));
+    assert_eq!(words(&rig), (Paused, Some(true)));
+    assert!(rig.client.watch(SHARE, false, start, &rig.socket));
+    assert!(rig.client.watch(SHARE, true, start, &rig.socket));
+    assert_eq!(words(&rig), (Live, None));
+    answer(&mut rig, &mut session, Paused, true, start);
+    assert_eq!(words(&rig), (Paused, Some(true)));
+}
+
+// A new session shows the share live until the host's answer to the Watch
+// asked for again says how it stands, and takes no word of it before that
+// answer.
+#[test]
+fn a_new_session_hears_how_the_share_stands() {
+    use crate::view::ShareState::{Away, Live, Paused};
+    let start = Instant::now();
+    let (mut rig, mut session, _speaker) = watch_pressed(peer::PC_SOUND_SINCE, start);
+    answer(&mut rig, &mut session, Paused, true, start);
+    assert_eq!(words(&rig), (Paused, Some(true)));
+    let woke = start + Duration::from_secs(20);
+    assert!(rig.client.slept(Duration::from_secs(20), woke, &rig.socket));
+    rig.tick(woke);
+    let (_, mut session, response) = rig.host.answer_all(woke).pop().expect("a try");
+    rig.deliver(&response, woke);
+    assert_eq!(words(&rig), (Live, None));
+    // A new session starts the stream over, on the host's side too.
+    rig.host.reliable = Reliable::new();
+    let said = told_host(&mut rig.host, &mut session);
+    let asked = |message: &Message| {
+        matches!(
+            message,
+            Message::Watch {
+                share: SHARE,
+                on: true,
+                ..
+            }
+        )
+    };
+    assert!(said.iter().any(asked), "{said:?}");
+    let hello = rig.host.hello(&mut session, woke);
+    rig.deliver(&hello, woke);
+    bo_stands(&mut rig, &mut session, Away, woke);
+    assert_eq!(words(&rig), (Live, None));
+    answer(&mut rig, &mut session, Live, false, woke);
+    assert_eq!(words(&rig), (Live, Some(false)));
+}
+
+// Ana's PC sleeps with two of her Watches unanswered, after Stop and Watch
+// inside a round trip. Their answers went with the old session: the new one
+// waits only for the answer to the Watch it asks again, and takes no word of
+// the share before it.
+#[test]
+fn a_new_session_waits_for_one_answer_whatever_was_due() {
+    use crate::view::ShareState::{Away, Live, Paused};
+    let start = Instant::now();
+    let (mut rig, _, _speaker) = watch_pressed(peer::PC_SOUND_SINCE, start);
+    assert!(rig.client.watch(SHARE, false, start, &rig.socket));
+    assert!(rig.client.watch(SHARE, true, start, &rig.socket));
+    let woke = start + Duration::from_secs(20);
+    assert!(rig.client.slept(Duration::from_secs(20), woke, &rig.socket));
+    rig.tick(woke);
+    let (_, mut session, response) = rig.host.answer_all(woke).pop().expect("a try");
+    rig.deliver(&response, woke);
+    assert!(rig.host.open_all(&mut session) > 0);
+    // A new session starts the stream over, on the host's side too.
+    rig.host.reliable = Reliable::new();
+    let hello = rig.host.hello(&mut session, woke);
+    rig.deliver(&hello, woke);
+    bo_stands(&mut rig, &mut session, Away, woke);
+    assert_eq!(words(&rig), (Live, None));
+    answer(&mut rig, &mut session, Paused, true, woke);
+    assert_eq!(words(&rig), (Paused, Some(true)));
+    bo_says(&mut rig, &mut session, false, woke);
+    assert_eq!(words(&rig), (Paused, Some(false)));
+}
+
+// Ana's PC sleeps while the host restarts. The new run numbers its shares
+// from 1 again, and none has the number she watched yet when the Watch she
+// asks again reaches it, so that Watch goes unanswered and the first roster
+// ends the watch. Her Watch of the run's own share of that number, once it
+// comes, waits only for its own answer.
+#[test]
+fn a_watch_of_a_share_numbered_again_waits_for_its_own_answer() {
+    use crate::view::ShareState::Paused;
+    let start = Instant::now();
+    let (mut rig, _, _speaker) = watching(peer::PC_SOUND_SINCE, start);
+    let woke = start + Duration::from_secs(20);
+    assert!(rig.client.slept(Duration::from_secs(20), woke, &rig.socket));
+    rig.tick(woke);
+    let (_, mut session, response) = rig.host.answer_all(woke).pop().expect("a try");
+    rig.deliver(&response, woke);
+    assert!(rig.host.open_all(&mut session) > 0);
+    // A new session starts the stream over, on the host's side too.
+    rig.host.reliable = Reliable::new();
+    let hello = rig.host.hello(&mut session, woke);
+    rig.deliver(&hello, woke);
+    bo_shares(&mut rig, &mut session, None, woke);
+    assert_eq!(rig.client.screen.watched, None, "the watch ends");
+    bo_shares(&mut rig, &mut session, Some(SHARE), woke);
+    assert!(rig.client.watch(SHARE, true, woke, &rig.socket));
+    answer(&mut rig, &mut session, Paused, true, woke);
+    assert_eq!(words(&rig), (Paused, Some(true)));
+    bo_says(&mut rig, &mut session, false, woke);
+    assert_eq!(words(&rig), (Paused, Some(false)));
 }
 
 // A client standing for a copy older than PC_SOUND_SINCE counts channel 8
