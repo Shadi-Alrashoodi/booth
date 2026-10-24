@@ -1184,7 +1184,7 @@ impl Host {
             self.voice_reports(now, socket);
             self.share_reports(now, socket);
         }
-        self.share_step(now, socket);
+        changed |= self.share_step(now, socket);
         self.control_step(now);
 
         changed |= someone_left;
@@ -7359,6 +7359,37 @@ mod tests {
         assert!(view.numbers.sound.is_some());
         assert_eq!(view.numbers.sound_dropped, 0);
         assert_eq!(rig.host.drops.bad, 0);
+    }
+
+    // A friend turns PC sound off within the gap, and the word waits for its
+    // end. The timer pass at the gap's end tells this host's own viewer and
+    // says the view changed. The timer thread stores a view only when a pass
+    // says so, and if this one did not, the panel would show the word up to
+    // a ping late. The pass just before has nothing to show.
+    #[test]
+    fn a_held_back_word_redraws_the_hosts_panel() {
+        let start = Instant::now();
+        let gap = sharing::WORDS_EVERY;
+        let mut rig = Rig::new(start);
+        rig.host.version = peer::PC_SOUND_SINCE;
+        let mut ana = Guest::new();
+        ana.join_as(&mut rig, "Ana", peer::PC_SOUND_SINCE, None, start);
+        let share = granted(&mut rig, &mut ana, start);
+        assert!(rig.host.watch(share, true, start, &rig.socket));
+        let said = |on| Message::ShareSound { share, on };
+        ana.say(&mut rig, &said(true), start);
+        assert_eq!(rig.host.view(start, 0).share.watched_sound, Some(true));
+        let at = start + gap / 10;
+        ana.say(&mut rig, &said(false), at);
+        // Whatever else is due, a ping among it, goes on this pass.
+        rig.tick(at);
+
+        let almost = start + gap - Duration::from_millis(1);
+        assert!(!rig.host.on_timer(almost, &rig.socket));
+        assert_eq!(rig.host.view(almost, 0).share.watched_sound, Some(true));
+        let end = start + gap;
+        assert!(rig.host.on_timer(end, &rig.socket));
+        assert_eq!(rig.host.view(end, 0).share.watched_sound, Some(false));
     }
 
     // The volume this host plays a friend's PC sound at goes with every ear

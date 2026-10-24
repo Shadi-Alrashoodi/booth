@@ -1398,14 +1398,16 @@ impl Host {
     // whose copy reads that (peer::PC_SOUND_SINCE), and both to this host's
     // viewer, at most every WORDS_EVERY. A word held back goes at the gap's
     // end as it stands then; one that changed back meanwhile does not go.
-    fn tell_words(&mut self, now: Instant, socket: &Socket) {
+    // True when this host's own viewer heard a word, which only the view
+    // shows.
+    fn tell_words(&mut self, now: Instant, socket: &Socket) -> bool {
         let Some(live) = self.live.as_mut() else {
-            return;
+            return false;
         };
         let (state, sound) = (live.state, live.sound);
         if live.told_words == (state, sound) {
             live.words_due = None;
-            return;
+            return false;
         }
         if let Some(due) = live
             .words_told_at
@@ -1413,7 +1415,7 @@ impl Host {
             .filter(|due| now < *due)
         {
             live.words_due = Some(due);
-            return;
+            return false;
         }
         let state_changed = live.told_words.0 != state;
         let sound_changed = live.told_words.1 != sound;
@@ -1421,7 +1423,8 @@ impl Host {
         live.words_told_at = Some(now);
         live.words_due = None;
         let number = live.number;
-        if self.screen.watched == Some(number) {
+        let heard = self.screen.watched == Some(number);
+        if heard {
             if state_changed {
                 self.screen.watching.set_share_state(state);
             }
@@ -1451,6 +1454,7 @@ impl Host {
                 peer.flush(socket, now);
             }
         }
+        heard
     }
 
     // `seen` is the frame the watcher had when nothing more decoded; a
@@ -1838,15 +1842,17 @@ impl Host {
     // Every timer pass: facts held back by FACTS_EVERY, a shape of this
     // host's that waited for room, and the sharer's clock offset to anyone
     // watching whose copy is out of date, and this host's own viewer's.
-    pub(super) fn share_step(&mut self, now: Instant, socket: &Socket) {
+    // True when a word the gap held back reached this host's own viewer.
+    pub(super) fn share_step(&mut self, now: Instant, socket: &Socket) -> bool {
         self.tell_facts(now, socket);
-        self.tell_words(now, socket);
+        let heard = self.tell_words(now, socket);
         self.own_shape(now, socket);
         self.tell_clocks(false, now, socket);
         self.join_idrs(now, socket);
         if let Some(live) = &self.live {
             stats::gauge!("room.host.live.recovered", live.recovered);
         }
+        heard
     }
 
     // New watchers' IDR asks the gap held back, once it is over.
