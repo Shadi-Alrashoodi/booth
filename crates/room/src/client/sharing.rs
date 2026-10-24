@@ -739,11 +739,12 @@ impl Client {
                 }
             }
         }
-        // A host that restarted numbers its shares from 1 again, so a count
-        // left on a share the roster no longer shows would wait for an answer
-        // that never comes. Within one run no answer for a share follows the
-        // roster that shows it gone: both go on the same ordered stream, and
-        // share numbers are never reused.
+        // After a host restart the Watch asked again names a share of the old
+        // run, which the new run does not have, so a count left on a share the
+        // roster no longer shows would wait for an answer that never comes.
+        // Within one run no answer for a share follows the roster that shows
+        // it gone: both go on the same ordered stream, and share numbers are
+        // never reused.
         self.answers_due = self
             .answers_due
             .filter(|&(asked, _)| number(&now) == Some(asked));

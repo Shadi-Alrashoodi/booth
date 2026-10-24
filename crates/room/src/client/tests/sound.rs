@@ -981,11 +981,11 @@ fn a_new_session_waits_for_one_answer_whatever_was_due() {
     assert_eq!(words(&rig), (Paused, Some(false)));
 }
 
-// Ana's PC sleeps while the host restarts. The new run numbers its shares
-// from 1 again, and none has the number she watched yet when the Watch she
-// asks again reaches it, so that Watch goes unanswered and the first roster
-// ends the watch. Her Watch of the run's own share of that number, once it
-// comes, waits only for its own answer.
+// Ana's PC sleeps while the host restarts. None of the new run's shares has
+// the number she watched when the Watch she asks again reaches it, so that
+// Watch goes unanswered and the first roster ends the watch. A later share
+// of the run can still get that number, and her Watch of it waits only for
+// its own answer.
 #[test]
 fn a_watch_of_a_share_numbered_again_waits_for_its_own_answer() {
     use crate::view::ShareState::Paused;

@@ -16,7 +16,8 @@ use channels::Channel;
 use channels::video::{FrameFacts, Packetizer};
 use common::link::Link;
 use common::{
-    Forwarder, Hand, Member, code_to_invite, fresh_log, loopback, poll, read_log, timers,
+    Folder, Forwarder, Hand, Member, code_to_invite, config_in, fresh_log, loopback, poll,
+    read_log, timers,
 };
 use invite::Invite;
 use room::screen::{
@@ -24,7 +25,7 @@ use room::screen::{
     Watching,
 };
 use room::view::{LineKind, LinkState, ShareState, Source, View};
-use room::{Config, Timers};
+use room::{Config, Room, Timers};
 
 // What a video packet may carry on a 1200-byte datagram.
 const PAYLOAD: usize = 1200 - 32 - 1 - 2;
@@ -554,7 +555,7 @@ fn watcher_asks_reach_the_sharer() {
     // A range for a share that is not on goes nowhere either, and one about
     // frames that have not gone out yet counts as bad.
     bo_view.back(Back::Recover {
-        share: share + 1,
+        share: share.wrapping_add(1).max(1),
         first: 50,
         last: 50,
     });
@@ -729,7 +730,7 @@ fn capture_time_on_the_watchers_clock() {
     // The tolerance the voice tests hold mouth to ear to.
     assert!(apart.iter().all(|off| off.abs() < 2000), "{apart:?}");
     assert_eq!(
-        watching.to_here(hosts + 1, 0),
+        watching.to_here(hosts.wrapping_add(1).max(1), 0),
         None,
         "another share has no offset"
     );
@@ -1017,7 +1018,11 @@ fn on_1_3_0(name: &str, timers: Timers) -> Config {
 // Mara hosts, and Bo, a friend's program played by hand, shares, both on
 // 1.3.0. The invite is multi-use, for Ana after him.
 fn bo_shares() -> (Member, Hand, String, u32) {
-    let host = Member::host_with(on_1_3_0("Mara", timers()));
+    bo_shares_on(Member::host_with(on_1_3_0("Mara", timers())))
+}
+
+// As bo_shares, on a host already open.
+fn bo_shares_on(host: Member) -> (Member, Hand, String, u32) {
     host.room().new_invite(true);
     let code = host
         .wait_for(WAIT, "a multi-use invite", |v| {
@@ -1251,4 +1256,103 @@ fn a_new_session_hears_that_the_share_is_live_again() {
         text.contains("the session ran out without a rekey"),
         "{text}"
     );
+}
+
+// Mara's host restarts while Ana's link is down. Her session runs out short
+// of lost_after, so she joins the new run as a known device and asks again,
+// by number, for the share she watched. The new run's numbers start
+// elsewhere: that Watch finds no share, and her first roster ends the watch.
+#[test]
+fn a_watch_asked_again_after_a_host_restart_finds_no_share() {
+    let dir = Folder::new("share-restart");
+    let identity = Arc::new(keys::Identity::generate());
+    let mara = || {
+        let mut config = config_in("Mara", timers(), dir.0.clone());
+        config.version = V1_3_0;
+        config
+    };
+    let (mut first, mut bo, code, share) =
+        bo_shares_on(Member::host_as(Arc::clone(&identity), mara()));
+    let port = first.port();
+    let forwarder = Forwarder::new(loopback(port));
+    // A session that cannot rekey runs out 600 ms after it began, long
+    // before she would be lost.
+    let short = Timers {
+        rekey_after: Duration::from_millis(300),
+        reject_after: Duration::from_millis(600),
+        lost_after: Duration::from_secs(10),
+        ..timers()
+    };
+    let ana_log = fresh_log("share", "restart", "client");
+    let mut config = on_1_3_0("Ana", short);
+    config.log = Some(ana_log.clone());
+    let ana = Member::join_with(
+        config,
+        Arc::new(keys::Identity::generate()),
+        code_to_invite(&code, forwarder.addr),
+    );
+    until(&ana, &mut bo, "Bo's share in Ana's roster", |v| {
+        v.strip.state == LinkState::Live
+            && v.share.current.as_ref().is_some_and(|c| c.number == share)
+    });
+    ana.room().watch(share, true);
+    until(&ana, &mut bo, "the answer to Ana's Watch", |v| {
+        v.share.watching && words(v) == (ShareState::Live, Some(false))
+    });
+    // The next run takes her back only from the list this one saved. Read
+    // before the block, so the block stays short.
+    let key = *ana.identity.public();
+    poll(Duration::from_secs(5), "Ana on the host's list", || {
+        bo.answer_pings();
+        let devices = Room::known_devices(&dir.0).expect("the list reads");
+        devices.devices.iter().any(|d| d.key == key).then_some(())
+    });
+
+    // Past reject_after, and short of lost_after.
+    forwarder.block(true);
+    let blocked = Instant::now();
+    first.leave();
+    let host_log = fresh_log("share", "restart", "host");
+    let mut config = mara();
+    config.port = port;
+    config.log = Some(host_log.clone());
+    let second = Member::host_as(identity, config);
+    let hosts = shares(&second, 60);
+    assert_ne!(
+        hosts, share,
+        "the new run's share has the number Ana watched"
+    );
+    thread::sleep((blocked + Duration::from_secs(1)).saturating_duration_since(Instant::now()));
+    forwarder.block(false);
+    let unblocked = Instant::now();
+    let view = ana.wait_for(
+        Duration::from_secs(10),
+        "Ana back in the new run, watching nothing",
+        |v| {
+            v.strip.state == LinkState::Live
+                && v.share.current.as_ref().is_some_and(|c| c.number == hosts)
+                && !v.share.watching
+        },
+    );
+    println!(
+        "Ana watched share {share} of the first run; {:.0} ms after her link came back the second run's share {hosts} was in her roster and her watch had ended",
+        unblocked.elapsed().as_secs_f64() * 1000.0
+    );
+    let lines = system_lines(&view);
+    for line in ["Bo stopped sharing", "Mara started sharing"] {
+        assert!(lines.iter().any(|l| l == line), "{lines:?}");
+    }
+    drop(ana);
+    drop(second);
+    let text = read_log(&ana_log);
+    assert!(
+        text.contains("the session ran out without a rekey"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("lost, back to the invite addresses"),
+        "{text}"
+    );
+    let text = read_log(&host_log);
+    assert!(!text.contains("watches share"), "{text}");
 }

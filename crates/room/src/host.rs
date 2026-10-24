@@ -620,7 +620,10 @@ impl Host {
             relay_first: 0,
             screen,
             live: None,
-            next_share: 1,
+            // At random and never 0, which no message carries: a friend's PC
+            // that slept through a restart asks again by number for the share
+            // it watched, and must find no share of this run under it.
+            next_share: u32::from_le_bytes(peer::random()).max(1),
             own_watcher: Watcher::default(),
             sound,
             own_sound,
@@ -6197,6 +6200,37 @@ mod tests {
             .expect("the share granted")
     }
 
+    // Each run of the host starts its share numbers at random and counts up
+    // from there, past u32::MAX to 1 and never to 0.
+    #[test]
+    fn a_run_numbers_its_shares_from_a_random_start() {
+        let start = Instant::now();
+        let mut earlier = Rig::new(start);
+        let mut ana = Guest::new();
+        ana.join(&mut earlier, "Ana", start);
+        let first = granted(&mut earlier, &mut ana, start);
+        let mut rig = Rig::new(start);
+        let mut ana = Guest::new();
+        ana.join(&mut rig, "Ana", start);
+        let share = granted(&mut rig, &mut ana, start);
+        assert_ne!(share, first);
+
+        ana.say(&mut rig, &Message::ShareStop, start);
+        assert_eq!(
+            granted(&mut rig, &mut ana, start),
+            share.wrapping_add(1).max(1)
+        );
+
+        // Later, so these two asks fit the limit on asks to share whatever
+        // its burst.
+        let later = start + Duration::from_secs(4);
+        rig.host.next_share = u32::MAX;
+        ana.say(&mut rig, &Message::ShareStop, later);
+        assert_eq!(granted(&mut rig, &mut ana, later), u32::MAX);
+        ana.say(&mut rig, &Message::ShareStop, later);
+        assert_eq!(granted(&mut rig, &mut ana, later), 1);
+    }
+
     // A frame of one data and one parity shard of the smallest size, the
     // cheapest packet a sharer can send.
     fn tiny_packet() -> Vec<u8> {
@@ -7176,7 +7210,11 @@ mod tests {
         assert_eq!(rig.host.drops.bad, 1);
         rig.deliver(&sent_sound(&mut ana, 0, 0, &frame), from_ana, start);
         assert_eq!(rig.host.drops.bad, 2);
-        rig.deliver(&sent_sound(&mut ana, share + 1, 0, &frame), from_ana, start);
+        rig.deliver(
+            &sent_sound(&mut ana, share.wrapping_add(1).max(1), 0, &frame),
+            from_ana,
+            start,
+        );
         assert_eq!(rig.host.drops.bad, 3);
         bo.say(&mut rig, &Message::ShareSound { share, on: true }, start);
         assert_eq!(rig.host.drops.bad, 4);
