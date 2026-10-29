@@ -15,7 +15,7 @@
 
 use crate::bindings::Bindings;
 use crate::key::{Chord, Key, Modifiers};
-use crate::tracker::{INJECTED, RI_KEY_E0, RawKey};
+use crate::tracker::{INJECTED, RawKey};
 
 // Windows takes a low-level hook away without a word when the thread that
 // set it answers too late (LowLevelHooksTimeout). While it is in, both sides
@@ -29,9 +29,6 @@ use crate::tracker::{INJECTED, RI_KEY_E0, RawKey};
 // such as the made-up Shift around the arrows and the second half of Pause,
 // which the hook may not.
 const AHEAD: u64 = 4;
-
-const VK_PAUSE: u32 = 0x13;
-const VK_NUMLOCK: u32 = 0x90;
 
 pub(crate) struct Grab {
     bindings: Bindings,
@@ -149,31 +146,13 @@ pub(crate) fn windows_acts(key: Key, held: Modifiers) -> bool {
         || ((key == Key::F4 || key == Key::SPACE) && with(Modifiers::ALT))
 }
 
-// A key as the hook reports it: the scan code without its prefix and a flag
-// for E0, named the way Raw Input names it. The hook reports Pause as 45
-// without the flag and Num Lock as 45 with it, the other way round from
-// what the keyboard sends.
-pub(crate) fn from_hook(vk: u32, scan: u32, extended: bool) -> Option<Key> {
-    match vk {
-        VK_PAUSE => return Some(Key::PAUSE),
-        VK_NUMLOCK => return Some(Key::from_scan(0, 0x45)),
-        _ => {}
-    }
-    let raw = RawKey {
-        make_code: u16::try_from(scan).ok()?,
-        flags: if extended { RI_KEY_E0 } else { 0 },
-        vkey: u16::try_from(vk).ok()?,
-        device: INJECTED,
-    };
-    raw.key()
-}
-
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
 
     use super::*;
     use crate::bindings::Action;
+    use crate::tracker::RI_KEY_E0;
 
     const KEYBOARD: usize = 0x0002_0017;
     const E: Key = Key::from_scan(0, 0x12);
@@ -438,27 +417,6 @@ mod tests {
                 grab.raw(RawKey::press(L, KEYBOARD), ON);
             }
             assert!(grab.lost(), "reported {reported}");
-        }
-    }
-
-    #[test]
-    fn hook_keys_are_named_the_way_raw_input_names_them() {
-        let cases = [
-            ((0x13, 0x45, false), Some(Key::PAUSE)),
-            ((0x90, 0x45, true), Some(Key::from_scan(0, 0x45))),
-            ((0x5B, 0x5B, true), Some(Key::LEFT_WIN)),
-            ((0xA3, 0x1D, true), Some(Key::RIGHT_CTRL)),
-            ((0xA2, 0x1D, false), Some(Key::LEFT_CTRL)),
-            ((0x09, 0x0F, false), Some(Key::TAB)),
-            ((0x23, 0x4F, true), Some(Key::END)),
-            // The made-up Shift around the arrows under Num Lock.
-            ((0xA0, 0x2A, true), None),
-            // A key sent by its virtual key alone has no scan code.
-            ((0x41, 0, false), None),
-            ((0x41, 0x1_0000, false), None),
-        ];
-        for ((vk, scan, extended), key) in cases {
-            assert_eq!(from_hook(vk, scan, extended), key, "{vk:#x} {scan:#x}");
         }
     }
 

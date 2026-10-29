@@ -7,6 +7,8 @@
 use std::fmt;
 use std::str::FromStr;
 
+use crate::tracker::{INJECTED, RI_KEY_E0, RawKey};
+
 // Scan code set 1 make code, with the prefix byte the keyboard sends before
 // it (0xE0 or 0xE1) in the high byte. So Left Ctrl is 0x001D and Right Ctrl,
 // which sends E0 1D, is 0xE01D.
@@ -15,6 +17,10 @@ pub struct Key(u16);
 
 const E0: u16 = 0xE000;
 const E1: u16 = 0xE100;
+
+const VK_PAUSE: u32 = 0x13;
+const VK_NUMLOCK: u32 = 0x90;
+const VK_PACKET: u32 = 0xE7;
 
 impl Key {
     pub const ESC: Key = Key(0x01);
@@ -42,6 +48,28 @@ impl Key {
     // `prefix` is 0, 0xE0 or 0xE1; `code` the make code without it.
     pub const fn from_scan(prefix: u8, code: u8) -> Key {
         Key((prefix as u16) << 8 | code as u16)
+    }
+
+    // A key as a window's key messages and the low-level hook give it: the
+    // scan code without its prefix and a flag for E0, named the way Raw Input
+    // names it. Both give Pause as 45 without the flag and Num Lock as 45
+    // with it, the other way round from what the keyboard sends.
+    pub fn from_windows(vk: u32, scan: u32, extended: bool) -> Option<Key> {
+        match vk {
+            VK_PAUSE => return Some(Key::PAUSE),
+            VK_NUMLOCK => return Some(Key::from_scan(0, 0x45)),
+            // Text a program typed through SendInput: the character sits
+            // where the scan code would be.
+            VK_PACKET => return None,
+            _ => {}
+        }
+        let raw = RawKey {
+            make_code: u16::try_from(scan).ok()?,
+            flags: if extended { RI_KEY_E0 } else { 0 },
+            vkey: u16::try_from(vk).ok()?,
+            device: INJECTED,
+        };
+        raw.key()
     }
 
     pub fn scan(self) -> u16 {
@@ -407,6 +435,38 @@ mod tests {
             "Key zz",
         ] {
             assert_eq!(Key::parse(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn window_keys_are_named_the_way_raw_input_names_them() {
+        let cases = [
+            ((0x13, 0x45, false), Some(Key::PAUSE)),
+            ((0x90, 0x45, true), Some(Key::from_scan(0, 0x45))),
+            ((0x5B, 0x5B, true), Some(Key::LEFT_WIN)),
+            ((0xA3, 0x1D, true), Some(Key::RIGHT_CTRL)),
+            ((0xA2, 0x1D, false), Some(Key::LEFT_CTRL)),
+            ((0x09, 0x0F, false), Some(Key::TAB)),
+            ((0x23, 0x4F, true), Some(Key::END)),
+            // Ctrl+Pause.
+            ((0x03, 0x46, true), Some(Key::from_scan(0xE0, 0x46))),
+            ((0x20, 0x39, false), Some(Key::SPACE)),
+            ((0x0D, 0x1C, false), Some(Key::from_scan(0, 0x1C))),
+            ((0x0D, 0x1C, true), Some(Key::from_scan(0xE0, 0x1C))),
+            // The made-up Shift around the arrows under Num Lock.
+            ((0xA0, 0x2A, true), None),
+            // A key sent by its virtual key alone has no scan code.
+            ((0x41, 0, false), None),
+            ((0x41, 0x1_0000, false), None),
+            ((0xE7, 0x2D, false), None),
+            ((0xE7, 0x4E2D, false), None),
+        ];
+        for ((vk, scan, extended), key) in cases {
+            assert_eq!(
+                Key::from_windows(vk, scan, extended),
+                key,
+                "{vk:#x} {scan:#x}"
+            );
         }
     }
 }

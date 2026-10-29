@@ -55,8 +55,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::feed::{Captured, RawMouse, Sink};
-use crate::grab::{Grab, from_hook};
+use crate::grab::Grab;
 use crate::hotkeys::Loop;
+use crate::key::Key;
 use crate::remote::Shared;
 use crate::tracker::{Elevation, RawKey};
 
@@ -218,7 +219,7 @@ impl Hooked {
     // A key taken while the viewer is not in front, a release or repeat of
     // one taken before, stays away from Windows and goes nowhere.
     fn event(&mut self, event: &KBDLLHOOKSTRUCT) -> bool {
-        let key = from_hook(
+        let key = Key::from_windows(
             event.vkCode,
             event.scanCode,
             event.flags & LLKHF_EXTENDED != 0,
