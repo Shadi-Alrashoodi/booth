@@ -4601,6 +4601,63 @@ mod tests {
         assert_eq!(asks(&rig), 1);
     }
 
+    // With the link down, Share while this PC shares changes the frame rate
+    // and the share runs on, as it does while live; one while the ask is out
+    // does nothing. Only an ask that would go out is refused.
+    #[test]
+    fn a_share_asked_for_again_while_reconnecting_runs_on() {
+        use crate::screen::{OwnShare, Refusal};
+
+        let timers = Timers::default();
+        let start = Instant::now();
+        let (mut rig, _session) = Rig::connected(timers, start);
+        let down = start + timers.reconnecting_after;
+        rig.tick(down);
+        assert_eq!(rig.client.state, LinkState::Reconnecting);
+        let sent = |rig: &Rig| {
+            rig.client
+                .link
+                .reliable
+                .unacked()
+                .filter(|message| {
+                    matches!(
+                        Message::decode(message),
+                        Some(Message::ShareStart { .. } | Message::ShareStop)
+                    )
+                })
+                .count()
+        };
+
+        rig.client
+            .screen
+            .sharing
+            .set_state(OwnShare::Sharing { number: 3, fps: 60 });
+        rig.client.share(90, down, &rig.socket);
+        assert_eq!(
+            rig.client.screen.sharing.state(),
+            OwnShare::Sharing { number: 3, fps: 90 }
+        );
+
+        rig.client
+            .screen
+            .sharing
+            .set_state(OwnShare::Asking { fps: 60 });
+        rig.client.share(90, down, &rig.socket);
+        assert_eq!(
+            rig.client.screen.sharing.state(),
+            OwnShare::Asking { fps: 60 }
+        );
+        assert_eq!(sent(&rig), 0);
+
+        rig.client.screen.sharing.set_state(OwnShare::Off);
+        assert!(rig.client.share(90, down, &rig.socket));
+        assert_eq!(
+            rig.client.screen.sharing.state(),
+            OwnShare::Refused(Refusal::NotLive)
+        );
+        assert_eq!(sent(&rig), 0, "an ask went out with the link down");
+    }
+
     // A new watcher's ask that comes ahead of the facts that count them
     // sends this PC's PC sound to the host until those facts come or
     // JOINING_FOR runs out, and only a step sees it run out: the share's

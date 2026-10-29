@@ -33,17 +33,15 @@ fn sharer_of(roster: &Roster) -> Option<(&Entry, EntryShare)> {
 
 impl Client {
     // The panel's Share: an ask to the host, and nothing captured before the
-    // answer, or refused here while the roster shows someone else sharing.
-    // While this PC shares, the frame rate changes.
+    // answer, or refused here while the host cannot be reached or the roster
+    // shows someone else sharing. While this PC shares, the frame rate
+    // changes, with the link down too: the share runs on, and the host hears
+    // the new rate once the link is back.
     pub(crate) fn share(&mut self, fps: u8, now: Instant, socket: &Socket) -> bool {
         if self.state == LinkState::Closed {
             return false;
         }
         self.screen.problem = None;
-        if self.state != LinkState::Live || self.sessions.current.is_none() {
-            self.share_refused(Refusal::NotLive);
-            return true;
-        }
         let state = self.screen.sharing.state();
         let asks = match state {
             // The host hears the new rate from the share's thread, as the
@@ -60,6 +58,10 @@ impl Client {
             }
             OwnShare::Asking { .. } => false,
             OwnShare::Off | OwnShare::Refused(_) => {
+                if self.state != LinkState::Live || self.sessions.current.is_none() {
+                    self.share_refused(Refusal::NotLive);
+                    return true;
+                }
                 // The host would refuse it with the same line, a round trip
                 // later. A share that started since the last roster is the
                 // host's to refuse.

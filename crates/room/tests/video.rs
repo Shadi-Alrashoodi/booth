@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 
 use common::voiced::heard_cues;
 use common::window::Window;
-use common::{Member, code_to_invite, config, fresh_log, loopback, poll, read_log, timers};
+use common::{
+    Forwarder, Member, code_to_invite, config, fresh_log, loopback, poll, read_log, timers,
+};
 use room::view::{
     Codec, LineKind, LinkState, OwnShare, Paused, ShareState, SharingNumbers, View, WatchingNumbers,
 };
@@ -1127,6 +1129,69 @@ fn share_that_cannot_start_says_why() {
         host.wait_for(WAIT, "no share in the room", |v| v.share.current.is_none());
         ana.wait_for(WAIT, "no share in the room", |v| v.share.current.is_none());
     }
+}
+
+// Room::share while Ana shares and her link to the host is reconnecting
+// changes the frame rate, as it does while live, and the share runs on
+// through the blip: ending it on her PC would tell the host nothing, and
+// everyone would see her sharing with no picture. Back live, the host has
+// the new rate.
+#[test]
+fn a_share_asked_for_again_while_reconnecting_runs_on() {
+    let _turn = turn();
+    if !ready() {
+        return;
+    }
+    // Neither side gives the other up while the link is down below.
+    let patient = |mut config: Config| {
+        config.timers.lost_after = Duration::from_secs(10);
+        config
+    };
+    let host = Member::host_with(patient(config("Mara", timers())));
+    host.room().new_invite(true);
+    let code = host
+        .wait_for(WAIT, "a multi-use invite", |v| {
+            v.invite
+                .as_ref()
+                .is_some_and(|i| i.multi_use && !i.code.is_empty())
+        })
+        .invite
+        .expect("an invite")
+        .code;
+    let forwarder = Forwarder::new(loopback(host.port()));
+    let ana = Member::join_with(
+        patient(config_with(
+            "Ana",
+            pattern(None),
+            room::DEFAULT_VIDEO_UPLOAD_KBPS,
+        )),
+        std::sync::Arc::new(keys::Identity::generate()),
+        code_to_invite(&code, forwarder.addr),
+    );
+    ana.wait_for(WAIT, "live with Mara", |v| {
+        v.strip.state == LinkState::Live && v.people.len() == 2
+    });
+    let number = shares(&ana, 60);
+
+    forwarder.block(true);
+    ana.wait_for(WAIT, "reconnecting", |v| {
+        v.strip.state == LinkState::Reconnecting
+    });
+    ana.room().share(30, None);
+    ana.wait_for(WAIT, "the new rate on Ana's PC", |v| {
+        v.share.own == OwnShare::Sharing { number, fps: 30 }
+    });
+    forwarder.block(false);
+    ana.wait_for(WAIT, "live again", |v| v.strip.state == LinkState::Live);
+    host.wait_for(WAIT, "the new rate at the host", |v| {
+        v.share
+            .current
+            .as_ref()
+            .is_some_and(|c| c.number == number && c.name == "Ana" && c.fps == 30)
+    });
+    let view = ana.view();
+    assert!(view.share.running.is_some(), "the capture closed");
+    assert_eq!(view.share.problem, None);
 }
 
 // Paused by hand, the share lets go of the pattern and sends nothing: the
