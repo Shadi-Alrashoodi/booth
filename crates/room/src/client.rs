@@ -437,6 +437,12 @@ pub(crate) struct Client {
     // shows: the one asked with, then what the share's thread said it runs
     // at. Kept here because the roster copy can be a step behind.
     told_fps: Option<(u32, u8)>,
+    // ShareStarts the host has yet to answer on this session, and while this
+    // PC asks, how many of them it answers before the ask: after Stop and
+    // Share inside a round trip, the answer to a rate the share's thread told
+    // or to the ask taken back is still on its way, and is not the ask's.
+    starts_due: u32,
+    ahead_of_ask: u32,
     // An input packet's events on their way to this PC's injector, kept so
     // taking one allocates nothing.
     input_events: Vec<crate::remote::InputEvent>,
@@ -608,6 +614,8 @@ impl Client {
             answers_due: None,
             watched_sharer: None,
             told_fps: None,
+            starts_due: 0,
+            ahead_of_ask: 0,
             input_events: Vec::with_capacity(crate::remote::MAX_EVENTS),
         }
     }
@@ -4681,5 +4689,6 @@ mod tests {
     }
 
     mod answers;
+    mod asks;
     mod sound;
 }

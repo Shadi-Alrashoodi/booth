@@ -1008,6 +1008,8 @@ impl Host {
                 (ShareAnswer::Granted { share }, true)
             }
         };
+        // One answer for every ShareStart, a rate too: the client counts them
+        // to tell its ask's answer from the others.
         let peer = &mut self.peers[i];
         peer.link.queue(&Message::ShareAnswer(answer));
         peer.flush(socket, now);

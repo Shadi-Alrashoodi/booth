@@ -299,6 +299,49 @@ fn share_ends_when_its_sharer_leaves_or_is_lost() {
     friends.clear();
 }
 
+// Ana stops and asks again before the answer to her first ask is back. The
+// host grants the first ask, ends that share at the stop and grants the
+// second, and the roster that ends the first share reaches her between the
+// two grants. She shares under the second number, and stays on it.
+#[test]
+fn an_ask_taken_back_and_made_again_shares_under_the_new_number() {
+    let (host, _, mut through) = room_of(&["Mara"], timers());
+    let forwarder = Forwarder::new(loopback(host.port()));
+    through.candidates = vec![invite::Candidate {
+        kind: invite::CandidateKind::Lan,
+        addr: forwarder.addr,
+    }];
+    let ana = Member::join("Ana", timers(), through);
+    ana.wait_for(WAIT, "Ana live", |v| v.strip.state == LinkState::Live);
+    // Everything Ana sends reaches the host 600 ms late. Her stop and second
+    // ask leave 400 ms after the first ask, 200 ms before its answer is back,
+    // and reach the host 400 ms after the roster that shows the first share,
+    // 150 ms past the 250 ms the host leaves between two rosters, so the one
+    // that ends the first share goes at once, ahead of the second grant. If
+    // the times slip the test still passes, but may not meet that order.
+    forwarder.hold(Duration::from_millis(600), Duration::from_millis(600));
+    ana.room().share(60, None);
+    thread::sleep(Duration::from_millis(400));
+    ana.room().stop_sharing();
+    ana.room().share(60, None);
+    let view = host.wait_for(WAIT, "Ana's second share at the host", |v| {
+        let started = system_lines(v)
+            .iter()
+            .filter(|line| *line == "Ana started sharing")
+            .count();
+        v.share.current.as_ref().is_some_and(|c| c.name == "Ana") && started == 2
+    });
+    let second = view.share.current.expect("a share").number;
+    ana.wait_for(WAIT, "Ana sharing under the second number", |v| {
+        number(v) == Some(second)
+    });
+    ana.holds_for(
+        Duration::from_millis(500),
+        "Ana left the second share",
+        |v| number(v) == Some(second),
+    );
+}
+
 #[test]
 fn video_reaches_only_the_watchers() {
     let (host, friends, invite) = room_of(&["Mara", "Ana", "Bo", "Cy"], timers());

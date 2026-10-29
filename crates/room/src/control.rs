@@ -181,7 +181,9 @@ pub(crate) enum Message {
     Periods(Periods),
     // A client to the host: may it share, at this many frames a second. It
     // captures nothing before the answer. Sent again while its share lasts,
-    // it says the frame rate changed and gets the same answer.
+    // it says the frame rate changed and gets the same answer. Each one gets
+    // one answer, in the order they came: the client counts on that to tell
+    // its ask's answer from the others.
     ShareStart {
         fps: u8,
     },

@@ -83,8 +83,8 @@ impl Client {
             }
         };
         if asks {
-            self.link.queue(&Message::ShareStart { fps });
-            self.flush(now, socket);
+            self.ahead_of_ask = self.starts_due;
+            self.send_share_start(fps, now, socket);
         }
         true
     }
@@ -100,6 +100,14 @@ impl Client {
         self.control_share_ended(now);
         self.screen.sharing.set_state(OwnShare::Off);
         true
+    }
+
+    // The count of answers due is right only while every ShareStart goes out
+    // here.
+    fn send_share_start(&mut self, fps: u8, now: Instant, socket: &Socket) {
+        self.starts_due += 1;
+        self.link.queue(&Message::ShareStart { fps });
+        self.flush(now, socket);
     }
 
     // The panel's Share sound for this PC's share, pressed at `press`: only
@@ -326,8 +334,7 @@ impl Client {
                 }
                 log!(self.log, "share {share}: runs at {fps} fps");
                 self.told_fps = Some((share, fps));
-                self.link.queue(&Message::ShareStart { fps });
-                self.flush(now, socket);
+                self.send_share_start(fps, now, socket);
                 return false;
             }
             ShareNews::Software { share, sentence } => {
@@ -647,22 +654,28 @@ impl Client {
             && self.answers_due.is_none_or(|(asked, _)| asked != share)
     }
 
+    // The host answers every ShareStart once, in the order they went, so the
+    // count says which answer is the ask's. The others answered a rate the
+    // share's thread told, which changes nothing here, or an ask taken back,
+    // whose grant the ShareStop after it ends at the host.
     fn answered(&mut self, answer: ShareAnswer) {
-        let (asked, asking) = match self.screen.sharing.state() {
-            OwnShare::Asking { fps } => (fps, true),
-            OwnShare::Sharing { fps, .. } => (fps, false),
-            // Stopped before the answer came; the host has the stop too.
-            _ => return,
+        self.starts_due = self.starts_due.saturating_sub(1);
+        let OwnShare::Asking { fps: asked } = self.screen.sharing.state() else {
+            return;
         };
+        if let Some(ahead) = self.ahead_of_ask.checked_sub(1) {
+            self.ahead_of_ask = ahead;
+            log!(
+                self.log,
+                "share: an answer to an earlier share start, not to this ask"
+            );
+            return;
+        }
         match answer {
             ShareAnswer::Granted { share } => {
                 log!(self.log, "share {share}: the host lets this pc share");
-                // The ask carried this rate, and the roster has it now. A
-                // grant while sharing answers a rate the share's thread
-                // told, which told_fps has already.
-                if asking {
-                    self.told_fps = Some((share, asked));
-                }
+                // The ask carried this rate, and the roster has it now.
+                self.told_fps = Some((share, asked));
                 self.screen.sharing.set_state(OwnShare::Sharing {
                     number: share,
                     fps: asked,
@@ -813,6 +826,8 @@ impl Client {
         // session it was given in; a rekey does not come through here.
         self.control_over(ControlEnd::SessionLost);
         self.end_own_share();
+        // Any answer to a ShareStart still due went with the old stream.
+        self.starts_due = 0;
         // The host passes on nothing of the share before it reads the Watch
         // below, so the old ear has nothing more to play, and its answer to
         // that Watch says the sharer's word again: the first, which only sets
