@@ -526,8 +526,7 @@ mod tests {
                 down(VK_CONTROL, 0x1D, EXTENDED | AGAIN),
                 false,
             ),
-            // Its character, U+4E2D, sets the bit for a key already down.
-            ("a packet", down(VK_PACKET, 0x4E2D, 0), false),
+            ("a packet", down(VK_PACKET, 0, 0), false),
             (
                 "the input method's",
                 down(VK_PROCESSKEY, 0x39, AGAIN),

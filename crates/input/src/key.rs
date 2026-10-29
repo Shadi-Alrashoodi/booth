@@ -58,8 +58,8 @@ impl Key {
         match vk {
             VK_PAUSE => return Some(Key::PAUSE),
             VK_NUMLOCK => return Some(Key::from_scan(0, 0x45)),
-            // Text a program typed through SendInput: the character sits
-            // where the scan code would be.
+            // Text a program typed through SendInput: the low-level hook gets
+            // the character where the scan code would be.
             VK_PACKET => return None,
             _ => {}
         }
@@ -458,8 +458,8 @@ mod tests {
             // A key sent by its virtual key alone has no scan code.
             ((0x41, 0, false), None),
             ((0x41, 0x1_0000, false), None),
+            // A hyphen typed through SendInput, as the low-level hook gets it.
             ((0xE7, 0x2D, false), None),
-            ((0xE7, 0x4E2D, false), None),
         ];
         for ((vk, scan, extended), key) in cases {
             assert_eq!(
