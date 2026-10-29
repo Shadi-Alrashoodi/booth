@@ -53,6 +53,11 @@ windows-sys = { workspace = true, features = ["Wdk_System_SystemServices", "Win3
 # Already in the tree through egui-winit. Used directly for the one call egui
 # does not offer: keeping the invite out of clipboard history and cloud sync.
 arboard = { version = "=3.6.1", default-features = false }
+# Already in the tree through eframe, at this version, which must stay
+# eframe's. Used directly for the message hook on the event loop eframe builds
+# (main.rs): eframe hands over the builder but not winit's trait that adds the
+# hook.
+winit = { version = "=0.30.13", default-features = false }
 # Phosphor Icons (MIT OR Apache-2.0, the font MIT): the gear on Settings and the
 # muted and deafened glyphs in the ring slot.
 egui-phosphor = { version = "=0.14.0", default-features = false, features = ["subset"] }

@@ -25,16 +25,20 @@ mod volumes;
 mod win;
 mod winver;
 
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::iter::Peekable;
 use std::ops::RangeInclusive;
 use std::process::ExitCode;
+use std::rc::Rc;
 use std::str::FromStr;
 use std::time::Duration;
 
 use eframe::egui::{IconData, ViewportBuilder};
 use eframe::egui_wgpu::{SurfaceConfig, WgpuConfiguration, WgpuSetup, WgpuSetupCreateNew};
 use eframe::wgpu;
+use input::PanelKeys;
+use winit::platform::windows::EventLoopBuilderExtWindows;
 
 use crate::app::NotStarted;
 use crate::backlog::Backlog;
@@ -151,10 +155,16 @@ fn main() -> ExitCode {
             "firewall: this account runs every program as administrator (uac off, or the built-in administrator), the panel included",
         ));
     }
+    // The message hook and the panel both run on this thread.
+    let panel_keys = Rc::new(RefCell::new(PanelKeys::default()));
     let result = eframe::run_native(
         "Booth",
-        native_options(),
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, setup, firewall, backlog)))),
+        native_options(Rc::clone(&panel_keys)),
+        Box::new(move |cc| {
+            Ok(Box::new(app::App::new(
+                cc, setup, firewall, backlog, panel_keys,
+            )))
+        }),
     );
     win::drop_window_icons();
     // The window is gone and the room with it, but a router slow to delete
@@ -536,7 +546,7 @@ fn port_number(text: &str) -> Option<u16> {
     text.parse().ok().filter(|&port| port != 0)
 }
 
-fn native_options() -> eframe::NativeOptions {
+fn native_options(panel_keys: Rc<RefCell<PanelKeys>>) -> eframe::NativeOptions {
     let mut setup = WgpuSetupCreateNew::without_display_handle();
     // DX12 only: it is on every Windows 10 and 11 PC, and leaving Vulkan and
     // GL out means one driver path to test instead of three.
@@ -558,6 +568,12 @@ fn native_options() -> eframe::NativeOptions {
             wgpu_setup: WgpuSetup::CreateNew(setup),
             ..WgpuConfiguration::default()
         },
+        // winit makes a key message into text, a paste or a press of the
+        // focused control once it translates and dispatches it, so the
+        // hotkeys' keys are kept back before that.
+        event_loop_builder: Some(Box::new(move |builder| {
+            builder.with_msg_hook(win::panel_key_hook(panel_keys));
+        })),
         ..eframe::NativeOptions::default()
     }
 }

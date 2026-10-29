@@ -1,15 +1,16 @@
+use std::cell::RefCell;
 use std::fs::File;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use eframe::egui::text_edit::TextEditState;
 use eframe::egui::{
-    self, CentralPanel, Context, Frame, Key, KeyboardShortcut, Modifiers, RawInput, Ui, UiBuilder,
-    ViewportCommand,
+    CentralPanel, Context, Frame, Key, KeyboardShortcut, Modifiers, Ui, UiBuilder, ViewportCommand,
 };
 use eframe::wgpu::rwh::{HasWindowHandle, RawWindowHandle};
-use input::{Action, Chord, Event};
+use input::{Action, Chord, Event, PanelKeys};
 use invite::Invite;
 use keys::Identity;
 use net::firewall::FirewallState;
@@ -99,6 +100,9 @@ pub struct App {
     // only when these do.
     scale: Option<f32>,
     focused: Option<bool>,
+    // Shared with the message hook (main.rs), which runs between passes on
+    // this thread.
+    panel_keys: Rc<RefCell<PanelKeys>>,
 }
 
 pub struct Setup {
@@ -169,6 +173,7 @@ impl App {
         setup: Result<Setup, String>,
         firewall: Firewall,
         mut backlog: Backlog,
+        panel_keys: Rc<RefCell<PanelKeys>>,
     ) -> App {
         theme::apply(&cc.egui_ctx);
         if let Ok(handle) = cc.window_handle()
@@ -211,6 +216,7 @@ impl App {
             update: Update::off(),
             scale: None,
             focused: None,
+            panel_keys,
         };
         // The start screen reads the known hosts each time it opens. The
         // devices are read only in settings and when a room opens, so a list
@@ -788,6 +794,18 @@ impl App {
         self.hotkeys.capture(waiting);
     }
 
+    // The message hook decides between passes what egui gets of each key, so
+    // after each pass it learns what the panel is doing.
+    fn follow_panel_keys(&self, ctx: &Context) {
+        let Ok(mut keys) = self.panel_keys.try_borrow_mut() else {
+            return;
+        };
+        keys.set_bindings(self.hotkeys.bindings());
+        keys.set_capture(self.hotkeys.capturing());
+        keys.set_typing(ctx.text_edit_focused());
+        keys.set_focused(ctx.input(|input| input.viewport().focused != Some(false)));
+    }
+
     fn logging(&self) -> bool {
         self.setup
             .as_ref()
@@ -1120,24 +1138,7 @@ impl eframe::App for App {
         if let Some(tray) = &mut self.tray {
             tray.show(tray::look(view.as_ref(), self.control_offered));
         }
-    }
-
-    // While settings waits for a new key the key belongs to the hotkeys,
-    // which read it themselves. The panel must not act on it as well: Space
-    // pressing the focused button, Tab moving on, Esc closing something.
-    fn raw_input_hook(&mut self, _ctx: &Context, raw_input: &mut RawInput) {
-        if self.hotkeys.capturing() {
-            raw_input.events.retain(|event| {
-                !matches!(
-                    event,
-                    egui::Event::Key { .. }
-                        | egui::Event::Text(_)
-                        | egui::Event::Copy
-                        | egui::Event::Cut
-                        | egui::Event::Paste(_)
-                )
-            });
-        }
+        self.follow_panel_keys(ctx);
     }
 
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
@@ -1321,6 +1322,7 @@ impl eframe::App for App {
         }
         // Change or Save pressed on this frame starts or ends a wait.
         self.follow_capture();
+        self.follow_panel_keys(ui.ctx());
     }
 }
 

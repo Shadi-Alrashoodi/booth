@@ -804,9 +804,9 @@ pub fn choice_row(
 // disabled. `description` is what a screen reader says after the name: the
 // line under the row. True when a click, a screen reader or Space turned it.
 // Space only on its own, not as it repeats, and only while the ring shows:
-// egui takes Space or Enter with any keys held for a click, so a hotkey such
-// as Ctrl+Shift+Space, which shows or hides the panel, would turn it as well,
-// and it keeps the focus after a click, where no ring says Space goes.
+// egui takes Space or Enter with any keys held, and each repeat, for a click,
+// and a switch that sends PC sound out turns only on a press meant for it.
+// egui also keeps the focus after a click, where no ring says Space goes.
 pub fn checkbox_row(
     ui: &mut Ui,
     id: Id,

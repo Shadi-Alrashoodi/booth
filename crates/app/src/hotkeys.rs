@@ -219,6 +219,8 @@ impl PauseKey {
 
 pub struct Hotkeys {
     running: Option<input::Hotkeys>,
+    // As last given to the hotkey thread.
+    bindings: Bindings,
     // Each with when the hotkey thread heard it: while the panel is
     // minimized it looks only a few times a second, and the share key's
     // second press is timed from the key, not from when the panel looked.
@@ -261,6 +263,7 @@ impl Hotkeys {
         };
         Hotkeys {
             running,
+            bindings,
             heard,
             failed,
             paused: false,
@@ -275,6 +278,7 @@ impl Hotkeys {
         let (_, heard) = mpsc::channel();
         Hotkeys {
             running: None,
+            bindings: Bindings::default(),
             heard,
             failed: None,
             paused: false,
@@ -331,14 +335,20 @@ impl Hotkeys {
     }
 
     // False when refused because this PC is controlled.
-    pub fn set_bindings(&self, bindings: Bindings) -> bool {
+    pub fn set_bindings(&mut self, bindings: Bindings) -> bool {
         if self.flags.controlled() {
             return false;
         }
+        self.bindings = bindings;
         if let Some(running) = &self.running {
             running.set_bindings(bindings);
         }
         true
+    }
+
+    // What the hotkey thread runs with; None while it does not run.
+    pub fn bindings(&self) -> Option<Bindings> {
+        self.running.as_ref().map(|_| self.bindings)
     }
 }
 
@@ -461,6 +471,7 @@ mod tests {
         off.capture(true);
         off.set_bindings(Bindings::default());
         assert!(off.heard().is_empty());
+        assert_eq!(off.bindings(), None, "no key is the hotkeys'");
     }
 
     // While this PC is controlled the bindings take no change and no key is
@@ -468,7 +479,10 @@ mod tests {
     #[test]
     fn while_controlled_the_bindings_stay_as_they_are() {
         let mut keys = Hotkeys::off();
-        assert!(keys.set_bindings(Bindings::default()));
+        let mut first = Bindings::default();
+        first.set(Action::Mute, "F8".parse().unwrap());
+        assert!(keys.set_bindings(first));
+        assert_eq!(keys.bindings, first);
         keys.capture(true);
         assert!(keys.capturing());
         keys.capture(false);
@@ -477,6 +491,7 @@ mod tests {
         let mut moved = Bindings::default();
         moved.set(Action::Panic, "F9".parse().unwrap());
         assert!(!keys.set_bindings(moved));
+        assert_eq!(keys.bindings, first, "the panel's copy too");
         keys.capture(true);
         assert!(!keys.capturing());
     }

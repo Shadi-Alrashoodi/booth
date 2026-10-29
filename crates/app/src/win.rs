@@ -1,10 +1,14 @@
+use std::cell::RefCell;
+use std::ffi::c_void;
 use std::io;
 #[cfg(feature = "store")]
 use std::path::Path;
 use std::ptr;
+use std::rc::Rc;
 use std::sync::{Mutex, PoisonError};
 
 use eframe::egui::Color32;
+use input::{Key, Modifiers, PanelKeys};
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, HWND, SYSTEMTIME};
 use windows_sys::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DwmSetWindowAttribute,
@@ -22,11 +26,15 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows_sys::Win32::System::WindowsProgramming::GetUserNameW;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, GetKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_PROCESSKEY, VK_RMENU, VK_RWIN,
+    VK_SHIFT,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, HWND_TOP, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW,
-    MB_ICONERROR, MB_OK, MessageBoxW, SM_CXICON, SM_CXSMICON, SPI_GETCLIENTAREAANIMATION,
+    MB_ICONERROR, MB_OK, MSG, MessageBoxW, SM_CXICON, SM_CXSMICON, SPI_GETCLIENTAREAANIMATION,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetForegroundWindow, SetWindowPos,
-    SystemParametersInfoW, WM_SETICON,
+    SystemParametersInfoW, WM_KEYDOWN, WM_KEYUP, WM_SETICON, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 use windows_sys::core::BOOL;
 
@@ -95,6 +103,97 @@ pub fn bring_forward(hwnd: isize) {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
         }
+    }
+}
+
+// For winit's message hook, which sees each message the panel's thread takes
+// off its queue before winit translates and dispatches it.
+pub fn panel_key_hook(keys: Rc<RefCell<PanelKeys>>) -> impl FnMut(*const c_void) -> bool + 'static {
+    move |msg| {
+        // SAFETY: winit hands its hook a pointer to the MSG it just took off
+        // the queue, alive until the hook returns.
+        let msg = unsafe { &*msg.cast::<MSG>() };
+        keys.try_borrow_mut()
+            .is_ok_and(|mut keys| keep_from_panel(&mut keys, msg))
+    }
+}
+
+// True keeps the message from the panel: a press never translated makes no
+// text, paste or window menu either. Every key message this thread gets is
+// the panel's: the region picker, the tray and the viewer have threads of
+// their own.
+pub fn keep_from_panel(keys: &mut PanelKeys, msg: &MSG) -> bool {
+    if !matches!(
+        msg.message,
+        WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP
+    ) {
+        return false;
+    }
+    let bits = msg.lParam as u32;
+    let Some(key) = Key::from_windows(
+        msg.wParam as u32,
+        (bits >> 16) & 0xFF,
+        bits & (1 << 24) != 0,
+    ) else {
+        return false;
+    };
+    if matches!(msg.message, WM_KEYUP | WM_SYSKEYUP) {
+        keys.release(key);
+        return false;
+    }
+    let repeat = bits & (1 << 30) != 0;
+    // SAFETY: both take a virtual key code and only read Windows' key state.
+    let keyboard = || {
+        readings(
+            |vk| unsafe { GetKeyState(i32::from(vk)) } < 0,
+            |vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0,
+        )
+    };
+    // The input method took this key, and egui-winit drops it; translating
+    // it is how the input method's text arrives. The input method can let
+    // the same key's repeats go by as the key itself, so a fresh press goes
+    // to PanelKeys all the same.
+    if msg.wParam == usize::from(VK_PROCESSKEY) {
+        if !repeat {
+            keys.press(key, &keyboard());
+        }
+        return false;
+    }
+    if repeat {
+        return keys.repeat(key);
+    }
+    keys.press(key, &keyboard())
+}
+
+// GetKeyState follows the messages this thread has read and may lack a
+// modifier pressed while another window had the focus; GetAsyncKeyState is
+// the keyboard now, which a message read late can be behind.
+fn readings(read: impl Fn(u16) -> bool, now: impl Fn(u16) -> bool) -> [Modifiers; 4] {
+    let [read, read_altgr] = modifiers(read);
+    let [now, now_altgr] = modifiers(now);
+    [read, read_altgr, now, now_altgr]
+}
+
+// The modifiers held, and the same without Ctrl while Right Alt is down: on a
+// layout with AltGr, Windows makes up a Left Ctrl press for Right Alt, and the
+// hotkeys, which hear Raw Input only, never hear it.
+fn modifiers(down: impl Fn(u16) -> bool) -> [Modifiers; 2] {
+    let mut held = Modifiers::NONE;
+    for (vk, modifier) in [
+        (VK_SHIFT, Modifiers::SHIFT),
+        (VK_MENU, Modifiers::ALT),
+        (VK_LWIN, Modifiers::WIN),
+        (VK_RWIN, Modifiers::WIN),
+    ] {
+        if down(vk) {
+            held = held.with(modifier);
+        }
+    }
+    let ctrl = held.with(Modifiers::CTRL);
+    match (down(VK_CONTROL), down(VK_RMENU)) {
+        (false, _) => [held; 2],
+        (true, false) => [ctrl; 2],
+        (true, true) => [ctrl, held],
     }
 }
 
@@ -362,4 +461,130 @@ fn local(unix: u64) -> Option<SYSTEMTIME> {
             && SystemTimeToTzSpecificLocalTime(ptr::null(), &utc, &mut local) != 0
     };
     ok.then_some(local)
+}
+
+#[cfg(test)]
+mod tests {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        VK_BACK, VK_F10, VK_LMENU, VK_M, VK_PACKET, VK_RETURN, VK_SPACE,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR;
+
+    use super::*;
+
+    // In lParam, beside the scan code: E0, and the key was down before.
+    const EXTENDED: u32 = 1 << 24;
+    const AGAIN: u32 = 1 << 30;
+
+    fn message(message: u32, vk: u16, scan: u32, bits: u32) -> MSG {
+        MSG {
+            message,
+            wParam: usize::from(vk),
+            lParam: ((scan << 16) | bits | 1) as isize,
+            ..MSG::default()
+        }
+    }
+
+    fn down(vk: u16, scan: u32, bits: u32) -> MSG {
+        message(WM_KEYDOWN, vk, scan, bits)
+    }
+
+    fn up(vk: u16, scan: u32) -> MSG {
+        message(WM_KEYUP, vk, scan, AGAIN | (1 << 31))
+    }
+
+    // No bindings, so the hotkeys take no press and the keyboard's real
+    // state, which a fresh press reads, never decides here.
+    #[test]
+    fn key_messages_reach_panel_keys() {
+        let mut keys = PanelKeys::default();
+        let steps = [
+            ("Space held from before", down(VK_SPACE, 0x39, AGAIN), true),
+            ("its release", up(VK_SPACE, 0x39), false),
+            ("a character", message(WM_CHAR, 0x20, 0x39, AGAIN), false),
+            ("Space pressed", down(VK_SPACE, 0x39, 0), false),
+            ("its repeat", down(VK_SPACE, 0x39, AGAIN), false),
+            ("its release", up(VK_SPACE, 0x39), false),
+            ("Space pressed again", down(VK_SPACE, 0x39, 0), false),
+            (
+                "its release with Alt down",
+                message(WM_SYSKEYUP, VK_SPACE, 0x39, AGAIN | 1 << 31 | 1 << 29),
+                false,
+            ),
+            (
+                "Space held from before, after it",
+                down(VK_SPACE, 0x39, AGAIN),
+                true,
+            ),
+            (
+                "F10 held from before",
+                message(WM_SYSKEYDOWN, VK_F10, 0x44, AGAIN),
+                true,
+            ),
+            (
+                "Right Ctrl held from before",
+                down(VK_CONTROL, 0x1D, EXTENDED | AGAIN),
+                false,
+            ),
+            // Its character, U+4E2D, sets the bit for a key already down.
+            ("a packet", down(VK_PACKET, 0x4E2D, 0), false),
+            (
+                "the input method's",
+                down(VK_PROCESSKEY, 0x39, AGAIN),
+                false,
+            ),
+            (
+                "Space still held from before",
+                down(VK_SPACE, 0x39, AGAIN),
+                true,
+            ),
+            (
+                "Backspace to the input method",
+                down(VK_PROCESSKEY, 0x0E, 0),
+                false,
+            ),
+            ("its repeat as itself", down(VK_BACK, 0x0E, AGAIN), false),
+            ("Enter pressed", down(VK_RETURN, 0x1C, 0), false),
+            (
+                "Num Enter held from before",
+                down(VK_RETURN, 0x1C, EXTENDED | AGAIN),
+                true,
+            ),
+        ];
+        for (what, msg, kept) in steps {
+            assert_eq!(keep_from_panel(&mut keys, &msg), kept, "{what}");
+        }
+        keys.set_capture(true);
+        assert!(
+            keep_from_panel(&mut keys, &down(VK_M, 0x32, 0)),
+            "M while Settings waits"
+        );
+        assert!(
+            !keep_from_panel(&mut keys, &down(VK_PROCESSKEY, 0x32, 0)),
+            "the input method's key while Settings waits"
+        );
+    }
+
+    #[test]
+    fn altgr_is_read_with_and_without_its_ctrl() {
+        let read = |held: &[u16]| modifiers(|vk| held.contains(&vk));
+        let ctrl_alt = Modifiers::CTRL.with(Modifiers::ALT);
+        assert_eq!(read(&[]), [Modifiers::NONE; 2]);
+        assert_eq!(
+            read(&[VK_CONTROL, VK_SHIFT]),
+            [Modifiers::CTRL.with(Modifiers::SHIFT); 2]
+        );
+        assert_eq!(read(&[VK_CONTROL, VK_MENU, VK_LMENU]), [ctrl_alt; 2]);
+        assert_eq!(
+            read(&[VK_CONTROL, VK_MENU, VK_RMENU]),
+            [ctrl_alt, Modifiers::ALT]
+        );
+        assert_eq!(read(&[VK_MENU, VK_RMENU]), [Modifiers::ALT; 2]);
+        let altgr = |vk: u16| [VK_CONTROL, VK_MENU, VK_RMENU].contains(&vk);
+        let up = |_: u16| false;
+        for four in [readings(altgr, up), readings(up, altgr)] {
+            assert!(four.contains(&ctrl_alt), "{four:?}");
+            assert!(four.contains(&Modifiers::ALT), "{four:?}");
+        }
+    }
 }
