@@ -61,22 +61,25 @@ struct Failed {
 }
 
 fn run(sharing: &Arc<Sharing>, source: &VideoSource, log: &Log) {
-    let mut last = None;
-    while let Some(start) = next_share(sharing, last, log) {
-        last = Some(start.number);
+    // The last share's number, if that share failed. A share that ended
+    // without failing ended on the room's word, so its number is free at
+    // once.
+    let mut failed = None;
+    while let Some(start) = next_share(sharing, &mut failed, log) {
         let number = start.number;
         let outcome = panic::catch_unwind(AssertUnwindSafe(|| share(sharing, source, log, start)));
         sharing.closed();
         sharing.set_numbers(None);
-        let failed = match outcome {
+        let failure = match outcome {
             Ok(Ok(())) => None,
-            Ok(Err(failed)) => Some(failed),
+            Ok(Err(failure)) => Some(failure),
             Err(payload) => Some(Failed {
                 ran: true,
                 why: format!("the share's thread stopped: {}", panic_text(&*payload)),
             }),
         };
-        if let Some(Failed { ran, why }) = failed {
+        failed = failure.as_ref().map(|_| number);
+        if let Some(Failed { ran, why }) = failure {
             log!(log, "share {number}: {why}");
             sharing.tell(ShareNews::Failed {
                 share: number,
@@ -87,19 +90,19 @@ fn run(sharing: &Arc<Sharing>, source: &VideoSource, log: &Log) {
     }
 }
 
-// The next share of this PC's to run: not `last`, which ran already and
-// may still be granted while the room takes in that it failed. None once
-// the room closes.
-fn next_share(sharing: &Sharing, last: Option<u32>, log: &Log) -> Option<Start> {
+// The next share of this PC's to run: not `failed`, which the room can
+// still show granted until it takes the failure in. Once it shows anything
+// but Sharing that share is over for it, whether it took the failure in or
+// ended the share first, and the number can be granted again: a host that
+// restarted numbers its shares afresh. None once the room closes.
+fn next_share(sharing: &Sharing, failed: &mut Option<u32>, log: &Log) -> Option<Start> {
     let mut waits_failed = false;
     loop {
         if sharing.closing() {
             return None;
         }
-        if let OwnShare::Sharing { number, fps } = sharing.state()
-            && Some(number) != last
-        {
-            return Some(Start { number, fps });
+        if let Some(start) = startable(sharing.state(), failed) {
+            return Some(start);
         }
         if let Err(err) = net::pace::wait(sharing.signal(), None) {
             if !std::mem::replace(&mut waits_failed, true) {
@@ -109,6 +112,17 @@ fn next_share(sharing: &Sharing, last: Option<u32>, log: &Log) -> Option<Start> 
                 );
             }
             thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+fn startable(state: OwnShare, failed: &mut Option<u32>) -> Option<Start> {
+    match state {
+        OwnShare::Sharing { number, fps } if Some(number) != *failed => Some(Start { number, fps }),
+        OwnShare::Sharing { .. } => None,
+        OwnShare::Off | OwnShare::Asking { .. } | OwnShare::Refused(_) => {
+            *failed = None;
+            None
         }
     }
 }
@@ -1319,6 +1333,95 @@ mod tests {
         assert!(!pictured.after(Duration::from_secs(5), false, false));
         let text = crate::screen::NO_PICTURE;
         assert!(text.is_ascii() && !text.contains('!') && text.ends_with('.'));
+    }
+
+    // A share that failed is not started again while the room shows it
+    // granted, as it can until it takes the failure in; another share is.
+    // Off, Asking or Refused say the room let it go, and a grant of the same
+    // number starts after that: a host that restarted numbers its shares
+    // afresh.
+    #[test]
+    fn a_failed_share_waits_until_the_room_lets_it_go() {
+        let granted = |number| OwnShare::Sharing { number, fps: 60 };
+        let start = |state: OwnShare, failed: &mut Option<u32>| {
+            startable(state, failed).map(|start| (start.number, start.fps))
+        };
+        let mut failed = Some(1);
+        assert_eq!(start(granted(1), &mut failed), None, "started again");
+        assert_eq!(failed, Some(1));
+        assert_eq!(start(granted(2), &mut failed), Some((2, 60)));
+        for over in [
+            OwnShare::Off,
+            OwnShare::Asking { fps: 60 },
+            OwnShare::Refused(crate::screen::Refusal::NotLive),
+        ] {
+            let mut failed = Some(1);
+            assert_eq!(start(over.clone(), &mut failed), None, "{over:?}");
+            assert_eq!(failed, None, "{over:?}");
+            assert_eq!(start(granted(1), &mut failed), Some((1, 60)), "{over:?}");
+        }
+    }
+
+    // The same rule on the share's own thread: a share that fails is told to
+    // the room once, not over and over while the room still shows it
+    // granted. Another number starts, and so does the failed one once the
+    // room has shown it Off. The pattern at 0x0 is refused before any monitor
+    // or graphics card is looked at, so nothing is captured.
+    #[test]
+    fn a_failed_share_fails_once_while_it_is_granted() {
+        let wake = net::pace::Signal::new().expect("create an event");
+        let clock = crate::peer::Clock::new(Instant::now());
+        let sharing = Sharing::new(clock, false, None, 1000, wake);
+        let thread = start(
+            Arc::clone(&sharing),
+            VideoSource::Pattern {
+                width: 0,
+                height: 0,
+                busy: false,
+            },
+            Log::off(),
+        )
+        .expect("start the share's thread");
+        // The shares told failed until `share` is, and for 300 ms after.
+        let failures = |share: u32| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut until = deadline;
+            let mut told = Vec::new();
+            while Instant::now() < until {
+                told.extend(
+                    sharing
+                        .take_news()
+                        .into_iter()
+                        .filter_map(|news| match news {
+                            ShareNews::Failed { share, .. } => Some(share),
+                            _ => None,
+                        }),
+                );
+                if until == deadline && told.contains(&share) {
+                    until = Instant::now() + Duration::from_millis(300);
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            told
+        };
+
+        sharing.set_state(OwnShare::Sharing { number: 1, fps: 60 });
+        let first = failures(1);
+        sharing.set_state(OwnShare::Sharing { number: 2, fps: 60 });
+        let another = failures(2);
+        sharing.set_state(OwnShare::Off);
+        // Long enough for the thread to see Off before the grant below.
+        thread::sleep(Duration::from_millis(500));
+        sharing.set_state(OwnShare::Sharing { number: 2, fps: 60 });
+        let again = failures(2);
+        // Before the asserts: a thread that fails over and over must not
+        // outlive the test.
+        sharing.close();
+        thread.join().expect("the share's thread ended");
+
+        assert_eq!(first, [1]);
+        assert_eq!(another, [2]);
+        assert_eq!(again, [2]);
     }
 
     // A region smaller than SMALLEST_REGION either way is refused before any
