@@ -223,6 +223,9 @@ impl InRoom {
         if let Ok(list) = monitors::list()
             && !list.is_empty()
         {
+            if self.monitors.is_some() {
+                self.list_room.refilled(Instant::now());
+            }
             self.monitors = Some(monitors::picks(&list));
             self.windows = window_picks();
         }
@@ -282,6 +285,10 @@ impl InRoom {
         if let Some(picks) = &self.monitors {
             block = true;
             let picked = share_list(ui, picks, &self.windows);
+            if let Some((room, left)) = self.list_room.refill_room(now) {
+                keep_room(ui, top, room);
+                ui.ctx().request_repaint_after(left);
+            }
             self.list_room.measured(ui.cursor().top() - top);
             match picked {
                 Some(RowPick::Monitor(i)) => {
@@ -308,6 +315,7 @@ impl InRoom {
                         // Closed since the list was taken: a list as it is
                         // now, rather than a share that cannot start.
                         self.windows = window_picks();
+                        self.list_room.refilled(now);
                     }
                 }
                 None => {}
@@ -1220,9 +1228,32 @@ struct ListRoom {
     drawn: f32,
     // The room kept, and since when.
     held: Option<(f32, Instant)>,
+    // The height the list had when it refilled in place, and since when.
+    refilled: Option<(f32, Instant)>,
 }
 
 impl ListRoom {
+    // A pick of a window that has closed, or the share key on an open list,
+    // refills the list where it is, shorter by the windows gone, which moves
+    // what is under it up under a click aimed at the list as a list that
+    // goes would.
+    fn refilled(&mut self, now: Instant) {
+        self.refilled = Some((self.drawn, now));
+    }
+
+    // While the list shows: the height it keeps since it refilled, and how
+    // long that has left.
+    fn refill_room(&mut self, now: Instant) -> Option<(f32, Duration)> {
+        let (room, since) = self.refilled?;
+        let left = BLOCK_AFTER
+            .checked_sub(now.saturating_duration_since(since))
+            .filter(|left| !left.is_zero());
+        if left.is_none() {
+            self.refilled = None;
+        }
+        left.map(|left| (room, left))
+    }
+
     // A list on screen again ends any room kept for the last one.
     fn measured(&mut self, height: f32) {
         self.drawn = height;
@@ -1236,12 +1267,14 @@ impl ListRoom {
             self.held = Some((self.drawn, now));
         }
         self.drawn = 0.0;
+        self.refilled = None;
     }
 
     // Esc and Share again are aimed at the keyboard and the title row, not
     // at the list, so nothing under it needs to stay.
     fn clear(&mut self) {
         self.drawn = 0.0;
+        self.refilled = None;
     }
 
     // Every frame. The room kept and how long its least wait has left; None
@@ -3572,5 +3605,111 @@ mod tests {
             let (_, output) = draw(panel, Vec::new(), view(gone), at(gone));
             assert_eq!(place(&output, TOGGLE).top(), under_block.top(), "{gone} ms");
         }
+    }
+
+    // A list that refilled keeps the height it had until BLOCK_AFTER has
+    // gone; a list that goes, or is closed by Esc or Share again, keeps
+    // nothing of it for the next one.
+    #[test]
+    fn a_refilled_list_keeps_its_height_a_while() {
+        let t = Instant::now();
+        let at = |ms: u64| t + Duration::from_millis(ms);
+        let kept = |left: u64| Some((240.0, Duration::from_millis(left)));
+        let mut list = ListRoom::default();
+        assert_eq!(list.refill_room(t), None, "never refilled");
+        list.measured(240.0);
+        list.refilled(t);
+        assert_eq!(list.refill_room(at(16)), kept(484));
+        list.measured(240.0);
+        assert_eq!(list.refill_room(at(499)), kept(1));
+        assert_eq!(list.refill_room(at(500)), None);
+        assert_eq!(list.refill_room(at(16)), None, "over for good");
+
+        list.measured(240.0);
+        list.refilled(t);
+        list.give_way(at(16));
+        list.measured(160.0);
+        assert_eq!(list.refill_room(at(32)), None, "the list went");
+        list.refilled(t);
+        list.clear();
+        assert_eq!(list.refill_room(at(32)), None, "Esc or Share again");
+    }
+
+    // A pick of a window that has closed refills the list in place, here two
+    // windows shorter, which would bring the invite's lifetime toggle up
+    // under the row just clicked. The list keeps its height until
+    // BLOCK_AFTER has gone, so a second click there presses nothing, and the
+    // toggle then moves up once.
+    #[test]
+    fn a_second_click_on_a_list_that_refilled_presses_nothing() {
+        use crate::controls::tests::{frame, press, release};
+        use eframe::egui::{Event, PlatformOutput, pos2};
+        const TOGGLE: &str = "single use, 10 min";
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let picks = picks();
+        let all = [window(1, "Notes"), window(2, "Game"), window(3, "Mail")];
+        let left = [window(1, "Notes")];
+        // One frame in body's order while the list stays open, then the
+        // invite's first row.
+        let draw = |list: &mut ListRoom, windows: &[WindowPick], events: Vec<Event>, now| {
+            frame(&ctx, events, |ui| {
+                let top = ui.cursor().top();
+                let picked = share_list(ui, &picks, windows);
+                if let Some((room, _)) = list.refill_room(now) {
+                    keep_room(ui, top, room);
+                }
+                list.measured(ui.cursor().top() - top);
+                let toggled = controls::region(ui, |ui| lifetime_row(ui, false));
+                (picked, toggled)
+            })
+        };
+        let place = |output: &PlatformOutput, label: &str| {
+            let bounds = output
+                .accesskit_update
+                .as_ref()
+                .expect("accesskit is on")
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label))
+                .and_then(|(_, node)| node.bounds())
+                .unwrap_or_else(|| panic!("nothing called {label}"));
+            Rect::from_min_max(
+                pos2(bounds.x0 as f32, bounds.y0 as f32),
+                pos2(bounds.x1 as f32, bounds.y1 as f32),
+            )
+        };
+        let t = Instant::now();
+        let at = |ms: u64| t + Duration::from_millis(ms);
+
+        // Without the height kept, the toggle would be under Mail's row.
+        let (_, output) = draw(&mut ListRoom::default(), &left, Vec::new(), t);
+        let unkept = place(&output, TOGGLE);
+        let list = &mut ListRoom::default();
+        let (_, output) = draw(list, &all, Vec::new(), t);
+        let kept = place(&output, TOGGLE);
+        let mail = place(&output, &all[2].spoken);
+        assert!(unkept.intersects(mail), "{unkept:?} {mail:?}");
+        let aim = unkept.intersect(mail).center();
+
+        // The first click, on Mail's row: its window has closed, so body
+        // refills the list.
+        draw(list, &all, press(aim), t);
+        let ((picked, _), _) = draw(list, &all, release(aim), t);
+        assert_eq!(picked, Some(RowPick::Window(2)));
+        list.refilled(t);
+        for (ms, events) in [
+            (16, Vec::new()),
+            (100, press(aim)),
+            (116, release(aim)),
+            (499, Vec::new()),
+        ] {
+            let ((_, toggled), output) = draw(list, &left, events, at(ms));
+            assert!(!toggled, "a second click at {ms} ms");
+            assert_eq!(place(&output, TOGGLE), kept, "{ms} ms");
+        }
+        let (_, output) = draw(list, &left, Vec::new(), at(500));
+        assert_eq!(place(&output, TOGGLE), unkept, "500 ms");
     }
 }
