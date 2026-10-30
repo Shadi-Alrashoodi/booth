@@ -58,8 +58,8 @@ const BUFFERS: u32 = 2;
 // only once nothing has been presented for this long, and strip_due as well.
 // A share that is sending frames brings the word back with them, and a
 // present of the same picture between two of theirs would only cost GPU time
-// and, with vsync or while composed, a place in the queue ahead of the next
-// one.
+// and hold the next one back: when DWM steps aside a refresh with vsync and a
+// millisecond or so without, and now and then a refresh while composed.
 const QUIET: Duration = Duration::from_millis(100);
 
 // A share that shows a picture at least this often draws new strip numbers
@@ -441,16 +441,21 @@ impl Viewer {
         )?;
         shared.set_placed(placed);
         shared.set_has_shape(self.scene.has_shape());
-        let (interval, flags) = if self.vsync {
-            (1, DXGI_PRESENT(0))
-        } else if self.tearing {
-            (0, DXGI_PRESENT_ALLOW_TEARING)
+        // Interval 0 also with vsync: composed, a present takes the place of
+        // one not shown yet, where at interval 1 it would wait a refresh
+        // behind that one, so a pointer moved alone just before its picture
+        // does not hold the picture back a refresh. When DWM steps aside
+        // (full screen, or a window on its own overlay plane) a flip once
+        // queued still goes first. Without the tearing flag a flip still
+        // waits for the refresh, so nothing tears.
+        let flags = if self.tearing && !self.vsync {
+            DXGI_PRESENT_ALLOW_TEARING
         } else {
-            (0, DXGI_PRESENT(0))
+            DXGI_PRESENT(0)
         };
         // SAFETY: a live swap chain; ALLOW_TEARING is passed only when the
         // swap chain was made with the matching flag.
-        let presented = unsafe { self.swap.chain.Present(interval, flags) };
+        let presented = unsafe { self.swap.chain.Present(0, flags) };
         let took = started.elapsed();
         presented
             .ok()
