@@ -124,7 +124,7 @@ pub fn room_error(err: &RoomError) -> String {
 
 // Windows' own message ends with a full stop before the error number, which
 // reads badly in the middle of a sentence.
-fn os_text(text: &str) -> String {
+pub fn os_text(text: &str) -> String {
     text.replace(". (os error", " (os error")
 }
 

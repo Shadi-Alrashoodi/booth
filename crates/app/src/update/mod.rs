@@ -22,6 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 // friend where to get the host's version.
 pub use invite::RELEASES_PAGE;
 
+use crate::messages;
 use download::{DownloadError, Kept};
 use http::{FetchError, Rules};
 use manifest::{MOST_MANIFEST_BYTES, MOST_SIGNATURE_BYTES, Manifest, Version};
@@ -203,9 +204,13 @@ fn check(
     }
     let record = dir.join(LAST_CHECK);
     if let Err(err) = fs::write(&record, format!("checked = {now}\r\n")) {
-        return check_failed(&format!(
-            "{} could not be written ({err})",
+        log.push(format!(
+            "update: could not write {}: {err}",
             record.display()
+        ));
+        return Checked::Failed(format!(
+            "Could not check for a new version: {LAST_CHECK} could not be written. Windows said: {}. Booth looks again the next time it starts.",
+            messages::os_text(&err.to_string())
         ));
     }
     let (manifest_url, signature_url) = (latest_url(MANIFEST_FILE), latest_url(SIGNATURE_FILE));
@@ -608,9 +613,14 @@ fn saved(kept: &Kept, own: Option<PathBuf>) -> String {
 }
 
 fn clause(err: &io::Error) -> String {
-    err.to_string().trim_end().trim_end_matches('.').to_owned()
+    messages::os_text(&err.to_string())
+        .trim_end()
+        .trim_end_matches('.')
+        .to_owned()
 }
 
+// No line gives a folder's path, which is under the Windows profile; the
+// log line has the whole path.
 fn download_failed(manifest: &Manifest, err: &DownloadError) -> String {
     let version = manifest.version;
     match err {
@@ -627,23 +637,21 @@ fn download_failed(manifest: &Manifest, err: &DownloadError) -> String {
         DownloadError::Mismatch => String::from(
             "The download did not match the signed release, so Booth deleted it. Press Download to try again.",
         ),
-        DownloadError::Taken(path) => format!(
-            "A different {} is already in {}. Move it away, then press Download again.",
-            manifest.zip,
-            path.parent().unwrap_or(path).display()
+        DownloadError::Taken(_) => format!(
+            "A different {} is already in Downloads. Move it away, then press Download again.",
+            manifest.zip
         ),
         DownloadError::NoDownloads(err) => format!(
             "Could not find the Downloads folder: {}. Press Download to try again.",
             clause(err)
         ),
-        DownloadError::Part { path, source } => format!(
-            "Could not write {}: {}. Check that the disk has room, then press Download again.",
-            path.display(),
+        DownloadError::Part { source, .. } => format!(
+            "Could not write the download: {}. Check that the disk has room, then press Download again.",
             clause(source)
         ),
-        DownloadError::Move { to, source } => format!(
-            "Could not move the download to {}: {}. Press Download to try again.",
-            to.display(),
+        DownloadError::Move { source, .. } => format!(
+            "Could not move {} into Downloads: {}. Press Download to try again.",
+            manifest.zip,
             clause(source)
         ),
     }
@@ -874,11 +882,27 @@ mod tests {
             panic!("{checked:?}");
         };
         assert!(
-            sentence.starts_with("Could not check for a new version: "),
+            sentence.starts_with(
+                "Could not check for a new version: update.txt could not be written. Windows said: "
+            ),
             "{sentence}"
         );
+        assert!(
+            sentence.ends_with(". Booth looks again the next time it starts."),
+            "{sentence}"
+        );
+        assert!(
+            !sentence.contains(&folder.0.display().to_string()),
+            "{sentence}"
+        );
+        assert!(!sentence.contains(". (os error"), "{sentence}");
         assert!(server.asked.is_empty());
-        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(log.len(), 2, "{log:?}");
+        let record = folder.0.join(LAST_CHECK);
+        assert!(
+            log[1].starts_with(&format!("update: could not write {}: ", record.display())),
+            "{log:?}"
+        );
     }
 
     #[test]
@@ -986,7 +1010,7 @@ mod tests {
             ),
             (
                 DownloadError::Taken(path.clone()),
-                r"A different booth-0.2.0-windows-x64.zip is already in C:\Users\Mara\Downloads. Move it away, then press Download again.",
+                "A different booth-0.2.0-windows-x64.zip is already in Downloads. Move it away, then press Download again.",
             ),
             (
                 DownloadError::Fetch(FetchError::TooBig(download::MOST_ZIP_BYTES)),
@@ -1015,6 +1039,43 @@ mod tests {
                     download: true,
                 })
             );
+        }
+        // Windows' own words stand in the middle of these, so only their
+        // ends are fixed. Neither names a folder.
+        let denied = || io::Error::from_raw_os_error(5);
+        let part = PathBuf::from(r"C:\Users\Mara\AppData\Local\Booth\download.part");
+        let ends = [
+            (
+                DownloadError::Part {
+                    path: part,
+                    source: denied(),
+                },
+                "Could not write the download: ",
+                ". Check that the disk has room, then press Download again.",
+            ),
+            (
+                DownloadError::Move {
+                    to: path,
+                    source: denied(),
+                },
+                "Could not move booth-0.2.0-windows-x64.zip into Downloads: ",
+                ". Press Download to try again.",
+            ),
+        ];
+        for (err, start, end) in ends {
+            let mut update = update_in(State::Downloading {
+                manifest: manifest(),
+                got: 0,
+                total: None,
+            });
+            update.apply(Event::Downloaded(Err(err)));
+            let shown = update.shown().expect("a line");
+            assert_eq!((shown.tone, shown.download), (Tone::Problem, true));
+            let text = shown.text;
+            assert!(text.starts_with(start), "{text}");
+            assert!(text.ends_with(end), "{text}");
+            assert!(!text.contains(r"\Users\"), "{text}");
+            assert!(!text.contains(". (os error"), "{text}");
         }
     }
 
