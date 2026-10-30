@@ -686,6 +686,11 @@ pub fn list_failed(err: &KnownError) -> String {
 pub fn list_error(err: &KnownError) -> String {
     let text = list_failed(err);
     match err {
+        KnownError::Write(KeyError::Write { source, .. })
+            if source.kind() == io::ErrorKind::StorageFull =>
+        {
+            format!("{text} Check that the disk is not full, then press Save again.")
+        }
         KnownError::Write(KeyError::Write { .. }) => {
             format!("{text} Close any program that has the file open, then press Save again.")
         }
@@ -1724,6 +1729,10 @@ mod tests {
         let text = list_error(&temp);
         assert!(text.starts_with("Could not save devices.bin: "), "{text}");
         assert!(!text.contains(r"\Users\"), "{text}");
+        assert!(
+            text.ends_with("Check that the disk is not full, then press Save again."),
+            "{text}"
+        );
 
         let read = KnownError::Read {
             list: List::Devices,
