@@ -430,8 +430,9 @@ impl Room {
     /// Pauses this PC's share, or resumes it. Paused, its thread lets go of
     /// the screen and the encoder and sends nothing, not even to someone who
     /// starts watching, until it resumes with an IDR; `share.running.held`
-    /// says so once it has let go. Watchers keep the last picture they had.
-    /// A share that ends and a new one are not paused.
+    /// says so as soon as the thread stops reading the screen, before it
+    /// lets go of the capture and the encoder. Watchers keep the last
+    /// picture they had. A share that ends and a new one are not paused.
     pub fn pause_share(&self, on: bool) {
         self.threads.sharing().set_held(on);
     }

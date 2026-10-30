@@ -1467,3 +1467,61 @@ fn a_minimized_window_pauses_the_share() {
     );
     assert_eq!(ana.view().share.watched_state, ShareState::Paused);
 }
+
+// Paused by hand, a share shows it in the panel and to its watchers before
+// it lets go of the capture and the encoder, which can take seconds while
+// other work holds the core: here the window capture's close takes 2 s.
+// Resumed, it is live again.
+#[test]
+fn a_pause_shows_before_the_share_lets_go() {
+    let _turn = turn();
+    if !ready() {
+        return;
+    }
+    let reads = invite::Version {
+        major: 1,
+        minor: 3,
+        patch: 0,
+    };
+    let config = |name, video| {
+        let mut config = config_with(name, video, room::DEFAULT_VIDEO_UPLOAD_KBPS);
+        config.version = reads;
+        config
+    };
+    let window = Window::open(640, 360);
+    let (host, friends) = room_of(config("Mara", screen()), vec![config("Ana", pattern(None))]);
+    let ana = &friends[0];
+    let number = shares_window(&host, &window);
+    watches(ana, number);
+    poll(WAIT, "Ana's first frames", || {
+        ana.view().numbers.watching.filter(|w| w.shown > 0)
+    });
+    capture::fault::set_drop_takes(window.id().hwnd, Duration::from_secs(2));
+    let pressed = Instant::now();
+    host.room().pause_share(true);
+    let soon = Duration::from_millis(500);
+    host.wait_for(soon, "the share shown paused", |v| {
+        v.share.running.as_ref().is_some_and(|running| running.held)
+    });
+    let shown = pressed.elapsed();
+    ana.wait_for(
+        soon.saturating_sub(pressed.elapsed()),
+        "Ana hearing the share is paused",
+        |v| v.share.watched_state == ShareState::Paused,
+    );
+    println!(
+        "paused in the panel {:.1} ms and for Ana {:.1} ms after the press",
+        shown.as_secs_f64() * 1000.0,
+        pressed.elapsed().as_secs_f64() * 1000.0
+    );
+    host.room().pause_share(false);
+    host.wait_for(WAIT, "the share resumed", |v| {
+        v.share
+            .running
+            .as_ref()
+            .is_some_and(|running| !running.held)
+    });
+    ana.wait_for(WAIT, "Ana hearing it is live again", |v| {
+        v.share.watched_state == ShareState::Live
+    });
+}

@@ -255,10 +255,22 @@ fn share(
             _ => break,
         }
         // Paused by hand: the screen is let go before anything more of it is
-        // read, and taken up again when the pause ends.
+        // read, and taken up again when the pause ends. The panel and the
+        // watchers are told first: nothing of the screen is read from here
+        // on, and letting go of the capture and the encoder can take seconds
+        // while other work holds the core.
         if sharing.held() != sharer.held() {
             if sharing.held() {
                 watchers.hide_pointer();
+                sharing.set_running(sharing.running().map(|running| RunningShare {
+                    held: true,
+                    ..running
+                }));
+                told_state = ShareState::Paused;
+                sharing.tell(ShareNews::State {
+                    share: number,
+                    state: ShareState::Paused,
+                });
                 sharer.pause();
                 log!(
                     log,
@@ -272,11 +284,11 @@ fn share(
                     "share {number}: resumed at {width}x{height} and {} fps",
                     sharer.fps()
                 );
+                sharing.set_running(sharing.running().map(|running| RunningShare {
+                    held: sharer.held(),
+                    ..running
+                }));
             }
-            sharing.set_running(sharing.running().map(|running| RunningShare {
-                held: sharer.held(),
-                ..running
-            }));
         }
         // Not while capture is paused either: a new box or rate opens the
         // source again.

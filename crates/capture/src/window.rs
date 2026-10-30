@@ -976,6 +976,10 @@ fn refused(window: WindowId, err: &windows::core::Error) -> CaptureError {
 // the session and the pool ends Windows' part at once.
 impl Drop for WindowCapture {
     fn drop(&mut self) {
+        #[cfg(feature = "fault")]
+        if let Some(takes) = crate::fault::drop_takes(self.window.hwnd) {
+            std::thread::sleep(takes);
+        }
         let _ = self.session.Close();
         let _ = self.pool.Close();
     }

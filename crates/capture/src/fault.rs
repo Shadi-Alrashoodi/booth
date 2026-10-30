@@ -51,3 +51,19 @@ pub(crate) fn hold_after_minimized(window: isize) -> Option<Duration> {
     let at = holds.iter().position(|&(set_for, _)| set_for == window)?;
     Some(holds.swap_remove(at).1)
 }
+
+static DROP_TAKES: Mutex<Option<(isize, Duration)>> = Mutex::new(None);
+
+/// The next capture of `window` to be dropped takes `takes` before it
+/// closes anything, once, as a close held up by other work on the PC does.
+pub fn set_drop_takes(window: isize, takes: Duration) {
+    *DROP_TAKES.lock().unwrap_or_else(|p| p.into_inner()) = Some((window, takes));
+}
+
+pub(crate) fn drop_takes(window: isize) -> Option<Duration> {
+    DROP_TAKES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take_if(|(set_for, _)| *set_for == window)
+        .map(|(_, takes)| takes)
+}
