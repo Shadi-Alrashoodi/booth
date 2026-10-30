@@ -12,7 +12,7 @@ use voice::audio::{Echo, Microphone};
 
 use crate::elevated::Exit;
 use crate::running::{self, PortHolder};
-use crate::settings::SaveError;
+use crate::settings::{self, SaveError};
 use crate::update::RELEASES_PAGE;
 use crate::volumes::Problem;
 use crate::win;
@@ -112,9 +112,11 @@ pub fn room_error(err: &RoomError) -> String {
             "Could not start the room's network threads. Windows said: {}. Close some programs and try again.",
             os_text(&os.to_string())
         ),
+        // Only the file: its folder is under the Windows profile, and the
+        // advice needs none.
         RoomError::Log { path, source } => format!(
             "Could not open the log file {}. Windows said: {}. Start Booth without --log, or free some disk space and try again.",
-            path.display(),
+            path.file_name().unwrap_or_default().to_string_lossy(),
             os_text(&source.to_string())
         ),
     }
@@ -722,24 +724,24 @@ pub fn last_seen(unix: u64) -> String {
     }
 }
 
+// Names settings.txt but not its folder, which is under the Windows profile;
+// the log line has the whole path.
 pub fn settings_error(err: &SaveError) -> String {
     let close_it = "Close any program that has the file open, then press Save again.";
+    let file = settings::FILE;
     match err {
-        SaveError::Read { path, source } => format!(
-            "Could not read {}, so saving now could lose what else is in it. Windows said: {}. {close_it}",
-            path.display(),
+        SaveError::Read { source, .. } => format!(
+            "Could not read {file}, so saving now could lose what else is in it. Windows said: {}. {close_it}",
             os_text(&source.to_string())
         ),
-        // The path is the temporary file, which means nothing to anyone;
-        // the folder is where to look.
-        SaveError::Write { path, source } => format!(
-            "Could not write the new settings in {}. Windows said: {}. Check that the disk is not full, then press Save again.",
-            path.parent().unwrap_or(path).display(),
+        // Of the new copy written beside it, which a full disk stops; its
+        // temporary name means nothing to anyone.
+        SaveError::Write { source, .. } => format!(
+            "Could not write {file}. Windows said: {}. Check that the disk is not full, then press Save again.",
             os_text(&source.to_string())
         ),
-        SaveError::Replace { path, source } => format!(
-            "Could not replace {} with the new settings. Windows said: {}. {close_it}",
-            path.display(),
+        SaveError::Replace { source, .. } => format!(
+            "Could not replace {file} with the new settings. Windows said: {}. {close_it}",
             os_text(&source.to_string())
         ),
     }
@@ -1117,12 +1119,30 @@ mod tests {
             let text = settings_error(err);
             assert!(text.starts_with("Could not "), "{text}");
             assert!(text.ends_with("press Save again."), "{text}");
+            assert!(text.contains("settings.txt"), "{text}");
+            assert!(!text.contains(r"\Users\"), "{text}");
+            assert!(!text.contains(".tmp"), "{text}");
             assert!(!text.contains(". (os error"), "{text}");
             assert!(!seen.contains(&text), "{err} says the same as another");
             seen.push(text);
         }
-        assert!(seen[1].contains(r"in C:\Users\a\AppData\Local\Booth."));
-        assert!(!seen[1].contains(".tmp"), "{}", seen[1]);
+    }
+
+    // The log file's line names booth.log and nothing of the folder it is
+    // in, which is under the Windows profile.
+    #[test]
+    fn log_file_named_without_its_folder() {
+        let err = RoomError::Log {
+            path: std::path::PathBuf::from(r"C:\Users\Mara\AppData\Local\Booth\booth.log"),
+            source: io::Error::from_raw_os_error(5),
+        };
+        let text = room_error(&err);
+        assert!(
+            text.starts_with("Could not open the log file booth.log. Windows said: "),
+            "{text}"
+        );
+        assert!(!text.contains("Mara"), "{text}");
+        assert!(!text.contains(". (os error"), "{text}");
     }
 
     // The volume files' line names the file and nothing else of where it

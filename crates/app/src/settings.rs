@@ -14,7 +14,7 @@ use invite::BuildError;
 use room::{DEFAULT_SENSITIVITY_DB, SENSITIVITY_DB, TalkMode};
 use voice::audio::{Choice, Direction};
 
-const FILE: &str = "settings.txt";
+pub const FILE: &str = "settings.txt";
 const NAME: &str = "name";
 const PORT: &str = "port";
 const STUN_SERVERS: &str = "stun_servers";
