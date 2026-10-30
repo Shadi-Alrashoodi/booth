@@ -3,7 +3,7 @@
 // pauses and timings, never the pixels.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -11,9 +11,9 @@ use capture::{Next, Options, PauseReason, WINDOW_GONE, WindowCapture, WindowId};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DispatchMessageW, IsWindow, MSG, PM_REMOVE, PeekMessageW, PostMessageW,
-    SW_MINIMIZE, SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetWindowPos,
-    SetWindowTextW, ShowWindowAsync, TranslateMessage, WINDOW_STYLE, WM_CLOSE, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    SW_MINIMIZE, SW_RESTORE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
+    SetWindowPos, SetWindowTextW, ShowWindowAsync, TranslateMessage, WINDOW_STYLE, WM_CLOSE,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{HSTRING, w};
 
@@ -105,10 +105,13 @@ impl Drop for Window {
     }
 }
 
-// A window minimized or restored beside the fast window holds up its
-// pictures, about 10 more of 240 held: the tests that do it take turns with
-// that one.
-static MINIMIZING: Mutex<()> = Mutex::new(());
+// The tests that minimize a window, or time its pictures, run alone, the
+// rest side by side. A window minimized or restored beside the fast window
+// holds up its pictures, about 10 more of 240 held, and windows changing
+// beside a restore held up in the drain change which of its pictures
+// Windows keeps: 4 tries in 9 found none of the restored window's own,
+// against 1 in 11 alone.
+static ALONE: RwLock<()> = RwLock::new(());
 
 fn adapter() -> Option<capture::Adapter> {
     capture::make_process_dpi_aware().unwrap();
@@ -152,6 +155,7 @@ fn sizes_for(capture: &mut WindowCapture, within: Duration) -> Vec<(u32, u32)> {
 
 #[test]
 fn a_window_is_captured_at_its_own_size() {
+    let _turn = ALONE.read().unwrap_or_else(|p| p.into_inner());
     let Some(adapter) = adapter() else { return };
     let window = Window::open(640, 360);
     let opened = Instant::now();
@@ -173,6 +177,7 @@ fn a_window_is_captured_at_its_own_size() {
 // size, so its first frame needs no second encoder.
 #[test]
 fn a_bordered_window_opens_at_the_size_of_its_pictures() {
+    let _turn = ALONE.read().unwrap_or_else(|p| p.into_inner());
     let Some(adapter) = adapter() else { return };
     let window = Window::with_style(WS_OVERLAPPEDWINDOW, 640, 360);
     let capture = WindowCapture::open(window.id(), &adapter, Options::default()).unwrap();
@@ -185,6 +190,7 @@ fn a_bordered_window_opens_at_the_size_of_its_pictures() {
 
 #[test]
 fn a_window_names_the_monitor_it_is_on() {
+    let _turn = ALONE.read().unwrap_or_else(|p| p.into_inner());
     let Some(_) = adapter() else { return };
     let window = Window::open(400, 300);
     let monitor = capture::window_monitor(window.id()).expect("no monitor for the window");
@@ -201,6 +207,7 @@ fn a_window_names_the_monitor_it_is_on() {
 // room shows, and a handle that names no window is no window.
 #[test]
 fn a_closed_window_does_not_open() {
+    let _turn = ALONE.read().unwrap_or_else(|p| p.into_inner());
     let Some(adapter) = adapter() else { return };
     assert_eq!(WindowId::of(0), None);
     let window = Window::open(320, 240);
@@ -222,6 +229,7 @@ fn a_closed_window_does_not_open() {
 
 #[test]
 fn a_window_scaled_down_into_the_box() {
+    let _turn = ALONE.read().unwrap_or_else(|p| p.into_inner());
     let Some(adapter) = adapter() else { return };
     let window = Window::open(1200, 600);
     let options = Options {
@@ -240,6 +248,7 @@ fn a_window_scaled_down_into_the_box() {
 // keeps that size while the window changes inside it.
 #[test]
 fn a_small_window_is_padded_to_256() {
+    let _turn = ALONE.read().unwrap_or_else(|p| p.into_inner());
     let Some(adapter) = adapter() else { return };
     let window = Window::open(200, 120);
     let mut capture = WindowCapture::open(window.id(), &adapter, Options::default()).unwrap();
@@ -260,6 +269,7 @@ fn a_small_window_is_padded_to_256() {
 
 #[test]
 fn a_resized_window_comes_out_at_its_new_size() {
+    let _turn = ALONE.read().unwrap_or_else(|p| p.into_inner());
     let Some(adapter) = adapter() else { return };
     let window = Window::open(640, 360);
     let mut capture = WindowCapture::open(window.id(), &adapter, Options::default()).unwrap();
@@ -285,6 +295,7 @@ fn a_resized_window_comes_out_at_its_new_size() {
 // its newest picture at its own size.
 #[test]
 fn a_window_kept_in_a_frame() {
+    let _turn = ALONE.read().unwrap_or_else(|p| p.into_inner());
     let Some(adapter) = adapter() else { return };
     let window = Window::open(640, 360);
     let mut capture = WindowCapture::open(window.id(), &adapter, Options::default()).unwrap();
@@ -330,7 +341,7 @@ fn a_window_kept_in_a_frame() {
 // rate off the refresh grid makes anyway.
 #[test]
 fn a_fast_window_comes_at_the_rate_asked() {
-    let _turn = MINIMIZING.lock().unwrap_or_else(|p| p.into_inner());
+    let _turn = ALONE.write().unwrap_or_else(|p| p.into_inner());
     let Some(adapter) = adapter() else { return };
     let window = Window::open(640, 360);
     let options = Options {
@@ -393,7 +404,7 @@ fn a_fast_window_comes_at_the_rate_asked() {
 
 #[test]
 fn a_minimized_window_pauses_and_comes_back() {
-    let _turn = MINIMIZING.lock().unwrap_or_else(|p| p.into_inner());
+    let _turn = ALONE.write().unwrap_or_else(|p| p.into_inner());
     let Some(adapter) = adapter() else { return };
     // With a title bar and borders, as most windows shared are.
     let window = Window::with_style(WS_OVERLAPPEDWINDOW, 640, 360);
@@ -437,7 +448,7 @@ fn a_minimized_window_pauses_and_comes_back() {
 #[cfg(feature = "fault")]
 #[test]
 fn restore_during_the_drain() {
-    let _turn = MINIMIZING.lock().unwrap_or_else(|p| p.into_inner());
+    let _turn = ALONE.write().unwrap_or_else(|p| p.into_inner());
     let Some(adapter) = adapter() else { return };
     let window = Window::with_style(WS_OVERLAPPEDWINDOW, 640, 360);
     let mut capture = WindowCapture::open(window.id(), &adapter, Options::default()).unwrap();
@@ -460,10 +471,14 @@ fn restore_during_the_drain() {
         }
         capture::fault::set_hold_after_minimized(window.0, hold);
         let armed = Instant::now();
+        // Restored without being made the active window: with SW_RESTORE, a
+        // test process that had opened other windows got none of the
+        // restored window's own pictures in every try of 4 runs in 10, and
+        // without, never in two tries running in 14.
         let frames = thread::scope(|scope| {
             scope.spawn(|| {
                 thread::sleep(Duration::from_millis(100));
-                window.show(SW_RESTORE);
+                window.show(SW_SHOWNOACTIVATE);
             });
             let mut frames = Vec::new();
             while armed.elapsed() < Duration::from_secs(3) {
@@ -498,7 +513,7 @@ fn restore_during_the_drain() {
 #[cfg(feature = "fault")]
 #[test]
 fn minimized_and_restored_within_one_pass() {
-    let _turn = MINIMIZING.lock().unwrap_or_else(|p| p.into_inner());
+    let _turn = ALONE.write().unwrap_or_else(|p| p.into_inner());
     let Some(adapter) = adapter() else { return };
     let window = Window::with_style(WS_OVERLAPPEDWINDOW, 640, 360);
     let mut capture = WindowCapture::open(window.id(), &adapter, Options::default()).unwrap();
@@ -534,6 +549,7 @@ fn minimized_and_restored_within_one_pass() {
 
 #[test]
 fn a_closed_window_ends_the_capture() {
+    let _turn = ALONE.read().unwrap_or_else(|p| p.into_inner());
     let Some(adapter) = adapter() else { return };
     let window = Window::open(640, 360);
     let mut capture = WindowCapture::open(window.id(), &adapter, Options::default()).unwrap();
