@@ -29,8 +29,8 @@ use crate::screens::stats;
 use crate::sound::PeriodsAsk;
 use crate::strip;
 use crate::theme::{
-    self, AMBER, ASH, BAD, CHALK, CONTROL_HEIGHT, FIELD_GAP, HALF_STEP, QUIET_DOT, ROW_HEIGHT,
-    SIDE, STEP, TALKING, WARN,
+    self, AMBER, ASH, BAD, CHALK, CONTROL_HEIGHT, FIELD_GAP, HALF_STEP, PANEL, QUIET_DOT,
+    ROW_HEIGHT, SIDE, STEP, TALKING, WARN,
 };
 use crate::volumes::Volumes;
 use crate::win;
@@ -69,6 +69,7 @@ pub struct InRoom {
     // open, and the windows under them.
     monitors: Option<Vec<Pick>>,
     windows: Vec<WindowPick>,
+    list_room: ListRoom,
     // The region picker's answer, while it is open.
     region_pick: Option<Receiver<Result<Option<Picked>, String>>>,
     // The share started last from the panel was a region or a window: the
@@ -169,6 +170,7 @@ impl InRoom {
             monitors: None,
             region_pick: None,
             windows: Vec::new(),
+            list_room: ListRoom::default(),
             list_next: false,
             panic,
             allow_wait: AllowWait::default(),
@@ -272,12 +274,16 @@ impl InRoom {
             && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
         {
             self.monitors = None;
+            self.list_room.clear();
         }
+        let top = ui.cursor().top();
         // Whether a block in panel tone ends right above the body.
         let mut block = false;
         if let Some(picks) = &self.monitors {
             block = true;
-            match share_list(ui, picks, &self.windows) {
+            let picked = share_list(ui, picks, &self.windows);
+            self.list_room.measured(ui.cursor().top() - top);
+            match picked {
                 Some(RowPick::Monitor(i)) => {
                     let pick = &picks[i];
                     self.room.share(pick.fps, Some(pick.id.clone()));
@@ -306,6 +312,10 @@ impl InRoom {
                 }
                 None => {}
             }
+        }
+        // However the list went, what was under it must not move up yet.
+        if self.monitors.is_none() {
+            self.list_room.give_way(now);
         }
         if let Some(answer) = &self.region_pick {
             match answer.try_recv() {
@@ -336,6 +346,16 @@ impl InRoom {
             }
         }
         block |= self.request(ui, view);
+        // After the request block, which comes only while the share runs, so
+        // the room closing never moves Allow.
+        let placed = waits.placed.is_none();
+        if let Some((room, left)) = self.list_room.follow(&view.share, placed, now) {
+            block = true;
+            keep_room(ui, top, room);
+            if let Some(left) = left {
+                ui.ctx().request_repaint_after(left);
+            }
+        }
         if stats_open {
             self.periods.ask(ui.ctx(), &self.devices);
             let periods = self.periods.periods();
@@ -382,7 +402,10 @@ impl InRoom {
     // sharing needs no answer.
     fn share_pressed(&mut self, verb: Option<&ShareVerb>) {
         match verb {
-            Some(ShareVerb::Share) if self.monitors.is_some() => self.monitors = None,
+            Some(ShareVerb::Share) if self.monitors.is_some() => {
+                self.monitors = None;
+                self.list_room.clear();
+            }
             Some(ShareVerb::Share) => match monitors::list() {
                 Ok(list) if !list.is_empty() => {
                     self.monitors = Some(monitors::picks(&list));
@@ -480,33 +503,11 @@ impl InRoom {
         share: &ShareView,
         step: &mut Option<Step>,
     ) {
-        // The head and the lifetime toggle share one row, a head at the left
-        // and a bare verb at the right, as in the title row. The toggle is a
-        // plain secondary in both states: the control fill at rest means a
-        // toggle that is on or a button that Enter presses, and here it read
-        // as on and outweighed Copy.
-        let rect = row_rect(ui, CONTROL_HEIGHT);
-        let toggle = if invite.multi_use {
-            Button::new("anyone, 24 h").color(WARN)
-        } else {
-            Button::new("single use, 10 min")
-        };
-        let toggle_width = toggle.width(ui);
-        controls::split_row(
-            ui,
-            rect,
-            toggle_width,
-            |ui| {
-                controls::one_line(ui, "Invite", theme::section(), CHALK);
-            },
-            |ui| {
-                if toggle.show(ui).clicked() {
-                    *step = Some(Step::NewInvite {
-                        multi_use: !invite.multi_use,
-                    });
-                }
-            },
-        );
+        if lifetime_row(ui, invite.multi_use) {
+            *step = Some(Step::NewInvite {
+                multi_use: !invite.multi_use,
+            });
+        }
 
         let dead = invite.used || invite.expired;
         let outdated = outdated_by(invite);
@@ -697,6 +698,32 @@ impl InRoom {
         }
         new_code
     }
+}
+
+// The head and the lifetime toggle share one row, a head at the left and a
+// bare verb at the right, as in the title row. The toggle is a plain
+// secondary in both states: the control fill at rest means a toggle that is
+// on or a button that Enter presses, and here it read as on and outweighed
+// Copy. True when the toggle was pressed.
+fn lifetime_row(ui: &mut Ui, multi_use: bool) -> bool {
+    let rect = row_rect(ui, CONTROL_HEIGHT);
+    let toggle = if multi_use {
+        Button::new("anyone, 24 h").color(WARN)
+    } else {
+        Button::new("single use, 10 min")
+    };
+    let toggle_width = toggle.width(ui);
+    let mut pressed = false;
+    controls::split_row(
+        ui,
+        rect,
+        toggle_width,
+        |ui| {
+            controls::one_line(ui, "Invite", theme::section(), CHALK);
+        },
+        |ui| pressed = toggle.show(ui).clicked(),
+    );
+    pressed
 }
 
 // A code in Plex Mono on one line, cut in the middle, with its buttons at the
@@ -1110,7 +1137,8 @@ enum SharePress {
 // or moves, after the panel comes back from minimized, and after a new share
 // takes the block over, as Allow does (ALLOW_AFTER). Turning the switch on
 // also waits after it goes off, by itself or by hand, which moves nothing
-// above it, so Resume does not.
+// above it, so Resume does not. The list's room stays until the block has
+// stood this long.
 const BLOCK_AFTER: Duration = Duration::from_millis(500);
 
 // When the block last appeared, moved or changed hands, which Resume waits
@@ -1121,8 +1149,8 @@ struct BlockWait {
     shown: Option<(Showing, Instant, Instant)>,
 }
 
-// How much longer the block waits since it was placed, for Resume, and the
-// switch since its last change; None once over.
+// How much longer the block waits since it was placed, for Resume and the
+// list's room, and the switch since its last change; None once over.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Waits {
     placed: Option<Duration>,
@@ -1180,6 +1208,77 @@ impl BlockWait {
             placed: left(placed),
             switch: left(switched),
         }
+    }
+}
+
+// The share list's room, kept once the list goes from under the pointer:
+// what was under it would move up where a second click aimed at the list
+// lands, on a host the invite's lifetime toggle.
+#[derive(Debug, Default)]
+struct ListRoom {
+    // How tall the list was the last frame it showed.
+    drawn: f32,
+    // The room kept, and since when.
+    held: Option<(f32, Instant)>,
+}
+
+impl ListRoom {
+    // A list on screen again ends any room kept for the last one.
+    fn measured(&mut self, height: f32) {
+        self.drawn = height;
+        self.held = None;
+    }
+
+    // Every frame the list is closed: the first after it showed keeps its
+    // room, however it went, unless Esc or Share again cleared it.
+    fn give_way(&mut self, now: Instant) {
+        if self.drawn > 0.0 {
+            self.held = Some((self.drawn, now));
+        }
+        self.drawn = 0.0;
+    }
+
+    // Esc and Share again are aimed at the keyboard and the title row, not
+    // at the list, so nothing under it needs to stay.
+    fn clear(&mut self) {
+        self.drawn = 0.0;
+    }
+
+    // Every frame. The room kept and how long its least wait has left; None
+    // once that is over and either no share came of the list or this PC's
+    // share runs with its block still for BLOCK_AFTER. The least wait is for
+    // a share refused at once, which would otherwise give the room away
+    // before a double click's second press.
+    fn follow(
+        &mut self,
+        share: &ShareView,
+        placed: bool,
+        now: Instant,
+    ) -> Option<(f32, Option<Duration>)> {
+        let (room, since) = self.held?;
+        let left = BLOCK_AFTER
+            .checked_sub(now.saturating_duration_since(since))
+            .filter(|left| !left.is_zero());
+        let over = !own_share_on(&share.own) && share.running.is_none();
+        let taken =
+            matches!(share.own, OwnShare::Sharing { .. }) && share.running.is_some() && placed;
+        if left.is_none() && (over || taken) {
+            self.held = None;
+            return None;
+        }
+        Some((room, left))
+    }
+}
+
+// The rest of the list's room under what was drawn since `top`: in panel
+// tone, so it reads as one block with the share's, with nothing in it to
+// press, and add_space so no widget or id changes after it.
+fn keep_room(ui: &mut Ui, top: f32, room: f32) {
+    let rest = room - (ui.cursor().top() - top);
+    if rest > 0.0 {
+        let rect = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), rest));
+        ui.painter().rect_filled(rect, 0.0, PANEL);
+        ui.add_space(rest);
     }
 }
 
@@ -3135,6 +3234,15 @@ mod tests {
             .collect()
     }
 
+    fn window(hwnd: isize, title: &str) -> WindowPick {
+        WindowPick {
+            id: room::WindowId { hwnd, process: 1 },
+            title: title.to_string(),
+            quiet: String::from("notepad"),
+            spoken: format!("Share the window {title}"),
+        }
+    }
+
     // Region, after the monitors, opens the picker.
     #[test]
     fn one_click_in_the_monitor_list_picks_that_monitor() {
@@ -3169,12 +3277,6 @@ mod tests {
         use eframe::egui::{Context, pos2};
         let ctx = Context::default();
         theme::apply(&ctx);
-        let window = |hwnd, title: &str| WindowPick {
-            id: room::WindowId { hwnd, process: 1 },
-            title: title.to_string(),
-            quiet: String::from("notepad"),
-            spoken: format!("Share the window {title}"),
-        };
         let windows = [window(1, "Notes"), window(2, "Game")];
         let (second, _) = frame(&ctx, Vec::new(), |ui| {
             assert_eq!(share_list(ui, &[], &windows), None);
@@ -3184,5 +3286,291 @@ mod tests {
         frame(&ctx, press(second), |ui| share_list(ui, &[], &windows));
         let (pressed, _) = frame(&ctx, release(second), |ui| share_list(ui, &[], &windows));
         assert_eq!(pressed, Some(RowPick::Window(1)));
+    }
+
+    // The list's room stays from the frame the list goes, however it went,
+    // until BLOCK_AFTER has passed and either no share of this PC's came of
+    // it or that share runs with its block in place for BLOCK_AFTER: through
+    // an ask, a grant before the capture opens and the block's own wait, and
+    // past a share refused at once. A list on screen again ends it, and Esc
+    // or Share again keeps none.
+    #[test]
+    fn the_list_s_room_stays_until_the_block_can_take_it() {
+        // A frame with the list closed, in body's order.
+        fn closed(
+            list: &mut ListRoom,
+            share: &ShareView,
+            placed: bool,
+            now: Instant,
+        ) -> Option<(f32, Option<Duration>)> {
+            list.give_way(now);
+            list.follow(share, placed, now)
+        }
+        let t = Instant::now();
+        let at = |ms: u64| t + Duration::from_millis(ms);
+        let room = 160.0;
+        let kept = |left: Option<u64>| Some((room, left.map(Duration::from_millis)));
+        let off = ShareView::default();
+        let asking = ShareView {
+            own: OwnShare::Asking { fps: 120 },
+            ..ShareView::default()
+        };
+        let granted = ShareView {
+            own: OwnShare::Sharing {
+                number: 7,
+                fps: 120,
+            },
+            ..ShareView::default()
+        };
+        let block = Some(RunningShare {
+            software: false,
+            paused: None,
+            held: false,
+        });
+        let running = ShareView {
+            running: block.clone(),
+            ..granted.clone()
+        };
+        let mut list = ListRoom::default();
+        assert_eq!(closed(&mut list, &off, true, t), None, "never measured");
+
+        // A host's pick: Off still in the pick's own frame, granted at once,
+        // the block 80 ms on and in place 500 ms after.
+        list.measured(room);
+        assert_eq!(closed(&mut list, &off, true, t), kept(Some(500)));
+        assert_eq!(
+            closed(&mut list, &granted, true, at(16)),
+            kept(Some(484)),
+            "granted, not running"
+        );
+        assert_eq!(closed(&mut list, &running, false, at(80)), kept(Some(420)));
+        assert_eq!(
+            closed(&mut list, &running, false, at(579)),
+            kept(None),
+            "the block still waits"
+        );
+        assert_eq!(closed(&mut list, &running, true, at(580)), None);
+        assert_eq!(closed(&mut list, &running, true, at(600)), None);
+
+        // A client's pick, asking for a round trip or much longer.
+        list.measured(room);
+        assert_eq!(closed(&mut list, &off, true, t), kept(Some(500)));
+        assert_eq!(closed(&mut list, &asking, true, at(16)), kept(Some(484)));
+        assert_eq!(
+            closed(&mut list, &asking, true, at(2_000)),
+            kept(None),
+            "asking at 2 s"
+        );
+
+        // Refused at once, as a client asking while reconnecting is: the
+        // least wait counts from the frame the list went, not from any frame
+        // after.
+        let refused = ShareView {
+            own: OwnShare::Refused(Refusal::NotLive),
+            ..ShareView::default()
+        };
+        list.measured(room);
+        assert_eq!(closed(&mut list, &off, true, t), kept(Some(500)));
+        assert_eq!(closed(&mut list, &refused, true, at(16)), kept(Some(484)));
+        assert_eq!(closed(&mut list, &refused, true, at(300)), kept(Some(200)));
+        assert_eq!(closed(&mut list, &refused, true, at(499)), kept(Some(1)));
+        assert_eq!(closed(&mut list, &refused, true, at(500)), None);
+
+        // Region, before the picker is up, or Share taken away by someone
+        // else's share: no share of this PC's comes of it.
+        let theirs = ShareView {
+            current: Some(mara_shares(false)),
+            ..ShareView::default()
+        };
+        for share in [&off, &theirs] {
+            list.measured(room);
+            assert_eq!(closed(&mut list, share, true, t), kept(Some(500)));
+            assert_eq!(closed(&mut list, share, true, at(499)), kept(Some(1)));
+            assert_eq!(closed(&mut list, share, true, at(500)), None);
+        }
+
+        // Stopped, and asked again from the list while the old share's
+        // thread still closes: its block stands in place, but it is not this
+        // share's.
+        let closing = ShareView {
+            running: block,
+            ..asking.clone()
+        };
+        list.measured(room);
+        assert_eq!(closed(&mut list, &closing, true, t), kept(Some(500)));
+        assert_eq!(
+            closed(&mut list, &closing, true, at(600)),
+            kept(None),
+            "the old share's block"
+        );
+
+        list.measured(room);
+        assert_eq!(closed(&mut list, &off, true, t), kept(Some(500)));
+        list.measured(room);
+        assert_eq!(list.follow(&off, true, at(100)), None, "the list again");
+        list.clear();
+        assert_eq!(
+            closed(&mut list, &off, true, at(200)),
+            None,
+            "Esc or Share again"
+        );
+    }
+
+    // At 360 px with two monitors the invite's lifetime toggle lies under the
+    // second monitor's button, and under a window row once the share's block
+    // stands alone above it. After a pick, a second click at either place
+    // presses nothing until the room goes, and the toggle stays where the
+    // list left it, then moves once, up to where the block alone puts it: on
+    // a host, granted at once with the block 80 ms on, and on a client that
+    // asks for 200 ms first.
+    #[test]
+    fn a_second_click_where_the_list_was_presses_nothing() {
+        use crate::controls::tests::{frame, press, release};
+        use eframe::egui::{Event, PlatformOutput, pos2};
+        // What body keeps between frames, as far as the list and the block
+        // go.
+        #[derive(Default)]
+        struct Panel {
+            open: bool,
+            list: ListRoom,
+            wait: BlockWait,
+        }
+        const TOGGLE: &str = "single use, 10 min";
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let picks = picks();
+        let windows = [window(1, "Notes"), window(2, "Game"), window(3, "Mail")];
+        // One frame in body's order: the list while open, measured, closed
+        // by a pick; given way once closed; the block; the room; then the
+        // invite's first row, as the host's body has it under them.
+        let draw = |panel: &mut Panel, events: Vec<Event>, share: &ShareView, now: Instant| {
+            frame(&ctx, events, |ui| {
+                let top = ui.cursor().top();
+                let mut picked = None;
+                if panel.open {
+                    picked = share_list(ui, &picks, &windows);
+                    panel.list.measured(ui.cursor().top() - top);
+                    panel.open = picked.is_none();
+                }
+                if !panel.open {
+                    panel.list.give_way(now);
+                }
+                let waits = panel.wait.follow(share, now);
+                let pressed = share
+                    .running
+                    .as_ref()
+                    .and_then(|running| share_block(ui, running.held, &share.own_sound, waits));
+                if let Some((room, _)) = panel.list.follow(share, waits.placed.is_none(), now) {
+                    keep_room(ui, top, room);
+                }
+                let toggled = controls::region(ui, |ui| lifetime_row(ui, false));
+                (picked, pressed, toggled)
+            })
+        };
+        let place = |output: &PlatformOutput, label: &str| {
+            let bounds = output
+                .accesskit_update
+                .as_ref()
+                .expect("accesskit is on")
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label))
+                .and_then(|(_, node)| node.bounds())
+                .unwrap_or_else(|| panic!("nothing called {label}"));
+            Rect::from_min_max(
+                pos2(bounds.x0 as f32, bounds.y0 as f32),
+                pos2(bounds.x1 as f32, bounds.y1 as f32),
+            )
+        };
+        let t = Instant::now();
+        let at = |ms: u64| t + Duration::from_millis(ms);
+        let off = ShareView::default();
+        let asking = ShareView {
+            own: OwnShare::Asking { fps: 120 },
+            ..ShareView::default()
+        };
+        let granted = ShareView {
+            own: OwnShare::Sharing {
+                number: 7,
+                fps: 120,
+            },
+            ..ShareView::default()
+        };
+        let running = ShareView {
+            running: Some(RunningShare {
+                software: false,
+                paused: None,
+                held: false,
+            }),
+            ..granted.clone()
+        };
+
+        // Nothing above: the toggle lies under the second monitor's button,
+        // where a second click on that button lands once the list goes.
+        let (_, output) = draw(&mut Panel::default(), Vec::new(), &off, t);
+        let bare = place(&output, TOGGLE);
+        let listed = &mut Panel {
+            open: true,
+            ..Panel::default()
+        };
+        let (_, output) = draw(listed, Vec::new(), &off, t);
+        let second = place(&output, &picks[1].spoken);
+        let under_list = place(&output, TOGGLE).top();
+        let rows: Vec<Rect> = windows
+            .iter()
+            .map(|window| place(&output, &window.spoken))
+            .collect();
+        assert!(bare.intersects(second), "{bare:?} {second:?}");
+        // The block alone, in place: the toggle under a window row.
+        let settled = &mut Panel::default();
+        draw(settled, Vec::new(), &running, t);
+        let (_, output) = draw(settled, Vec::new(), &running, at(500));
+        let under_block = place(&output, TOGGLE);
+        let row = rows
+            .iter()
+            .find(|row| row.intersects(under_block))
+            .expect("the toggle under a window row");
+        let aims = [
+            bare.intersect(second).center(),
+            under_block.intersect(*row).center(),
+        ];
+
+        // Each view from the time it starts, when the second clicks come, and
+        // when the room goes.
+        let host = [(0, &off), (16, &granted), (80, &running)];
+        let client = [(0, &off), (16, &asking), (200, &granted), (280, &running)];
+        let runs = [
+            (&host[..], &[16, 80, 300, 579][..], 580),
+            (&client[..], &[16, 200, 280, 500, 779][..], 780),
+        ];
+        for (views, clicks, gone) in runs {
+            let view = |ms: u64| {
+                let mut started = views.iter().rev().filter(|(from, _)| ms >= *from);
+                let (_, view) = started.next().expect("each run has a view from 0 ms");
+                *view
+            };
+            let panel = &mut Panel {
+                open: true,
+                ..Panel::default()
+            };
+            let (_, output) = draw(panel, Vec::new(), &off, t);
+            let pick = place(&output, &picks[1].spoken).center();
+            draw(panel, press(pick), &off, t);
+            let ((picked, _, _), output) = draw(panel, release(pick), &off, t);
+            assert_eq!(picked, Some(RowPick::Monitor(1)));
+            assert_eq!(place(&output, TOGGLE).top(), under_list);
+            for &ms in clicks {
+                for aim in aims {
+                    for events in [Vec::new(), press(aim), release(aim)] {
+                        let (did, output) = draw(panel, events, view(ms), at(ms));
+                        assert_eq!(did, (None, None, false), "{ms} ms at {aim:?}");
+                        assert_eq!(place(&output, TOGGLE).top(), under_list, "{ms} ms");
+                    }
+                }
+            }
+            let (_, output) = draw(panel, Vec::new(), view(gone), at(gone));
+            assert_eq!(place(&output, TOGGLE).top(), under_block.top(), "{gone} ms");
+        }
     }
 }
