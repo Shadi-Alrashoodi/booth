@@ -14,6 +14,7 @@ use crate::elevated::Exit;
 use crate::running::{self, PortHolder};
 use crate::settings::SaveError;
 use crate::update::RELEASES_PAGE;
+use crate::volumes::Problem;
 use crate::win;
 
 // The lower crates write errors the way a log line reads: lower case, parts
@@ -564,14 +565,32 @@ pub fn row_menu(name: &str) -> String {
     format!("{name}, Enter opens the row menu")
 }
 
-// Each reason a sentence, one after another, or None when there are none.
-pub fn sentences<const N: usize>(reasons: [Option<String>; N]) -> Option<String> {
-    let said: Vec<String> = reasons
-        .iter()
-        .flatten()
-        .map(|reason| sentence(reason))
-        .collect();
-    (!said.is_empty()).then(|| said.join(" "))
+// Names the file, never its folder, which is under the Windows profile: the
+// line can stay for the whole room, where a share of the panel's monitor
+// shows it; the log line has the whole path.
+pub fn volumes_error(problem: &Problem) -> String {
+    let (kind, source) = match problem {
+        Problem::Read { kind, source }
+        | Problem::Write { kind, source }
+        | Problem::Replace { kind, source } => (kind, source),
+    };
+    let (file, what) = (kind.file(), kind.what());
+    let os = os_text(&source.to_string());
+    match problem {
+        Problem::Read { .. } if source.kind() == io::ErrorKind::FileTooLarge => format!(
+            "Could not read {file}, so {what} changed now are not saved. {} Delete the file, and the next room starts them all at 100.",
+            sentence(&source.to_string())
+        ),
+        Problem::Read { .. } => format!(
+            "Could not read {file}, so {what} changed now are not saved. Windows said: {os}. Close any program that has the file open, and the next room reads it again."
+        ),
+        Problem::Write { .. } => format!(
+            "Could not write {file}, so {what} are not saved. Windows said: {os}. Check that the disk is not full. Booth tries again at the next change."
+        ),
+        Problem::Replace { .. } => format!(
+            "Could not write {file}, so {what} are not saved. Windows said: {os}. Close any program that has the file open. Booth tries again at the next change."
+        ),
+    }
 }
 
 pub fn volume_label(name: &str) -> String {
@@ -895,24 +914,6 @@ mod tests {
         assert_eq!(sentence("Already a sentence."), "Already a sentence.");
     }
 
-    // Both volume files can fail at once, and both reasons show.
-    #[test]
-    fn reasons_one_after_another() {
-        assert_eq!(
-            sentences([
-                Some(String::from(
-                    "could not read volumes.txt; voice volumes are not saved"
-                )),
-                None,
-                Some(String::from("could not read sound-volumes.txt")),
-            ]),
-            Some(String::from(
-                "Could not read volumes.txt. Voice volumes are not saved. Could not read sound-volumes.txt."
-            ))
-        );
-        assert_eq!(sentences::<2>([None, None]), None);
-    }
-
     #[test]
     fn code_errors() {
         for err in [
@@ -1122,6 +1123,91 @@ mod tests {
         }
         assert!(seen[1].contains(r"in C:\Users\a\AppData\Local\Booth."));
         assert!(!seen[1].contains(".tmp"), "{}", seen[1]);
+    }
+
+    // The volume files' line names the file and nothing else of where it
+    // is, and each failure has its own advice.
+    #[test]
+    fn volumes_errors() {
+        use crate::volumes::Kind;
+        let denied = || io::Error::from_raw_os_error(5);
+        let full = || io::Error::from_raw_os_error(112);
+        let too_large = io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            "it is over 64 KB, more than Booth ever writes",
+        );
+        let problems = [
+            (
+                Problem::Read {
+                    kind: Kind::Voice,
+                    source: denied(),
+                },
+                "volumes.txt",
+            ),
+            (
+                Problem::Read {
+                    kind: Kind::PcSound,
+                    source: too_large,
+                },
+                "sound-volumes.txt",
+            ),
+            (
+                Problem::Write {
+                    kind: Kind::Voice,
+                    source: full(),
+                },
+                "volumes.txt",
+            ),
+            (
+                Problem::Replace {
+                    kind: Kind::PcSound,
+                    source: denied(),
+                },
+                "sound-volumes.txt",
+            ),
+        ];
+        let mut seen = Vec::new();
+        for (problem, file) in &problems {
+            let text = volumes_error(problem);
+            assert!(text.starts_with("Could not "), "{text}");
+            assert!(text.contains(&format!(" {file}, ")), "{text}");
+            for left_out in ["\\", ".tmp", "settings", ". (os error"] {
+                assert!(!text.contains(left_out), "{left_out}: {text}");
+            }
+            assert!(
+                !seen.contains(&text),
+                "{problem:?} says the same as another"
+            );
+            seen.push(text);
+        }
+        let os = |err: io::Error| os_text(&err.to_string());
+        assert_eq!(
+            seen[0],
+            format!(
+                "Could not read volumes.txt, so voice volumes changed now are not saved. Windows said: {}. Close any program that has the file open, and the next room reads it again.",
+                os(denied())
+            )
+        );
+        assert_sentences(&seen[1]);
+        assert!(!seen[1].contains("Windows said"), "{}", seen[1]);
+        assert_eq!(
+            seen[1],
+            "Could not read sound-volumes.txt, so PC sound volumes changed now are not saved. It is over 64 KB, more than Booth ever writes. Delete the file, and the next room starts them all at 100."
+        );
+        assert_eq!(
+            seen[2],
+            format!(
+                "Could not write volumes.txt, so voice volumes are not saved. Windows said: {}. Check that the disk is not full. Booth tries again at the next change.",
+                os(full())
+            )
+        );
+        assert_eq!(
+            seen[3],
+            format!(
+                "Could not write sound-volumes.txt, so PC sound volumes are not saved. Windows said: {}. Close any program that has the file open. Booth tries again at the next change.",
+                os(denied())
+            )
+        );
     }
 
     #[test]

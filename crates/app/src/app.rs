@@ -1304,6 +1304,13 @@ impl eframe::App for App {
             }
             ui.request_repaint();
         }
+        // Before a Leave on this frame drops the room screen, and its lines
+        // with it.
+        if let Screen::Room(in_room) = &mut self.screen {
+            for line in in_room.take_log() {
+                self.backlog.add(line);
+            }
+        }
         match step {
             Some(Step::Leave) => self.leave(),
             Some(Step::NewInvite { multi_use }) => {

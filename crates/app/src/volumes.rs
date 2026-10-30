@@ -28,7 +28,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    fn file(self) -> &'static str {
+    pub fn file(self) -> &'static str {
         match self {
             Kind::Voice => "volumes.txt",
             Kind::PcSound => "sound-volumes.txt",
@@ -36,12 +36,25 @@ impl Kind {
     }
 
     // What is not saved when the file cannot be read or written.
-    fn what(self) -> &'static str {
+    pub fn what(self) -> &'static str {
         match self {
             Kind::Voice => "voice volumes",
             Kind::PcSound => "PC sound volumes",
         }
     }
+}
+
+// Holds no path: the line made from it can stay for the whole room, where a
+// share of the panel's monitor shows it.
+#[derive(Debug)]
+pub enum Problem {
+    // Read as the room opened; it holds for the room.
+    Read { kind: Kind, source: io::Error },
+    // Writing the new copy beside the file: a full disk, most likely.
+    Write { kind: Kind, source: io::Error },
+    // Putting the new copy in the file's place: a program holding it, most
+    // likely.
+    Replace { kind: Kind, source: io::Error },
 }
 
 #[derive(Default)]
@@ -55,7 +68,10 @@ pub struct Volumes {
     unsaved: bool,
     // Why the file could not be read, which holds for the room, or why the
     // last save failed, until one goes through.
-    problem: Option<String>,
+    problem: Option<Problem>,
+    // The same failure with the whole path, for the log, until the app takes
+    // it.
+    log: Option<String>,
 }
 
 impl Volumes {
@@ -70,32 +86,33 @@ impl Volumes {
                 people: parse(&bytes),
                 unsaved: false,
                 problem: None,
+                log: None,
             },
             Err(err) => {
-                // Deleted, it is read again at the next room's start.
-                let step = if err.kind() == io::ErrorKind::FileTooLarge {
-                    "; delete the file, and the next room starts them all at 100"
-                } else {
-                    ""
-                };
+                let log = format!(
+                    "volumes: could not read {}: {err}; {} changed now are not saved",
+                    path.display(),
+                    kind.what()
+                );
                 Volumes {
                     kind,
                     dir: None,
                     people: Vec::new(),
                     unsaved: false,
-                    problem: Some(format!(
-                        "could not read {}: {err}; {} changed now are not saved{step}",
-                        path.display(),
-                        kind.what()
-                    )),
+                    problem: Some(Problem::Read { kind, source: err }),
+                    log: Some(log),
                 }
             }
         }
     }
 
     // What the panel says while it holds.
-    pub fn problem(&self) -> Option<&str> {
-        self.problem.as_deref()
+    pub fn problem(&self) -> Option<&Problem> {
+        self.problem.as_ref()
+    }
+
+    pub fn take_log(&mut self) -> Option<String> {
+        self.log.take()
     }
 
     pub fn get(&self, key: &[u8; 32]) -> u8 {
@@ -124,9 +141,9 @@ impl Volumes {
 
     // Only when something changed since the last save, and once: a disk
     // that refused it is tried again at the next change, not every frame.
-    pub fn save(&mut self) -> Result<(), SaveError> {
+    pub fn save(&mut self) {
         let Some(dir) = self.dir.as_deref().filter(|_| self.unsaved) else {
-            return Ok(());
+            return;
         };
         self.unsaved = false;
         let mut text = String::new();
@@ -136,21 +153,30 @@ impl Volumes {
             }
             text.push_str(&format!(" {percent}\r\n"));
         }
-        let saved = settings::replace(dir, &dir.join(self.kind.file()), text.as_bytes());
-        self.problem = saved.as_ref().err().map(|err| {
-            format!(
-                "{err}; {} are not saved, and Booth tries again at the next change",
-                self.kind.what()
-            )
+        let err = match settings::replace(dir, &dir.join(self.kind.file()), text.as_bytes()) {
+            Ok(()) => {
+                self.problem = None;
+                return;
+            }
+            Err(err) => err,
+        };
+        self.log = Some(format!("volumes: {err}; tried again at the next change"));
+        let kind = self.kind;
+        self.problem = Some(match err {
+            SaveError::Write { source, .. } => Problem::Write { kind, source },
+            // replace() never reads the file first, so Read cannot come from
+            // it.
+            SaveError::Read { source, .. } | SaveError::Replace { source, .. } => {
+                Problem::Replace { kind, source }
+            }
         });
-        saved
     }
 }
 
 // A room left with a person's menu still open has not written it yet.
 impl Drop for Volumes {
     fn drop(&mut self) {
-        let _ = self.save();
+        self.save();
     }
 }
 
@@ -224,13 +250,14 @@ mod tests {
     fn kept_across_a_restart() {
         let dir = folder("kept");
         let mut volumes = Volumes::load(&dir, Kind::Voice);
-        assert_eq!(volumes.problem(), None);
+        assert!(volumes.problem().is_none());
         assert_eq!(volumes.get(&[7; 32]), 100);
         volumes.set([7; 32], 40);
         volumes.set([9; 32], 0);
         volumes.set([3; 32], 200);
         volumes.set([3; 32], 100);
-        volumes.save().unwrap();
+        volumes.save();
+        assert!(volumes.problem().is_none());
         let text = std::fs::read_to_string(dir.join("volumes.txt")).unwrap();
         assert_eq!(text.lines().count(), 2, "{text}");
         assert!(
@@ -266,11 +293,11 @@ mod tests {
         let dir = folder("sound");
         let mut voice = Volumes::load(&dir, Kind::Voice);
         let mut sound = Volumes::load(&dir, Kind::PcSound);
-        assert_eq!(sound.problem(), None);
+        assert!(sound.problem().is_none());
         voice.set([7; 32], 40);
         sound.set([7; 32], 0);
-        voice.save().unwrap();
-        sound.save().unwrap();
+        voice.save();
+        sound.save();
         let text = std::fs::read_to_string(dir.join("sound-volumes.txt")).unwrap();
         assert_eq!(text, format!("{} 0\r\n", "07".repeat(32)));
         let voice = Volumes::load(&dir, Kind::Voice);
@@ -278,11 +305,27 @@ mod tests {
         assert_eq!((voice.get(&[7; 32]), sound.get(&[7; 32])), (40, 0));
         std::fs::remove_file(dir.join("sound-volumes.txt")).unwrap();
         std::fs::create_dir(dir.join("sound-volumes.txt")).unwrap();
-        let unreadable = Volumes::load(&dir, Kind::PcSound);
-        let problem = unreadable.problem().expect("a reason");
+        let mut unreadable = Volumes::load(&dir, Kind::PcSound);
         assert!(
-            problem.ends_with("; PC sound volumes changed now are not saved"),
-            "{problem}"
+            matches!(
+                unreadable.problem(),
+                Some(Problem::Read {
+                    kind: Kind::PcSound,
+                    ..
+                })
+            ),
+            "{:?}",
+            unreadable.problem()
+        );
+        let log = unreadable.take_log().expect("a log line");
+        let path = dir.join("sound-volumes.txt");
+        assert!(
+            log.starts_with(&format!("volumes: could not read {}: ", path.display())),
+            "{log}"
+        );
+        assert!(
+            log.ends_with("; PC sound volumes changed now are not saved"),
+            "{log}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -317,15 +360,26 @@ mod tests {
         // file another program holds open without sharing.
         std::fs::create_dir(dir.join("volumes.txt")).unwrap();
         let mut volumes = Volumes::load(&dir, Kind::Voice);
-        let problem = volumes.problem().expect("a reason").to_owned();
+        let read = |volumes: &Volumes| {
+            matches!(
+                volumes.problem(),
+                Some(Problem::Read {
+                    kind: Kind::Voice,
+                    ..
+                })
+            )
+        };
+        assert!(read(&volumes), "{:?}", volumes.problem());
+        let log = volumes.take_log().expect("a log line");
         assert!(
-            problem.ends_with("; voice volumes changed now are not saved"),
-            "{problem}"
+            log.ends_with("; voice volumes changed now are not saved"),
+            "{log}"
         );
         volumes.set([7; 32], 40);
         assert_eq!(volumes.get(&[7; 32]), 40);
-        volumes.save().unwrap();
-        assert_eq!(volumes.problem(), Some(problem.as_str()), "it holds");
+        volumes.save();
+        assert!(read(&volumes), "it holds: {:?}", volumes.problem());
+        assert_eq!(volumes.take_log(), None);
         drop(volumes);
         assert!(dir.join("volumes.txt").is_dir());
         let _ = std::fs::remove_dir_all(&dir);
@@ -340,21 +394,22 @@ mod tests {
         let big = line.repeat(30_000);
         std::fs::write(dir.join("sound-volumes.txt"), &big).unwrap();
         let mut volumes = Volumes::load(&dir, Kind::PcSound);
-        let problem = volumes.problem().expect("a reason");
-        assert!(problem.contains("over 64 KB"), "{problem}");
-        assert!(
-            problem.ends_with("; delete the file, and the next room starts them all at 100"),
-            "{problem}"
-        );
+        match volumes.problem() {
+            Some(Problem::Read {
+                kind: Kind::PcSound,
+                source,
+            }) => assert_eq!(source.kind(), io::ErrorKind::FileTooLarge, "{source}"),
+            other => panic!("{other:?}"),
+        }
         assert_eq!(volumes.get(&[0xab; 32]), 100);
         volumes.set([7; 32], 40);
-        volumes.save().unwrap();
+        volumes.save();
         drop(volumes);
         let kept = std::fs::read_to_string(dir.join("sound-volumes.txt")).unwrap();
         assert!(kept == big, "written over");
         let at_most = line.repeat(256);
         std::fs::write(dir.join("sound-volumes.txt"), &at_most).unwrap();
-        assert_eq!(Volumes::load(&dir, Kind::PcSound).problem(), None);
+        assert!(Volumes::load(&dir, Kind::PcSound).problem().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -367,21 +422,67 @@ mod tests {
         volumes.set([7; 32], 40);
         // A folder where the file goes: the rename over it fails.
         std::fs::create_dir(dir.join("sound-volumes.txt")).unwrap();
-        assert!(volumes.save().is_err());
-        let problem = volumes.problem().expect("a reason");
+        volumes.save();
+        let replace = |volumes: &Volumes| {
+            matches!(
+                volumes.problem(),
+                Some(Problem::Replace {
+                    kind: Kind::PcSound,
+                    ..
+                })
+            )
+        };
+        assert!(replace(&volumes), "{:?}", volumes.problem());
+        let log = volumes.take_log().expect("a log line");
+        let path = dir.join("sound-volumes.txt");
         assert!(
-            problem.ends_with(
-                "; PC sound volumes are not saved, and Booth tries again at the next change"
-            ),
-            "{problem}"
+            log.starts_with(&format!("volumes: could not replace {}: ", path.display())),
+            "{log}"
         );
+        assert!(log.ends_with("; tried again at the next change"), "{log}");
+        assert!(!log.contains("with the new settings"), "{log}");
         // As the room asks each frame while the menu is closed.
-        volumes.save().unwrap();
-        assert!(volumes.problem().is_some(), "it holds");
+        volumes.save();
+        assert!(replace(&volumes), "it holds: {:?}", volumes.problem());
+        assert_eq!(volumes.take_log(), None);
         std::fs::remove_dir(dir.join("sound-volumes.txt")).unwrap();
         volumes.set([7; 32], 50);
-        volumes.save().unwrap();
-        assert_eq!(volumes.problem(), None);
+        volumes.save();
+        assert!(volumes.problem().is_none());
+        assert_eq!(volumes.take_log(), None);
+        drop(volumes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The new copy cannot be written beside the file, as on a full disk:
+    // that is a problem of its own, and only the log names the temporary
+    // file.
+    #[test]
+    fn a_full_disk_is_a_write_not_a_replace() {
+        let dir = folder("full");
+        let mut volumes = Volumes::load(&dir, Kind::Voice);
+        volumes.set([7; 32], 40);
+        // A folder where the new copy goes stands in for a full disk.
+        let temp = dir.join(format!("volumes.{}.tmp", std::process::id()));
+        std::fs::create_dir(&temp).unwrap();
+        volumes.save();
+        assert!(
+            matches!(
+                volumes.problem(),
+                Some(Problem::Write {
+                    kind: Kind::Voice,
+                    ..
+                })
+            ),
+            "{:?}",
+            volumes.problem()
+        );
+        let log = volumes.take_log().expect("a log line");
+        assert!(
+            log.starts_with(&format!("volumes: could not write {}: ", temp.display())),
+            "{log}"
+        );
+        std::fs::remove_dir(&temp).unwrap();
         drop(volumes);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -395,7 +496,8 @@ mod tests {
             key[..2].copy_from_slice(&n.to_le_bytes());
             volumes.set(key, 50);
         }
-        volumes.save().unwrap();
+        volumes.save();
+        assert!(volumes.problem().is_none());
         let again = Volumes::load(&dir, Kind::Voice);
         assert_eq!(again.each().count(), MOST_PEOPLE);
         let mut newest = [0u8; 32];

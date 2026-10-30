@@ -187,6 +187,15 @@ impl InRoom {
         self.switch_wait.out_of_sight();
     }
 
+    // The volume files' log lines since the last frame, with the paths their
+    // line leaves out.
+    pub fn take_log(&mut self) -> Vec<String> {
+        [&mut self.volumes, &mut self.sound_volumes]
+            .into_iter()
+            .filter_map(Volumes::take_log)
+            .collect()
+    }
+
     // From the app's logic, not from show: the panel is minimized over a
     // game when a request comes, and the asker would wait until it opens.
     pub fn decline_unshown(&mut self, view: &View, control_offered: bool) {
@@ -1423,13 +1432,17 @@ impl InRoom {
         // Written once the menu closes, not at each step of a drag. Each
         // keeps what went wrong with it, which the line below says.
         if !self.menu.is_open() {
-            let _ = self.volumes.save();
-            let _ = self.sound_volumes.save();
+            self.volumes.save();
+            self.sound_volumes.save();
         }
-        let problems = [&self.volumes, &self.sound_volumes]
-            .map(|volumes| volumes.problem().map(str::to_owned));
-        if let Some(error) = &messages::sentences(problems) {
+        let problems: Vec<String> = [&self.volumes, &self.sound_volumes]
+            .into_iter()
+            .filter_map(Volumes::problem)
+            .map(messages::volumes_error)
+            .collect();
+        if !problems.is_empty() {
             row_last = false;
+            let error = problems.join(" ");
             controls::gutter(ui, 0.0, STEP, |ui| {
                 controls::prose(ui, error.as_str(), theme::caption(), BAD);
             });

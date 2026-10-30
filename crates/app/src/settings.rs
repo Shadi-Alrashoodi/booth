@@ -641,11 +641,9 @@ impl fmt::Display for SaveError {
             SaveError::Write { path, source } => {
                 write!(f, "could not write {}: {source}", path.display())
             }
-            SaveError::Replace { path, source } => write!(
-                f,
-                "could not replace {} with the new settings: {source}",
-                path.display()
-            ),
+            SaveError::Replace { path, source } => {
+                write!(f, "could not replace {}: {source}", path.display())
+            }
         }
     }
 }
