@@ -68,17 +68,14 @@ fn exe_folder() -> Result<PathBuf, DecodeError> {
     exe.parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| DecodeError::NoExeFolder {
-            detail: format!("{} has no folder", exe.display()),
+            detail: String::from("Windows gave booth.exe's path without a folder"),
         })
 }
 
 pub(crate) fn load_from(folder: &Path) -> Result<Library, DecodeError> {
     for file in [AVCODEC, AVUTIL] {
         if !folder.join(file).is_file() {
-            return Err(DecodeError::Missing {
-                file,
-                folder: folder.to_path_buf(),
-            });
+            return Err(DecodeError::Missing { file });
         }
     }
     // Each one looks for its imports in System32 only. avcodec imports
@@ -178,13 +175,8 @@ impl Module {
         // imports) would be looked for in this folder first, and booth.exe
         // usually sits in Downloads.
         // SAFETY: a full path in a live string; the flag needs no file handle.
-        let handle = unsafe { LoadLibraryExW(&path, None, LOAD_LIBRARY_SEARCH_SYSTEM32) }.map_err(
-            |source| DecodeError::Load {
-                file,
-                folder: folder.to_path_buf(),
-                source,
-            },
-        )?;
+        let handle = unsafe { LoadLibraryExW(&path, None, LOAD_LIBRARY_SEARCH_SYSTEM32) }
+            .map_err(|source| DecodeError::Load { file, source })?;
         Ok(Module { handle, file })
     }
 
@@ -244,11 +236,9 @@ mod tests {
         println!("{text}");
         assert_eq!(
             text,
-            format!(
-                "the video decoder is missing: avcodec-62.dll was not found next to booth.exe in {}\\. Unzip Booth again with all its files",
-                folder.display()
-            )
+            "the video decoder is missing: avcodec-62.dll was not found next to booth.exe. Unzip Booth again with all its files"
         );
+        assert!(!text.contains(&folder.display().to_string()), "{text}");
 
         std::fs::write(folder.join(AVCODEC), b"").unwrap();
         let text = load_from(&folder).err().expect("no avutil").to_string();
@@ -268,13 +258,9 @@ mod tests {
             .expect("text is not a DLL")
             .to_string();
         println!("{text}");
-        assert!(
-            text.starts_with(&format!(
-                "could not load avutil-60.dll from {}\\: ",
-                folder.display()
-            )),
-            "{text}"
-        );
+        assert!(text.starts_with("could not load avutil-60.dll: "), "{text}");
+        assert!(!text.contains(&folder.display().to_string()), "{text}");
+        assert!(!text.contains('\\'), "{text}");
         assert!(
             text.ends_with("Unzip Booth again with all its files"),
             "{text}"

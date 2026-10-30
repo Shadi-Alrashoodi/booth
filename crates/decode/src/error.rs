@@ -1,5 +1,4 @@
 use std::fmt;
-use std::path::PathBuf;
 
 use crate::decoder::{Codec, MAX_ACCESS_UNIT};
 use crate::library::AVCODEC;
@@ -12,17 +11,18 @@ const LARGEST: (u32, u32) = (4096, 2304);
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum DecodeError {
+    // No folder in this or Load: booth.exe's is under the Windows profile
+    // when unzipped in Downloads or installed per user, these words reach
+    // the room's chat, and the room's log names the exe's path.
     /// One of FFmpeg's DLLs is not next to the exe.
     Missing {
         file: &'static str,
-        folder: PathBuf,
     },
     NoExeFolder {
         detail: String,
     },
     Load {
         file: &'static str,
-        folder: PathBuf,
         source: windows::core::Error,
     },
     MissingExport {
@@ -146,23 +146,17 @@ fn system_text(source: &windows::core::Error, file: &str) -> String {
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DecodeError::Missing { file, folder } => write!(
+            DecodeError::Missing { file } => write!(
                 f,
-                "the video decoder is missing: {file} was not found next to booth.exe in {}\\. {UNZIP}",
-                folder.display()
+                "the video decoder is missing: {file} was not found next to booth.exe. {UNZIP}"
             ),
             DecodeError::NoExeFolder { detail } => write!(
                 f,
                 "could not find the folder booth.exe runs from, where the video decoder's files are: {detail}"
             ),
-            DecodeError::Load {
-                file,
-                folder,
-                source,
-            } => write!(
+            DecodeError::Load { file, source } => write!(
                 f,
-                "could not load {file} from {}\\: {}. {UNZIP}",
-                folder.display(),
+                "could not load {file}: {}. {UNZIP}",
                 system_text(source, file)
             ),
             DecodeError::MissingExport { file, name } => write!(
