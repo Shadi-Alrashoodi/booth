@@ -38,7 +38,8 @@ windows = { workspace = true, features = [
 
 [features]
 # Tests only (room's tests turn it on): src/fault.rs, which lets a test say
-# what a look at the desktop finds. A release build never has it.
+# what a look at the desktop finds, or hold up a window capture. A release
+# build never has it.
 fault = []
 
 [dev-dependencies]

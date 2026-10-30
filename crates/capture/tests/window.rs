@@ -3,7 +3,7 @@
 // pauses and timings, never the pixels.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -104,6 +104,11 @@ impl Drop for Window {
         self.close();
     }
 }
+
+// A window minimized or restored beside the fast window holds up its
+// pictures, about 10 more of 240 held: the tests that do it take turns with
+// that one.
+static MINIMIZING: Mutex<()> = Mutex::new(());
 
 fn adapter() -> Option<capture::Adapter> {
     capture::make_process_dpi_aware().unwrap();
@@ -325,6 +330,7 @@ fn a_window_kept_in_a_frame() {
 // rate off the refresh grid makes anyway.
 #[test]
 fn a_fast_window_comes_at_the_rate_asked() {
+    let _turn = MINIMIZING.lock().unwrap_or_else(|p| p.into_inner());
     let Some(adapter) = adapter() else { return };
     let window = Window::open(640, 360);
     let options = Options {
@@ -387,6 +393,7 @@ fn a_fast_window_comes_at_the_rate_asked() {
 
 #[test]
 fn a_minimized_window_pauses_and_comes_back() {
+    let _turn = MINIMIZING.lock().unwrap_or_else(|p| p.into_inner());
     let Some(adapter) = adapter() else { return };
     // With a title bar and borders, as most windows shared are.
     let window = Window::with_style(WS_OVERLAPPEDWINDOW, 640, 360);
@@ -419,6 +426,110 @@ fn a_minimized_window_pauses_and_comes_back() {
     println!("after restoring: {sizes:?}");
     assert!(!sizes.is_empty());
     assert!(sizes.iter().all(|&each| each == size), "{sizes:?}");
+}
+
+// A restore that lands while a pass that found the window minimized is held
+// up, here for 1 s, still comes out, with the restore's own pictures and not
+// only the one Windows sends once the drain makes room in the pool. When the
+// restore's first two pictures are its caption and a size in between, that
+// late one is the first there is of the restored window, so up to three
+// restores are tried for one that shows the rest.
+#[cfg(feature = "fault")]
+#[test]
+fn restore_during_the_drain() {
+    let _turn = MINIMIZING.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(adapter) = adapter() else { return };
+    let window = Window::with_style(WS_OVERLAPPEDWINDOW, 640, 360);
+    let mut capture = WindowCapture::open(window.id(), &adapter, Options::default()).unwrap();
+    let size = frame_size(&mut capture, Duration::from_secs(2)).unwrap();
+    let hold = Duration::from_secs(1);
+    let mut early = false;
+    for _ in 0..3 {
+        window.show(SW_MINIMIZE);
+        let start = Instant::now();
+        let mut paused = None;
+        while start.elapsed() < Duration::from_secs(2) && paused.is_none() {
+            if let Next::Paused(why) = capture.next().unwrap() {
+                paused = Some(why);
+            }
+        }
+        assert_eq!(paused, Some(PauseReason::Minimized));
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(300) {
+            capture.next().unwrap();
+        }
+        capture::fault::set_hold_after_minimized(window.0, hold);
+        let armed = Instant::now();
+        let frames = thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(100));
+                window.show(SW_RESTORE);
+            });
+            let mut frames = Vec::new();
+            while armed.elapsed() < Duration::from_secs(3) {
+                if let Next::Frame(frame) = capture.next().unwrap() {
+                    let at = frame.present.saturating_duration_since(armed);
+                    frames.push(((frame.width, frame.height), at, armed.elapsed()));
+                }
+            }
+            frames
+        });
+        println!("the window comes out {size:?}; after the restore {frames:?}");
+        let Some(&(_, first, came)) = frames.first() else {
+            panic!("no frame in the 3 s after the restore");
+        };
+        assert!(frames.iter().all(|&(each, ..)| each == size), "{frames:?}");
+        // The first picture is from well before the hold ends: one of the
+        // restore's own, not one Windows sent once the pass was through.
+        // Coming back only after the hold says the restore did land in it.
+        if first < Duration::from_millis(900) && came >= hold {
+            early = true;
+            break;
+        }
+    }
+    assert!(
+        early,
+        "no restore came out with a picture from before the hold ended"
+    );
+}
+
+// A window minimized and restored again within one pass, here held up for
+// 1 s, is no pause, and what the restore sends at other sizes stays out.
+#[cfg(feature = "fault")]
+#[test]
+fn minimized_and_restored_within_one_pass() {
+    let _turn = MINIMIZING.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(adapter) = adapter() else { return };
+    let window = Window::with_style(WS_OVERLAPPEDWINDOW, 640, 360);
+    let mut capture = WindowCapture::open(window.id(), &adapter, Options::default()).unwrap();
+    let size = frame_size(&mut capture, Duration::from_secs(2)).unwrap();
+    let hold = Duration::from_secs(1);
+    capture::fault::set_hold_after_minimized(window.0, hold);
+    let minimized = Instant::now();
+    let frames = thread::scope(|scope| {
+        scope.spawn(|| {
+            window.show(SW_MINIMIZE);
+            thread::sleep(Duration::from_millis(300));
+            window.show(SW_RESTORE);
+        });
+        let mut frames = Vec::new();
+        while minimized.elapsed() < Duration::from_secs(3) {
+            match capture.next().unwrap() {
+                Next::Frame(frame) => {
+                    frames.push(((frame.width, frame.height), minimized.elapsed()));
+                }
+                Next::Paused(why) => panic!("paused for {why:?}: {frames:?}"),
+                _ => {}
+            }
+        }
+        frames
+    });
+    println!("the window comes out {size:?}; minimized and restored {frames:?}");
+    // The pass that saw the window minimized held everything up from well
+    // before the restore: what comes back after the hold came out of it.
+    let after: Vec<_> = frames.iter().filter(|&&(_, came)| came >= hold).collect();
+    assert!(!after.is_empty(), "no frame after the hold: {frames:?}");
+    assert!(after.iter().all(|&&(each, _)| each == size), "{frames:?}");
 }
 
 #[test]

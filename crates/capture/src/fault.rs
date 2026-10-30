@@ -28,3 +28,26 @@ pub fn clear() {
 pub(crate) fn desktop_said() -> Option<(Option<PauseReason>, Duration)> {
     desktop().clone()
 }
+
+static HOLD_AFTER_MINIMIZED: Mutex<Vec<(isize, Duration)>> = Mutex::new(Vec::new());
+
+/// The next pass of `window`'s capture that finds it minimized sleeps
+/// `hold` right after IsIconic says so, once, so a restore can land between
+/// that look and the rest of the pass. Only that window's: capture's window
+/// tests run side by side, and others minimize, or hold, a window of their
+/// own.
+pub fn set_hold_after_minimized(window: isize, hold: Duration) {
+    let mut holds = HOLD_AFTER_MINIMIZED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    holds.retain(|&(set_for, _)| set_for != window);
+    holds.push((window, hold));
+}
+
+pub(crate) fn hold_after_minimized(window: isize) -> Option<Duration> {
+    let mut holds = HOLD_AFTER_MINIMIZED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let at = holds.iter().position(|&(set_for, _)| set_for == window)?;
+    Some(holds.swap_remove(at).1)
+}

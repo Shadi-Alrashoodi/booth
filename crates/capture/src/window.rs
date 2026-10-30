@@ -469,12 +469,43 @@ impl WindowCapture {
                 return Err(CaptureError::other(WINDOW_CLOSED));
             }
             if self.window.minimized() {
+                #[cfg(feature = "fault")]
+                if let Some(hold) = crate::fault::hold_after_minimized(self.window.hwnd) {
+                    std::thread::sleep(hold);
+                }
                 // What Windows composes of a minimized window is only its
-                // caption: no picture to send, and no size to follow.
+                // caption: no picture to send, and no size to follow. But a
+                // restore can land between that look and the drain, which
+                // would hand its pictures back unseen: a still window then
+                // sends one more, late, once the drain makes room in a full
+                // pool. DWM's bounds read then can be the restored window's,
+                // not the caption. So IsIconic is asked again after both,
+                // with the newest picture kept, and a window back by then
+                // gets the filter of any restore, even before its pause was
+                // told; on the capture's first minimize it has no caption to
+                // judge by, so while DWM is behind its real picture can be
+                // dropped. A window gone meanwhile is left to the next pass.
+                let mut newest = None;
                 while let Ok(frame) = self.pool.TryGetNextFrame() {
+                    if let Some(older) = newest.replace(frame) {
+                        let _ = older.Close();
+                    }
+                }
+                let bounds = self.size();
+                if !self.window.minimized() && self.window.exists() {
+                    self.minimized = false;
+                    self.restoring_until = Some(Instant::now() + RESTORING);
+                    if let Some(frame) = newest
+                        && let Some(next) = self.take(&frame)?
+                    {
+                        return Ok(next);
+                    }
+                    continue;
+                }
+                if let Some(frame) = newest {
                     let _ = frame.Close();
                 }
-                if let Some(size) = self.size() {
+                if let Some(size) = bounds {
                     self.caption = Some(size);
                 }
                 self.natural = None;
