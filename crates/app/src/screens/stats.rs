@@ -50,10 +50,7 @@ pub fn show(
         audio,
         showing,
     );
-    if let Some(path) = log_file {
-        out.group(None);
-        out.add("Log file", Some(path.display().to_string()));
-    }
+    log_line(&mut out, log_file);
     // Over the people list and the chat, the whole height between the title
     // row and the strip, in panel tone.
     let whole = ui.available_rect_before_wrap();
@@ -197,7 +194,7 @@ struct Line {
     label: &'static str,
     value: String,
     level: Level,
-    // The value is "Hidden while you share" in place of an address.
+    // The value is "Hidden while you share" in place of an address or a path.
     hidden: bool,
     // The value is a person's name, set in Plex Sans as names are
     // everywhere else, not in the mono of the readings.
@@ -335,9 +332,10 @@ impl Lines {
         }
     }
 
-    // A line that can hold an IP address. The label stays while you share,
-    // so the panel keeps its shape as a share starts and stops.
-    fn address(&mut self, label: &'static str, value: Option<String>) {
+    // A line that can hold an IP address, this PC's or a friend's, or a
+    // path under the Windows profile. The label stays while you share, so
+    // the panel keeps its shape as a share starts and stops.
+    fn private(&mut self, label: &'static str, value: Option<String>) {
         if !self.hide_addresses {
             self.add(label, value);
         } else if value.is_some() {
@@ -409,7 +407,7 @@ fn build(
     out.add("Loss inbound, from pings", n.inbound_loss_pct.map(percent));
     out.add("Path", n.path.map(|path| strip::path_word(path).to_owned()));
     out.part();
-    out.address("Remote address", n.peer_addr.map(|addr| addr.to_string()));
+    out.private("Remote address", n.peer_addr.map(|addr| addr.to_string()));
     out.add("Local port", Some(format!("UDP {}", n.local_port)));
     out.add("Firewall", Some(firewall.to_owned()));
     out.part();
@@ -521,26 +519,33 @@ fn build(
         "NAT mapping",
         n.mapping.map(|word| mapping(word).to_owned()),
     );
-    out.address("Public address", n.public_addr.map(|addr| addr.to_string()));
+    out.private("Public address", n.public_addr.map(|addr| addr.to_string()));
     let mapped_by = match (role, &n.mapping_protocol) {
         (Role::Host, Some(protocol)) => Some(protocol.clone()),
         (Role::Host, None) if !asking => Some(String::from("none")),
         _ => None,
     };
     out.add("Port mapping", mapped_by);
-    out.address("Mapped address", n.mapped_addr.map(|addr| addr.to_string()));
+    out.private("Mapped address", n.mapped_addr.map(|addr| addr.to_string()));
     if let Some(change) = &n.address_change {
         out.add("Address changed", Some(changed(change, now_unix)));
-        out.address("Old address", Some(change.from.to_string()));
-        out.address("New address", Some(change.to.to_string()));
+        out.private("Old address", Some(change.from.to_string()));
+        out.private("New address", Some(change.to.to_string()));
     }
     if let Some(name) = &n.address_name {
         out.add("Address name", Some(name.name.clone()));
         // Whatever the lookup said: its answer names the addresses it
         // refused as well as the ones it took.
-        out.address("Name points to", points_to(name));
+        out.private("Name points to", points_to(name));
     }
     out
+}
+
+// Under --log, where the log is: its folder is under the Windows profile, so
+// it reads hidden while you share, as the addresses do.
+fn log_line(out: &mut Lines, path: Option<&Path>) {
+    out.group(None);
+    out.private("Log file", path.map(|path| path.display().to_string()));
 }
 
 // While this PC's share runs: what its encoder makes and what goes out.
@@ -1800,6 +1805,35 @@ mod tests {
         };
         let (off, on) = off_and_on(Role::Host, &n);
         assert_eq!(off, on);
+    }
+
+    // Under --log the log file's path is a line of its own, and while you
+    // share it reads hidden as the addresses do, its label kept.
+    #[test]
+    fn the_log_file_reads_hidden_while_you_share() {
+        let path = Path::new(r"C:\Users\Mara\AppData\Local\Booth\booth.log");
+        let shown = |hide_addresses, path| {
+            let mut out = Lines::new(hide_addresses);
+            log_line(&mut out, path);
+            out.lines
+        };
+        assert_eq!(
+            shown(false, Some(path)),
+            [line(
+                "Log file",
+                r"C:\Users\Mara\AppData\Local\Booth\booth.log",
+                Level::Good
+            )]
+        );
+        let hidden = shown(true, Some(path));
+        assert_eq!(hidden.len(), 1, "{hidden:?}");
+        assert_eq!(hidden[0].label, "Log file");
+        assert_eq!(hidden[0].value, "Hidden while you share");
+        assert!(hidden[0].hidden);
+        assert_eq!(value_color(&hidden[0]), ASH);
+        for hide_addresses in [false, true] {
+            assert!(shown(hide_addresses, None).is_empty());
+        }
     }
 
     #[test]

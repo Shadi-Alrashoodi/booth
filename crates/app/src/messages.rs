@@ -747,8 +747,8 @@ pub fn settings_error(err: &SaveError) -> String {
 
 pub const ANYONE: &str = "Anyone who sees this code can join for 24 hours.";
 pub const EMPTY_ROOM: &str = "Send the invite to your friends.";
-// In place of the invite code and the stats panel's address lines, from the
-// ask until the capture has closed.
+// In place of the invite code, the stats panel's address lines and its log
+// file line, from the ask until the capture has closed.
 pub const HIDDEN_WHILE_SHARING: &str = "Hidden while you share";
 
 pub const UPLOAD_ABOUT: &str =
