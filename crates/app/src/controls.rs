@@ -85,11 +85,16 @@ pub fn buttons(ui: &mut Ui, buttons: &[Button], height: f32) -> Option<usize> {
     let mut pressed = None;
     ui.allocate_ui_with_layout(vec2(width, height), layout, |ui| {
         for (i, button) in buttons.iter().enumerate() {
-            let clicked = ui
-                .push_id(button.text, |ui| button.show(ui))
-                .inner
-                .clicked();
-            if clicked && button.enabled {
+            let response = ui.push_id(button.text, |ui| button.show(ui)).inner;
+            let drawn = Drawn {
+                off_limits: !button.enabled,
+                checked: false,
+            };
+            // Resume and Allow are disabled while they wait, and egui would
+            // still hand them the click of a press made then.
+            let began_off = aimed(ui, &response, drawn).off_limits;
+            let pointer = response.clicked_by(PointerButton::Primary);
+            if response.clicked() && button.enabled && !(pointer && began_off) {
                 pressed = Some(i);
             }
         }
@@ -384,7 +389,8 @@ impl<'a> Button<'a> {
     // A button that stays where it is and can still be reached with Tab,
     // so its name can say why it does nothing now. Screen readers call it
     // unavailable, the pointer stays an arrow over it, and title_row and
-    // buttons() never report it pressed.
+    // buttons() never report it pressed, nor take a click from a press made
+    // while it was disabled.
     pub fn enabled(mut self, enabled: bool) -> Button<'a> {
         self.enabled = enabled;
         self
@@ -819,40 +825,16 @@ pub fn checkbox_row(
     let description = description.to_owned();
     ui.ctx()
         .accesskit_node_builder(response.id, |node| node.set_description(description));
-    // egui places a press on the last frame's layout, so the row as the last
-    // frame drew it is what the press was aimed at, and egui gives the click
-    // to the control the press began on, even when it has moved by the
-    // release. A click is one only if the row was never off limits from then
-    // on, or the wait after it appears would be a press shorter, and is
-    // checked as it was then: not one during which it turned by itself,
-    // which would turn it back.
-    let drawn = Drawn {
-        off_limits: !enabled,
-        checked,
-    };
-    let (last, press) = ui.ctx().data_mut(|data| {
-        let last = data
-            .get_temp::<Drawn>(response.id.with("drawn"))
-            .unwrap_or(drawn);
-        data.insert_temp(response.id.with("drawn"), drawn);
-        let key = response.id.with("press");
-        let before = data.get_temp::<Drawn>(key);
-        if response.is_pointer_button_down_on() {
-            let began = before.unwrap_or(last);
-            let off_limits = began.off_limits || !enabled;
-            data.insert_temp(
-                key,
-                Drawn {
-                    off_limits,
-                    ..began
-                },
-            );
-        } else {
-            data.remove::<Drawn>(key);
-        }
-        (last, before)
-    });
-    let began = press.unwrap_or(last);
+    let began = aimed(
+        ui,
+        &response,
+        Drawn {
+            off_limits: !enabled,
+            checked,
+        },
+    );
+    // Checked as when pressed: a click during which it turned by itself
+    // would turn it back.
     let click = response.clicked_by(PointerButton::Primary)
         && !began.off_limits
         && began.checked == checked;
@@ -874,12 +856,44 @@ pub fn checkbox_row(
     enabled && (click || space || reader)
 }
 
-// A checkbox row as a frame drew it. For a press while it is held: off
-// limits at any time since the frame it was aimed at, and checked as then.
+// A control as a frame drew it. For a press while it is held: off limits at
+// any time since the frame it was aimed at, and checked as then.
 #[derive(Clone, Copy)]
 struct Drawn {
     off_limits: bool,
     checked: bool,
+}
+
+// egui places a press on the last frame's layout and gives the click to the
+// control the press began on, even when it has moved by the release, so the
+// control as the last frame drew it is what the press was aimed at. Returns
+// it as drawn then, and off limits if it was at any moment since: a click is
+// one only if it never was, or the wait after a control appears would be a
+// press shorter.
+fn aimed(ui: &Ui, response: &Response, drawn: Drawn) -> Drawn {
+    let (last, press) = ui.ctx().data_mut(|data| {
+        let last = data
+            .get_temp::<Drawn>(response.id.with("drawn"))
+            .unwrap_or(drawn);
+        data.insert_temp(response.id.with("drawn"), drawn);
+        let key = response.id.with("press");
+        let before = data.get_temp::<Drawn>(key);
+        if response.is_pointer_button_down_on() {
+            let began = before.unwrap_or(last);
+            let off_limits = began.off_limits || drawn.off_limits;
+            data.insert_temp(
+                key,
+                Drawn {
+                    off_limits,
+                    ..began
+                },
+            );
+        } else {
+            data.remove::<Drawn>(key);
+        }
+        (last, before)
+    });
+    press.unwrap_or(last)
 }
 
 fn choice(
@@ -1330,7 +1344,8 @@ pub(crate) mod tests {
 
     // Share and Leave at the right of the title row in that order. While
     // someone else shares, Share stays in ash, a click on it does nothing,
-    // and a screen reader hears who shares.
+    // nor does a press made then and let go after their share ends, and a
+    // screen reader hears who shares.
     #[test]
     fn title_row_verbs() {
         let ctx = Context::default();
@@ -1365,12 +1380,79 @@ pub(crate) mod tests {
             assert_eq!(got, pressed, "{at:?}");
         }
         let enabled = || [Button::new("Share"), Button::new("Leave")];
+        frame(&ctx, press(share), |ui| {
+            title_row(ui, TUESDAY, &verbs(busy))
+        });
+        let (got, _) = frame(&ctx, release(share), |ui| {
+            title_row(ui, TUESDAY, &enabled())
+        });
+        assert_eq!(got, None, "pressed while busy");
+        frame(&ctx, Vec::new(), |ui| title_row(ui, TUESDAY, &enabled()));
         let (got, _) = frame(&ctx, press(share), |ui| title_row(ui, TUESDAY, &enabled()));
         assert_eq!(got, None);
         let (got, _) = frame(&ctx, release(share), |ui| {
             title_row(ui, TUESDAY, &enabled())
         });
         assert_eq!(got, Some(0));
+    }
+
+    // A press is aimed at a button as the frame before it drew it, which is
+    // where egui places it: one made while the button was disabled, or held
+    // while it was for a moment, is no click when it is let go, even with
+    // the button enabled by then. A click while it is enabled throughout,
+    // and Space after Tab, still press it; Space while it is disabled does
+    // not.
+    #[test]
+    fn a_press_made_while_a_button_is_disabled_is_no_click() {
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        let draw = |enabled: bool| {
+            move |ui: &mut Ui| {
+                let resume = [Button::new("Resume").enabled(enabled)];
+                buttons(ui, &resume, CONTROL_HEIGHT)
+            }
+        };
+        let (at, _) = frame(&ctx, Vec::new(), |ui| {
+            let at = ui.cursor().min + vec2(10.0, CONTROL_HEIGHT / 2.0);
+            draw(true)(ui);
+            at
+        });
+        // The frame before the press, the press, a frame while it is held,
+        // and the release, each with whether the button is enabled then.
+        let slow_click = |shown: [bool; 4]| {
+            let [seen, first, then, last] = shown;
+            frame(&ctx, Vec::new(), draw(seen));
+            frame(&ctx, press(at), draw(first));
+            frame(&ctx, Vec::new(), draw(then));
+            frame(&ctx, release(at), draw(last)).0
+        };
+        assert_eq!(slow_click([true; 4]), Some(0), "enabled throughout");
+        assert_eq!(
+            slow_click([false, false, true, true]),
+            None,
+            "pressed while disabled, let go enabled"
+        );
+        assert_eq!(
+            slow_click([true, true, false, true]),
+            None,
+            "disabled for a frame while held"
+        );
+        frame(&ctx, Vec::new(), draw(false));
+        let events = [press(at), release(at)].concat();
+        assert_eq!(
+            frame(&ctx, events, draw(true)).0,
+            None,
+            "in one frame, after a disabled one"
+        );
+        // Each on a panel of its own, where Tab reaches the button.
+        let space = |enabled: bool| {
+            let ctx = Context::default();
+            theme::apply(&ctx);
+            frame(&ctx, vec![key(Key::Tab)], draw(enabled));
+            frame(&ctx, vec![key(Key::Space)], draw(enabled)).0
+        };
+        assert_eq!(space(true), Some(0), "Space after Tab");
+        assert_eq!(space(false), None, "Space while disabled");
     }
 
     // Leave on a room that has ended and Settings on the start screen stand

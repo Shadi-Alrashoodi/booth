@@ -856,7 +856,8 @@ mod tests {
     }
 
     // Allow and Don't allow answer the request as drawn, by its number, and
-    // Allow does nothing while it waits out ALLOW_AFTER.
+    // Allow does nothing while it waits out ALLOW_AFTER, nor for a press made
+    // then and let go after.
     #[test]
     fn the_request_block_answers_the_request_it_shows() {
         let ctx = context();
@@ -887,9 +888,14 @@ mod tests {
             "{values:?}"
         );
         assert_eq!(click(&ctx, allow, draw(false)), None, "Allow still waits");
+        frame(&ctx, Vec::new(), draw(true));
         assert_eq!(click(&ctx, allow, draw(true)), Some(Answer::Allow(3)));
         assert_eq!(click(&ctx, dont, draw(false)), Some(Answer::DontAllow(3)));
         assert_eq!(click(&ctx, dont, draw(true)), Some(Answer::DontAllow(3)));
+        frame(&ctx, Vec::new(), draw(false));
+        frame(&ctx, press(allow), draw(false));
+        let (released, _) = frame(&ctx, release(allow), draw(true));
+        assert_eq!(released, None, "pressed while it waited");
     }
 
     #[test]
