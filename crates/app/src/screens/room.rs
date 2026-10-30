@@ -76,7 +76,7 @@ pub struct InRoom {
     list_next: bool,
     panic: PanicKey,
     allow_wait: AllowWait,
-    switch_wait: SwitchWait,
+    block_wait: BlockWait,
     decline: Decline,
     menu: RowMenu,
     // How loud this PC plays each person, and the PC sound of their
@@ -172,7 +172,7 @@ impl InRoom {
             list_next: false,
             panic,
             allow_wait: AllowWait::default(),
-            switch_wait: SwitchWait::default(),
+            block_wait: BlockWait::default(),
             decline: Decline::default(),
             menu: RowMenu::default(),
             volumes,
@@ -181,10 +181,11 @@ impl InRoom {
     }
 
     // From the app's logic while the panel is minimized: it comes back with
-    // Share PC sound waiting as if its block had just appeared, so a click
-    // meant for a game as the panel comes forward does not turn it on.
+    // Resume and Share PC sound waiting as if their block had just appeared,
+    // so a click meant for a game as the panel comes forward neither resumes
+    // a pause nor turns PC sound on.
     pub fn out_of_sight(&mut self) {
-        self.switch_wait.out_of_sight();
+        self.block_wait.out_of_sight();
     }
 
     // The volume files' log lines since the last frame, with the paths their
@@ -244,6 +245,7 @@ impl InRoom {
     }
 
     fn body(&mut self, ui: &mut Ui, view: &View, stats_open: bool) -> Option<Step> {
+        let now = Instant::now();
         let mut step = None;
         let title = if view.room_name.is_empty() {
             "Booth"
@@ -321,13 +323,13 @@ impl InRoom {
                 Err(TryRecvError::Empty) => {}
             }
         }
-        let wait = self.switch_wait.follow(&view.share, Instant::now());
-        if let Some(left) = wait {
+        let waits = self.block_wait.follow(&view.share, now);
+        for left in [waits.placed, waits.switch].into_iter().flatten() {
             ui.ctx().request_repaint_after(left);
         }
         if let Some(running) = &view.share.running {
             block = true;
-            match share_block(ui, running.held, &view.share.own_sound, wait.is_none()) {
+            match share_block(ui, running.held, &view.share.own_sound, waits) {
                 Some(SharePress::Resume) => self.room.pause_share(false),
                 Some(SharePress::Sound(on)) => self.room.share_sound(on),
                 None => {}
@@ -1098,19 +1100,33 @@ enum SharePress {
     Sound(bool),
 }
 
-// A click aimed at the share list, or at the rows under it, can land on Share
-// PC sound as the block appears in the list's place, some 80 ms after the
-// share is picked on a host and a round trip more on a client, or as a pause
-// or a resume moves it; and a click aimed at it while on, to turn it off, can
-// land just after its capture failed and turned it off. The switch waits
-// this long after each, after a new share takes the block over, and after it
-// goes off, before it can be turned on, as Allow does (ALLOW_AFTER).
-const SWITCH_AFTER: Duration = Duration::from_millis(500);
+// A click aimed at the share list, or at the rows under it, can land in the
+// block as it appears in the list's place, some 80 ms after the share is
+// picked on a host and a round trip more on a client, or as a pause or a
+// resume moves it, and a click meant for a game can land there as the panel
+// comes back from minimized; a click aimed at Share PC sound while on, to
+// turn it off, can land just after its capture failed and turned it off.
+// Resume and turning the switch on wait this long after the block appears
+// or moves, after the panel comes back from minimized, and after a new share
+// takes the block over, as Allow does (ALLOW_AFTER). Turning the switch on
+// also waits after it goes off, by itself or by hand, which moves nothing
+// above it, so Resume does not.
+const BLOCK_AFTER: Duration = Duration::from_millis(500);
 
-// When the block with Share PC sound last appeared, or changed what it shows.
+// When the block last appeared, moved or changed hands, which Resume waits
+// after, and when what a press on the switch means last changed, which the
+// switch waits after.
 #[derive(Debug, Default)]
-struct SwitchWait {
-    shown: Option<(Showing, Instant)>,
+struct BlockWait {
+    shown: Option<(Showing, Instant, Instant)>,
+}
+
+// How much longer the block waits since it was placed, for Resume, and the
+// switch since its last change; None once over.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Waits {
+    placed: Option<Duration>,
+    switch: Option<Duration>,
 }
 
 // What the block shows that moves the switch or changes what a press on it
@@ -1124,17 +1140,17 @@ struct Showing {
     on: bool,
 }
 
-impl SwitchWait {
+impl BlockWait {
     fn out_of_sight(&mut self) {
         self.shown = None;
     }
 
-    // Every frame in a room. How much longer the switch waits, or None once
-    // it can be turned on, or when it does not show.
-    fn follow(&mut self, share: &ShareView, now: Instant) -> Option<Duration> {
+    // Every frame in a room. Turning the switch moves nothing above it, so
+    // only the switch's wait starts again then.
+    fn follow(&mut self, share: &ShareView, now: Instant) -> Waits {
         let Some(running) = &share.running else {
             self.shown = None;
-            return None;
+            return Waits::default();
         };
         let number = match share.own {
             OwnShare::Sharing { number, .. } => Some(number),
@@ -1145,25 +1161,36 @@ impl SwitchWait {
             held: running.held,
             on: share.own_sound.on,
         };
-        let since = match self.shown {
-            Some((shown, since)) if shown == showing => since,
-            _ => {
-                self.shown = Some((showing, now));
-                now
+        let (placed, switched) = match self.shown {
+            Some((shown, placed, switched)) if shown == showing => (placed, switched),
+            Some((shown, placed, _))
+                if (shown.share, shown.held) == (showing.share, showing.held) =>
+            {
+                (placed, now)
             }
+            _ => (now, now),
         };
-        SWITCH_AFTER
-            .checked_sub(now.saturating_duration_since(since))
-            .filter(|left| !left.is_zero())
+        self.shown = Some((showing, placed, switched));
+        let left = |since: Instant| {
+            BLOCK_AFTER
+                .checked_sub(now.saturating_duration_since(since))
+                .filter(|left| !left.is_zero())
+        };
+        Waits {
+            placed: left(placed),
+            switch: left(switched),
+        }
     }
 }
 
 // While this PC's share runs, under the title row as the monitor list is.
 // Paused by hand: the paused sentence and Resume, which is secondary, since
-// Stop sharing stays the room's one primary. Then Share PC sound, off at the
-// start of every share, with the line under it; `ready` once SWITCH_AFTER is
-// up. Turning it off never waits.
-fn share_block(ui: &mut Ui, held: bool, own: &OwnSound, ready: bool) -> Option<SharePress> {
+// Stop sharing stays the room's one primary, and waits as the switch does: a
+// stray click on it sends the screen again after a pause made on purpose.
+// Then Share PC sound, off at the start of every share, with the line under
+// it. `waits` says when each takes a press; turning the switch off never
+// waits.
+fn share_block(ui: &mut Ui, held: bool, own: &OwnSound, waits: Waits) -> Option<SharePress> {
     controls::region(ui, |ui| {
         let mut press = None;
         if held {
@@ -1178,14 +1205,15 @@ fn share_block(ui: &mut Ui, held: bool, own: &OwnSound, ready: bool) -> Option<S
                 controls::text(ui, paused_sentence(own.on), theme::body(), CHALK);
             });
             ui.add_space(STEP);
-            if controls::buttons(ui, &[Button::new("Resume")], CONTROL_HEIGHT).is_some() {
+            let resume = Button::new("Resume").enabled(waits.placed.is_none());
+            if controls::buttons(ui, &[resume], CONTROL_HEIGHT).is_some() {
                 press = Some(SharePress::Resume);
             }
             ui.add_space(FIELD_GAP);
         }
         let (line, color) = sound_line(own);
         let id = ui.id().with("share pc sound");
-        let enabled = own.on || (own.unavailable.is_none() && ready);
+        let enabled = own.on || (own.unavailable.is_none() && waits.switch.is_none());
         if controls::checkbox_row(ui, id, own.on, messages::SHARE_PC_SOUND, enabled, &line) {
             press = Some(SharePress::Sound(!own.on));
         }
@@ -1733,6 +1761,15 @@ mod tests {
         assert_eq!(paused_sentence(false), messages::SHARE_PAUSED);
     }
 
+    // The block's waits both over, or both just begun.
+    fn ready(ready: bool) -> Waits {
+        let left = (!ready).then_some(BLOCK_AFTER);
+        Waits {
+            placed: left,
+            switch: left,
+        }
+    }
+
     // While you share, a click on Share PC sound, a screen reader's click, or
     // Space on it with no other key while its ring shows, asks for the other
     // state. Enter, Space held with keys such as the panel's own
@@ -1748,9 +1785,9 @@ mod tests {
         use crate::controls::tests::{frame, press, release};
         use eframe::egui::{Event, accesskit, pos2};
         // As the app draws a frame: the ring follows the keyboard.
-        fn draw(ui: &mut Ui, held: bool, own: &OwnSound, ready: bool) -> Option<SharePress> {
+        fn draw(ui: &mut Ui, held: bool, own: &OwnSound, done: bool) -> Option<SharePress> {
             controls::note_focus_source(ui.ctx());
-            share_block(ui, held, own, ready)
+            share_block(ui, held, own, ready(done))
         }
         let ctx = Context::default();
         theme::apply(&ctx);
@@ -1951,7 +1988,7 @@ mod tests {
             };
             let size = vec2(width, 640.0);
             let (_, output) = frame_at(&ctx, size, Vec::new(), |ui| {
-                share_block(ui, true, &own, true)
+                share_block(ui, true, &own, ready(true))
             });
             let nodes = output.accesskit_update.expect("a tree").nodes;
             nodes
@@ -1967,14 +2004,15 @@ mod tests {
         }
     }
 
-    // The switch waits SWITCH_AFTER from when the block appears, and again
-    // when a pause or a resume moves it, when another share takes it over
-    // with no frame between, when it comes back after it went or after the
-    // panel was minimized, while it stays a moment after Stop sharing, and
-    // after it goes off, which only turning it on waits for. Going on starts
-    // it too, which changes nothing while the switch is on.
+    // The block waits BLOCK_AFTER from when it appears, and again when a
+    // pause or a resume moves it, when another share takes it over with no
+    // frame between, when it comes back after it went or after the panel was
+    // minimized, and while it stays a moment after Stop sharing: Resume and
+    // the switch both wait then. Going on or off, also while paused, starts
+    // only the switch's wait again: it moves nothing above the switch, and
+    // only turning it on waits for that.
     #[test]
-    fn share_pc_sound_waits_after_it_appears_or_moves() {
+    fn the_block_waits_after_it_appears_or_moves() {
         let t = Instant::now();
         let at = |ms: u64| t + Duration::from_millis(ms);
         let sharing = |number, held| ShareView {
@@ -1986,55 +2024,199 @@ mod tests {
             }),
             ..ShareView::default()
         };
-        let none = ShareView::default();
-        let mut wait = SwitchWait::default();
-        assert_eq!(wait.follow(&none, t), None);
-        assert_eq!(wait.follow(&sharing(1, false), t), Some(SWITCH_AFTER));
-        assert_eq!(
-            wait.follow(&sharing(1, false), at(300)),
-            Some(Duration::from_millis(200))
-        );
-        assert_eq!(wait.follow(&sharing(1, false), at(500)), None);
-        assert_eq!(wait.follow(&sharing(1, true), at(900)), Some(SWITCH_AFTER));
-        assert_eq!(wait.follow(&sharing(1, true), at(1_400)), None);
-        assert_eq!(
-            wait.follow(&sharing(1, false), at(1_500)),
-            Some(SWITCH_AFTER)
-        );
-        assert_eq!(
-            wait.follow(&sharing(2, false), at(2_100)),
-            Some(SWITCH_AFTER)
-        );
-        assert_eq!(wait.follow(&none, at(2_700)), None);
-        assert_eq!(
-            wait.follow(&sharing(2, false), at(2_800)),
-            Some(SWITCH_AFTER)
-        );
-        assert_eq!(wait.follow(&sharing(2, false), at(3_300)), None);
-        wait.out_of_sight();
-        assert_eq!(
-            wait.follow(&sharing(2, false), at(3_400)),
-            Some(SWITCH_AFTER)
-        );
-        let sounding = ShareView {
+        let on = |share: ShareView| ShareView {
             own_sound: OwnSound {
                 on: true,
                 ..OwnSound::default()
             },
-            ..sharing(2, false)
+            ..share
         };
-        assert_eq!(wait.follow(&sounding, at(4_000)), Some(SWITCH_AFTER));
-        assert_eq!(wait.follow(&sounding, at(4_500)), None);
+        let none = ShareView::default();
+        let both = |left| Waits {
+            placed: Some(left),
+            switch: Some(left),
+        };
+        let fresh = both(BLOCK_AFTER);
+        let switched = Waits {
+            placed: None,
+            switch: Some(BLOCK_AFTER),
+        };
+        let over = Waits::default();
+        let mut wait = BlockWait::default();
+        assert_eq!(wait.follow(&none, t), over);
+        assert_eq!(wait.follow(&sharing(1, false), t), fresh);
+        assert_eq!(
+            wait.follow(&sharing(1, false), at(300)),
+            both(Duration::from_millis(200))
+        );
+        assert_eq!(wait.follow(&sharing(1, false), at(500)), over);
+        assert_eq!(wait.follow(&sharing(1, true), at(900)), fresh, "paused");
+        assert_eq!(wait.follow(&sharing(1, true), at(1_400)), over);
+        assert_eq!(wait.follow(&sharing(1, false), at(1_500)), fresh, "resumed");
+        assert_eq!(
+            wait.follow(&sharing(2, false), at(2_100)),
+            fresh,
+            "another share"
+        );
+        assert_eq!(wait.follow(&none, at(2_700)), over);
+        assert_eq!(
+            wait.follow(&sharing(2, false), at(2_800)),
+            fresh,
+            "back after it went"
+        );
+        assert_eq!(wait.follow(&sharing(2, false), at(3_300)), over);
+        wait.out_of_sight();
+        assert_eq!(
+            wait.follow(&sharing(2, false), at(3_400)),
+            fresh,
+            "back from minimized"
+        );
+        assert_eq!(
+            wait.follow(&on(sharing(2, false)), at(4_000)),
+            switched,
+            "gone on"
+        );
+        assert_eq!(wait.follow(&on(sharing(2, false)), at(4_500)), over);
         assert_eq!(
             wait.follow(&sharing(2, false), at(4_600)),
-            Some(SWITCH_AFTER),
+            switched,
             "gone off"
+        );
+        assert_eq!(wait.follow(&sharing(2, true), at(5_000)), fresh, "paused");
+        assert_eq!(
+            wait.follow(&on(sharing(2, true)), at(5_600)),
+            switched,
+            "turned on while paused"
         );
         let stopping = ShareView {
             own: OwnShare::Off,
-            ..sharing(2, false)
+            ..on(sharing(2, true))
         };
-        assert_eq!(wait.follow(&stopping, at(5_200)), Some(SWITCH_AFTER));
+        assert_eq!(wait.follow(&stopping, at(6_200)), fresh, "Stop sharing");
+    }
+
+    // Resume, on a share paused by hand, shows disabled and takes no press
+    // while the block waits: no click, nor one pressed then and let go
+    // after, nor one held while the block waited again, nor Space or a
+    // screen reader's click. Once ready, a click, Space after Tab or a
+    // screen reader's click still resumes, also while the switch alone
+    // still waits, and the switch then takes no press.
+    #[test]
+    fn resume_waits_as_the_switch_does() {
+        use crate::controls::tests::{frame, press, release};
+        use eframe::egui::{Event, PlatformOutput, accesskit, pos2};
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let off = &OwnSound::default();
+        let draw = |waits: Waits| move |ui: &mut Ui| share_block(ui, true, off, waits);
+        let resume = |output: PlatformOutput| {
+            let nodes = output.accesskit_update.expect("a tree").nodes;
+            nodes
+                .into_iter()
+                .find(|(_, node)| node.label() == Some("Resume"))
+                .expect("Resume")
+        };
+        let (wait, go) = (ready(false), ready(true));
+        let (_, output) = frame(&ctx, Vec::new(), draw(wait));
+        let (id, node) = resume(output);
+        assert!(node.is_disabled(), "disabled while it waits");
+        let bounds = node.bounds().expect("Resume, placed");
+        let at = pos2(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        let (_, output) = frame(&ctx, Vec::new(), draw(go));
+        assert!(!resume(output).1.is_disabled(), "enabled once ready");
+        // The frame before the press, the press, a frame while it is held,
+        // and the release, each with the waits then.
+        let click_at = |point, shown: [Waits; 4]| {
+            let [seen, first, then, last] = shown;
+            frame(&ctx, Vec::new(), draw(seen));
+            frame(&ctx, press(point), draw(first));
+            frame(&ctx, Vec::new(), draw(then));
+            frame(&ctx, release(point), draw(last)).0
+        };
+        let slow_click = |shown: [Waits; 4]| click_at(at, shown);
+        assert_eq!(slow_click([go; 4]), Some(SharePress::Resume), "ready");
+        assert_eq!(slow_click([wait; 4]), None, "while it waits");
+        assert_eq!(
+            slow_click([wait, wait, go, go]),
+            None,
+            "pressed while it waited, let go after"
+        );
+        assert_eq!(
+            slow_click([go, go, wait, go]),
+            None,
+            "waiting again while held"
+        );
+        frame(&ctx, Vec::new(), draw(wait));
+        let events = [press(at), release(at)].concat();
+        assert_eq!(
+            frame(&ctx, events, draw(go)).0,
+            None,
+            "in one frame, as the wait ends"
+        );
+        let switch_only = Waits {
+            placed: None,
+            switch: Some(BLOCK_AFTER),
+        };
+        assert_eq!(
+            slow_click([switch_only; 4]),
+            Some(SharePress::Resume),
+            "only the switch waits"
+        );
+        let (_, output) = frame(&ctx, Vec::new(), draw(switch_only));
+        let nodes = output.accesskit_update.expect("a tree").nodes;
+        let (_, switch) = nodes
+            .into_iter()
+            .find(|(_, node)| node.label() == Some(messages::SHARE_PC_SOUND))
+            .expect("the switch");
+        assert!(switch.is_disabled(), "the switch, while only it waits");
+        let bounds = switch.bounds().expect("the switch, placed");
+        let on_switch = pos2(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        assert_eq!(
+            click_at(on_switch, [switch_only; 4]),
+            None,
+            "the switch, while only it waits"
+        );
+        assert_eq!(
+            click_at(on_switch, [go; 4]),
+            Some(SharePress::Sound(true)),
+            "the switch, once ready"
+        );
+        let reader = |waits: Waits| {
+            let request = accesskit::ActionRequest {
+                action: accesskit::Action::Click,
+                target_tree: accesskit::TreeId::ROOT,
+                target_node: id,
+                data: None,
+            };
+            let events = vec![Event::AccessKitActionRequest(request)];
+            frame(&ctx, events, draw(waits)).0
+        };
+        assert_eq!(reader(go), Some(SharePress::Resume), "a screen reader");
+        assert_eq!(reader(wait), None, "a screen reader, while it waits");
+        let key = |key| Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        // Each on a panel of its own, where Tab reaches Resume, the block's
+        // first stop while paused.
+        let space = |waits: Waits| {
+            let ctx = Context::default();
+            theme::apply(&ctx);
+            frame(&ctx, vec![key(Key::Tab)], draw(waits));
+            frame(&ctx, vec![key(Key::Space)], draw(waits)).0
+        };
+        assert_eq!(space(go), Some(SharePress::Resume), "Space after Tab");
+        assert_eq!(space(wait), None, "Space while it waits");
     }
 
     // The control switch (control.rs): on once the app has an injector.
