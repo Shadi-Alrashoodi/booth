@@ -264,15 +264,44 @@ pub enum KnownError {
 }
 
 // Words for the log, each with what to do. The panel has its own message
-// for Damaged and shows the rest as they are, in sentence case.
+// for Damaged and shows the rest without folders, in sentence case.
 impl fmt::Display for KnownError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.words(f, true)
+    }
+}
+
+impl KnownError {
+    // The same words naming each file but not its folder, which is under
+    // the Windows profile, for lines on screen.
+    pub fn without_folders(&self) -> String {
+        let mut text = String::new();
+        let _ = self.words(&mut text, false);
+        text
+    }
+
+    fn words(&self, f: &mut dyn fmt::Write, folders: bool) -> fmt::Result {
+        let shown = |path: &Path| {
+            if folders {
+                path.display().to_string()
+            } else {
+                let name = path.file_name().unwrap_or_default();
+                name.to_string_lossy().into_owned()
+            }
+        };
+        let key_error = |err: &KeyError| {
+            if folders {
+                err.to_string()
+            } else {
+                err.without_folders()
+            }
+        };
         match self {
             KnownError::Damaged { list, kept_as, why } => write!(
                 f,
                 "the list of {} could not be read ({why}), so it starts empty; the old file is kept as {}",
                 list.words(),
-                kept_as.display()
+                shown(kept_as)
             ),
             KnownError::Stuck {
                 list,
@@ -281,21 +310,22 @@ impl fmt::Display for KnownError {
                 source,
             } => write!(
                 f,
-                "the list of {} in {} could not be read ({why}) and could not be put aside: {source}; it is left as it is and nothing is saved over it; move it out of that folder, then start Booth again",
+                "the list of {} in {} could not be read ({why}) and could not be put aside: {source}; it is left as it is and nothing is saved over it; move it out of Booth's data folder, then start Booth again",
                 list.words(),
-                path.display()
+                shown(path)
             ),
             KnownError::Newer { list, path } => write!(
                 f,
                 "the list of {} in {} was written by a newer version of Booth; it is left as it is and nothing is saved over it; run the newest version of Booth",
                 list.words(),
-                path.display()
+                shown(path)
             ),
             KnownError::Read { source, .. } => write!(
                 f,
-                "{source}; it is left as it is and nothing is saved over it; close any program that has it open, then start Booth again"
+                "{}; it is left as it is and nothing is saved over it; close any program that has it open, then start Booth again",
+                key_error(source)
             ),
-            KnownError::Write(err) => err.fmt(f),
+            KnownError::Write(err) => f.write_str(&key_error(err)),
         }
     }
 }
@@ -308,8 +338,8 @@ impl std::error::Error for KnownError {}
 pub enum ListProblem {
     // Put aside, and the list started empty.
     Damaged(DamagedList),
-    // Left where it is and not written to. `why` is the error in log words,
-    // with what to do.
+    // Left where it is and not written to. `why` names the file but not its
+    // folder, with what to do.
     Unusable { list: List, why: String },
 }
 
@@ -371,7 +401,7 @@ fn open<T: Default>(
         Err(KeyError::Decrypt { source, .. }) => format!(
             "Windows could not decrypt it, so another Windows user or another PC made it, or it is damaged: {source}"
         ),
-        Err(err) => err.to_string(),
+        Err(err) => err.without_folders(),
     };
     match keys::put_aside(&path) {
         Ok(kept_as) => Opened::empty(Some(KnownError::Damaged { list, kept_as, why }), true),
@@ -922,7 +952,7 @@ impl KnownError {
             | KnownError::Newer { list, .. }
             | KnownError::Read { list, .. } => Some(ListProblem::Unusable {
                 list: *list,
-                why: self.to_string(),
+                why: self.without_folders(),
             }),
             KnownError::Write(_) => None,
         }

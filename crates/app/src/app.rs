@@ -561,7 +561,7 @@ impl App {
             }
             Err(err) => {
                 self.backlog.add(format!("known hosts: {err}"));
-                start.address_error = Some(messages::sentence(&err.to_string()));
+                start.address_error = Some(messages::list_failed(&err));
                 self.list_problem(&err);
             }
         }
@@ -593,7 +593,7 @@ impl App {
             }
             Err(err) => {
                 self.backlog.add(format!("known hosts: {err}"));
-                start.known_error = Some(messages::sentence(&err.to_string()));
+                start.known_error = Some(messages::list_failed(&err));
                 self.list_problem(&err);
             }
         }

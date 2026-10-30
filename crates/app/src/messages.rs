@@ -675,10 +675,16 @@ pub fn unusable(why: &str) -> String {
     sentence(&os_text(why))
 }
 
+// Names the list's file but not its folder, which is under the Windows
+// profile; the log has the whole path.
+pub fn list_failed(err: &KnownError) -> String {
+    sentence(&os_text(&err.without_folders()))
+}
+
 // A Remove or Unblock that could not be written, or whose list could not be
 // read first.
 pub fn list_error(err: &KnownError) -> String {
-    let text = sentence(&os_text(&err.to_string()));
+    let text = list_failed(err);
     match err {
         KnownError::Write(KeyError::Write { .. }) => {
             format!("{text} Close any program that has the file open, then press Save again.")
@@ -1695,15 +1701,29 @@ mod tests {
             source: io::Error::from_raw_os_error(5),
         });
         let text = list_error(&write);
-        assert!(
-            text.starts_with(r"Could not save C:\Users\a\AppData\Local\Booth\devices.bin: "),
-            "{text}"
-        );
+        assert!(text.starts_with("Could not save devices.bin: "), "{text}");
+        assert!(!text.contains(r"\Users\"), "{text}");
         assert!(
             text.ends_with("Close any program that has the file open, then press Save again."),
             "{text}"
         );
         assert!(!text.contains(". (os error"), "{text}");
+        // The log keeps the whole path.
+        assert!(
+            write
+                .to_string()
+                .contains(r"C:\Users\a\AppData\Local\Booth\devices.bin"),
+            "{write}"
+        );
+        // The temporary copy it was writing is named as the file it was for.
+        let temp = KnownError::Write(KeyError::Write {
+            file: keys::FileKind::Protected,
+            path: path.with_file_name("devices.bin.4242-0.tmp"),
+            source: io::Error::from_raw_os_error(112),
+        });
+        let text = list_error(&temp);
+        assert!(text.starts_with("Could not save devices.bin: "), "{text}");
+        assert!(!text.contains(r"\Users\"), "{text}");
 
         let read = KnownError::Read {
             list: List::Devices,
@@ -1714,6 +1734,13 @@ mod tests {
             },
         };
         let text = list_error(&read);
+        assert!(text.starts_with("Could not read devices.bin: "), "{text}");
+        assert!(!text.contains(r"\Users\"), "{text}");
+        assert!(
+            read.to_string()
+                .contains(r"C:\Users\a\AppData\Local\Booth\devices.bin"),
+            "{read}"
+        );
         assert!(
             text.ends_with("Close any program that has it open, then start Booth again."),
             "{text}"

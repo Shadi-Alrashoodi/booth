@@ -469,6 +469,8 @@ fn unreadable_list_put_aside() {
         err.to_string().contains("it is not a list of known hosts"),
         "{err}"
     );
+    let shown = err.without_folders();
+    assert!(shown.ends_with("kept as hosts.bin.bad"), "{shown}");
     assert!(hosts(&folder.0).unwrap().is_empty());
     assert_eq!(folder.names(), ["hosts.bin.bad"]);
 
@@ -496,21 +498,25 @@ fn stuck_list_never_written_over() {
     assert!(!opened.writable);
     let err = opened.problem.expect("stuck");
     assert!(matches!(err, KnownError::Stuck { .. }));
-    assert!(matches!(
-        err.problem(),
-        Some(ListProblem::Unusable {
-            list: List::Hosts,
-            ..
-        })
-    ));
-    // The file is named once, and the line ends with what to do.
-    let text = err.to_string();
-    assert_eq!(text.matches("hosts.bin").count(), 1, "{text}");
+    let Some(ListProblem::Unusable {
+        list: List::Hosts,
+        why,
+    }) = err.problem()
+    else {
+        panic!("a stuck list is a line on the start screen: {err}");
+    };
+    // The file is named once and its folder not at all, and the line ends
+    // with what to do. The log keeps the folder.
+    assert_eq!(why.matches("hosts.bin").count(), 1, "{why}");
+    assert!(!why.contains(&folder.0.display().to_string()), "{why}");
     assert!(
-        text.contains("could not be put aside: .bad to .bad9 are all taken;"),
-        "{text}"
+        why.contains("could not be put aside: .bad to .bad9 are all taken;"),
+        "{why}"
     );
-    assert!(text.ends_with("then start Booth again"), "{text}");
+    assert!(why.ends_with("then start Booth again"), "{why}");
+    let text = err.to_string();
+    let path = folder.0.join("hosts.bin");
+    assert!(text.contains(&path.display().to_string()), "{text}");
     assert!(forget_host(&folder.0, &[1; 32]).is_err());
     assert_eq!(fs::read(folder.0.join("hosts.bin")).unwrap(), b"junk");
 }
@@ -538,13 +544,21 @@ fn a_list_from_a_newer_booth_is_left_alone() {
         err.to_string().ends_with("run the newest version of Booth"),
         "{err}"
     );
-    assert!(matches!(
-        err.problem(),
-        Some(ListProblem::Unusable {
-            list: List::Hosts,
-            ..
-        })
-    ));
+    let path = folder.0.join("hosts.bin");
+    assert!(
+        err.to_string().contains(&path.display().to_string()),
+        "{err}"
+    );
+    let Some(ListProblem::Unusable {
+        list: List::Hosts,
+        why,
+    }) = err.problem()
+    else {
+        panic!("a newer list is a line on the start screen: {err}");
+    };
+    assert_eq!(why.matches("hosts.bin").count(), 1, "{why}");
+    assert!(!why.contains(&folder.0.display().to_string()), "{why}");
+    assert!(why.ends_with("run the newest version of Booth"), "{why}");
     let opened = open_hosts(&folder.0);
     assert!(!opened.writable && opened.list.is_empty());
     let kept = keys::read_protected(&folder.0.join("hosts.bin")).unwrap();

@@ -238,6 +238,14 @@ fn tmp_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+// So an error on screen names the file being saved, not its temporary copy.
+pub(crate) fn tmp_target(name: &str) -> Option<&str> {
+    let (target, numbers) = name.strip_suffix(".tmp")?.rsplit_once('.')?;
+    let (process, write) = numbers.split_once('-')?;
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    (!target.is_empty() && digits(process) && digits(write)).then_some(target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,6 +303,22 @@ mod tests {
             let prefix = format!("identity.key.{}-", process::id());
             assert!(name.starts_with(&prefix), "{name}");
             assert!(name.ends_with(".tmp"), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_temporary_name_leads_back_to_its_file() {
+        let tmp = tmp_path(Path::new("devices.bin"));
+        let name = tmp.file_name().and_then(|n| n.to_str()).expect("name");
+        assert_eq!(tmp_target(name), Some("devices.bin"));
+        for other in [
+            "devices.bin",
+            "devices.bin.bad",
+            "x.tmp",
+            "settings.4242.tmp",
+            ".4242-0.tmp",
+        ] {
+            assert_eq!(tmp_target(other), None, "{other}");
         }
     }
 }
