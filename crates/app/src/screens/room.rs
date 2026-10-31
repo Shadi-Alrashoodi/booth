@@ -2227,6 +2227,46 @@ mod tests {
         assert_eq!(wait.follow(&stopping, at(6_200)), fresh, "Stop sharing");
     }
 
+    // Space or Enter pressed on Resume while it waits, and held, does not
+    // resume the share by its repeats once the wait ends; a fresh press does.
+    #[test]
+    fn a_key_held_through_the_wait_does_not_resume() {
+        use crate::controls::tests::frame;
+        use eframe::egui::Event;
+        let off = &OwnSound::default();
+        let draw = |waits: Waits| move |ui: &mut Ui| share_block(ui, true, off, waits);
+        let key = |key, repeat| Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat,
+            modifiers: Modifiers::NONE,
+        };
+        let (wait, go) = (ready(false), ready(true));
+        for held in [Key::Space, Key::Enter] {
+            let ctx = Context::default();
+            theme::apply(&ctx);
+            frame(&ctx, vec![key(Key::Tab, false)], draw(wait));
+            let press = |repeat, waits| frame(&ctx, vec![key(held, repeat)], draw(waits)).0;
+            assert_eq!(press(false, wait), None, "{held:?} pressed while it waits");
+            assert_eq!(press(true, wait), None, "{held:?} repeating while it waits");
+            assert_eq!(press(true, go), None, "{held:?} repeating once ready");
+            let up = Event::Key {
+                key: held,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            };
+            frame(&ctx, vec![up], draw(go));
+            assert_eq!(
+                press(false, go),
+                Some(SharePress::Resume),
+                "{held:?} pressed again"
+            );
+        }
+    }
+
     // Resume, on a share paused by hand, shows disabled and takes no press
     // while the block waits: no click, nor one pressed then and let go
     // after, nor one held while the block waited again, nor Space or a
