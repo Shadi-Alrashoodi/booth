@@ -17,8 +17,8 @@ use crate::log::log;
 use crate::remote::ControlEnd;
 use crate::screen::wire::{self, RELAYED, SENT, ShapeChunk};
 use crate::screen::{
-    self, Answer, Back, FACTS_EVERY, IDR_ASK_EVERY, OwnShare, Refusal, ShareNews, WatchEvent,
-    WatchNews, is_after, percent, permille, recover_span,
+    self, Answer, Back, FACTS_EVERY, IDR_ASK_EVERY, OwnShare, Refusal, ShareNews, ShareOutlet,
+    WatchEvent, WatchNews, is_after, percent, permille, recover_span,
 };
 use crate::socket::Socket;
 use crate::sound;
@@ -554,22 +554,29 @@ impl Host {
             .filter(|live| live.sharer == own && !self.closed)
             .map(|live| live.number);
         let watching = |peer: &&Peer| number.is_some() && peer.share.watching == number;
+        // A pointer's mark goes to the watchers whose copies read it, from a
+        // room that stands for a copy that sets it.
+        let marking = self.version >= crate::peer::MARK_SINCE;
+        let marks = |peer: &Peer| marking && peer.link.marks_read;
         let peers = &self.peers;
         let links = peers.iter().filter(watching).filter_map(|peer| {
             let session = peer.sessions.current.as_ref()?;
             session
                 .is_confirmed()
-                .then(|| (session.remote_index(), peer.media.to()))
+                .then(|| (session.remote_index(), peer.media.to(), marks(peer)))
         });
         self.screen.publish(links, || {
             peers
                 .iter()
                 .filter(watching)
                 .filter_map(|peer| {
-                    Some(Outlet {
-                        sealer: peer.sessions.current.as_ref()?.sealer()?,
-                        to: peer.media.to(),
-                        sent: Arc::clone(&peer.share.video_out),
+                    Some(ShareOutlet {
+                        link: Outlet {
+                            sealer: peer.sessions.current.as_ref()?.sealer()?,
+                            to: peer.media.to(),
+                            sent: Arc::clone(&peer.share.video_out),
+                        },
+                        marks: marks(peer),
                     })
                 })
                 .collect()
@@ -648,7 +655,7 @@ impl Host {
         plain[2] = slot;
         let timers = self.timers;
         self.peers[i].link.media_passed(now, &timers);
-        self.relay(number, plain, now, socket);
+        self.relay(number, plain, false, now, socket);
         if self.screen.watched == Some(number) {
             self.screen
                 .watching
@@ -682,13 +689,16 @@ impl Host {
             return false;
         }
         let slot = peer.slot;
-        let pointer = match wire::read_pointer(plain.get(1..).unwrap_or_default(), SENT) {
+        // A room standing for an older copy refuses a marked update and
+        // counts it bad, as such a copy does.
+        let marks = self.version >= crate::peer::MARK_SINCE;
+        let pointer = match wire::read_pointer(plain.get(1..).unwrap_or_default(), SENT, marks) {
             Ok((_, pointer)) => pointer,
             Err(why) => return self.refused_media(i, "a pointer update", &why.to_string(), now),
         };
         plain[1] = RELAYED;
         plain[2] = slot;
-        self.relay(number, plain, now, socket);
+        self.relay(number, plain, pointer.with_picture, now, socket);
         if self.screen.watched == Some(number) {
             self.screen.watching.pointer(number, pointer);
         }
@@ -756,8 +766,16 @@ impl Host {
     // Seals `plain` once for each friend who watches `number` and sends it
     // where their media goes, with buffers kept for it. Each packet starts
     // at the next friend in turn, so a full uplink drops each one's copies
-    // as often.
-    fn relay(&mut self, number: u32, plain: &[u8], now: Instant, socket: &Socket) {
+    // as often. `marked`: `plain` is a pointer update with its mark, which
+    // stays only for a friend whose copy reads it.
+    fn relay(
+        &mut self,
+        number: u32,
+        plain: &mut [u8],
+        marked: bool,
+        now: Instant,
+        socket: &Socket,
+    ) {
         let timers = self.timers;
         let per_second = relay_per_second(self.upload_kbps);
         let count = self.peers.len();
@@ -783,6 +801,9 @@ impl Host {
             let Some(session) = other.sessions.current.as_mut() else {
                 continue;
             };
+            if marked {
+                wire::mark(&mut plain[1..], other.link.marks_read);
+            }
             if session.encrypt(plain, &mut self.video_sealed).is_err() {
                 continue;
             }

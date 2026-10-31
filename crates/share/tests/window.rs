@@ -2,8 +2,9 @@
 // changes the size of: the share starts at the size Windows composes, and
 // while the window is dragged to new sizes the pictures keep going out in
 // the frame the encoder has, new encoders keep RESIZE_SPACING apart, and the
-// window's own size goes out once it stands still. Sizes and times only,
-// never the pixels.
+// window's own size goes out once it stands still. A pointer update that
+// rides a picture says so, after a resume too. Sizes and times only, never
+// the pixels.
 
 use std::sync::mpsc;
 use std::thread;
@@ -93,17 +94,18 @@ impl Drop for Window {
     }
 }
 
-// What the share says and sends, each with when it came.
+// What the share says and sends, each with when it came, and each pointer
+// update with whether it came with a picture.
 #[derive(Default)]
 struct Watching {
     sent: Vec<(Instant, Sent)>,
     lines: Vec<(Instant, String)>,
-    cursors: Vec<CursorUpdate>,
+    cursors: Vec<(CursorUpdate, bool)>,
 }
 
 impl Audience for Watching {
-    fn cursor(&mut self, update: CursorUpdate) {
-        self.cursors.push(update);
+    fn cursor(&mut self, update: CursorUpdate, with_picture: bool) {
+        self.cursors.push((update, with_picture));
     }
 
     fn back(&mut self, _: &mut Vec<Back>) {}
@@ -204,14 +206,41 @@ fn a_window_share_opens_at_the_size_of_its_pictures() {
     assert!(watching.new_sizes().is_empty(), "{:?}", watching.lines);
     assert_eq!(sharer.numbers().resized, 0);
     // The pointer goes on its own: its first update goes whether it is over
-    // the window or not, and a shown one is on the picture.
-    assert!(!watching.cursors.is_empty());
-    for update in watching.cursors.iter().filter(|update| update.visible) {
+    // the window or not, and a shown one is on the picture. The first rides
+    // the first picture, which the fps cap sends at once, so it is marked as
+    // that picture's.
+    let (first, with_picture) = watching.cursors.first().expect("a pointer update");
+    assert!(*with_picture, "{first:?} went alone");
+    for (update, _) in watching.cursors.iter().filter(|(update, _)| update.visible) {
         assert!(
             update.x < opened.0 as i32 && update.y < opened.1 as i32,
             "{update:?}"
         );
     }
+}
+
+// Paused by hand and resumed, a share's source opens again and its first
+// pointer update goes as before, on the first picture, marked as its own.
+#[test]
+fn a_resumed_share_marks_its_first_pointer() {
+    let Some(adapter) = adapter() else { return };
+    let window = Window::with_style(WS_POPUP, 640, 360);
+    let mut sharer = open(&window, adapter);
+    let mut watching = Watching::default();
+    run(&mut sharer, &mut watching, Duration::from_millis(300));
+    sharer.pause();
+    let before = watching.cursors.len();
+    assert!(
+        sharer
+            .resume(&mut |_| {})
+            .unwrap_or_else(|err| panic!("{err}"))
+    );
+    run(&mut sharer, &mut watching, Duration::from_millis(300));
+    let (first, with_picture) = watching
+        .cursors
+        .get(before)
+        .expect("a pointer update after the resume");
+    assert!(*with_picture, "{first:?} went alone");
 }
 
 // On Windows' software encoder a window that grows past 1080p goes on within

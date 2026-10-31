@@ -36,7 +36,7 @@ struct Watching {
 }
 
 impl Audience for Watching {
-    fn cursor(&mut self, _: CursorUpdate) {}
+    fn cursor(&mut self, _: CursorUpdate, _: bool) {}
 
     fn back(&mut self, into: &mut Vec<Back>) {
         into.append(&mut self.back);

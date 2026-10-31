@@ -58,6 +58,16 @@ pub(crate) const PC_SOUND_SINCE: invite::Version = invite::Version {
     patch: 0,
 };
 
+// A pointer update says it came with the picture about to be encoded
+// (screen::wire's WITH_PICTURE) only to a peer whose Hello says MARK_SINCE
+// or later: an older copy refuses the whole update for the flag, so its
+// pointer would stop.
+pub(crate) const MARK_SINCE: invite::Version = invite::Version {
+    major: 1,
+    minor: 3,
+    patch: 0,
+};
+
 // Feedback waiting on its stream, in flight or queued, past which new
 // feedback is held and merged until it drains: recover requests into one
 // span, and the newest IDR ask and loss report. A request that waits behind
@@ -385,6 +395,8 @@ pub(crate) struct Link {
     pub state_read: bool,
     // And PC sound (PC_SOUND_SINCE).
     pub sound_read: bool,
+    // And a pointer update's mark (MARK_SINCE).
+    pub marks_read: bool,
     held: Held,
     pub stats: LinkStats,
     pub offset: OffsetEstimator,
@@ -458,6 +470,7 @@ impl Link {
             limits_read: false,
             state_read: false,
             sound_read: false,
+            marks_read: false,
             held: Held::default(),
             stats: LinkStats::new(),
             offset: OffsetEstimator::new(),

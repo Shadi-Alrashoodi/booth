@@ -978,29 +978,30 @@ impl<'a> Watchers<'a> {
     }
 
     // Someone started watching after the shape went out: it goes again,
-    // under a new id, with the pointer where it is.
+    // under a new id, with the pointer where it is. No picture comes with
+    // that pointer, so it is not marked.
     fn shape_again(&mut self) {
         let Some((_, shape)) = self.shape.take() else {
             return;
         };
         self.send_shape(shape);
         if let (Some((x, y, visible)), Some((id, _))) = (self.pointer, &self.shape) {
-            self.outbox.pointer(x, y, visible, *id);
+            self.outbox.pointer(x, y, visible, *id, false);
         }
     }
 
     // For a pause: the pointer the watchers last saw would stay on their
-    // picture otherwise.
+    // picture otherwise. No picture follows it either.
     fn hide_pointer(&mut self) {
         let (x, y) = self.pointer.map_or((0, 0), |(x, y, _)| (x, y));
         self.pointer = Some((x, y, false));
         let id = self.shape.as_ref().map_or(0, |(id, _)| *id);
-        self.outbox.pointer(x, y, false, id);
+        self.outbox.pointer(x, y, false, id, false);
     }
 }
 
 impl Audience for Watchers<'_> {
-    fn cursor(&mut self, update: CursorUpdate) {
+    fn cursor(&mut self, update: CursorUpdate, with_picture: bool) {
         if let Some(shape) = &update.shape {
             match room_shape(shape, update.scale) {
                 Some(shape) => self.send_shape(shape),
@@ -1019,7 +1020,8 @@ impl Audience for Watchers<'_> {
         }
         self.pointer = Some((update.x, update.y, update.visible));
         let id = self.shape.as_ref().map_or(0, |(id, _)| *id);
-        self.outbox.pointer(update.x, update.y, update.visible, id);
+        self.outbox
+            .pointer(update.x, update.y, update.visible, id, with_picture);
     }
 
     // With the facts, taken together: a new watcher's IDR ask comes in the
@@ -1224,7 +1226,14 @@ fn kbps(bytes: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use session::Session;
     use share::{CursorKind, MonitorId, Region, WindowId};
+
+    use crate::screen::ShareOutlet;
+    use crate::screen::wire::{SENT, read_pointer};
+    use crate::socket::Socket;
+    use crate::talk::Outlet;
+    use crate::testing::{Wire, session_pair};
 
     // What capture gives crosses the room as it was, its scale with it, and
     // the watcher's viewer gets it back as capture made it.
@@ -1558,6 +1567,82 @@ mod tests {
         sharing.set_state(OwnShare::Sharing { number: 2, fps: 60 });
         desktop.follow(&mut unseen, || Some(PauseReason::SecureDesktop));
         assert!(!sound.shut(), "the last share's look");
+    }
+
+    // The pointer updates that came to `at` since the last look, as the far
+    // end of its link reads them: x, shown, marked.
+    fn pointers(at: &Wire, far: &mut Session) -> Vec<(i32, bool, bool)> {
+        let mut plain = Vec::new();
+        at.packets()
+            .iter()
+            .map(|packet| {
+                far.decrypt(packet, &mut plain).expect("opens");
+                let (channel, payload) = channels::unframe(&plain).expect("a frame");
+                assert_eq!(channel, channels::Channel::Cursor);
+                let (_, pointer) =
+                    read_pointer(payload, SENT, true).expect("an update Booth sends");
+                (pointer.x, pointer.visible, pointer.with_picture)
+            })
+            .collect()
+    }
+
+    // Only the pointer of a picture is marked, and only on the link whose
+    // copy reads the mark. The pointer sent again with the shape for a new
+    // watcher, and the one that hides it for a pause, have no picture after
+    // them.
+    #[test]
+    fn only_a_pictures_pointer_is_marked() {
+        let wake = net::pace::Signal::new().expect("create an event");
+        let clock = crate::peer::Clock::new(Instant::now());
+        let socket = Arc::new(Socket::bind(0, Log::off()).expect("bind a socket"));
+        let sharing = Sharing::new(clock, false, Some(socket), 1000, wake);
+        let (reads, older) = (Wire::new(), Wire::new());
+        let (near, mut far) = session_pair();
+        let (older_near, mut older_far) = session_pair();
+        let outlet = |session: &Session, to: &Wire, marks: bool| ShareOutlet {
+            link: Outlet {
+                sealer: session.sealer().expect("the initiator may send"),
+                to: to.addr(),
+                sent: Arc::default(),
+            },
+            marks,
+        };
+        sharing.set_outlets(vec![
+            outlet(&near, &reads, true),
+            outlet(&older_near, &older, false),
+        ]);
+        let log = Log::off();
+        let mut watchers = Watchers::new(&sharing, &log, 1, false);
+        let at = |x: i32, shape: Option<CursorShape>| CursorUpdate {
+            x,
+            y: 6,
+            visible: true,
+            scale: 1.0,
+            shape,
+        };
+        let arrow = CursorShape {
+            kind: CursorKind::Color,
+            width: 32,
+            height: 32,
+            pitch: 128,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            bytes: vec![7; 32 * 32 * 4],
+        };
+        watchers.cursor(at(5, Some(arrow)), true);
+        assert_eq!(pointers(&reads, &mut far), [(5, true, true)]);
+        assert_eq!(pointers(&older, &mut older_far), [(5, true, false)]);
+        watchers.cursor(at(7, None), false);
+        assert_eq!(pointers(&reads, &mut far), [(7, true, false)]);
+        watchers.shape_again();
+        assert_eq!(
+            pointers(&reads, &mut far),
+            [(7, true, false)],
+            "a new watcher's"
+        );
+        watchers.hide_pointer();
+        assert_eq!(pointers(&reads, &mut far), [(7, false, false)], "a pause's");
+        assert_eq!(pointers(&older, &mut older_far).len(), 3);
     }
 
     // The source can answer with a pointer update, or with nothing new,

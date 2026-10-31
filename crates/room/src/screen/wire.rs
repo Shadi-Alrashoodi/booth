@@ -7,6 +7,10 @@
 //
 // Video:   kind u8, slot u8, then the channels::video packet.
 // Pointer: kind u8, slot u8, seq u32, x i32, y i32, flags u8, shape u32.
+// A pointer's flags are VISIBLE, and WITH_PICTURE when the update is the
+// pointer of the picture about to be encoded. WITH_PICTURE goes only to a
+// copy whose Hello says peer::MARK_SINCE: an older one refuses the whole
+// update for it.
 // A sharer sends kind SENT with slot 0 to the host; the host sends RELAYED
 // with the sharer's slot to each watcher. Both prefixes are two bytes, so the
 // host turns one into the other in place. Numbers are little endian.
@@ -41,7 +45,9 @@ pub const INTERNET_DATAGRAM: usize = 1200;
 pub(crate) const MAX_VIDEO: usize = LAN_DATAGRAM - session::DATA_OVERHEAD - 1;
 
 const POINTER_LEN: usize = PREFIX + 4 + 4 + 4 + 1 + 4;
+const FLAGS_AT: usize = PREFIX + 12;
 const VISIBLE: u8 = 1 << 0;
+const WITH_PICTURE: u8 = 1 << 1;
 // Frames are at most 4096 pixels wide after scaling (capture's
 // Options::max_width, which its Plan::new applies and the room's share
 // leaves at its default), and a pointer partly off the monitor is only a
@@ -69,6 +75,9 @@ pub struct Pointer {
     pub y: i32,
     pub visible: bool,
     pub shape: u32,
+    // The pointer of the picture about to be encoded: the watcher's viewer
+    // may draw it with that picture.
+    pub with_picture: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,11 +238,23 @@ pub(crate) fn write_pointer(kind: u8, slot: u8, pointer: &Pointer, out: &mut Vec
     out.extend_from_slice(&pointer.seq.to_le_bytes());
     out.extend_from_slice(&pointer.x.to_le_bytes());
     out.extend_from_slice(&pointer.y.to_le_bytes());
-    out.push(if pointer.visible { VISIBLE } else { 0 });
+    let visible = if pointer.visible { VISIBLE } else { 0 };
+    let with_picture = if pointer.with_picture {
+        WITH_PICTURE
+    } else {
+        0
+    };
+    out.push(visible | with_picture);
     out.extend_from_slice(&pointer.shape.to_le_bytes());
 }
 
-pub(crate) fn read_pointer(payload: &[u8], kind: u8) -> Result<(u8, Pointer), WireError> {
+// `marks` says this side reads WITH_PICTURE. Without it every flag but
+// VISIBLE is refused, as a copy older than peer::MARK_SINCE refuses them.
+pub(crate) fn read_pointer(
+    payload: &[u8],
+    kind: u8,
+    marks: bool,
+) -> Result<(u8, Pointer), WireError> {
     let (slot, rest) = prefix(payload, kind)?;
     if payload.len() < POINTER_LEN {
         return Err(WireError::Short);
@@ -247,7 +268,12 @@ pub(crate) fn read_pointer(payload: &[u8], kind: u8) -> Result<(u8, Pointer), Wi
     let y = i32::from_le_bytes(word(8));
     let flags = rest[12];
     let shape = u32::from_le_bytes(word(13));
-    if flags & !VISIBLE != 0 {
+    let known = if marks {
+        VISIBLE | WITH_PICTURE
+    } else {
+        VISIBLE
+    };
+    if flags & !known != 0 {
         return Err(WireError::Flags(flags));
     }
     if x.unsigned_abs() > MAX_POSITION as u32 || y.unsigned_abs() > MAX_POSITION as u32 {
@@ -261,8 +287,22 @@ pub(crate) fn read_pointer(payload: &[u8], kind: u8) -> Result<(u8, Pointer), Wi
             y,
             visible: flags & VISIBLE != 0,
             shape,
+            with_picture: flags & WITH_PICTURE != 0,
         },
     ))
+}
+
+// Sets or clears WITH_PICTURE in a pointer update already written or read,
+// in place, for the loops that seal one buffer once for each link. `payload`
+// starts at the kind byte, as read_pointer's does.
+pub(crate) fn mark(payload: &mut [u8], on: bool) {
+    if let Some(flags) = payload.get_mut(FLAGS_AT) {
+        if on {
+            *flags |= WITH_PICTURE;
+        } else {
+            *flags &= !WITH_PICTURE;
+        }
+    }
 }
 
 // The encode time channels::video puts at the front of data shard 0, inside
@@ -652,23 +692,73 @@ mod tests {
             y: 1439,
             visible: true,
             shape: 9,
+            with_picture: false,
         };
         let packet = pointer_packet(SENT, 0, &pointer);
         assert_eq!(packet.len(), POINTER_LEN);
-        assert_eq!(read_pointer(&packet, SENT), Ok((0, pointer)));
+        for marks in [false, true] {
+            assert_eq!(read_pointer(&packet, SENT, marks), Ok((0, pointer)));
+        }
         let relayed = pointer_packet(RELAYED, 2, &pointer);
-        assert_eq!(read_pointer(&relayed, RELAYED), Ok((2, pointer)));
+        assert_eq!(read_pointer(&relayed, RELAYED, false), Ok((2, pointer)));
+
+        // A marked update reads either way it goes where the mark is read.
+        // A copy older than MARK_SINCE refuses it whole, which is why it
+        // goes only to copies that read it.
+        let marked = Pointer {
+            with_picture: true,
+            ..pointer
+        };
+        let sent = pointer_packet(SENT, 0, &marked);
+        assert_eq!(read_pointer(&sent, SENT, true), Ok((0, marked)));
+        let relayed = pointer_packet(RELAYED, 2, &marked);
+        assert_eq!(read_pointer(&relayed, RELAYED, true), Ok((2, marked)));
+        assert_eq!(
+            read_pointer(&sent, SENT, false),
+            Err(WireError::Flags(0x03))
+        );
+        assert_eq!(
+            read_pointer(&relayed, RELAYED, false),
+            Err(WireError::Flags(0x03))
+        );
 
         // Offsets: kind 0, slot 1, seq 2, x 6, y 10, flags 14, shape 15.
+        assert_eq!(FLAGS_AT, 14);
         let mut flags = packet.clone();
-        flags[14] = 0x02;
-        assert_eq!(read_pointer(&flags, SENT), Err(WireError::Flags(0x02)));
+        flags[14] = 0x04;
+        for marks in [false, true] {
+            assert_eq!(
+                read_pointer(&flags, SENT, marks),
+                Err(WireError::Flags(0x04))
+            );
+        }
+        // Cleared and set again in place, as the host does for each watcher:
+        // nothing else in the packet changes.
+        let mut turned = relayed.clone();
+        mark(&mut turned, false);
+        assert_eq!(turned, pointer_packet(RELAYED, 2, &pointer));
+        assert_eq!(read_pointer(&turned, RELAYED, false), Ok((2, pointer)));
+        mark(&mut turned, true);
+        assert_eq!(turned, relayed);
+        assert_eq!(read_pointer(&turned, RELAYED, true), Ok((2, marked)));
+        let hidden = Pointer {
+            visible: false,
+            ..pointer
+        };
+        let mut turned = pointer_packet(SENT, 0, &hidden);
+        mark(&mut turned, true);
+        let hidden_marked = Pointer {
+            with_picture: true,
+            ..hidden
+        };
+        assert_eq!(turned, pointer_packet(SENT, 0, &hidden_marked));
+
         let far = Pointer {
             x: MAX_POSITION + 1,
             ..pointer
         };
         assert_eq!(
-            read_pointer(&pointer_packet(SENT, 0, &far), SENT),
+            read_pointer(&pointer_packet(SENT, 0, &far), SENT, true),
             Err(WireError::Position {
                 x: MAX_POSITION + 1,
                 y: 1439
@@ -676,9 +766,15 @@ mod tests {
         );
         let mut trailing = packet.clone();
         trailing.push(0);
-        assert_eq!(read_pointer(&trailing, SENT), Err(WireError::Trailing(1)));
+        assert_eq!(
+            read_pointer(&trailing, SENT, true),
+            Err(WireError::Trailing(1))
+        );
         for cut in 0..packet.len() {
-            assert!(read_pointer(&packet[..cut], SENT).is_err(), "cut at {cut}");
+            assert!(
+                read_pointer(&packet[..cut], SENT, true).is_err(),
+                "cut at {cut}"
+            );
         }
     }
 
@@ -932,14 +1028,14 @@ mod tests {
             visible in any::<bool>(),
             shape in any::<u32>(),
             slot in 0u8..MAX_ROSTER as u8,
+            with_picture in any::<bool>(),
         ) {
-            let pointer = Pointer { seq, x, y, visible, shape };
+            let pointer = Pointer { seq, x, y, visible, shape, with_picture };
+            let sent = pointer_packet(SENT, 0, &pointer);
+            prop_assert_eq!(read_pointer(&sent, SENT, true), Ok((0, pointer)));
+            prop_assert_eq!(read_pointer(&sent, SENT, false).is_ok(), !with_picture);
             prop_assert_eq!(
-                read_pointer(&pointer_packet(SENT, 0, &pointer), SENT),
-                Ok((0, pointer))
-            );
-            prop_assert_eq!(
-                read_pointer(&pointer_packet(RELAYED, slot, &pointer), RELAYED),
+                read_pointer(&pointer_packet(RELAYED, slot, &pointer), RELAYED, true),
                 Ok((slot, pointer))
             );
         }
@@ -963,10 +1059,13 @@ mod tests {
                     prop_assert!(usize::from(slot) < MAX_ROSTER);
                     prop_assert!(packet.shard.len() <= MAX_VIDEO);
                 }
-                if let Ok((_, pointer)) = read_pointer(&bytes, kind) {
-                    let mut again = Vec::new();
-                    write_pointer(kind, bytes[1], &pointer, &mut again);
-                    prop_assert_eq!(again, bytes.clone());
+                for marks in [false, true] {
+                    if let Ok((_, pointer)) = read_pointer(&bytes, kind, marks) {
+                        prop_assert!(marks || !pointer.with_picture);
+                        let mut again = Vec::new();
+                        write_pointer(kind, bytes[1], &pointer, &mut again);
+                        prop_assert_eq!(again, bytes.clone());
+                    }
                 }
             }
             if let Some(chunk) = ShapeChunk::read(&mut Reader(&bytes)) {

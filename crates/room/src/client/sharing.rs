@@ -13,8 +13,8 @@ use crate::log::log;
 use crate::remote::ControlEnd;
 use crate::screen::wire::{self, PREFIX, RELAYED};
 use crate::screen::{
-    self, Answer, Back, OwnShare, Refusal, ShareNews, WatchEvent, WatchNews, percent, permille,
-    recover_span,
+    self, Answer, Back, OwnShare, Refusal, ShareNews, ShareOutlet, WatchEvent, WatchNews, percent,
+    permille, recover_span,
 };
 use crate::socket::Socket;
 use crate::sound;
@@ -426,19 +426,25 @@ impl Client {
             .as_ref()
             .filter(|session| live && session.is_confirmed());
         let to = self.media.map(|media| media.to());
+        // A pointer's mark goes only to a host whose copy reads it, from a
+        // room that stands for a copy that sets it.
+        let marks = self.link.marks_read && self.version >= crate::peer::MARK_SINCE;
         let links = session
             .zip(to)
-            .map(|(session, to)| (session.remote_index(), to))
+            .map(|(session, to)| (session.remote_index(), to, marks))
             .into_iter();
         let sent = &self.video_out;
         self.screen.publish(links, || {
             session
                 .zip(to)
                 .and_then(|(session, to)| {
-                    Some(Outlet {
-                        sealer: session.sealer()?,
-                        to,
-                        sent: Arc::clone(sent),
+                    Some(ShareOutlet {
+                        link: Outlet {
+                            sealer: session.sealer()?,
+                            to,
+                            sent: Arc::clone(sent),
+                        },
+                        marks,
                     })
                 })
                 .into_iter()
@@ -502,7 +508,10 @@ impl Client {
     }
 
     pub(super) fn on_cursor(&mut self, payload: &[u8], now: Instant) -> bool {
-        let (slot, pointer) = match wire::read_pointer(payload, RELAYED) {
+        // A room standing for an older copy refuses a marked update and
+        // counts it bad, as such a copy does.
+        let marks = self.version >= crate::peer::MARK_SINCE;
+        let (slot, pointer) = match wire::read_pointer(payload, RELAYED, marks) {
             Ok(read) => read,
             Err(why) => return self.refused_media("a pointer update", &why.to_string(), now),
         };

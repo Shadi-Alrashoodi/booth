@@ -143,7 +143,10 @@ pub struct Setup {
 // Every call comes from the thread that calls Sharer::next.
 pub trait Audience {
     // A pointer update, the moment capture has it and never behind a frame.
-    fn cursor(&mut self, update: CursorUpdate);
+    // `with_picture` is true for the pointer of the picture about to be
+    // encoded, which the watchers' viewers may draw with it, and false for
+    // one that moved alone.
+    fn cursor(&mut self, update: CursorUpdate, with_picture: bool);
     // What came back from the viewers since the last call, added to `into`.
     // Asked just before each frame is encoded, so the answer is in it.
     fn back(&mut self, into: &mut Vec<Back>);
@@ -828,7 +831,7 @@ impl Sharer {
                 }
                 self.count_source(&frame);
                 if let Some(cursor) = frame.cursor.clone() {
-                    audience.cursor(cursor);
+                    audience.cursor(cursor, true);
                 }
                 // Decided before this picture goes out fitted, so it goes
                 // once, to the new encoder, at the window's own size.
@@ -841,7 +844,7 @@ impl Sharer {
                 self.go(frame, audience)?;
             }
             Next::Cursor(update) => {
-                audience.cursor(update);
+                audience.cursor(update, false);
                 self.quiet(audience)?;
             }
             Next::Idle => self.quiet(audience)?,

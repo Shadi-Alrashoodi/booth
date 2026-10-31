@@ -417,7 +417,7 @@ fn video_reaches_only_the_watchers() {
     };
     let id = sharing.shape(arrow.clone()).expect("a shape Booth sends");
     for x in 0..5 {
-        outbox.pointer(100 + x, 200, true, id);
+        outbox.pointer(100 + x, 200, true, id, false);
     }
     for member in [&host, bo] {
         // Each look takes what has come, and the five pointers and the shape
@@ -1398,4 +1398,283 @@ fn a_watch_asked_again_after_a_host_restart_finds_no_share() {
     );
     let text = read_log(&host_log);
     assert!(!text.contains("watches share"), "{text}");
+}
+
+// 1.3.0 is the first copy that reads a pointer update's mark, which says
+// the update came with the picture about to be encoded. An older one refuses
+// the whole update for it.
+const MARK_SINCE: invite::Version = invite::Version {
+    major: 1,
+    minor: 3,
+    patch: 0,
+};
+const OLDER: invite::Version = invite::Version {
+    major: 1,
+    minor: 2,
+    patch: 0,
+};
+
+fn standing_for(name: &str, version: invite::Version) -> Config {
+    let mut config = common::config(name, timers());
+    config.version = version;
+    config
+}
+
+// As room_of, with a config for each.
+fn room_with(host: Config, friends: Vec<Config>) -> (Member, Vec<Member>, Invite) {
+    let host = Member::host_with(host);
+    host.room().new_invite(true);
+    let view = host.wait_for(WAIT, "a multi-use invite", |v| {
+        v.invite
+            .as_ref()
+            .is_some_and(|i| i.multi_use && !i.code.is_empty())
+    });
+    let invite = code_to_invite(&view.invite.expect("an invite").code, loopback(host.port()));
+    let people = friends.len() + 1;
+    let friends: Vec<Member> = friends
+        .into_iter()
+        .map(|config| {
+            Member::join_with(config, Arc::new(keys::Identity::generate()), invite.clone())
+        })
+        .collect();
+    for friend in &friends {
+        friend.wait_for(WAIT, "live with everyone", |v| {
+            v.strip.state == LinkState::Live && v.people.len() == people
+        });
+    }
+    host.wait_for(WAIT, "everyone in", |v| v.people.len() == people);
+    (host, friends, invite)
+}
+
+fn watched_by(member: &Member, share: u32, watchers: u8) {
+    member.wait_for(WAIT, "the watchers counted", |v| {
+        v.share
+            .current
+            .as_ref()
+            .is_some_and(|c| c.number == share && c.watchers == Some(watchers))
+    });
+}
+
+// Whether the pointer update at `x` that reached `member` for `share` was
+// marked, or None when it did not come within a second.
+fn marked_at(member: &Member, share: u32, x: i32) -> Option<bool> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut batch = Batch::default();
+    loop {
+        member.room().watching().take(&mut batch);
+        if let Some((at, pointer)) = batch.pointer
+            && at == share
+            && pointer.x == x
+        {
+            return Some(pointer.with_picture);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+// The flags of the pointer update at `x` as they reached a hand, read from
+// the packet: kind 0, slot 1, seq 2, x 6, y 10, flags 14, shape 15. None
+// when it did not come within 200 ms.
+fn flags_at(hand: &mut Hand, x: i32) -> Option<u8> {
+    let deadline = Instant::now() + Duration::from_millis(200);
+    loop {
+        hand.answer_pings();
+        let came = hand.received().into_iter().find(|(channel, payload)| {
+            *channel == Channel::Cursor && payload.len() == 19 && payload[6..10] == x.to_le_bytes()
+        });
+        if let Some((_, payload)) = came {
+            return Some(payload[14]);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+// The control message Hello: kind 24, the protocol and the version, each
+// little-endian, the name, and no address.
+fn hello(name: &str, version: invite::Version) -> Vec<u8> {
+    let mut hello = vec![24];
+    for part in [
+        invite::PROTOCOL,
+        version.major,
+        version.minor,
+        version.patch,
+    ] {
+        hello.extend_from_slice(&part.to_le_bytes());
+    }
+    hello.push(name.len() as u8);
+    hello.extend_from_slice(name.as_bytes());
+    hello.push(0);
+    hello
+}
+
+// Marked updates from `outbox`, the next x each time, until one reaches the
+// hand with `flags`: the x it came at, or None when none did within WAIT.
+fn marked_until(
+    outbox: &mut room::screen::Outbox,
+    hand: &mut Hand,
+    x: &mut i32,
+    flags: u8,
+) -> Option<i32> {
+    let deadline = Instant::now() + WAIT;
+    while Instant::now() < deadline {
+        *x += 1;
+        outbox.pointer(*x, 40, true, 0, true);
+        if flags_at(hand, *x) == Some(flags) {
+            return Some(*x);
+        }
+    }
+    None
+}
+
+// A pointer update's mark reaches only copies that read it. The host clears
+// it for a watcher standing for 1.2.0; a sharer marks only toward a host
+// whose copy reads it, and only from a room standing for 1.3.0; a host that
+// shares marks for each watcher by that watcher's latest Hello, a Hello that
+// changes on the same session and address included, and only from a room
+// standing for 1.3.0. Nobody counts any of it bad, and a host standing for
+// 1.2.0 refuses a marked update that comes anyway, as such a copy does.
+#[test]
+fn a_pointer_mark_reaches_only_copies_that_read_it() {
+    let (host, friends, invite) = room_with(
+        standing_for("Mara", MARK_SINCE),
+        vec![
+            standing_for("Ana", MARK_SINCE),
+            standing_for("Bo", MARK_SINCE),
+            standing_for("Cy", OLDER),
+        ],
+    );
+    let (ana, bo, cy) = (&friends[0], &friends[1], &friends[2]);
+    let bad = |member: &Member| member.view().numbers.dropped_bad;
+    let (mara_bad, cy_bad) = (bad(&host), bad(cy));
+
+    // Ana's share, passed on by Mara to Bo and Cy, and watched by Mara.
+    let share = shares(ana, 60);
+    for member in [bo, cy, &host] {
+        watches(member, share);
+    }
+    watched_by(&host, share, 3);
+    let mut outbox = ana.room().sharing().outbox();
+    let marks = |x: i32| [&host, bo, cy].map(|member| marked_at(member, share, x));
+    outbox.pointer(10, 20, true, 0, true);
+    assert_eq!(marks(10), [Some(true), Some(true), Some(false)]);
+    outbox.pointer(11, 20, true, 0, false);
+    assert_eq!(marks(11), [Some(false); 3]);
+
+    // Mara's own share to Bo, Cy and Eve, a hand whose Hello says 1.2.0,
+    // then 1.3.0, then 1.2.0 again, on one session and address.
+    ana.room().stop_sharing();
+    host.wait_for(WAIT, "Ana's share over", |v| v.share.current.is_none());
+    let share = shares(&host, 60);
+    for member in [bo, cy] {
+        watches(member, share);
+    }
+    let mut eve = Hand::join_as(&invite, loopback(host.port()), "Eve", OLDER);
+    let mut watch = vec![12];
+    watch.extend_from_slice(&share.to_le_bytes());
+    watch.extend_from_slice(&[1, 1]);
+    eve.say(&watch);
+    until(&host, &mut eve, "Eve watching too", |v| {
+        v.share
+            .current
+            .as_ref()
+            .is_some_and(|c| c.watchers == Some(3))
+    });
+    let mut outbox = host.room().sharing().outbox();
+    outbox.pointer(30, 40, true, 0, true);
+    assert_eq!(
+        [bo, cy].map(|member| marked_at(member, share, 30)),
+        [Some(true), Some(false)]
+    );
+    assert_eq!(flags_at(&mut eve, 30), Some(0x01), "Eve standing for 1.2.0");
+    let mut x = 30;
+    eve.say(&hello("Eve", MARK_SINCE));
+    let read = marked_until(&mut outbox, &mut eve, &mut x, 0x03);
+    assert!(
+        read.is_some(),
+        "no mark reached Eve after her Hello said 1.3.0"
+    );
+    eve.say(&hello("Eve", OLDER));
+    let cleared = marked_until(&mut outbox, &mut eve, &mut x, 0x01);
+    assert!(
+        cleared.is_some(),
+        "the mark still reached Eve after her Hello said 1.2.0"
+    );
+
+    // Cy's share, from a room standing for 1.2.0, to Mara and Bo: unmarked
+    // all the way.
+    host.room().stop_sharing();
+    cy.wait_for(WAIT, "Mara's share over", |v| v.share.current.is_none());
+    let share = shares(cy, 60);
+    for member in [bo, &host] {
+        watches(member, share);
+    }
+    watched_by(&host, share, 2);
+    let mut outbox = cy.room().sharing().outbox();
+    outbox.pointer(50, 60, true, 0, true);
+    assert_eq!(
+        [&host, bo].map(|member| marked_at(member, share, 50)),
+        [Some(false); 2]
+    );
+    assert_eq!((bad(&host), bad(cy)), (mara_bad, cy_bad));
+    println!(
+        "Eve's updates came marked from x {read:?} after her Hello said 1.3.0, and unmarked from x {cleared:?} after it said 1.2.0"
+    );
+    drop(eve);
+    drop(friends);
+    drop(host);
+
+    // A host standing for 1.2.0: Ana's marked update reaches Bo unmarked,
+    // the host's own share marks nothing, and a marked update that comes
+    // anyway, from a hand, is refused and counted bad, as such a copy does.
+    let (host, friends, invite) = room_with(
+        standing_for("Mara", OLDER),
+        vec![
+            standing_for("Ana", MARK_SINCE),
+            standing_for("Bo", MARK_SINCE),
+        ],
+    );
+    let (ana, bo) = (&friends[0], &friends[1]);
+    let before = bad(&host);
+    let share = shares(ana, 60);
+    watches(bo, share);
+    watched_by(&host, share, 1);
+    ana.room().sharing().outbox().pointer(70, 80, true, 0, true);
+    assert_eq!(marked_at(bo, share, 70), Some(false));
+    ana.room().stop_sharing();
+    host.wait_for(WAIT, "Ana's share over", |v| v.share.current.is_none());
+    let share = shares(&host, 60);
+    watches(bo, share);
+    watched_by(&host, share, 1);
+    host.room()
+        .sharing()
+        .outbox()
+        .pointer(90, 80, true, 0, true);
+    assert_eq!(marked_at(bo, share, 90), Some(false));
+    assert_eq!(bad(&host), before);
+    host.room().stop_sharing();
+    host.wait_for(WAIT, "Mara's share over", |v| v.share.current.is_none());
+    let mut dee = Hand::join_as(&invite, loopback(host.port()), "Dee", MARK_SINCE);
+    // ShareStart, kind 9, at 60 fps.
+    dee.say(&[9, 60]);
+    until(&host, &mut dee, "Dee sharing", |v| {
+        v.share.current.as_ref().is_some_and(|c| c.name == "Dee")
+    });
+    // Kind 1 (sent to the host) and slot 0, seq 0, x and y, VISIBLE and
+    // WITH_PICTURE, shape 0.
+    let mut marked = vec![1, 0];
+    marked.extend_from_slice(&0u32.to_le_bytes());
+    marked.extend_from_slice(&110i32.to_le_bytes());
+    marked.extend_from_slice(&80i32.to_le_bytes());
+    marked.push(0x03);
+    marked.extend_from_slice(&0u32.to_le_bytes());
+    dee.send(Channel::Cursor, &marked);
+    until(&host, &mut dee, "the marked update counted bad", |v| {
+        v.numbers.dropped_bad > before
+    });
 }

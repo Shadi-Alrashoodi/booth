@@ -2311,6 +2311,7 @@ impl Client {
                         self.link.limits_read = version >= peer::LIMITS_SINCE;
                         self.link.state_read = version >= peer::SHARE_STATE_SINCE;
                         self.link.sound_read = version >= peer::PC_SOUND_SINCE;
+                        self.link.marks_read = version >= peer::MARK_SINCE;
                         self.send_watch_limits();
                         if version != invite::VERSION {
                             log!(

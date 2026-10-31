@@ -3042,6 +3042,7 @@ impl Host {
                     self.peers[i].link.limits_read = version >= peer::LIMITS_SINCE;
                     self.peers[i].link.state_read = version >= peer::SHARE_STATE_SINCE;
                     self.peers[i].link.sound_read = version >= peer::PC_SOUND_SINCE;
+                    self.peers[i].link.marks_read = version >= peer::MARK_SINCE;
                     let peer = &self.peers[i];
                     if first
                         && version != invite::VERSION
@@ -3967,8 +3968,8 @@ mod tests {
         );
     }
 
-    // Whether a friend's copy reads PC sound is its latest Hello's version,
-    // and a link starts out without it.
+    // Whether a friend's copy reads PC sound, and a pointer update's mark,
+    // is its latest Hello's version, and a link starts out without either.
     #[test]
     fn pc_sound_goes_by_each_hello() {
         let start = Instant::now();
@@ -4005,6 +4006,7 @@ mod tests {
             ana.say(&mut rig, &hello, now);
             rig.tick(now);
             assert_eq!(rig.host.peers[0].link.sound_read, reads, "{version}");
+            assert_eq!(rig.host.peers[0].link.marks_read, reads, "{version}");
         }
     }
 

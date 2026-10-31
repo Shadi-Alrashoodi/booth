@@ -298,7 +298,7 @@ pub struct Sharing {
     told: Mutex<Told>,
     // Set when an answer, new facts or a new state waits.
     wake: Signal,
-    outlets: Mutex<Arc<[Outlet]>>,
+    outlets: Mutex<Arc<[ShareOutlet]>>,
     // Bumped whenever the outlets change, so an Outbox takes the list again
     // only then.
     generation: AtomicU64,
@@ -743,7 +743,7 @@ impl Sharing {
         video || self.sound.sent_lately(now)
     }
 
-    fn set_outlets(&self, outlets: Vec<Outlet>) {
+    fn set_outlets(&self, outlets: Vec<ShareOutlet>) {
         *lock(&self.outlets) = outlets.into();
         self.generation.fetch_add(1, Ordering::Release);
     }
@@ -832,6 +832,13 @@ impl Sharing {
     }
 }
 
+// One link this PC's share goes out on, and whether the copy at its far end
+// reads a pointer update's mark (peer::MARK_SINCE).
+pub(crate) struct ShareOutlet {
+    pub link: Outlet,
+    pub marks: bool,
+}
+
 // A sharer's thread's way out: seals each packet for every link in the
 // outlet list and sends it, with buffers of its own, so nothing allocates
 // once it runs. Each packet starts at the next outlet in turn: the copies
@@ -841,7 +848,7 @@ impl Sharing {
 // many frames, in a simulated link.
 pub struct Outbox {
     sharing: Arc<Sharing>,
-    outlets: Arc<[Outlet]>,
+    outlets: Arc<[ShareOutlet]>,
     generation: u64,
     first: usize,
     plain: Vec<u8>,
@@ -872,7 +879,7 @@ impl Outbox {
                 },
             );
         }
-        let sent = self.send();
+        let sent = self.send(false);
         if sent > 0 {
             let sharing = &self.sharing;
             sharing.video_sent.fetch_add(1, Ordering::Relaxed);
@@ -889,19 +896,28 @@ impl Outbox {
     }
 
     // Where the pointer is now; its sequence number is given here.
-    pub fn pointer(&mut self, x: i32, y: i32, visible: bool, shape: u32) -> usize {
+    // `with_picture` is said only on the links whose copies read it.
+    pub fn pointer(
+        &mut self,
+        x: i32,
+        y: i32,
+        visible: bool,
+        shape: u32,
+        with_picture: bool,
+    ) -> usize {
         let pointer = Pointer {
             seq: self.sharing.next_pointer.fetch_add(1, Ordering::Relaxed),
             x,
             y,
             visible,
             shape,
+            with_picture,
         };
         let (kind, slot) = self.prefix();
         self.plain.clear();
         self.plain.push(Channel::Cursor as u8);
         wire::write_pointer(kind, slot, &pointer, &mut self.plain);
-        self.send()
+        self.send(with_picture)
     }
 
     fn prefix(&self) -> (u8, u8) {
@@ -912,7 +928,9 @@ impl Outbox {
         }
     }
 
-    fn send(&mut self) -> usize {
+    // `marked`: the plain buffer is a pointer update with WITH_PICTURE set,
+    // which each link gets only if its copy reads it.
+    fn send(&mut self, marked: bool) -> usize {
         let generation = self.sharing.generation.load(Ordering::Acquire);
         if generation != self.generation {
             self.outlets = Arc::clone(&lock(&self.sharing.outlets));
@@ -926,13 +944,21 @@ impl Outbox {
         self.first = self.first.wrapping_add(1);
         for i in 0..count {
             let outlet = &self.outlets[(self.first + i) % count];
-            if outlet.sealer.seal(&self.plain, &mut self.sealed).is_err() {
+            if marked {
+                wire::mark(&mut self.plain[1..], outlet.marks);
+            }
+            if outlet
+                .link
+                .sealer
+                .seal(&self.plain, &mut self.sealed)
+                .is_err()
+            {
                 continue;
             }
             // A failed send is a dead route; the room hears about that from
             // the silence, as with every other packet.
-            if socket.send_to(&self.sealed, outlet.to).is_ok() {
-                outlet.sent.count(self.sealed.len());
+            if socket.send_to(&self.sealed, outlet.link.to).is_ok() {
+                outlet.link.sent.count(self.sealed.len());
                 sent += 1;
             }
         }
@@ -1733,8 +1759,9 @@ pub(crate) struct Screen {
     pub watching: Arc<Watching>,
     // Remote control of the share, either way.
     pub remote: Remote,
-    // Which sessions and addresses the sharer's outlets have now.
-    published: Vec<(u32, SocketAddr)>,
+    // Which sessions and addresses the sharer's outlets have now, and
+    // whether each reads a pointer update's mark.
+    published: Vec<(u32, SocketAddr, bool)>,
     // The share this PC watches.
     pub watched: Option<u32>,
     shapes: Assembler,
@@ -1811,12 +1838,13 @@ impl Screen {
     }
 
     // Hands the sharer's thread a new list of links when the sessions,
-    // addresses or watchers changed. Called after every step the room takes,
-    // so it compares without allocating and builds sealers only on a change.
+    // addresses or watchers changed, or a Hello changed whether a link reads
+    // the mark. Called after every step the room takes, so it compares
+    // without allocating and builds sealers only on a change.
     pub(crate) fn publish(
         &mut self,
-        links: impl Iterator<Item = (u32, SocketAddr)> + Clone,
-        outlets: impl FnOnce() -> Vec<Outlet>,
+        links: impl Iterator<Item = (u32, SocketAddr, bool)> + Clone,
+        outlets: impl FnOnce() -> Vec<ShareOutlet>,
     ) {
         if links.clone().eq(self.published.iter().copied()) {
             return;
