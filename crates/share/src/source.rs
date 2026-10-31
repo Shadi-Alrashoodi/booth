@@ -262,6 +262,15 @@ impl Source {
         }
     }
 
+    // Desktop Duplication only: Windows.Graphics.Capture says nothing of the
+    // lock screen at all, so a window share looks at the desktop before each
+    // picture instead.
+    pub(crate) fn rested(&mut self) {
+        if let Source::Screen(capture) = self {
+            capture.rested();
+        }
+    }
+
     pub(crate) fn next(&mut self) -> Result<Next, String> {
         match self {
             Source::Screen(capture) => capture.next().map_err(|err| err.to_string()),

@@ -518,12 +518,20 @@ impl Sharer {
 
     // Lets go of the source and the encoder, for someone who paused their
     // share: nothing of the screen is read until resume(), and the last
-    // picture goes with them, so whoever starts watching meanwhile gets
-    // nothing from before the pause. next() is not called while it holds.
+    // picture goes with them, as does what the pacer has not sent yet, so
+    // whoever starts watching meanwhile gets nothing from before the pause.
+    // next() is not called while it holds.
     pub fn pause(&mut self) {
-        self.last = None;
+        self.forget_pictures();
         self.opened = None;
         self.held = true;
+    }
+
+    // Nothing from before goes out from here on: neither the last picture,
+    // kept to send again, nor what the pacer still holds.
+    fn forget_pictures(&mut self) {
+        self.last = None;
+        self.pacer.cancel();
     }
 
     // The same source again, at what it ran at before the pause, its first
@@ -540,6 +548,15 @@ impl Sharer {
 
     pub fn held(&self) -> bool {
         self.held
+    }
+
+    // No picture was asked for a while, as while nobody watches and the
+    // room lets the share rest: one a monitor's capture held from before
+    // goes out only after a look at the desktop (Capture::rested).
+    pub fn rested(&mut self) {
+        if let Some(opened) = &mut self.opened {
+            opened.source.rested();
+        }
     }
 
     // Under 8 Mbit/s a viewer, 1440p120 is not worth its frames, and an
@@ -856,6 +873,18 @@ impl Sharer {
             Next::Idle => self.quiet(audience)?,
             Next::Paused(reason) => {
                 self.paused = true;
+                // Locked, on a UAC prompt or disconnected, the PC may be left
+                // alone: nothing from before goes out meanwhile, not even to
+                // whoever starts watching, as after a pause by hand, and the
+                // first picture after it is an IDR, which also stands in for
+                // the frames cut off on their way.
+                if matches!(
+                    reason,
+                    PauseReason::SecureDesktop | PauseReason::Disconnected
+                ) {
+                    self.forget_pictures();
+                    self.answers.force_idr();
+                }
                 audience.paused(&reason);
             }
         }

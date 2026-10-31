@@ -9,7 +9,7 @@
 // window opens; everything on the GPU happens on the test's own thread, one
 // test at a time.
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use capture::CursorUpdate;
@@ -311,6 +311,73 @@ fn a_paused_share_comes_back_with_an_idr() {
         .resume(&mut |line| said.push(line))
         .unwrap_or_else(|err| panic!("{err}"));
     assert!(!again);
+}
+
+// Paused by hand, a share sends no more of a frame the pacer had not sent
+// yet: here the send function holds the pacer on the first IDR's first
+// packet until the pause.
+#[test]
+fn a_pause_sends_nothing_more_of_a_frame_on_its_way() {
+    let Some((_turn, adapter)) = gpu() else {
+        return;
+    };
+    let (opens, opened) = mpsc::channel::<()>();
+    let (reached, held) = mpsc::channel::<()>();
+    let packets: Packets = Arc::default();
+    let send = {
+        let packets = Arc::clone(&packets);
+        let mut first = true;
+        move |packet: &[u8]| {
+            if std::mem::take(&mut first) {
+                let _ = reached.send(());
+                let _ = opened.recv();
+            }
+            packets
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(packet.to_vec());
+        }
+    };
+    let setup = Setup {
+        choice: Choice::Pattern {
+            adapter,
+            width: 1280,
+            height: 720,
+            busy: false,
+        },
+        fps: 60,
+        settings: Settings::default(),
+        encoder: None,
+        codec: None,
+        takes_hevc: false,
+        payload: PAYLOAD_INTERNET,
+        spread: false,
+        clock: Clock::starting(Instant::now()),
+        keep_times: false,
+    };
+    let mut said = Vec::new();
+    let mut sharer = Sharer::open(setup, send, &mut |line| said.push(line))
+        .unwrap_or_else(|err| panic!("{err}"));
+    // Dropped before the sharer if an assert fails, which lets the pacer go
+    // and the sharer's drop join it.
+    let gate = opens;
+    let mut watching = Watching::default();
+    sharer
+        .next(&mut watching)
+        .unwrap_or_else(|err| panic!("{err}"));
+    let first = watching.sent[0];
+    assert!(first.idr && first.packets > 1, "{first:?}");
+    held.recv_timeout(Duration::from_secs(5))
+        .unwrap_or_else(|err| panic!("the pacer sent nothing: {err}"));
+    sharer.pause();
+    gate.send(()).unwrap_or_else(|err| panic!("{err}"));
+    std::thread::sleep(Duration::from_millis(200));
+    let went = taken(&packets).len();
+    println!(
+        "{went} of the IDR's {} packets went out, the one held when it paused included",
+        first.packets
+    );
+    assert_eq!(went, 1);
 }
 
 // A 4K limit that comes while the share is in H.264 waits there at 1440p.

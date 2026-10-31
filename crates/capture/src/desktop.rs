@@ -1,7 +1,8 @@
 // Whether Windows shows this session's own desktop. Desktop Duplication
 // refuses the secure desktop and a disconnected session, which a monitor's
-// capture reports as a pause; Windows.Graphics.Capture goes on without a
-// word, so a window share asks here.
+// capture reports as a pause, though only once it asks for a picture: one
+// it held through a rest asks here first. Windows.Graphics.Capture goes on
+// without a word, so a window share asks here.
 
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};

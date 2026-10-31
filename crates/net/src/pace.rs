@@ -17,6 +17,10 @@
 // Ordinary frames, which the encoder holds to about one frame's worth, keep
 // the half interval.
 //
+// A share that pauses cancels what it put before (cancel below): the frame
+// in the mailbox, what is left of the one under way and those waiting
+// behind it go no further, however long the thread was held up.
+//
 // The thread blocks on the mailbox's event and the high-resolution timer
 // together. A sleep or a timed wait would run on the default 15.6 ms timer,
 // which is longer than a whole 120 fps frame.
@@ -133,6 +137,8 @@ struct Job {
     spread: bool,
     // The rate the encoder is set to, in bits per second, or 0 if unknown.
     rate_bps: u32,
+    // How many cancels came before it was put: one after it stops it.
+    cancels: u64,
 }
 
 #[derive(Default)]
@@ -150,6 +156,7 @@ struct Shared {
     packets: AtomicU64,
     cut_short: AtomicU64,
     discarded: AtomicU64,
+    cancels: AtomicU64,
 }
 
 impl Shared {
@@ -191,6 +198,7 @@ impl Pacer {
             packets: AtomicU64::new(0),
             cut_short: AtomicU64::new(0),
             discarded: AtomicU64::new(0),
+            cancels: AtomicU64::new(0),
         });
         let thread = thread::Builder::new()
             .name("video send".into())
@@ -252,6 +260,7 @@ impl Pacer {
             interval,
             spread,
             rate_bps,
+            cancels: self.shared.cancels.load(Ordering::Acquire),
         };
         let mut mailbox = self.shared.lock();
         if mailbox.failed.is_some() {
@@ -261,6 +270,21 @@ impl Pacer {
         if let Some(old) = mailbox.job.replace(job) {
             keep_spare(&mut mailbox, old.burst);
             self.shared.discarded.fetch_add(1, Ordering::Relaxed);
+        }
+        drop(mailbox);
+        self.shared.signal.set();
+    }
+
+    // Nothing put before this goes out from here on: the frame in the
+    // mailbox is dropped, and the thread sends no more of the one under way
+    // or of those waiting behind it. A packet already in the send function
+    // still goes. Frames put after it go as any frame. None of it counts as
+    // discarded: the caller let go of those frames itself.
+    pub fn cancel(&self) {
+        let mut mailbox = self.shared.lock();
+        self.shared.cancels.fetch_add(1, Ordering::AcqRel);
+        if let Some(old) = mailbox.job.take() {
+            keep_spare(&mut mailbox, old.burst);
         }
         drop(mailbox);
         self.shared.signal.set();
@@ -371,8 +395,12 @@ impl Going {
         }
     }
 
+    // A frame cancelled while its packets go, as when the send function
+    // blocked on a full socket buffer, stops at the next one.
     fn send_one(&mut self, send: &mut impl FnMut(&[u8]), shared: &Shared) {
-        if let Some(packet) = self.job.burst.packet(self.next) {
+        if self.job.cancels == shared.cancels.load(Ordering::Acquire)
+            && let Some(packet) = self.job.burst.packet(self.next)
+        {
             send(packet);
             shared.packets.fetch_add(1, Ordering::Relaxed);
         }
@@ -428,6 +456,17 @@ fn run(shared: &Shared, timer: &Timer, mut send: impl FnMut(&[u8])) {
         };
         if stop {
             return;
+        }
+        // What a cancel since the last wake left goes no further, and a
+        // newer frame does not wait behind what is left of a big one.
+        let cancels = shared.cancels.load(Ordering::Acquire);
+        if let Some(old) = going.take_if(|going| going.job.cancels != cancels) {
+            recycle(shared, old.job.burst);
+        }
+        while waiting.front().is_some_and(|job| job.cancels != cancels) {
+            if let Some(old) = waiting.pop_front() {
+                recycle(shared, old.burst);
+            }
         }
         let now = Instant::now();
         if let Some(job) = job {
@@ -678,6 +717,80 @@ mod tests {
             .collect();
         assert!(got.is_sorted(), "{got:?}");
         assert_eq!(pacer.numbers().cut_short, 3);
+    }
+
+    // After a cancel nothing put before it goes: not what is left of the
+    // frame the send function holds the thread on, nor the frame in the
+    // mailbox. The packet already in the send function goes. A frame put
+    // after the cancel goes whole, and nothing counts as discarded.
+    #[test]
+    fn nothing_put_before_a_cancel_goes_after_it() {
+        let (opens, opened) = mpsc::channel::<()>();
+        let (reached, held) = mpsc::channel::<()>();
+        let (sender, receiver) = mpsc::channel();
+        let pacer = Pacer::start(move |packet: &[u8]| {
+            if packet == [1, 0] {
+                let _ = reached.send(());
+                let _ = opened.recv();
+            }
+            let _ = sender.send(packet.to_vec());
+        })
+        .unwrap();
+        // Dropped before the pacer if an assert fails, which lets the thread
+        // go and the pacer's drop join it.
+        let gate = opens;
+        let interval = Duration::from_nanos(8_333_333);
+        pacer.put(burst_of(&pacer, 1, 30), interval, false, 0);
+        held.recv_timeout(Duration::from_secs(5)).unwrap();
+        pacer.put(burst_of(&pacer, 2, 30), interval, false, 0);
+        pacer.cancel();
+        assert_eq!(waiting(&pacer), None);
+        gate.send(()).unwrap();
+        pacer.put(burst_of(&pacer, 3, 4), interval, false, 0);
+        let got: Vec<Vec<u8>> = (0..5)
+            .map(|_| receiver.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect();
+        assert_eq!(got, [[1, 0], [3, 0], [3, 1], [3, 2], [3, 3]]);
+        assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+        assert_eq!(pacer.numbers().discarded, 0);
+    }
+
+    // Cancelled while a big frame is spread at twice the rate, what is left
+    // of it goes at once from the schedule: a frame put after the cancel
+    // goes out then, not after the big one's last packet would have.
+    #[test]
+    fn a_frame_after_a_cancel_waits_behind_nothing() {
+        let (sender, receiver) = mpsc::channel();
+        let pacer = Pacer::start(move |packet: &[u8]| {
+            let _ = sender.send((packet[0], Instant::now()));
+        })
+        .unwrap();
+        let interval = Duration::from_nanos(8_333_333);
+        let mut big = pacer.burst();
+        for index in 0..30 {
+            let mut packet = vec![0; 1000];
+            packet[..2].copy_from_slice(&[1, index]);
+            big.push(&packet);
+        }
+        // 240 000 bits at twice 200 kbit/s take 600 ms.
+        pacer.put(big, interval, true, 200_000);
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(5)).unwrap().0, 1);
+        pacer.cancel();
+        let put = Instant::now();
+        pacer.put(burst_of(&pacer, 2, 4), interval, true, 200_000);
+        let mut second = Vec::new();
+        while second.len() < 4 {
+            let (number, at) = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+            if number == 2 {
+                second.push(at);
+            }
+        }
+        let waited = second[0] - put;
+        println!(
+            "a frame put after the cancel: its first packet {:.2} ms after the put, where the cancelled frame had about 580 ms left",
+            waited.as_secs_f64() * 1000.0
+        );
+        assert!(waited < Duration::from_millis(100), "{waited:?}");
     }
 
     // The send function is the caller's code. When it panics the thread ends,

@@ -86,6 +86,8 @@ pub struct Capture {
     copy: Option<(ID3D11Texture2D, ID3D11ShaderResourceView)>,
     cap: FpsCap,
     pending: Option<Pending>,
+    // Told of a rest since next() last ran (rested()).
+    rested: bool,
     skipped: u32,
     // While paused, the reason last told.
     paused: Option<PauseReason>,
@@ -100,8 +102,9 @@ pub struct Capture {
     // drawn on: it holds for that mode only.
     region: Option<(Region, (u32, u32))>,
     qpc_frequency: i64,
-    // Tests make Windows refuse the desktop with this, since only the user
-    // can bring up the secure desktop, and count the tries.
+    // Tests make Windows refuse the desktop with this, and a look at it find
+    // it away, since only the user can bring up the secure desktop, and
+    // count the tries.
     #[cfg(test)]
     refuse: Option<PauseReason>,
     #[cfg(test)]
@@ -208,6 +211,7 @@ impl Capture {
             copy: None,
             cap: FpsCap::new(options.max_fps),
             pending: None,
+            rested: false,
             skipped: 0,
             paused: None,
             missing: Missing::default(),
@@ -247,6 +251,14 @@ impl Capture {
         self.converter.compile_time()
     }
 
+    // The share asked for no picture for a while, as it does while nobody
+    // watches. Desktop Duplication tells of the lock screen only when it is
+    // asked for a picture, so one held for the fps cap from before goes out
+    // only after a look at the desktop, however short the rest was.
+    pub fn rested(&mut self) {
+        self.rested = true;
+    }
+
     // Blocks until there is something to say. Not an Iterator: it never
     // ends, and each item can be an error.
     #[allow(clippy::should_implement_trait)]
@@ -254,6 +266,9 @@ impl Capture {
         // AcquireNextFrame can time out early, on a refresh that brought
         // nothing new, so Idle waits for the whole of IDLE_WAIT.
         let mut idle_at = Instant::now() + IDLE_WAIT;
+        // For this call only: one that returns with a picture still held has
+        // asked Windows for a newer one, which tells of a lock by itself.
+        let mut rested = mem::take(&mut self.rested);
         loop {
             if self.duplication.is_none() {
                 // The first try is at once, since a mode change is often
@@ -278,6 +293,18 @@ impl Capture {
             let now = Instant::now();
             let until = match self.cap.held_until() {
                 Some(until) if until <= now => {
+                    // Held through a rest, however short, or past its time
+                    // by more than a wait for a change, as after a stall,
+                    // the picture can be from before the lock screen came
+                    // up, which only the next AcquireNextFrame would say.
+                    // The desktop is looked at first: away, the picture goes
+                    // with the duplication, from before the loss. One held
+                    // only until its slot while the share runs goes at once.
+                    let late = now.saturating_duration_since(until) > IDLE_WAIT;
+                    if (mem::take(&mut rested) || late) && self.desktop_away() {
+                        self.lose();
+                        continue;
+                    }
                     let Some(pending) = self.pending.take() else {
                         self.cap.drop_held();
                         continue;
@@ -460,6 +487,16 @@ impl Capture {
     fn lose(&mut self) {
         self.duplication = None;
         self.drop_pending();
+    }
+
+    // Windows shows another desktop than this session's own, or cannot say
+    // (desktop.rs). reopen() then finds out from Desktop Duplication itself.
+    fn desktop_away(&self) -> bool {
+        #[cfg(test)]
+        if self.refuse.is_some() {
+            return true;
+        }
+        crate::desktop_away().is_some()
     }
 
     fn drop_pending(&mut self) {
@@ -1221,5 +1258,74 @@ mod tests {
             }
         }
         panic!("only pointer updates once the desktop was back");
+    }
+
+    // A picture held for the fps cap through a rest, as a share takes while
+    // nobody watches, can be from before the lock screen came up, which only
+    // the next AcquireNextFrame would say. So the share says it rested, and
+    // the desktop is looked at before the picture goes, however short the
+    // rest: with the look and Windows refusing the desktop, as the test
+    // above plays them, it goes with the duplication and the call says
+    // paused; on the user's desktop, as this PC's is while the test runs, it
+    // goes out. One look for each rest: a picture held only until its slot
+    // while the share runs goes out without one, as the frames of a share
+    // that runs never wait for one. One held long past its slot with no rest
+    // said, as after a stall, is looked at too.
+    #[test]
+    fn a_frame_held_through_a_rest_waits_for_a_look_at_the_desktop() {
+        let _turn = desktop_turn();
+        let Some(mut capture) = primary_capture() else {
+            return;
+        };
+        // Just past its time, so next() hands it over, or not, before it
+        // asks Windows for anything new.
+        let just_past = |capture: &Capture| {
+            let due = capture.cap.held_until().unwrap();
+            thread::sleep(due.saturating_duration_since(Instant::now()) + Duration::from_millis(5));
+        };
+        hold_one(&mut capture);
+        just_past(&capture);
+        capture.rested();
+        capture.refuse = Some(PauseReason::SecureDesktop);
+        assert!(matches!(
+            capture.next().unwrap(),
+            Next::Paused(PauseReason::SecureDesktop)
+        ));
+        assert!(capture.pending.is_none() && capture.duplication.is_none());
+        assert_eq!(capture.cap.held_until(), None);
+
+        capture.refuse = None;
+        match capture.next().unwrap() {
+            Next::Frame(_) => {}
+            other => panic!("{other:?} once the desktop was back"),
+        }
+        // Past the slot the picture that went out booked.
+        thread::sleep(IDLE_WAIT);
+        let start = hold_one(&mut capture);
+        just_past(&capture);
+        capture.rested();
+        match capture.next().unwrap() {
+            Next::Frame(frame) => assert_eq!(frame.present, start + Duration::from_millis(1)),
+            other => panic!("{other:?} for the picture held through a rest"),
+        }
+
+        thread::sleep(IDLE_WAIT);
+        capture.refuse = Some(PauseReason::SecureDesktop);
+        let start = hold_one(&mut capture);
+        just_past(&capture);
+        match capture.next().unwrap() {
+            Next::Frame(frame) => assert_eq!(frame.present, start + Duration::from_millis(1)),
+            other => panic!("{other:?} for a picture held until its slot"),
+        }
+
+        thread::sleep(IDLE_WAIT);
+        hold_one(&mut capture);
+        thread::sleep(IDLE_WAIT * 2);
+        assert!(matches!(
+            capture.next().unwrap(),
+            Next::Paused(PauseReason::SecureDesktop)
+        ));
+        assert!(capture.pending.is_none() && capture.duplication.is_none());
+        assert_eq!(capture.cap.held_until(), None);
     }
 }

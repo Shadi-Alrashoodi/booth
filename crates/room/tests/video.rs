@@ -4,21 +4,25 @@
 // captured but a window a test makes: every other share here is capture's
 // test pattern.
 // Every viewer window opens without taking the focus and closes within
-// seconds, and the tests take turns on the GPU.
+// seconds, and the tests take turns on the GPU. Where a test reads every
+// packet the host passes on, the watcher is played by hand instead.
 //
 // Skipped, with the reason printed, on a PC without an NVIDIA GPU or without
 // the FFmpeg DLLs next to the test.
 
 mod common;
 
+use std::cell::Cell;
 use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use capture::PauseReason;
+use channels::Channel;
 use common::voiced::heard_cues;
 use common::window::Window;
 use common::{
-    Forwarder, Member, code_to_invite, config, fresh_log, loopback, poll, read_log, timers,
+    Forwarder, Hand, Member, code_to_invite, config, fresh_log, loopback, poll, read_log, timers,
 };
 use room::view::{
     Codec, LineKind, LinkState, OwnShare, Paused, ShareState, SharingNumbers, View, WatchingNumbers,
@@ -1681,4 +1685,481 @@ fn a_pause_shows_before_the_share_lets_go() {
     ana.wait_for(WAIT, "Ana hearing it is live again", |v| {
         v.share.watched_state == ShareState::Live
     });
+}
+
+// The first version that hears how a share stands (control's ShareState and
+// WatchAnswer).
+const STATE_SINCE: invite::Version = invite::Version {
+    major: 1,
+    minor: 3,
+    patch: 0,
+};
+
+// How a share stands, as those messages carry it.
+const LIVE: u8 = 0;
+const PAUSED: u8 = 1;
+const AWAY: u8 = 2;
+
+// Mara hosts on 1.3.0, sharing from `video`, with a multi-use invite for
+// the watchers played by hand.
+fn hosting(video: VideoConfig) -> (Member, invite::Invite) {
+    let mut config = config_with("Mara", video, room::DEFAULT_VIDEO_UPLOAD_KBPS);
+    config.version = STATE_SINCE;
+    let host = Member::host_with(config);
+    host.room().new_invite(true);
+    let view = host.wait_for(WAIT, "a multi-use invite", |v| {
+        v.invite
+            .as_ref()
+            .is_some_and(|i| i.multi_use && !i.code.is_empty())
+    });
+    let invite = code_to_invite(&view.invite.expect("an invite").code, loopback(host.port()));
+    (host, invite)
+}
+
+// Watchers played by hand on 1.3.0, in the room: each keeps every packet the
+// host passes on and hears how the share stands.
+fn hand_watchers(host: &Member, invite: &invite::Invite, names: &[&str]) -> Vec<Hand> {
+    let hands = names
+        .iter()
+        .map(|name| Hand::join_as(invite, loopback(host.port()), name, STATE_SINCE))
+        .collect();
+    host.wait_for(WAIT, "everyone in", |v| v.people.len() == names.len() + 1);
+    hands
+}
+
+// Watch, kind 12: the share, on or off, and flags that take HEVC, so a
+// watcher played by hand never moves the share to another codec.
+fn watch(share: u32, on: bool) -> Vec<u8> {
+    let mut out = vec![12];
+    out.extend_from_slice(&share.to_le_bytes());
+    out.extend_from_slice(&[u8::from(on), 1]);
+    out
+}
+
+fn watched_by(host: &Member, count: u8) {
+    host.wait_for(WAIT, "the watchers counted", |v| {
+        v.share
+            .current
+            .as_ref()
+            .is_some_and(|current| current.watchers == Some(count))
+    });
+}
+
+// What a watcher played by hand got.
+#[derive(Debug, Default)]
+struct Heard {
+    // Each frame once, from its first data shard: its number, and whether it
+    // is an IDR.
+    frames: Vec<(u32, bool)>,
+    // When the first of them came.
+    first: Option<Instant>,
+    pointers: usize,
+    // How the share stands, as each ShareState (kind 27) and the answer to
+    // its Watch (WatchAnswer, kind 29) told it.
+    told: Vec<u8>,
+}
+
+impl Heard {
+    fn take(&mut self, hand: &mut Hand) {
+        hand.answer_pings();
+        for (channel, payload) in hand.received() {
+            match channel {
+                Channel::Video => {
+                    if let Some(frame) = first_shard(&payload) {
+                        self.first.get_or_insert_with(Instant::now);
+                        self.frames.push(frame);
+                    }
+                }
+                Channel::Cursor => self.pointers += 1,
+                _ => {}
+            }
+        }
+        for message in hand.messages() {
+            if let [27, _, _, _, _, state] | [29, _, _, _, _, state, _] = message[..] {
+                self.told.push(state);
+            }
+        }
+    }
+}
+
+// The frame of a packet that carries the frame's first data shard, which
+// the host relays behind a prefix of two bytes: its number, and whether it
+// is an IDR, the lowest bit of the flags that lead the shard.
+fn first_shard(payload: &[u8]) -> Option<(u32, bool)> {
+    let packet = channels::video::read_packet(payload.get(2..)?).ok()?;
+    (packet.index == 0).then(|| (packet.frame, packet.shard[0] & 1 != 0))
+}
+
+// What each hand got, their pings answered as they came, until `done` says
+// so, which must be within WAIT.
+fn listen_until(hands: &mut [Hand], what: &str, done: impl Fn(&[Heard]) -> bool) -> Vec<Heard> {
+    let mut heard: Vec<Heard> = hands.iter().map(|_| Heard::default()).collect();
+    let deadline = Instant::now() + WAIT;
+    while !done(&heard) {
+        assert!(
+            Instant::now() < deadline,
+            "{what}: not within {WAIT:?}: {heard:?}"
+        );
+        for (hand, heard) in hands.iter_mut().zip(&mut heard) {
+            heard.take(hand);
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    heard
+}
+
+fn listen(hands: &mut [Hand], span: Duration) -> Vec<Heard> {
+    let end = Instant::now() + span;
+    listen_until(hands, "a span", |_| Instant::now() >= end)
+}
+
+// Until hand `which` is told the share stands at `state`, and `then` after.
+fn until_told(hands: &mut [Hand], which: usize, state: u8, then: Duration) -> Vec<Heard> {
+    let told = Cell::new(None);
+    listen_until(hands, &format!("hand {which} told {state}"), |heard| {
+        if told.get().is_none() && heard[which].told.contains(&state) {
+            told.set(Some(Instant::now()));
+        }
+        told.get().is_some_and(|at: Instant| at.elapsed() >= then)
+    })
+}
+
+// From `at` to the first picture `heard` got, in ms.
+fn first_after(heard: &Heard, at: Instant) -> f64 {
+    let first = heard.first.expect("a picture");
+    first.saturating_duration_since(at).as_secs_f64() * 1000.0
+}
+
+// What a window share's looks at the desktop find, from the test, until it
+// is dropped and they ask Windows again.
+struct Looks;
+
+impl Looks {
+    fn find(away: Option<PauseReason>) -> Looks {
+        Looks::set(away);
+        Looks
+    }
+
+    fn set(away: Option<PauseReason>) {
+        capture::fault::set_desktop(away, Duration::ZERO);
+    }
+}
+
+impl Drop for Looks {
+    fn drop(&mut self) {
+        capture::fault::clear();
+    }
+}
+
+// The hands, as hand_watchers lists them.
+const ANA: usize = 0;
+const BO: usize = 1;
+
+// A shared window's capture says nothing of the lock screen, a UAC prompt or
+// a lost session, so its share looks at the desktop itself, told here what
+// it finds. Away, or when Windows cannot say, the share lets go of the
+// window and its watchers hear it is away: nothing of it goes out, not even
+// to someone who starts watching then, nor to someone who starts watching a
+// share that rested with nobody watching and so looked at nothing. Back, it
+// comes again from an IDR. The window changes all along, so a share that
+// went on would have pictures to send.
+#[test]
+fn a_shared_window_sends_nothing_while_the_desktop_is_away() {
+    let _turn = turn();
+    if !ready() {
+        return;
+    }
+    let _looks = Looks::find(None);
+    let window = Window::open(640, 360);
+    let _changing = window.keep_changing(Duration::from_millis(30));
+    let (host, invite) = hosting(screen());
+    let mut hands = hand_watchers(&host, &invite, &["Ana", "Bo"]);
+    let number = shares_window(&host, &window);
+    hands[ANA].say(&watch(number, true));
+    watched_by(&host, 1);
+    let live = listen(&mut hands, Duration::from_millis(500));
+    println!("watched: {} frames in 500 ms", live[ANA].frames.len());
+    assert!(live[ANA].frames.len() >= 5, "{:?}", live[ANA]);
+    let unknown = PauseReason::Changing(String::from(
+        "could not find out whether this session is connected: a test",
+    ));
+    for (what, away) in [
+        ("the secure desktop", PauseReason::SecureDesktop),
+        ("a disconnected session", PauseReason::Disconnected),
+        ("Windows not saying", unknown),
+    ] {
+        let went = Instant::now();
+        Looks::set(Some(away));
+        until_told(&mut hands, ANA, AWAY, Duration::ZERO);
+        let told = went.elapsed();
+        // A frame on its way when the share let go may still land.
+        listen(&mut hands, Duration::from_millis(100));
+        let gone = listen(&mut hands, Duration::from_secs(1));
+        assert!(gone[ANA].frames.is_empty(), "{what}: {:?}", gone[ANA]);
+        let came = Instant::now();
+        Looks::set(None);
+        let back = until_told(&mut hands, ANA, LIVE, Duration::from_millis(500));
+        assert!(
+            back[ANA].frames.len() >= 5 && back[ANA].frames[0].1,
+            "{what}: {:?}",
+            back[ANA]
+        );
+        println!(
+            "{what}: told away {:.0} ms after the look changed, then no frame in 1 s; back, the first picture, an IDR, {:.0} ms after, {} frames until live and 500 ms more",
+            told.as_secs_f64() * 1000.0,
+            first_after(&back[ANA], came),
+            back[ANA].frames.len()
+        );
+    }
+
+    Looks::set(Some(PauseReason::SecureDesktop));
+    until_told(&mut hands, ANA, AWAY, Duration::from_millis(100));
+    hands[BO].say(&watch(number, true));
+    watched_by(&host, 2);
+    let joined = listen(&mut hands, Duration::from_secs(1));
+    assert_eq!(joined[BO].told, [AWAY], "{:?}", joined[BO]);
+    assert!(
+        joined[BO].frames.is_empty() && joined[ANA].frames.is_empty(),
+        "{joined:?}"
+    );
+    let came = Instant::now();
+    Looks::set(None);
+    let back = until_told(&mut hands, BO, LIVE, Duration::from_millis(500));
+    for (who, heard) in [("Ana", &back[ANA]), ("Bo", &back[BO])] {
+        assert!(
+            heard.frames.len() >= 5 && heard.frames[0].1,
+            "{who}: {heard:?}"
+        );
+    }
+    println!(
+        "a watcher who came while away: told away, no frame in 1 s; back, its first picture, an IDR, {:.0} ms after",
+        first_after(&back[BO], came)
+    );
+
+    for hand in &mut hands {
+        hand.say(&watch(number, false));
+    }
+    watched_by(&host, 0);
+    // Long enough for the facts to say nobody watches, so the share rests.
+    listen(&mut hands, Duration::from_millis(1500));
+    Looks::set(Some(PauseReason::SecureDesktop));
+    hands[ANA].say(&watch(number, true));
+    watched_by(&host, 1);
+    let rested = listen(&mut hands, Duration::from_secs(1));
+    assert_eq!(rested[ANA].told, [LIVE, AWAY], "{:?}", rested[ANA]);
+    assert!(rested[ANA].frames.is_empty(), "{:?}", rested[ANA]);
+    println!("watching after a rest while away: told live, then away, and no frame in 1 s");
+}
+
+// A pause by hand and the desktop's away each hold a window share by
+// themselves. Paused by hand while the desktop is away, the share stays
+// paused when the desktop comes back; Resume pressed while the desktop is
+// away again takes nothing up, not even the pointer, until the desktop is
+// back, and the window comes again from an IDR. So does Resume after the
+// desktop went away during a pause by hand, when nothing looked at it.
+// Closed while its desktop is away, the window ends the share as it would
+// otherwise.
+#[test]
+fn a_window_share_waits_for_the_desktop_and_a_pause_by_hand() {
+    let _turn = turn();
+    if !ready() {
+        return;
+    }
+    let _looks = Looks::find(None);
+    let window = Window::open(640, 360);
+    let _changing = window.keep_changing(Duration::from_millis(30));
+    let (host, invite) = hosting(screen());
+    let mut hands = hand_watchers(&host, &invite, &["Ana"]);
+    let number = shares_window(&host, &window);
+    hands[ANA].say(&watch(number, true));
+    watched_by(&host, 1);
+    let live = listen(&mut hands, Duration::from_millis(500));
+    assert!(live[ANA].frames.len() >= 5, "{:?}", live[ANA]);
+    let held = || {
+        host.view()
+            .share
+            .running
+            .is_some_and(|running| running.held)
+    };
+
+    // Letting go of the window's capture can take seconds while other work
+    // holds the core, as this one is made to: the watchers hear the share is
+    // away before it.
+    capture::fault::set_drop_takes(window.id().hwnd, Duration::from_secs(2));
+    let went = Instant::now();
+    Looks::set(Some(PauseReason::SecureDesktop));
+    until_told(&mut hands, ANA, AWAY, Duration::ZERO);
+    let told = went.elapsed();
+    assert!(
+        told < Duration::from_millis(500),
+        "told away {told:?} after the look changed"
+    );
+    host.room().pause_share(true);
+    until_told(&mut hands, ANA, PAUSED, Duration::ZERO);
+    Looks::set(None);
+    let paused = listen(&mut hands, Duration::from_secs(1));
+    assert!(
+        paused[ANA].frames.is_empty() && paused[ANA].told.is_empty(),
+        "the desktop back during the pause: {:?}",
+        paused[ANA]
+    );
+    assert!(held(), "the pause by hand ended by itself");
+
+    Looks::set(Some(PauseReason::SecureDesktop));
+    host.room().pause_share(false);
+    let resumed = until_told(&mut hands, ANA, AWAY, Duration::from_secs(1));
+    assert!(
+        resumed[ANA].frames.is_empty() && resumed[ANA].pointers == 0,
+        "Resume while the desktop is away: {:?}",
+        resumed[ANA]
+    );
+    assert!(!held(), "still paused by hand after Resume");
+    let came = Instant::now();
+    Looks::set(None);
+    let back = until_told(&mut hands, ANA, LIVE, Duration::from_millis(500));
+    assert!(
+        back[ANA].frames.len() >= 5 && back[ANA].frames[0].1,
+        "{:?}",
+        back[ANA]
+    );
+    println!(
+        "told away {:.0} ms after the look changed, with the capture 2 s letting go; the desktop back during a pause by hand: no frame and no word in 1 s; Resume while away: told away, no frame and no pointer in 1 s; back, the first picture, an IDR, {:.0} ms after",
+        told.as_secs_f64() * 1000.0,
+        first_after(&back[ANA], came)
+    );
+
+    // Nothing looks at the desktop during a pause by hand. Gone away then,
+    // it is found at Resume, before the window is taken up: a window taken
+    // up and let go again would hide the pointer as it went.
+    host.room().pause_share(true);
+    until_told(&mut hands, ANA, PAUSED, Duration::ZERO);
+    Looks::set(Some(PauseReason::SecureDesktop));
+    host.room().pause_share(false);
+    let resumed = until_told(&mut hands, ANA, AWAY, Duration::from_secs(1));
+    assert!(
+        resumed[ANA].frames.is_empty() && resumed[ANA].pointers == 0,
+        "Resume after the desktop went away during the pause: {:?}",
+        resumed[ANA]
+    );
+    let came = Instant::now();
+    Looks::set(None);
+    let back = until_told(&mut hands, ANA, LIVE, Duration::from_millis(500));
+    assert!(
+        back[ANA].frames.len() >= 5 && back[ANA].frames[0].1,
+        "{:?}",
+        back[ANA]
+    );
+    println!(
+        "the desktop away during a pause by hand, then Resume: told away, no frame and no pointer in 1 s; back, the first picture, an IDR, {:.0} ms after",
+        first_after(&back[ANA], came)
+    );
+
+    Looks::set(Some(PauseReason::SecureDesktop));
+    until_told(&mut hands, ANA, AWAY, Duration::ZERO);
+    window.close();
+    // Ana goes on answering, so she still watches and the share does not
+    // rest, where it would find the window gone as well.
+    listen_until(&mut hands, "the share over", |_| {
+        host.view().share.current.is_none()
+    });
+    let problems = lines(&host.view(), LineKind::Problem);
+    assert_eq!(
+        problems.last().map(String::as_str),
+        Some("Sharing stopped: the shared window was closed."),
+        "{problems:?}"
+    );
+}
+
+// The test pattern paused as a monitor's capture pauses (share::fault), and
+// going on again however the test ends.
+struct PatternAway;
+
+impl PatternAway {
+    fn set(away: Option<PauseReason>) {
+        share::fault::pattern_away(away);
+    }
+}
+
+impl Drop for PatternAway {
+    fn drop(&mut self) {
+        PatternAway::set(None);
+    }
+}
+
+// A monitor's capture pauses by itself on the lock screen, a UAC prompt or a
+// lost session (the pattern does here, through share::fault), and the share
+// lets go of the last picture it kept to send again on a still screen:
+// someone who starts watching meanwhile hears the share is away and gets
+// nothing from before, and the first picture after the pause is an IDR,
+// whether someone started watching meanwhile or not.
+#[test]
+fn a_screen_share_keeps_no_picture_through_the_secure_desktop() {
+    let _turn = turn();
+    if !ready() {
+        return;
+    }
+    let _away = PatternAway;
+    let small = VideoConfig {
+        source: VideoSource::Pattern {
+            width: 640,
+            height: 360,
+            busy: false,
+        },
+        ..pattern(None)
+    };
+    let (host, invite) = hosting(small);
+    let mut hands = hand_watchers(&host, &invite, &["Ana", "Bo"]);
+    let number = shares(&host, 60);
+    hands[ANA].say(&watch(number, true));
+    watched_by(&host, 1);
+    let live = listen(&mut hands, Duration::from_millis(500));
+    assert!(live[ANA].frames.len() >= 5, "{:?}", live[ANA]);
+    // With nobody starting to watch during the pause, whose IDR would bring
+    // one by itself.
+    PatternAway::set(Some(PauseReason::SecureDesktop));
+    until_told(&mut hands, ANA, AWAY, Duration::from_millis(100));
+    let came = Instant::now();
+    PatternAway::set(None);
+    let back = until_told(&mut hands, ANA, LIVE, Duration::from_millis(500));
+    assert!(
+        back[ANA].frames.len() >= 5 && back[ANA].frames[0].1,
+        "watched through the pause: {:?}",
+        back[ANA]
+    );
+    println!(
+        "watched through the secure desktop: back, the first picture, an IDR, {:.0} ms after",
+        first_after(&back[ANA], came)
+    );
+    for (what, away) in [
+        ("the secure desktop", PauseReason::SecureDesktop),
+        ("a disconnected session", PauseReason::Disconnected),
+    ] {
+        PatternAway::set(Some(away));
+        until_told(&mut hands, ANA, AWAY, Duration::from_millis(100));
+        hands[BO].say(&watch(number, true));
+        watched_by(&host, 2);
+        let joined = listen(&mut hands, Duration::from_secs(1));
+        assert_eq!(joined[BO].told, [AWAY], "{what}: {:?}", joined[BO]);
+        assert!(
+            joined[BO].frames.is_empty() && joined[ANA].frames.is_empty(),
+            "{what}: {joined:?}"
+        );
+        let came = Instant::now();
+        PatternAway::set(None);
+        let back = until_told(&mut hands, BO, LIVE, Duration::from_millis(500));
+        for (who, heard) in [("Ana", &back[ANA]), ("Bo", &back[BO])] {
+            assert!(
+                heard.frames.len() >= 5 && heard.frames[0].1,
+                "{what}, {who}: {heard:?}"
+            );
+        }
+        println!(
+            "{what}: a watcher who came meanwhile told away, no frame in 1 s; back, the first picture, an IDR, {:.0} ms after",
+            first_after(&back[BO], came)
+        );
+        hands[BO].say(&watch(number, false));
+        watched_by(&host, 1);
+        // Past the host's gap between one watcher's IDR asks.
+        listen(&mut hands, Duration::from_millis(600));
+    }
 }

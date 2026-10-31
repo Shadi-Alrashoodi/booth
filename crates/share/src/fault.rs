@@ -3,14 +3,16 @@
 //! test pattern draws no pointer, so a test of how a watcher's viewer draws
 //! the sharer's pointer gives it one, and reads back what each viewer drew
 //! for the pointers it held for their pictures, and what waits for a viewer
-//! in its inbox.
+//! in its inbox. The pattern can also pause as a monitor's capture does
+//! when Windows takes the desktop away, which no test can bring about for
+//! real while it goes on using the desktop.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use capture::{CursorKind, CursorShape, CursorUpdate, Next, Pattern};
+use capture::{CursorKind, CursorShape, CursorUpdate, Next, Pattern, PauseReason};
 use viewer::Cursor;
 
 use crate::Inbox;
@@ -109,8 +111,34 @@ pub fn cursor_waiting(inbox: &Inbox) -> Option<(CursorUpdate, bool, bool)> {
     inbox.cursor_waiting()
 }
 
-// The pattern's next frame or lone pointer while the hook is on.
+// Why the pattern is paused, and whether it said so yet.
+static AWAY: Mutex<Option<(PauseReason, bool)>> = Mutex::new(None);
+
+// How often a monitor's capture tries to get the desktop back while paused.
+const RETRY: Duration = Duration::from_millis(100);
+
+/// From now on the test pattern pauses for `reason` as a monitor's capture
+/// does when Windows takes the desktop away: it says so once, then that
+/// nothing is new every 100 ms, until pattern_away(None) gives its pictures
+/// back.
+pub fn pattern_away(reason: Option<PauseReason>) {
+    *lock(&AWAY) = reason.map(|reason| (reason, false));
+}
+
+// The pattern's pause while it has one, else its next frame or lone pointer
+// while the pointer hook is on.
 pub(crate) fn pattern_next(pattern: &mut Pattern) -> Option<Result<Next, String>> {
+    let away = lock(&AWAY)
+        .as_mut()
+        .map(|(reason, told)| (!std::mem::replace(told, true)).then(|| reason.clone()));
+    match away {
+        Some(Some(reason)) => return Some(Ok(Next::Paused(reason))),
+        Some(None) => {
+            std::thread::sleep(RETRY);
+            return Some(Ok(Next::Idle));
+        }
+        None => {}
+    }
     if !ON.load(Ordering::Acquire) {
         return None;
     }

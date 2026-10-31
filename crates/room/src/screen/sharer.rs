@@ -230,6 +230,10 @@ fn share(
     // share's own look at the desktop, has not answered since.
     let mut unseen = false;
     let mut desktop = window.map(|_| Desktop::new(sharing, log, number));
+    // Paused by hand, as this thread last took it in. The source is let go
+    // while that holds or while a window share's desktop is away, each apart
+    // from the other, and taken up again only when neither does.
+    let mut held = false;
     loop {
         if sharing.closing() {
             break;
@@ -259,8 +263,9 @@ fn share(
         // watchers are told first: nothing of the screen is read from here
         // on, and letting go of the capture and the encoder can take seconds
         // while other work holds the core.
-        if sharing.held() != sharer.held() {
-            if sharing.held() {
+        if sharing.held() != held {
+            held = !held;
+            if held {
                 watchers.hide_pointer();
                 sharing.set_running(sharing.running().map(|running| RunningShare {
                     held: true,
@@ -277,15 +282,25 @@ fn share(
                     "share {number}: paused, nothing of the screen is read until it resumes"
                 );
             } else {
-                sharer.resume(&mut say).map_err(ran)?;
-                let (width, height) = sharer.size();
-                log!(
-                    log,
-                    "share {number}: resumed at {width}x{height} and {} fps",
-                    sharer.fps()
-                );
+                // Nothing looked at the desktop during the pause, and the
+                // lock screen can have come and gone meanwhile, so a window
+                // share looks again first. A window whose desktop is away
+                // stays let go: the look that finds the desktop back takes
+                // it up.
+                if let Some(desktop) = &mut desktop {
+                    desktop.follow(&mut unseen, share::desktop_away);
+                }
+                if !desktop.as_ref().is_some_and(Desktop::away) {
+                    sharer.resume(&mut say).map_err(ran)?;
+                    let (width, height) = sharer.size();
+                    log!(
+                        log,
+                        "share {number}: resumed at {width}x{height} and {} fps",
+                        sharer.fps()
+                    );
+                }
                 sharing.set_running(sharing.running().map(|running| RunningShare {
-                    held: sharer.held(),
+                    held: false,
                     ..running
                 }));
             }
@@ -338,31 +353,62 @@ fn share(
         // yet.
         let nobody =
             applied.is_some_and(|facts| facts.watchers == 0) && !sharing.joining(Instant::now());
-        if sharer.held() || (nobody && !sharing.answers_waiting()) {
+        let rests = held || (nobody && !sharing.answers_waiting());
+        // Before each wait for a picture, up to 100 ms on a still window.
+        // The sound after a rest waits for this look only, and stops at
+        // the next look after the desktop goes, which comes later than
+        // one wait only when the encoder or the capture opens again in
+        // between. A session lost outside the console can take up to
+        // 100 ms more: capture keeps the session manager's answer that
+        // long. The window goes with the sound: it is let go as for a pause
+        // by hand, the watchers told first, and nothing of it goes out, not
+        // even to someone who starts watching, until a look finds the
+        // desktop back and takes it up again with an IDR.
+        if !rests && let Some(desktop) = &mut desktop {
+            desktop.follow(&mut unseen, share::desktop_away);
+            if desktop.away() && !sharer.held() {
+                watchers.hide_pointer();
+                told_state = ShareState::Away;
+                sharing.tell(ShareNews::State {
+                    share: number,
+                    state: ShareState::Away,
+                });
+                sharer.pause();
+            } else if !desktop.away() && sharer.held() {
+                sharer.resume(&mut say).map_err(ran)?;
+                let (width, height) = sharer.size();
+                log!(
+                    log,
+                    "share {number}: resumed at {width}x{height} and {} fps",
+                    sharer.fps()
+                );
+            }
+        }
+        if rests {
             // Nothing looks at the desktop while the share rests, and the
             // lock screen can come up meanwhile: the PC sound waits until
             // the capture, or for a window the share itself, has looked
-            // again.
+            // again, and a monitor's capture looks before a picture it held
+            // from before goes out, however short the rest.
             if nobody && !std::mem::replace(&mut unseen, true) {
                 sharing.set_unseen(number, true);
             }
+            sharer.rested();
             rest.until(sharing, next_second);
             // Nothing reads the window while the share rests, so its closing
             // is looked for here: the share ends as it would have.
             if window.is_some_and(|window| !window.exists()) {
                 return Err(ran(String::from(WINDOW_CLOSED)));
             }
-        } else {
-            // Before each wait for a picture, up to 100 ms on a still window.
-            // The sound after a rest waits for this look only, and stops at
-            // the next look after the desktop goes, which comes later than
-            // one wait only when the encoder or the capture opens again in
-            // between. A session lost outside the console can take up to
-            // 100 ms more: capture keeps the session manager's answer that
-            // long.
-            if let Some(desktop) = &mut desktop {
-                desktop.follow(&mut unseen, share::desktop_away);
+        } else if sharer.held() {
+            // The window's desktop is away: it is looked at again in a
+            // moment, or at once on the room's signal. Nothing reads the
+            // window meanwhile either.
+            rest.until(sharing, next_second.min(Instant::now() + AWAY_LOOK));
+            if window.is_some_and(|window| !window.exists()) {
+                return Err(ran(String::from(WINDOW_CLOSED)));
             }
+        } else {
             let asked = Instant::now();
             let late = sharer.numbers().held;
             sharer.next(&mut watchers).map_err(ran)?;
@@ -402,9 +448,9 @@ fn share(
         }
 
         // The watchers hear why no frames come, from the frame it changed on.
-        let state = if sharer.held() {
+        let state = if held {
             ShareState::Paused
-        } else if sharer.paused() {
+        } else if desktop.as_ref().is_some_and(Desktop::away) || sharer.paused() {
             ShareState::Away
         } else {
             ShareState::Live
@@ -684,9 +730,10 @@ impl FirstPicture {
 
 // A window's capture goes on through the lock screen, a UAC prompt and a
 // disconnected session without a word, where a monitor's pauses, and what
-// the PC plays then is not the sharer's to send. So a window share looks at
-// the desktop itself while it is watched, a few microseconds on this PC's
-// own screen, and while it is away the PC sound stops as on a monitor's
+// the PC shows and plays then is not the sharer's to send. So a window share
+// looks at the desktop itself while it is watched, a few microseconds on
+// this PC's own screen, and while it is away, or Windows cannot say, the
+// share lets go of the window and the PC sound stops, as on a monitor's
 // pause for it, until a look finds the desktop the sharer's again. A
 // minimized window keeps its sound.
 struct Desktop<'a> {
@@ -716,17 +763,17 @@ impl<'a> Desktop<'a> {
             match &away {
                 Some(PauseReason::Disconnected) => log!(
                     self.log,
-                    "share {}: this Windows session is disconnected, so no pc sound goes out until it is back",
+                    "share {}: this Windows session is disconnected, so nothing of the window and no pc sound goes out until it is back",
                     self.number
                 ),
                 Some(PauseReason::Changing(why)) => log!(
                     self.log,
-                    "share {}: {why}, so no pc sound goes out until Windows says it is",
+                    "share {}: {why}, so nothing of the window and no pc sound goes out until Windows says it is",
                     self.number
                 ),
                 Some(_) => log!(
                     self.log,
-                    "share {}: Windows shows another desktop than the window's, such as the lock screen or a UAC prompt, so no pc sound goes out until it is back",
+                    "share {}: Windows shows another desktop than the window's, such as the lock screen or a UAC prompt, so nothing of the window and no pc sound goes out until it is back",
                     self.number
                 ),
                 None => log!(
@@ -741,7 +788,16 @@ impl<'a> Desktop<'a> {
             self.sharing.set_unseen(self.number, false);
         }
     }
+
+    // The last look found the desktop away, or Windows could not say.
+    fn away(&self) -> bool {
+        self.away.is_some()
+    }
 }
+
+// While the desktop is away a window share looks again this often, as often
+// as it looks while it waits for pictures from a still window.
+const AWAY_LOOK: Duration = Duration::from_millis(100);
 
 // While nobody watches, the share's thread waits for the room's signal,
 // which new facts, a new state and the room closing all set, or for the
