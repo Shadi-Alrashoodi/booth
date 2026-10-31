@@ -1668,7 +1668,7 @@ impl Attached {
             return;
         }
         self.pointer = Some(pointer);
-        self.hand_pointer();
+        self.hand_pointer(Some(pointer.with_picture));
     }
 
     fn shape_in(&mut self, id: u32, shape: Shape) {
@@ -1676,15 +1676,17 @@ impl Attached {
             self.shapes.pop_front();
         }
         self.shapes.push_back((id, shape));
-        // A shape that came after the update naming it goes out now.
+        // A shape that came after the update naming it goes out now, on
+        // that update: one the viewer holds for its picture keeps waiting.
         if self.pointer.is_some_and(|pointer| pointer.shape == id) {
-            self.hand_pointer();
+            self.hand_pointer(None);
         }
     }
 
     // The pointer as capture had it, with its shape the first time the
     // viewer can draw it, as capture sends a shape only when it changes.
-    fn hand_pointer(&mut self) {
+    // `with_picture` is None when only its shape is new.
+    fn hand_pointer(&mut self, with_picture: Option<bool>) {
         let Some(pointer) = self.pointer else {
             return;
         };
@@ -1700,13 +1702,17 @@ impl Attached {
             self.scale = f32::from(named.scale_milli) / 1000.0;
             shape = Some(cursor_shape(named));
         }
-        self.inbox.cursor(share::CursorUpdate {
+        let update = share::CursorUpdate {
             x: pointer.x,
             y: pointer.y,
             visible: pointer.visible,
             scale: self.scale,
             shape,
-        });
+        };
+        match with_picture {
+            Some(with_picture) => self.inbox.cursor(update, with_picture),
+            None => self.inbox.shape(update),
+        }
     }
 }
 
@@ -2185,6 +2191,40 @@ mod tests {
         watching.take_shown(Some(1), &mut out);
         assert_eq!(out.len(), MOST_SHOWN);
         assert_eq!(out[0].0, 10);
+    }
+
+    // A shape that comes after the update naming it goes on that update as
+    // it waits in the viewer's inbox, which keeps its mark: the pointer of a
+    // picture stays one, and so does a pointer that moved alone.
+    #[test]
+    fn a_late_shape_goes_on_the_update_it_names() {
+        let wake = Signal::new().expect("create an event");
+        let watching = Watching::new(Clock::new(Instant::now()), wake, true, None, true);
+        let waiting = |inbox: &share::Inbox| {
+            share::fault::cursor_waiting(inbox)
+                .map(|(update, marked, shape_only)| (update.shape.is_some(), marked, shape_only))
+        };
+        for (share, with_picture) in [(1, true), (2, false)] {
+            let name = String::from("Ana");
+            watching.event(WatchEvent::Started {
+                share,
+                fps: 60,
+                name,
+            });
+            let inbox = watching.inbox_for(share).expect("the viewer's inbox");
+            let pointer = Pointer {
+                seq: 1,
+                x: 5,
+                y: 6,
+                visible: true,
+                shape: 7,
+                with_picture,
+            };
+            watching.pointer(share, pointer);
+            assert_eq!(waiting(&inbox), Some((false, with_picture, false)));
+            watching.shape(share, 7, color(1));
+            assert_eq!(waiting(&inbox), Some((true, with_picture, false)));
+        }
     }
 
     fn color(side: u16) -> Shape {

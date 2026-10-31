@@ -217,14 +217,16 @@ fn watch(
             watching.shown(share, &second.window.shown);
             let about = watching.sharer_clock(share).is_some_and(|(_, about)| about);
             let (fps, one_way_ms) = watching.pace(share).unwrap_or((start.fps, None));
+            let viewer = second.numbers;
             let numbers =
                 tally.second(second, about, watching.knob_dropped(share), fps, one_way_ms);
             seconds += 1;
             if seconds.is_multiple_of(LOG_EVERY_SECONDS) {
                 log!(
                     log,
-                    "watch {share}: {seconds} s: {}",
-                    numbers_line(&numbers)
+                    "watch {share}: {seconds} s: {}, {}",
+                    numbers_line(&numbers),
+                    pointer_words(viewer)
                 );
             }
             watching.set_numbers(Some(numbers));
@@ -256,7 +258,7 @@ fn said(log: &Log, share: u32, line: Line) {
 fn summary(numbers: &ViewerNumbers) -> String {
     let reassembly = &numbers.reassembly;
     format!(
-        "{:.0} s: {} frames shown, {} decoded, last in {}, {} codec changes, {} did not decode, {} came whole and {} were lost before the first IDR, {} repaired, {} dropped after it, {} held for an IDR, {} packets, {} lost, {}",
+        "{:.0} s: {} frames shown, {} decoded, last in {}, {} codec changes, {} did not decode, {} came whole and {} were lost before the first IDR, {} repaired, {} dropped after it, {} held for an IDR, {} packets, {} lost, {}, {}",
         numbers.ran.as_secs_f32(),
         numbers.presented,
         numbers.decoded,
@@ -275,6 +277,20 @@ fn summary(numbers: &ViewerNumbers) -> String {
         reassembly.shards_received,
         reassembly.shards_lost,
         share::path_word(numbers.path),
+        pointer_words(numbers),
+    )
+}
+
+// What the viewer did with the sharer's pointer: presents of it alone, and
+// pointers of pictures that waited for one, drawn with a picture or alone
+// once the wait ran out. Only with vsync on does any wait.
+fn pointer_words(numbers: &ViewerNumbers) -> String {
+    format!(
+        "pointer: {} drawn alone, {} with a picture, {} alone after {} ms",
+        numbers.pointer_alone,
+        numbers.pointer_waited,
+        numbers.pointer_ran_out,
+        share::POINTER_HOLD.as_millis()
     )
 }
 

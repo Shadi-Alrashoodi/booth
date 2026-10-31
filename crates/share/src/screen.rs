@@ -8,17 +8,18 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use capture::CursorUpdate;
 use channels::video::{Event, Frame, Reassembler};
 use decode::{Codec, DecodeError, Decoder, GpuTime};
 use encode::Codec as ShareCodec;
 use net::Timer;
 use stats::{Level, Thresholds, TraceSample};
 use viewer::{
-    ControlOut, Cursor, ErrorKind, LinkState, MouseMode, Options, PathWord, PcSound, ShareState,
-    Show, Strip, Video, Viewer,
+    ControlOut, Cursor, ErrorKind, LinkState, MouseMode, Options, PathWord, PcSound, PresentPath,
+    ShareState, Show, Strip, Video, Viewer,
 };
 
-use crate::cursor::pointer;
+use crate::cursor::{self, pointer};
 use crate::inbox::{Control, Inbox};
 use crate::numbers::{ViewerNumbers, end_to_end_level, ms, spread, stage_level};
 use crate::recovery::{Asks, Back};
@@ -31,6 +32,16 @@ const STRIP_EVERY: Duration = Duration::from_millis(250);
 const SECOND: Duration = Duration::from_secs(1);
 // A wait between two frames shown that anyone sees as the picture stopping.
 const STALL: Duration = Duration::from_millis(100);
+// How long the pointer of a picture waits for a picture with vsync on
+// wherever DWM steps aside, rather than a present of its own that puts that
+// picture a refresh later.
+// On a LAN it leads its picture by the encode, the decode and the present,
+// 4 to 5 ms; over the internet the frame's packets also spread over half an
+// interval less 2 ms and the path's jitter falls between the two, 12 to 15
+// ms at worst at 60 fps. An IDR can take longer, and its pointer then shows
+// alone this late, once. About one refresh at 60 Hz: nobody takes it for a
+// stuck pointer, where 50 ms starts to read as one.
+pub const POINTER_HOLD: Duration = Duration::from_millis(20);
 // The largest picture a share sends: in HEVC, to watchers that all take it
 // (Screen::takes_4k). Every other share fits capture's default.
 const FOUR_K: (u32, u32) = (4096, 2160);
@@ -275,6 +286,7 @@ pub struct Screen {
     // LinkNumbers::one_way_ms, 0 when there is none.
     one_way_ms: f32,
     pointer: Option<Cursor>,
+    hold: PointerHold,
     interval: Duration,
     clock: Option<Clock>,
     asks: Asks,
@@ -434,6 +446,150 @@ impl NewDecoders {
     }
 }
 
+// The pointer of a picture, held for a picture with vsync on (POINTER_HOLD),
+// kept apart from the loop so the rule can be tried with plain times. Drawn
+// alone just before its picture it would put that picture a refresh later
+// wherever DWM steps aside. With vsync off a present of the pointer alone
+// was measured to cost the picture nothing, so nothing is held then.
+struct PointerHold {
+    on: bool,
+    // The update held, the newest, and when its wait runs out.
+    held: Option<(CursorUpdate, Instant)>,
+    // A wait ran out and no picture has been presented since. Pictures are
+    // not coming (the first IDR not here yet, frames held for an IDR, a
+    // freeze, a lost share), so the pointers of pictures are drawn at once
+    // until one is, rather than one every POINTER_HOLD.
+    stalled: bool,
+    // The last present was composed by DWM, where a present takes the place
+    // of one not shown yet and a pointer drawn alone costs its picture
+    // nothing: nothing is held then. Unknown (after a resize or F11, or while
+    // Windows says nothing) holds, as the flip path does.
+    composed: bool,
+}
+
+impl PointerHold {
+    fn new(vsync: bool) -> PointerHold {
+        PointerHold {
+            on: vsync,
+            held: None,
+            stalled: false,
+            composed: false,
+        }
+    }
+
+    // What the present path word says after each present.
+    fn path(&mut self, path: Option<PresentPath>) {
+        self.composed = path == Some(PresentPath::Composed);
+        #[cfg(feature = "fault")]
+        if crate::fault::holds_as_flip() {
+            self.composed = false;
+        }
+    }
+
+    // A pointer update taken from the inbox: a shape that came late for the
+    // one before goes on it, anything else as came() says.
+    fn take(
+        &mut self,
+        update: CursorUpdate,
+        with_picture: bool,
+        shape_only: bool,
+        now: Instant,
+    ) -> Option<CursorUpdate> {
+        if shape_only {
+            self.shape(update)
+        } else {
+            self.came(update, with_picture, now)
+        }
+    }
+
+    // The update to draw now, if any: one that moved alone, or any while
+    // holds are off or stalled, the shape of one held kept when it has none.
+    // The pointer of a picture is held instead. A later one takes its place
+    // and keeps its deadline, so pointers that keep coming with no picture
+    // cannot hold the pointer back longer than one wait.
+    fn came(
+        &mut self,
+        update: CursorUpdate,
+        with_picture: bool,
+        now: Instant,
+    ) -> Option<CursorUpdate> {
+        let held = self.held.take();
+        let deadline = held
+            .as_ref()
+            .map_or(now + POINTER_HOLD, |(_, deadline)| *deadline);
+        let update = cursor::newer(held.map(|(held, _)| held), update);
+        if !with_picture || !self.on || self.composed || self.stalled {
+            return Some(update);
+        }
+        self.held = Some((update, deadline));
+        None
+    }
+
+    // The shape of the update taken last, which came after it: on the
+    // update held, which keeps waiting as it was, or to draw now when that
+    // update was drawn already.
+    fn shape(&mut self, update: CursorUpdate) -> Option<CursorUpdate> {
+        match self.held.take() {
+            Some((held, deadline)) => {
+                self.held = Some((cursor::newer(Some(held), update), deadline));
+                None
+            }
+            None => Some(update),
+        }
+    }
+
+    // A present: with a picture, the update held goes with it, any picture
+    // ending the wait, its own or not, and a stall. A present of the still
+    // picture draws the pointer from before and leaves the wait as it was.
+    fn present(&mut self, picture: bool) -> Option<CursorUpdate> {
+        if !picture {
+            return None;
+        }
+        self.stalled = false;
+        self.held.take().map(|(update, _)| update)
+    }
+
+    // The update held once its wait ran out, to draw alone; the pointers of
+    // pictures are drawn at once from then until a picture is presented.
+    fn ran_out(&mut self, now: Instant) -> Option<CursorUpdate> {
+        let (_, deadline) = self.held.as_ref()?;
+        if now < *deadline {
+            return None;
+        }
+        self.stalled = true;
+        self.held.take().map(|(update, _)| update)
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.held.as_ref().map(|(_, deadline)| *deadline)
+    }
+
+    fn held(&self) -> Option<&CursorUpdate> {
+        self.held.as_ref().map(|(update, _)| update)
+    }
+}
+
+// The latest the loop sleeps to: `next`, its next strip update or second,
+// or sooner the first deadline the reassembler, the asks, a new codec's wait
+// or the pointer's has.
+fn next_wake(
+    reassembler: &Reassembler,
+    asks: &Asks,
+    new_decoders: &NewDecoders,
+    hold: &PointerHold,
+    next: Instant,
+) -> Instant {
+    [
+        reassembler.next_deadline(),
+        asks.deadline(),
+        new_decoders.deadline(),
+        hold.deadline(),
+    ]
+    .into_iter()
+    .flatten()
+    .fold(next, Instant::min)
+}
+
 impl Screen {
     // Opens the window and the decoder on the window's device. Nothing is
     // shown until run().
@@ -514,6 +670,7 @@ impl Screen {
             link_loss: false,
             one_way_ms: 0.0,
             pointer: None,
+            hold: PointerHold::new(watch.vsync),
             interval: Duration::from_secs(1) / watch.fps.max(1),
             clock: watch.clock,
             asks: Asks::default(),
@@ -560,14 +717,13 @@ impl Screen {
             if self.inbox.stopped() || self.inbox.closed() || self.viewer.closed() {
                 break;
             }
-            let wake_at = [
-                reassembler.next_deadline(),
-                self.asks.deadline(),
-                self.new_decoders.deadline(),
-            ]
-            .into_iter()
-            .flatten()
-            .fold(next_second.min(next_strip), Instant::min);
+            let wake_at = next_wake(
+                &reassembler,
+                &self.asks,
+                &self.new_decoders,
+                &self.hold,
+                next_second.min(next_strip),
+            );
             self.timer.set_at(wake_at).map_err(|err| err.to_string())?;
             net::pace::wait(self.inbox.signal(), Some(&self.timer))
                 .map_err(|err| err.to_string())?;
@@ -587,10 +743,17 @@ impl Screen {
             if let Some(link) = taken.link {
                 self.set_link(link);
             }
-            // The pointer first, so a frame that came with it shows it.
-            let moved = taken.cursor.is_some();
+            // The pointer first, so a frame that came with it shows it. The
+            // pointer of a picture may wait for a picture instead.
+            let mut moved = false;
             if let Some(update) = taken.cursor {
-                self.pointer = Some(pointer(update, self.pointer.take()));
+                let drawn =
+                    self.hold
+                        .take(update, taken.with_picture, taken.shape_only, Instant::now());
+                if let Some(update) = drawn {
+                    self.pointer = Some(pointer(update, self.pointer.take()));
+                    moved = true;
+                }
             }
             let controlled = taken.control.is_some();
             if let Some(control) = taken.control {
@@ -609,6 +772,13 @@ impl Screen {
             }
             self.after_events(&reassembler, report);
             let now = Instant::now();
+            if let Some(update) = self.hold.ran_out(now) {
+                #[cfg(feature = "fault")]
+                crate::fault::let_go(crate::fault::LetGo::RanOut, &update);
+                self.numbers.pointer_ran_out += 1;
+                self.pointer = Some(pointer(update, self.pointer.take()));
+                moved = true;
+            }
             if now >= next_strip {
                 next_strip = now + STRIP_EVERY;
                 let loss = reassembler.loss(now).percent();
@@ -631,6 +801,9 @@ impl Screen {
                 || self.viewer.needs_redraw()
                 || strip_alone()
             {
+                if moved && !self.shown_this_wake {
+                    self.numbers.pointer_alone += 1;
+                }
                 self.redraw()?;
             }
             if self.viewer.strip_clicked() {
@@ -1005,12 +1178,21 @@ impl Screen {
     // When the present returned, or None when nothing was shown: minimized,
     // or the window closed just now, which the loop sees next.
     fn present(&mut self, video: Option<Video<'_>>) -> Result<Option<Instant>, String> {
+        let picture = video.is_some();
+        if let Some(update) = self.hold.present(picture) {
+            #[cfg(feature = "fault")]
+            crate::fault::let_go(crate::fault::LetGo::Picture, &update);
+            self.numbers.pointer_waited += 1;
+            self.pointer = Some(pointer(update, self.pointer.take()));
+        }
         let presented = self.viewer.present(&viewer::Frame {
             video,
             cursor: self.pointer.as_ref(),
             strip: &self.strip,
         });
         let returned = Instant::now();
+        #[cfg(feature = "fault")]
+        crate::fault::presented(picture, self.pointer.as_ref());
         // The viewer keeps a shape once it has it; it comes again only when
         // it changes.
         if let Some(pointer) = &mut self.pointer {
@@ -1023,6 +1205,7 @@ impl Screen {
                 // present made since, and the log says so then rather than
                 // repeat the word from before.
                 self.numbers.path = presented.path;
+                self.hold.path(presented.path);
                 Ok(presented.shown.then_some(returned))
             }
             Err(err) if err.kind() == ErrorKind::Closed => Ok(None),
@@ -1129,7 +1312,7 @@ impl Screen {
         let mode = self
             .control
             .filter(|_| self.out.is_some())
-            .map(|_| mouse_mode(self.pointer.as_ref()));
+            .map(|_| mouse_mode(&self.hold, self.pointer.as_ref()));
         if mode != self.mode {
             self.mode = mode;
             self.viewer.set_control(mode);
@@ -1137,8 +1320,14 @@ impl Screen {
     }
 }
 
-fn mouse_mode(pointer: Option<&Cursor>) -> MouseMode {
-    if pointer.is_some_and(|pointer| !pointer.visible) {
+// A pointer held for its picture counts at once: what the controller does
+// never waits for a picture.
+fn mouse_mode(hold: &PointerHold, drawn: Option<&Cursor>) -> MouseMode {
+    let visible = hold
+        .held()
+        .map(|update| update.visible)
+        .or(drawn.map(|pointer| pointer.visible));
+    if visible == Some(false) {
         MouseMode::Relative
     } else {
         MouseMode::Absolute
@@ -1390,7 +1579,8 @@ mod tests {
     }
 
     // A game hides the sharer's pointer: raw motion goes. The desktop, and a
-    // share with no pointer at all such as the pattern, get points.
+    // share with no pointer at all such as the pattern, get points. A hide,
+    // or a show, held for its picture counts at once.
     #[test]
     fn raw_mouse_only_while_the_pointer_is_hidden() {
         let shown = Cursor {
@@ -1404,9 +1594,174 @@ mod tests {
             visible: false,
             ..shown.clone()
         };
-        assert_eq!(mouse_mode(None), MouseMode::Absolute);
-        assert_eq!(mouse_mode(Some(&shown)), MouseMode::Absolute);
-        assert_eq!(mouse_mode(Some(&hidden)), MouseMode::Relative);
+        let nothing = PointerHold::new(true);
+        assert_eq!(mouse_mode(&nothing, None), MouseMode::Absolute);
+        assert_eq!(mouse_mode(&nothing, Some(&shown)), MouseMode::Absolute);
+        assert_eq!(mouse_mode(&nothing, Some(&hidden)), MouseMode::Relative);
+        let now = Instant::now();
+        let mut hides = PointerHold::new(true);
+        let hide = CursorUpdate {
+            visible: false,
+            ..at(1)
+        };
+        assert_eq!(hides.came(hide, true, now), None);
+        assert_eq!(mouse_mode(&hides, Some(&shown)), MouseMode::Relative);
+        let mut shows = PointerHold::new(true);
+        assert_eq!(shows.came(at(1), true, now), None);
+        assert_eq!(mouse_mode(&shows, Some(&hidden)), MouseMode::Absolute);
+    }
+
+    fn at(x: i32) -> CursorUpdate {
+        CursorUpdate {
+            x,
+            y: 0,
+            visible: true,
+            scale: 1.0,
+            shape: None,
+        }
+    }
+
+    fn shaped(x: i32) -> CursorUpdate {
+        CursorUpdate {
+            shape: Some(capture::CursorShape {
+                kind: capture::CursorKind::Color,
+                width: 1,
+                height: 1,
+                pitch: 4,
+                hotspot_x: 0,
+                hotspot_y: 0,
+                bytes: vec![255; 4],
+            }),
+            ..at(x)
+        }
+    }
+
+    // With vsync on, the pointer of a picture waits for a picture, its own
+    // or not, or for POINTER_HOLD, and a later one takes its place and keeps
+    // the deadline. After a wait that ran out the next ones are drawn at
+    // once until a picture is presented. One that moved alone, and every one
+    // with vsync off, is drawn at once, and one that moved alone ends a
+    // wait, keeping the shape of the one held.
+    #[test]
+    fn a_marked_pointer_waits_for_its_picture() {
+        let start = Instant::now();
+        let ms = |ms: u64| start + Duration::from_millis(ms);
+        let x = |update: Option<CursorUpdate>| update.map(|update| update.x);
+
+        let mut off = PointerHold::new(false);
+        assert_eq!(x(off.came(at(1), true, ms(0))), Some(1), "vsync off");
+        assert_eq!(off.deadline(), None);
+
+        let mut hold = PointerHold::new(true);
+        assert_eq!(x(hold.came(at(2), false, ms(0))), Some(2), "moved alone");
+        assert_eq!(hold.came(at(3), true, ms(0)), None);
+        assert_eq!(hold.came(at(4), true, ms(5)), None);
+        assert_eq!(hold.deadline(), Some(ms(20)), "the first one's deadline");
+        assert_eq!(hold.held().map(|update| update.x), Some(4));
+        assert_eq!(x(hold.present(true)), Some(4));
+        assert_eq!((hold.deadline(), hold.present(true)), (None, None));
+
+        assert_eq!(hold.came(at(5), true, ms(30)), None);
+        assert_eq!(hold.ran_out(ms(49)), None);
+        assert_eq!(x(hold.ran_out(ms(50))), Some(5));
+        assert_eq!(x(hold.came(at(6), true, ms(55))), Some(6), "stalled");
+        assert_eq!(hold.present(true), None);
+        assert_eq!(hold.came(shaped(7), true, ms(60)), None, "held again");
+        let alone = hold.came(at(8), false, ms(65)).expect("drawn at once");
+        assert_eq!(
+            (alone.x, alone.shape.is_some()),
+            (8, true),
+            "the held shape"
+        );
+        assert_eq!(hold.deadline(), None);
+
+        // A shape that comes after its update: on the update held, which
+        // keeps its deadline and goes with a picture or alone once its wait
+        // runs out, and drawn at once when that update was drawn already.
+        assert_eq!(hold.came(at(9), true, ms(70)), None);
+        assert_eq!(hold.shape(shaped(9)), None);
+        assert_eq!(hold.deadline(), Some(ms(90)));
+        let drawn = hold.present(true).expect("the update held");
+        assert_eq!((drawn.x, drawn.shape.is_some()), (9, true));
+        assert_eq!(hold.came(at(10), true, ms(100)), None);
+        assert_eq!(hold.shape(shaped(10)), None);
+        let alone = hold.ran_out(ms(120)).expect("its wait ran out");
+        assert_eq!((alone.x, alone.shape.is_some()), (10, true));
+        assert_eq!(hold.present(true), None);
+        assert_eq!(hold.came(at(11), true, ms(130)), None);
+        assert_eq!(x(hold.present(true)), Some(11));
+        let late = hold.shape(shaped(11)).expect("drawn at once");
+        assert_eq!((late.x, late.shape.is_some()), (11, true));
+        assert_eq!(hold.deadline(), None);
+    }
+
+    // A present of the still picture leaves a wait and a stall as they were;
+    // a shape that came late goes on the update held and keeps its deadline;
+    // and in a window DWM composes nothing is held, where the flip path, and
+    // a path not known yet, hold.
+    #[test]
+    fn a_hold_ends_only_with_a_picture_and_never_when_composed() {
+        let start = Instant::now();
+        let ms = |ms: u64| start + Duration::from_millis(ms);
+        let x = |update: Option<CursorUpdate>| update.map(|update| update.x);
+
+        let mut hold = PointerHold::new(true);
+        assert_eq!(hold.take(at(1), true, false, ms(0)), None);
+        assert_eq!(hold.present(false), None, "the still picture");
+        assert_eq!(
+            hold.take(shaped(1), false, true, ms(5)),
+            None,
+            "a late shape"
+        );
+        assert_eq!(hold.deadline(), Some(ms(20)));
+        let drawn = hold.ran_out(ms(20)).expect("run out");
+        assert_eq!((drawn.x, drawn.shape.is_some()), (1, true));
+        assert_eq!(hold.present(false), None);
+        assert_eq!(
+            x(hold.take(at(2), true, false, ms(25))),
+            Some(2),
+            "still stalled"
+        );
+        assert_eq!(hold.present(true), None);
+        assert_eq!(
+            hold.take(at(3), true, false, ms(30)),
+            None,
+            "held after a picture"
+        );
+        assert_eq!(x(hold.present(true)), Some(3));
+
+        hold.path(Some(PresentPath::Composed));
+        assert_eq!(
+            x(hold.take(at(4), true, false, ms(40))),
+            Some(4),
+            "composed"
+        );
+        hold.path(None);
+        assert_eq!(hold.take(at(5), true, false, ms(45)), None, "not known");
+        assert_eq!(x(hold.present(true)), Some(5));
+        hold.path(Some(PresentPath::Flip));
+        assert_eq!(hold.take(at(6), true, false, ms(50)), None, "flip");
+    }
+
+    // The loop's own wake with one pointer held and nothing more coming: at
+    // its wait's deadline, not at the next strip update, when the hold hands
+    // the pointer over to be drawn alone, and not a millisecond before.
+    #[test]
+    fn a_held_pointer_wakes_the_loop_at_its_deadline() {
+        let start = Instant::now();
+        let ms = |ms: u64| start + Duration::from_millis(ms);
+        let reassembler = Reassembler::new(Duration::from_secs(1) / 60);
+        let (asks, new_decoders) = (Asks::default(), NewDecoders::default());
+        let strip = ms(250);
+        let wake = |hold: &PointerHold| next_wake(&reassembler, &asks, &new_decoders, hold, strip);
+        let mut hold = PointerHold::new(true);
+        assert_eq!(wake(&hold), strip, "nothing held");
+        assert_eq!(hold.came(at(1), true, ms(0)), None);
+        let woke = wake(&hold);
+        assert_eq!(woke, ms(20));
+        assert_eq!(hold.ran_out(woke - Duration::from_millis(1)), None);
+        assert_eq!(hold.ran_out(woke).map(|update| update.x), Some(1));
+        assert_eq!(wake(&hold), strip, "drawn");
     }
 
     // The caller's link numbers go into the strip, its loss figure in place

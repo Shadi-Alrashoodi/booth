@@ -833,6 +833,12 @@ impl Sharer {
                 if let Some(cursor) = frame.cursor.clone() {
                     audience.cursor(cursor, true);
                 }
+                // A test's picture that never goes out after its pointer, as
+                // one too big to send does.
+                #[cfg(feature = "fault")]
+                if !crate::fault::picture_goes() {
+                    return Ok(());
+                }
                 // Decided before this picture goes out fitted, so it goes
                 // once, to the new encoder, at the window's own size.
                 if let Some(mut own) = self.window_resize(Instant::now())? {

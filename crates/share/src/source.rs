@@ -266,10 +266,16 @@ impl Source {
         match self {
             Source::Screen(capture) => capture.next().map_err(|err| err.to_string()),
             Source::Window(capture) => capture.next().map_err(|err| err.to_string()),
-            Source::Pattern(pattern) => pattern
-                .next()
-                .map(Next::Frame)
-                .map_err(|err| err.to_string()),
+            Source::Pattern(pattern) => {
+                #[cfg(feature = "fault")]
+                if let Some(next) = crate::fault::pattern_next(pattern) {
+                    return next;
+                }
+                pattern
+                    .next()
+                    .map(Next::Frame)
+                    .map_err(|err| err.to_string())
+            }
             Source::Busy(busy) => busy.next().map(Next::Frame),
         }
     }

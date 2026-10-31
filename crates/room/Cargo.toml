@@ -28,6 +28,10 @@ encode = { workspace = true, features = ["fault"] }
 # tests/sound.rs says what a window share's look at the desktop finds, and
 # tests/video.rs holds up a window capture's close.
 capture = { workspace = true, features = ["fault"] }
+# tests/video.rs gives the test pattern a pointer and reads back what each
+# viewer drew it with; src/screen.rs's tests read what waits in a viewer's
+# inbox.
+share = { workspace = true, features = ["fault"] }
 # tests/common/window.rs makes the windows tests/video.rs shares;
 # examples/share_numbers.rs reads a window's bounds from DWM.
 windows = { workspace = true, features = [

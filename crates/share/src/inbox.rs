@@ -34,6 +34,9 @@ struct Waiting {
     packets: VecDeque<Vec<u8>>,
     spare: Vec<Vec<u8>>,
     cursor: Option<CursorUpdate>,
+    // How the update waiting came, as Taken has it.
+    with_picture: bool,
+    shape_only: bool,
     encode_ms: Vec<f32>,
     link: Option<LinkNumbers>,
     fps: Option<u32>,
@@ -60,6 +63,11 @@ pub struct Inbox {
 // What the viewer's thread took at one wake besides the packets.
 pub(crate) struct Taken {
     pub cursor: Option<CursorUpdate>,
+    // The update is the pointer of a picture on its way (Inbox::cursor).
+    pub with_picture: bool,
+    // The update brings only the shape of the one handed before, which the
+    // viewer has taken already (Inbox::shape).
+    pub shape_only: bool,
     pub link: Option<LinkNumbers>,
     pub fps: Option<u32>,
     pub clock: Option<Clock>,
@@ -103,11 +111,29 @@ impl Inbox {
 
     // A pointer update never waits behind video. One the viewer has not
     // taken yet is replaced, but its shape is kept if the new one has none,
-    // since a shape is only sent when it changes.
-    pub fn cursor(&self, update: CursorUpdate) {
+    // since a shape is only sent when it changes. `with_picture`: it is the
+    // pointer of a picture on its way, which a viewer with vsync on draws
+    // with that picture. The newest update's mark is the one taken.
+    pub fn cursor(&self, update: CursorUpdate, with_picture: bool) {
         let mut waiting = self.lock();
         let update = cursor::newer(waiting.cursor.take(), update);
         waiting.cursor = Some(update);
+        waiting.with_picture = with_picture;
+        waiting.shape_only = false;
+        drop(waiting);
+        self.wake.set();
+    }
+
+    // The shape of the update handed last, which came after it. An update
+    // still waiting takes it and keeps its mark; once the viewer has taken
+    // that update the shape goes on its own, so a pointer the viewer holds
+    // for its picture keeps waiting for that picture.
+    pub fn shape(&self, update: CursorUpdate) {
+        let mut waiting = self.lock();
+        let shape_only = waiting.cursor.is_none() || waiting.shape_only;
+        let update = cursor::newer(waiting.cursor.take(), update);
+        waiting.cursor = Some(update);
+        waiting.shape_only = shape_only;
         drop(waiting);
         self.wake.set();
     }
@@ -200,11 +226,22 @@ impl Inbox {
         std::mem::swap(&mut waiting.packets, batch);
         Taken {
             cursor: waiting.cursor.take(),
+            with_picture: std::mem::take(&mut waiting.with_picture),
+            shape_only: std::mem::take(&mut waiting.shape_only),
             link: waiting.link.take(),
             fps: waiting.fps.take(),
             clock: waiting.clock.take(),
             control: waiting.control.take(),
         }
+    }
+
+    // The pointer update waiting, whether it came with its picture and
+    // whether it brings only a shape, for a test through fault.rs.
+    #[cfg(feature = "fault")]
+    pub(crate) fn cursor_waiting(&self) -> Option<(CursorUpdate, bool, bool)> {
+        let waiting = self.lock();
+        let cursor = waiting.cursor.clone()?;
+        Some((cursor, waiting.with_picture, waiting.shape_only))
     }
 
     pub(crate) fn take_encode_ms(&self) -> Vec<f32> {
@@ -253,11 +290,51 @@ mod tests {
     #[test]
     fn a_newer_position_keeps_a_shape_not_taken_yet() {
         let inbox = Inbox::new().unwrap();
-        inbox.cursor(at(1, Some(arrow())));
-        inbox.cursor(at(2, None));
+        inbox.cursor(at(1, Some(arrow())), false);
+        inbox.cursor(at(2, None), false);
         let taken = inbox.take(&mut VecDeque::new()).cursor.unwrap();
         assert_eq!((taken.x, taken.shape), (2, Some(arrow())));
         assert!(inbox.take(&mut VecDeque::new()).cursor.is_none());
+    }
+
+    // Whether an update came with a picture is the newest one's mark,
+    // whichever came first.
+    #[test]
+    fn the_newest_updates_mark_is_taken() {
+        let inbox = Inbox::new().unwrap();
+        for (first, then) in [(true, false), (false, true)] {
+            inbox.cursor(at(1, None), first);
+            inbox.cursor(at(2, None), then);
+            let taken = inbox.take(&mut VecDeque::new());
+            assert_eq!(
+                (taken.cursor.map(|update| update.x), taken.with_picture),
+                (Some(2), then)
+            );
+            assert!(!taken.shape_only);
+        }
+    }
+
+    // A shape that comes after its update goes on that update while it
+    // waits, which keeps its mark, and on its own once the viewer took it;
+    // a newer update then takes the shape and is a position again.
+    #[test]
+    fn a_late_shape_keeps_the_mark_of_its_update() {
+        let inbox = Inbox::new().unwrap();
+        let taken = |inbox: &Inbox| {
+            let taken = inbox.take(&mut VecDeque::new());
+            let cursor = taken
+                .cursor
+                .map(|update| (update.x, update.shape.is_some()));
+            (cursor, taken.with_picture, taken.shape_only)
+        };
+        inbox.cursor(at(1, None), true);
+        inbox.shape(at(1, Some(arrow())));
+        assert_eq!(taken(&inbox), (Some((1, true)), true, false), "waiting");
+        inbox.shape(at(1, Some(arrow())));
+        assert_eq!(taken(&inbox), (Some((1, true)), false, true), "taken");
+        inbox.shape(at(1, Some(arrow())));
+        inbox.cursor(at(2, None), true);
+        assert_eq!(taken(&inbox), (Some((2, true)), true, false), "newer");
     }
 
     #[test]

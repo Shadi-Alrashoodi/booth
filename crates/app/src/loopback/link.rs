@@ -80,8 +80,8 @@ impl<'a> SharerEnd<'a> {
 }
 
 impl Audience for SharerEnd<'_> {
-    fn cursor(&mut self, update: CursorUpdate, _: bool) {
-        self.link.inbox.cursor(update);
+    fn cursor(&mut self, update: CursorUpdate, with_picture: bool) {
+        self.link.inbox.cursor(update, with_picture);
     }
 
     fn back(&mut self, into: &mut Vec<Back>) {

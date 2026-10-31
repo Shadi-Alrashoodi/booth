@@ -18,6 +18,13 @@ stats.workspace = true
 # last frame before the screen goes still is not held up to 15 ms longer.
 windows-sys = { workspace = true, features = ["Win32_Media"] }
 
+[features]
+# Tests only (room's tests turn it on): src/fault.rs, which gives the test
+# pattern a pointer that moves with its pictures, holds some pictures back,
+# keeps what a viewer drew for the pointers it held, and reads what waits in
+# a viewer's inbox. A release build never has it.
+fault = []
+
 [dev-dependencies]
 # tests/sharer.rs makes the encoders stall and fail.
 encode = { workspace = true, features = ["fault"] }

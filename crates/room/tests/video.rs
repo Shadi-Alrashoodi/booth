@@ -24,6 +24,7 @@ use room::view::{
     Codec, LineKind, LinkState, OwnShare, Paused, ShareState, SharingNumbers, View, WatchingNumbers,
 };
 use room::{Config, Devices, LossKnob, Show, VideoConfig, VideoSource};
+use share::fault::LetGo;
 use voice::audio::fake::Fake;
 use windows::Win32::UI::WindowsAndMessaging::{SW_MINIMIZE, SW_RESTORE, WS_OVERLAPPEDWINDOW};
 
@@ -1314,6 +1315,162 @@ fn watchers_hear_that_the_share_is_paused() {
     host.wait_for(WAIT, "the host hearing it is live again", |v| {
         v.share.watched_state == ShareState::Live
     });
+}
+
+// The test pattern's pointer (share::fault), on for one test and off again
+// however it ends.
+struct PatternPointer;
+
+impl PatternPointer {
+    fn on() -> PatternPointer {
+        share::fault::pattern_pointer(true);
+        PatternPointer
+    }
+}
+
+impl Drop for PatternPointer {
+    fn drop(&mut self) {
+        share::fault::pattern_pointer(false);
+    }
+}
+
+// What a viewer's "over" line in its log says of the frames it showed and
+// of the sharer's pointer: drawn alone, drawn with a picture after waiting
+// for one, and drawn alone once that wait ran out.
+#[derive(Debug)]
+struct Drawn {
+    shown: u64,
+    alone: u64,
+    waited: u64,
+    ran_out: u64,
+}
+
+fn drawn(log: &str) -> Drawn {
+    let line = log
+        .lines()
+        .find(|line| line.contains(": over, "))
+        .unwrap_or_else(|| panic!("no over line in {log}"));
+    let before = |words: &str| -> u64 {
+        let end = line
+            .find(words)
+            .unwrap_or_else(|| panic!("no {words:?} in {line}"));
+        line[..end]
+            .rsplit(' ')
+            .next()
+            .and_then(|number| number.parse().ok())
+            .unwrap_or_else(|| panic!("no number before {words:?} in {line}"))
+    };
+    Drawn {
+        shown: before(" frames shown"),
+        alone: before(" drawn alone"),
+        waited: before(" with a picture"),
+        ran_out: before(" alone after"),
+    }
+}
+
+// The pointer of each picture is marked, and a watcher's viewer with vsync
+// on draws it with a picture instead of presenting it alone first, as a
+// watcher standing for 1.2.0 still does. The pattern's pointer moves with
+// every picture; every fourth goes alone, as capture's fps cap sends one,
+// and now and then two pictures never go out, so a held pointer's wait runs
+// out. Besides the counts in each viewer's log, what Bo's viewer drew for
+// each pointer it let go is read back: the pointer it held, with the picture
+// it waited for, or alone once the wait ran out.
+#[test]
+fn a_frames_pointer_is_drawn_with_its_picture() {
+    let _turn = turn();
+    if !ready() {
+        return;
+    }
+    let reads = invite::Version {
+        major: 1,
+        minor: 3,
+        patch: 0,
+    };
+    let older = invite::Version {
+        major: 1,
+        minor: 2,
+        patch: 0,
+    };
+    let _pointer = PatternPointer::on();
+    let config = |name, version, vsync| {
+        let video = VideoConfig {
+            vsync,
+            ..pattern(None)
+        };
+        let mut config = config_with(name, video, room::DEFAULT_VIDEO_UPLOAD_KBPS);
+        config.version = version;
+        config
+    };
+    let (bo_log, cy_log) = (
+        fresh_log("video", "marking", "bo"),
+        fresh_log("video", "marking", "cy"),
+    );
+    let mut bo_config = config("Bo", reads, true);
+    bo_config.log = Some(bo_log.clone());
+    let mut cy_config = config("Cy", older, true);
+    cy_config.log = Some(cy_log.clone());
+    let (host, friends) = room_of(
+        config("Mara", reads, false),
+        vec![config("Ana", reads, false), bo_config, cy_config],
+    );
+    let (ana, bo, cy) = (&friends[0], &friends[1], &friends[2]);
+    let bad = |member: &Member| member.view().numbers.dropped_bad;
+    let (mara_bad, cy_bad) = (bad(&host), bad(cy));
+    let number = shares(ana, 60);
+    watches(bo, number);
+    watches(cy, number);
+    thread::sleep(Duration::from_secs(3));
+    for member in [bo, cy] {
+        member.room().watch(number, false);
+        member.wait_for(WAIT, "the viewer closed", |v| !v.share.viewer_open);
+    }
+    let (mara_bad, cy_bad) = (bad(&host) - mara_bad, bad(cy) - cy_bad);
+    let released = share::fault::released();
+    drop(friends);
+    drop(host);
+    let (bo, cy) = (drawn(&read_log(&bo_log)), drawn(&read_log(&cy_log)));
+    let of = |count: u64, shown: u64| count as f64 / shown.max(1) as f64;
+    let by = |how| released.iter().filter(|r| r.by == how).count() as u64;
+    let (pictures, ran_out) = (by(LetGo::Picture), by(LetGo::RanOut));
+    println!(
+        "Bo (1.3.0, vsync on): {} frames shown, pointer {} drawn alone ({:.2}), {} with a picture ({:.2}), {} alone after 20 ms",
+        bo.shown,
+        bo.alone,
+        of(bo.alone, bo.shown),
+        bo.waited,
+        of(bo.waited, bo.shown),
+        bo.ran_out
+    );
+    println!(
+        "Cy (standing for 1.2.0, vsync on): {} frames shown, pointer {} drawn alone ({:.2}), {} with a picture, {} alone after 20 ms",
+        cy.shown,
+        cy.alone,
+        of(cy.alone, cy.shown),
+        cy.waited,
+        cy.ran_out
+    );
+    println!(
+        "Bo's viewer let go of {pictures} pointers with a picture and {ran_out} alone; bad packets while it ran: Mara {mara_bad}, Cy {cy_bad}"
+    );
+    assert!(of(bo.waited, bo.shown) >= 0.6, "{bo:?}");
+    assert!((0.15..=0.45).contains(&of(bo.alone, bo.shown)), "{bo:?}");
+    assert!((1..=8).contains(&bo.ran_out), "{bo:?}");
+    assert_eq!((cy.waited, cy.ran_out), (0, 0), "{cy:?}");
+    assert!(of(cy.alone, cy.shown) >= 0.8, "{cy:?}");
+    assert_eq!((mara_bad, cy_bad), (0, 0));
+    // Only Bo's viewer holds pointers. Each one it let go was drawn as it
+    // was held, at the present that came next: one with a picture when a
+    // picture let it go, one alone when its wait ran out.
+    assert_eq!((pictures, ran_out), (bo.waited, bo.ran_out), "{released:?}");
+    for pair in released.windows(2) {
+        assert_ne!(pair[0].held.x, pair[1].held.x, "{pair:?}");
+    }
+    for release in &released {
+        assert_eq!(release.drawn, Some(release.held), "{release:?}");
+        assert_eq!(release.picture, release.by == LetGo::Picture, "{release:?}");
+        assert_eq!(release.held.y, 200, "{release:?}");
+    }
 }
 
 // The screen, for the tests that share a window they make.
