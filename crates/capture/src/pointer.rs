@@ -34,8 +34,8 @@ pub(crate) const POINTER_EVERY: Duration = Duration::from_millis(4);
 // Each update is one datagram, so the last one is said once more this long
 // after it, and a hidden pointer again every HIDDEN_AGAIN: a lost one would
 // leave a pointer drawn on a picture it left.
-const AGAIN_AFTER: Duration = Duration::from_millis(100);
-const HIDDEN_AGAIN: Duration = Duration::from_secs(1);
+pub(crate) const AGAIN_AFTER: Duration = Duration::from_millis(100);
+pub(crate) const HIDDEN_AGAIN: Duration = Duration::from_secs(1);
 // The shape goes again for a new scale only once the scale held this long:
 // each step of a window being dragged has its own, and shapes are big.
 const SCALE_SETTLES: Duration = Duration::from_millis(200);

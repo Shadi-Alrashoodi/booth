@@ -97,7 +97,8 @@ pub struct Frame {
 #[derive(Clone, Debug)]
 pub enum Next {
     Frame(Frame),
-    // The pointer moved or changed shape and the picture did not.
+    // The pointer moved or changed shape and the picture did not, or a hidden
+    // pointer is said again.
     Cursor(CursorUpdate),
     // No new picture for the frame loop's whole wait, 100 ms: the screen is
     // still.

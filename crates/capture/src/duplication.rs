@@ -29,6 +29,7 @@ use crate::device;
 use crate::error::{CaptureError, ErrorKind, is_device_lost, meaning};
 use crate::missing::{Missed, Missing};
 use crate::monitors::{Monitor, Rotation, describe_output, find};
+use crate::pointer::{AGAIN_AFTER, HIDDEN_AGAIN};
 use crate::{CursorKind, CursorShape, CursorUpdate, Frame, Next, Options, PauseReason};
 
 // How long next() waits for a change before it answers Idle, and how often
@@ -101,6 +102,7 @@ pub struct Capture {
     // A region share's region, with the upright size of the monitor it was
     // drawn on: it holds for that mode only.
     region: Option<(Region, (u32, u32))>,
+    region_pointer: RegionPointer,
     qpc_frequency: i64,
     // Tests make Windows refuse the desktop with this, and a look at it find
     // it away, since only the user can bring up the secure desktop, and
@@ -121,6 +123,84 @@ struct Pending {
     converted: Instant,
     accumulated: u32,
     protected: bool,
+}
+
+// What a region share says of its pointer. As for a window (pointer.rs), a
+// pointer that does not show in the picture is only hidden, at the last place
+// it showed: nothing goes out of where it is or what shape it takes elsewhere
+// on the monitor.
+#[derive(Default)]
+struct RegionPointer {
+    // In desktop pixels from the region's corner, so it holds at any scale.
+    shown: (i32, i32),
+    // Windows hands a new shape over only once, so one that comes while the
+    // pointer does not show waits here until it does.
+    shape: Option<CursorShape>,
+    // While hidden, when that is said again: each update is one datagram, and
+    // a lost one would leave a pointer drawn on a picture it left. None while
+    // the pointer shows.
+    again_at: Option<Instant>,
+}
+
+impl RegionPointer {
+    // `shows`: Windows says the pointer is visible and it points inside the
+    // region.
+    fn update(
+        &mut self,
+        at: (i32, i32),
+        shows: bool,
+        shape: Option<CursorShape>,
+        scale: (f32, f32),
+        now: Instant,
+    ) -> Option<CursorUpdate> {
+        if shape.is_some() {
+            self.shape = shape;
+        }
+        if !shows {
+            let due = self.again_at.is_none_or(|at| now >= at);
+            return due.then(|| self.hidden(scale, now));
+        }
+        self.shown = at;
+        self.again_at = None;
+        Some(cursor_at(at, scale, true, self.shape.take()))
+    }
+
+    // Windows has nothing new to say of the pointer.
+    fn again(&mut self, scale: (f32, f32), now: Instant) -> Option<CursorUpdate> {
+        let due = self.again_at.is_some_and(|at| now >= at);
+        due.then(|| self.hidden(scale, now))
+    }
+
+    fn hidden(&mut self, scale: (f32, f32), now: Instant) -> CursorUpdate {
+        let wait = match self.again_at {
+            Some(_) => HIDDEN_AGAIN,
+            None => AGAIN_AFTER,
+        };
+        self.again_at = Some(now + wait);
+        cursor_at(self.shown, scale, false, None)
+    }
+
+    // The room hides the pointer for a pause, saying nothing of where it was,
+    // and nothing here undoes that before the next picture.
+    fn paused(&mut self) {
+        self.again_at = None;
+    }
+}
+
+// `at` is in desktop pixels from the top left of what is shared.
+fn cursor_at(
+    (x, y): (i32, i32),
+    (scale_x, scale_y): (f32, f32),
+    visible: bool,
+    shape: Option<CursorShape>,
+) -> CursorUpdate {
+    CursorUpdate {
+        x: (x as f32 * scale_x).round() as i32,
+        y: (y as f32 * scale_y).round() as i32,
+        visible,
+        scale: scale_x,
+        shape,
+    }
 }
 
 enum Acquired {
@@ -223,6 +303,7 @@ impl Capture {
             pointer: (0, 0, false),
             hotspot: (0, 0),
             region,
+            region_pointer: RegionPointer::default(),
             qpc_frequency: qpc_frequency.max(1),
             #[cfg(test)]
             refuse: None,
@@ -292,6 +373,7 @@ impl Capture {
                         return Ok(Next::Idle);
                     }
                     self.paused = Some(reason.clone());
+                    self.region_pointer.paused();
                     return Ok(Next::Paused(reason));
                 }
                 self.paused = None;
@@ -335,6 +417,11 @@ impl Capture {
                 .max(1) as u32;
             match self.acquire(timeout)? {
                 Acquired::Timeout => {
+                    // A pointer parked outside a region brings no frames.
+                    let scale = self.layout.plan.scale();
+                    if let Some(update) = self.region_pointer.again(scale, Instant::now()) {
+                        return Ok(Next::Cursor(update));
+                    }
                     if self.pending.is_none() && Instant::now() >= idle_at {
                         return Ok(Next::Idle);
                     }
@@ -659,26 +746,23 @@ impl Capture {
         if let Some(shape) = &shape {
             self.hotspot = (shape.hotspot_x, shape.hotspot_y);
         }
-        if !moved && shape.is_none() && !resized {
-            return Ok(None);
-        }
         let plan = self.layout.plan;
-        let (scale_x, scale_y) = plan.scale();
+        let scale = plan.scale();
+        if !moved && shape.is_none() && !resized {
+            return Ok(self.region_pointer.again(scale, Instant::now()));
+        }
         let (x, y, visible) = self.pointer;
         let (x, y) = (x - plan.crop.0 as i32, y - plan.crop.1 as i32);
+        if self.region.is_none() {
+            return Ok(Some(cursor_at((x, y), scale, visible, shape)));
+        }
         // A region shows the pointer only while it points inside it.
-        let inside = self.region.is_none() || {
-            let (hotspot_x, hotspot_y) = (x + self.hotspot.0, y + self.hotspot.1);
-            (0..plan.upright_width as i32).contains(&hotspot_x)
-                && (0..plan.upright_height as i32).contains(&hotspot_y)
-        };
-        Ok(Some(CursorUpdate {
-            x: (x as f32 * scale_x).round() as i32,
-            y: (y as f32 * scale_y).round() as i32,
-            visible: visible && inside,
-            scale: scale_x,
-            shape,
-        }))
+        let (hotspot_x, hotspot_y) = (x + self.hotspot.0, y + self.hotspot.1);
+        let inside = (0..plan.upright_width as i32).contains(&hotspot_x)
+            && (0..plan.upright_height as i32).contains(&hotspot_y);
+        Ok(self
+            .region_pointer
+            .update((x, y), visible && inside, shape, scale, Instant::now()))
     }
 
     // The pointer's shape is not desktop content; the viewer draws it.
@@ -1268,9 +1352,98 @@ mod tests {
         assert!(turned.is_err_and(|err| err.to_string().contains("Share the region again")));
     }
 
+    // Hidden: once at the last place shown, never where it is now, and again
+    // a moment later and then every second, for a lost datagram. A shape
+    // waits for a pointer that shows, the newest one only.
+    #[test]
+    fn a_region_says_nothing_of_a_pointer_outside_it() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let shape = |width: u32| CursorShape {
+            kind: CursorKind::Color,
+            width,
+            height: 2,
+            pitch: 8,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            bytes: vec![255; 16],
+        };
+        let scale = (0.5, 0.5);
+        let hidden_at = |x, y| CursorUpdate {
+            x,
+            y,
+            visible: false,
+            scale: 0.5,
+            shape: None,
+        };
+        let mut pointer = RegionPointer::default();
+        // Nothing shown yet, and a pointer watchers may still have from
+        // before is cleared.
+        assert_eq!(
+            pointer.update((900, 700), false, Some(shape(2)), scale, at(0)),
+            Some(hidden_at(0, 0))
+        );
+        assert_eq!(pointer.update((901, 700), false, None, scale, at(10)), None);
+        // A newer shape takes the place of the one waiting.
+        let newest = pointer.update((902, 700), false, Some(shape(3)), scale, at(20));
+        assert_eq!(newest, None);
+        let shown = pointer
+            .update((100, 60), true, None, scale, at(30))
+            .unwrap();
+        assert_eq!((shown.x, shown.y, shown.visible), (50, 30, true));
+        assert_eq!(shown.shape, Some(shape(3)));
+        let moved = pointer
+            .update((110, 60), true, None, scale, at(40))
+            .unwrap();
+        assert_eq!((moved.x, moved.y, moved.visible), (55, 30, true));
+        assert_eq!(moved.shape, None);
+        assert_eq!(pointer.again(scale, at(5000)), None);
+
+        // Leaves: at once, then by what Windows brings or by nothing at all.
+        assert_eq!(
+            pointer.update((-300, 900), false, None, scale, at(1000)),
+            Some(hidden_at(55, 30))
+        );
+        assert_eq!(
+            pointer.update((-301, 900), false, None, scale, at(1050)),
+            None
+        );
+        assert_eq!(pointer.again(scale, at(1099)), None);
+        assert_eq!(pointer.again(scale, at(1100)), Some(hidden_at(55, 30)));
+        assert_eq!(pointer.again(scale, at(2099)), None);
+        assert_eq!(
+            pointer.update((-302, 900), false, None, scale, at(2100)),
+            Some(hidden_at(55, 30))
+        );
+        assert_eq!(
+            pointer.update((-303, 900), false, None, scale, at(3099)),
+            None
+        );
+        // At the scale the pictures have now.
+        let halved = pointer.again((0.25, 0.25), at(3100)).unwrap();
+        assert_eq!((halved.x, halved.y, halved.visible), (28, 15, false));
+
+        // Back and out again: hidden at once, at the newer place.
+        let back = pointer
+            .update((20, 40), true, None, scale, at(3200))
+            .unwrap();
+        assert!(back.visible && back.shape.is_none());
+        let gone = pointer.update((700, 40), false, None, scale, at(3210));
+        assert_eq!(gone, Some(hidden_at(10, 20)));
+
+        // A pause was told: not said again until Windows says something.
+        pointer.paused();
+        assert_eq!(pointer.again(scale, at(9000)), None);
+        assert_eq!(
+            pointer.update((701, 40), false, None, scale, at(9010)),
+            Some(hidden_at(10, 20))
+        );
+    }
+
     // A region share's pictures are the region's size, its pointer is in
-    // the region's own pixels and hidden while it points outside, and a mode
-    // other than the one the region was drawn on ends it.
+    // the region's own pixels and hidden while it points outside, at the last
+    // place it showed, and a mode other than the one the region was drawn on
+    // ends it.
     #[test]
     fn a_region_has_its_own_size_and_pointer() {
         let _turn = desktop_turn();
@@ -1299,26 +1472,80 @@ mod tests {
         let duplication = capture.duplication.clone().unwrap();
         let still = DXGI_OUTDUPL_FRAME_INFO::default();
         capture.hotspot = (4, 4);
-        for (at, seen) in [
-            ((300, 150), Some((100, 50))),
-            ((196, 150), Some((-4, 50))),
-            ((195, 150), None),
-            ((835, 455), Some((635, 355))),
-            ((836, 150), None),
+        for (at, windows_says, seen, visible) in [
+            ((300, 150), true, (100, 50), true),
+            ((400, 150), false, (100, 50), false),
+            ((196, 150), true, (-4, 50), true),
+            ((195, 150), true, (-4, 50), false),
+            ((835, 455), true, (635, 355), true),
+            ((836, 150), true, (635, 355), false),
         ] {
-            capture.pointer = (at.0, at.1, true);
+            capture.pointer = (at.0, at.1, windows_says);
             let update = capture
                 .cursor_update(&still, &duplication, true)
                 .unwrap()
                 .unwrap();
-            match seen {
-                Some(seen) => {
-                    assert!(update.visible, "{at:?}");
-                    assert_eq!((update.x, update.y), seen, "{at:?}");
-                }
-                None => assert!(!update.visible, "{at:?}"),
-            }
+            assert_eq!(update.visible, visible, "{at:?}");
+            assert_eq!((update.x, update.y), seen, "{at:?}");
         }
+        // A further move outside says nothing, unless the time to say hidden
+        // again came just then, and then not where it went.
+        let mut moved = DXGI_OUTDUPL_FRAME_INFO {
+            LastMouseUpdateTime: 1,
+            ..Default::default()
+        };
+        moved.PointerPosition.Position.x = 900;
+        moved.PointerPosition.Position.y = 150;
+        moved.PointerPosition.Visible = true.into();
+        let update = capture.cursor_update(&moved, &duplication, false).unwrap();
+        assert!(
+            update.is_none_or(|update| (update.x, update.y, update.visible) == (635, 355, false))
+        );
+        // Pictures that say nothing of the pointer, as under a video, bring
+        // it when it is due and not before.
+        capture.region_pointer.again_at = Some(Instant::now());
+        let again = capture
+            .cursor_update(&still, &duplication, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!((again.x, again.y, again.visible), (635, 355, false));
+        capture.region_pointer.again_at = Some(Instant::now() + Duration::from_secs(60));
+        let early = capture.cursor_update(&still, &duplication, false).unwrap();
+        assert_eq!(early, None);
+        // Windows brings nothing for a pointer parked outside, and it is said
+        // again all the same.
+        capture.region_pointer.again_at = Some(Instant::now());
+        let again = loop {
+            match capture.next().unwrap() {
+                Next::Cursor(update) => break update,
+                Next::Frame(frame) => {
+                    if let Some(update) = frame.cursor {
+                        break update;
+                    }
+                }
+                other => panic!("{other:?} with hidden due to be said again"),
+            }
+        };
+        // Unless the real pointer came into the region just now.
+        if !again.visible {
+            assert_eq!((again.x, again.y), (635, 355));
+        }
+        // A loss that reopens at once tells no pause, so the room hides nothing
+        // and hidden is still said again.
+        let due = Some(Instant::now() + Duration::from_secs(60));
+        capture.region_pointer.again_at = due;
+        drop(duplication);
+        capture.lose();
+        assert_eq!(capture.reopen().unwrap(), None);
+        assert_eq!(capture.region_pointer.again_at, due);
+        // A told pause is another matter: the room hid it.
+        capture.refuse = Some(PauseReason::SecureDesktop);
+        capture.lose();
+        assert!(matches!(
+            capture.next().unwrap(),
+            Next::Paused(PauseReason::SecureDesktop)
+        ));
+        assert_eq!(capture.region_pointer.again_at, None);
         let options = Options::default();
         let (width, height) = (monitor.width, monitor.height);
         let name = "the monitor";
