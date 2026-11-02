@@ -762,7 +762,10 @@ fn lifetime_row(ui: &mut Ui, multi_use: bool) -> bool {
         |ui| {
             controls::one_line(ui, "Invite", theme::section(), CHALK);
         },
-        |ui| pressed = toggle.show(ui).clicked(),
+        |ui| {
+            let response = toggle.show(ui);
+            pressed = controls::fresh_click(ui, &response);
+        },
     );
     pressed
 }
@@ -1757,7 +1760,8 @@ fn voice_buttons(
                 // A toggle that is on keeps the control fill, so a muted
                 // microphone shows without reading the word.
                 let on = if mute { voice.muted } else { voice.deafened };
-                if button.on(on).enabled(!ended).show(ui).clicked() && !ended {
+                let response = button.on(on).enabled(!ended).show(ui);
+                if controls::fresh_click(ui, &response) && !ended {
                     pressed = Some(if mute {
                         VoicePress::Mute
                     } else {
@@ -3340,6 +3344,41 @@ mod tests {
         let ((held, got), _) = buttons_frame(&ctx, true, release(at));
         assert!(!held);
         assert_eq!(got, Some(VoicePress::Mute));
+    }
+
+    // Tab that many times, then press Space or Enter and keep it down: one
+    // press, and another only after it comes up. Each repeat counted, a held
+    // key would leave the microphone or the invite on whichever came last.
+    fn key_held_presses_once(tabs: usize, draw: impl Fn(&Context, Vec<Event>) -> bool) {
+        for held in [Key::Space, Key::Enter] {
+            let ctx = Context::default();
+            theme::apply(&ctx);
+            draw(&ctx, Vec::new());
+            for _ in 0..tabs {
+                let tab = vec![key_event(Key::Tab, true), key_event(Key::Tab, false)];
+                draw(&ctx, tab);
+            }
+            assert!(draw(&ctx, vec![key_event(held, true)]), "{held:?} pressed");
+            for _ in 0..3 {
+                assert!(!draw(&ctx, vec![key_event(held, true)]), "{held:?} repeats");
+            }
+            draw(&ctx, vec![key_event(held, false)]);
+            assert!(draw(&ctx, vec![key_event(held, true)]), "{held:?} again");
+        }
+    }
+
+    #[test]
+    fn a_key_held_on_the_lifetime_toggle_or_a_voice_button_presses_once() {
+        use crate::controls::tests::frame;
+        key_held_presses_once(1, |ctx, events| {
+            frame(ctx, events, |ui| lifetime_row(ui, false)).0
+        });
+        key_held_presses_once(1, |ctx, events| {
+            buttons_frame(ctx, false, events).0.1 == Some(VoicePress::Mute)
+        });
+        key_held_presses_once(2, |ctx, events| {
+            buttons_frame(ctx, false, events).0.1 == Some(VoicePress::Deafen)
+        });
     }
 
     // Tabbed to Mute, the keyboard stays on it when Hold to talk goes from

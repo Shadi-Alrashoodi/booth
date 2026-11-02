@@ -94,32 +94,35 @@ pub fn buttons(ui: &mut Ui, buttons: &[Button], height: f32) -> Option<usize> {
             // still hand them the click of a press made then.
             let began_off = aimed(ui, &response, drawn).off_limits;
             let pointer = response.clicked_by(PointerButton::Primary);
-            // egui takes each repeat of Space or Enter for a click too, so a
-            // key held down while they waited would press them once they no
-            // longer do: from the keys, only a fresh press counts.
-            let reader = ui.input(|input| {
-                input.has_accesskit_action_request(response.id, accesskit::Action::Click)
-            });
-            let fresh_key = ui.input(|input| {
-                input.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        Event::Key {
-                            key: Key::Space | Key::Enter,
-                            pressed: true,
-                            repeat: false,
-                            ..
-                        }
-                    )
-                })
-            });
-            let held_key = !pointer && !reader && !fresh_key;
-            if response.clicked() && button.enabled && !(pointer && began_off) && !held_key {
+            if fresh_click(ui, &response) && button.enabled && !(pointer && began_off) {
                 pressed = Some(i);
             }
         }
     });
     pressed
+}
+
+// egui takes each repeat of Space or Enter for a click too, so a key held down
+// would press a button over and over, or press one that waited once it no
+// longer does: from the keys, only a fresh press counts.
+pub fn fresh_click(ui: &Ui, response: &Response) -> bool {
+    let pointer = response.clicked_by(PointerButton::Primary);
+    let reader =
+        ui.input(|input| input.has_accesskit_action_request(response.id, accesskit::Action::Click));
+    let fresh_key = ui.input(|input| {
+        input.events.iter().any(|event| {
+            matches!(
+                event,
+                Event::Key {
+                    key: Key::Space | Key::Enter,
+                    pressed: true,
+                    repeat: false,
+                    ..
+                }
+            )
+        })
+    });
+    response.clicked() && (pointer || reader || fresh_key)
 }
 
 // One row with a name on the left and one thing `right_width` wide at the
