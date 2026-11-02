@@ -975,6 +975,28 @@ fn mark_highlighted_on_its_letter() {
     assert!(covers(&highlight(row)[0], &row.glyphs[0]));
 }
 
+// Plex builds ḥ from two glyphs, so End puts the caret a place past the last
+// char. Nothing is left to delete there, and this used to panic and end the
+// app; a step by a word stays where it is too.
+#[test]
+fn word_keys_past_the_last_char() {
+    let ctx = Context::default();
+    theme::apply(&ctx);
+    let mut draft = String::from("\u{1E25}asan");
+    composer(&ctx, &mut draft, Vec::new(), Modifiers::NONE);
+    let to_end = vec![key(Key::End, Modifiers::NONE)];
+    let (response, _, _) = composer(&ctx, &mut draft, to_end, Modifiers::NONE);
+    assert_eq!(caret(&ctx, &response), 6);
+    for modifiers in [Modifiers::CTRL, Modifiers::ALT] {
+        for pressed in [Key::Delete, Key::ArrowRight] {
+            let (response, _, _) =
+                composer(&ctx, &mut draft, vec![key(pressed, modifiers)], modifiers);
+            assert_eq!(draft, "\u{1E25}asan");
+            assert_eq!(caret(&ctx, &response), 6, "{pressed:?} {modifiers:?}");
+        }
+    }
+}
+
 // What a friend can send: any mix of Arabic, Hebrew, Latin, digits,
 // brackets, combining marks, joiners, emoji and control characters, and
 // now and then any character at all.

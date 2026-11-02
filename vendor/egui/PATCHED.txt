@@ -63,6 +63,16 @@ Changed in src/text_selection/text_cursor_state.rs
   such as U+01E9, gives the galley one more cursor place than the text
   has chars, and a double click or Ctrl+Left there underflowed, which a
   debug build stops on.
+- ccursor_next_word never returns a place behind the cursor. From that same
+  place past the end it gave the text's char count: Ctrl+Delete or Alt+Delete
+  then asked for a backward range, whose assert in delete_char_range stops
+  every build, and Ctrl+Right stepped back. Now Ctrl+Delete deletes nothing,
+  Ctrl+Right stays, and a double click there selects up to the cursor, so
+  the highlight reaches the end of the word.
+- select_word_at leaves a plain caret on an empty last row. It has no word,
+  and from that same place the selection would hold only the newline above,
+  so copying it would put an empty string on the clipboard.
+- Three tests for it, and one more in src/widgets/text_edit/text_buffer.rs.
 
 Other changes to the crate
 - Ten doc examples marked ignore. They include images by paths inside
@@ -85,4 +95,5 @@ one, over two Arabic rows, a newline after Arabic with vowel marks, a mark
 selected without its letter, in the composer, any selection of the
 property test's texts, and against a copy of 0.36.2's painter, unchanged
 but for its name and with its comments left out, which every row with no
-right-to-left glyph must still match.
+right-to-left glyph must still match. The word keys past the last char are
+tested there too, in the composer.

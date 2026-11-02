@@ -450,4 +450,12 @@ mod tests {
         // mixed
         test_case(txt_n_sel("<<L˻左[_]R˼右>>"), 3, 3, txt_n_sel("<<[_]>>"));
     }
+
+    #[test]
+    fn test_delete_next_word_past_the_end() {
+        let mut text = String::from("hasan");
+        let cursor = text.delete_next_word(CCursor::new(6));
+        assert_eq!(text, "hasan");
+        assert_eq!(cursor.index.0, 6);
+    }
 }

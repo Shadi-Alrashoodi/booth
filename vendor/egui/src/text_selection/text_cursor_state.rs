@@ -116,6 +116,10 @@ fn select_word_at(text: &str, ccursor: CCursor) -> CCursorRange {
     let line_range = line_start.index..line_end.index;
     let current_line_text = slice_char_range(text, line_range.clone());
 
+    if current_line_text.is_empty() {
+        return CCursorRange::one(ccursor);
+    }
+
     let relative_idx = ccursor.index - line_start.index;
     let relative_ccursor = CCursor::new(relative_idx);
 
@@ -165,7 +169,9 @@ fn select_line_at(text: &str, ccursor: CCursor) -> CCursorRange {
 
 pub fn ccursor_next_word(text: &str, ccursor: CCursor) -> CCursor {
     CCursor {
-        index: next_word_boundary_char_index(text, ccursor.index),
+        // A cursor from the galley can be past the last char (see
+        // ccursor_previous_word), and the boundary must not land behind it.
+        index: next_word_boundary_char_index(text, ccursor.index).max(ccursor.index),
         prefer_next_row: false,
     }
 }
@@ -377,6 +383,27 @@ mod test {
         assert_eq!(ccursor_next_word(text, CCursor::new(3)).index.0, 7);
         assert_eq!(ccursor_next_word(text, CCursor::new(7)).index.0, 11);
         assert_eq!(ccursor_next_word(text, CCursor::new(11)).index.0, 11);
+    }
+
+    #[test]
+    fn test_next_word_past_the_end() {
+        assert_eq!(ccursor_next_word("hasan", CCursor::new(6)).index.0, 6);
+        assert_eq!(ccursor_next_word("abc def", CCursor::new(9)).index.0, 9);
+        assert_eq!(ccursor_next_word("", CCursor::new(1)).index.0, 1);
+    }
+
+    #[test]
+    fn test_select_word_past_the_end() {
+        let range = select_word_at("abc def", CCursor::new(8));
+        assert_eq!(range.secondary.index.0, 4);
+        assert_eq!(range.primary.index.0, 8);
+    }
+
+    #[test]
+    fn test_select_word_on_empty_last_row() {
+        let range = select_word_at("h\n", CCursor::new(3));
+        assert_eq!(range.secondary.index.0, 3);
+        assert_eq!(range.primary.index.0, 3);
     }
 
     #[test]
