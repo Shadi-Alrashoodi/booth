@@ -1,4 +1,5 @@
 use std::ops::RangeInclusive;
+use std::time::{Duration, Instant};
 
 use eframe::egui::emath::GuiRounding;
 use eframe::egui::text::LayoutJob;
@@ -29,6 +30,10 @@ const PROSE_CHARS: f32 = 60.0;
 const SAMPLE: &str = "the quick brown fox jumps over the lazy dog";
 const KEYBOARD_FOCUS: &str = "focus came from the keyboard";
 const FOCUS_LAYER: &str = "focus rings";
+// A row that opened or went can put another row's button under the second
+// click of a double click, or under a key still held, where it acts at once.
+// Such buttons wait this long after the list changed, as Resume and Allow do.
+const SETTLE: Duration = Duration::from_millis(500);
 
 // What sits at the left of the title row: nothing on the screens before a
 // room, where the window's own title bar already shows the mark, or the
@@ -123,6 +128,19 @@ pub fn fresh_click(ui: &Ui, response: &Response) -> bool {
         })
     });
     response.clicked() && (pointer || reader || fresh_key)
+}
+
+// Whether SETTLE has gone since the list last changed, for Button::enabled on
+// a button drawn with buttons(). A frame is asked for at its end, or the button
+// would look disabled until the mouse next moved.
+pub fn settled(ui: &Ui, since: Option<Instant>, now: Instant) -> bool {
+    let left = since
+        .and_then(|since| SETTLE.checked_sub(now.saturating_duration_since(since)))
+        .filter(|left| !left.is_zero());
+    if let Some(left) = left {
+        ui.ctx().request_repaint_after(left);
+    }
+    left.is_none()
 }
 
 // One row with a name on the left and one thing `right_width` wide at the
@@ -1367,6 +1385,35 @@ pub(crate) mod tests {
             repeat: false,
             modifiers: Modifiers::NONE,
         }
+    }
+
+    #[test]
+    fn a_list_that_changed_settles_with_a_frame_at_the_end() {
+        use eframe::egui::ViewportId;
+        let ctx = Context::default();
+        let t = Instant::now();
+        let draw = |since, ms| {
+            let now = t + Duration::from_millis(ms);
+            let mut ready = false;
+            let output = ctx.run_ui(RawInput::default(), |ui| {
+                ready = settled(ui, since, now);
+            });
+            let delay = output.viewport_output[&ViewportId::ROOT].repaint_delay;
+            output.drop_without_applying_deltas();
+            (ready, delay)
+        };
+        // The first frames of a context ask for more by themselves.
+        draw(None, 0);
+        draw(None, 0);
+        assert_eq!(draw(None, 0), (true, Duration::MAX));
+        // egui takes off the time a frame takes to draw.
+        let (ready, delay) = draw(Some(t), 300);
+        assert!(!ready);
+        assert!(delay <= Duration::from_millis(200), "{delay:?}");
+        let (ready, delay) = draw(Some(t), 499);
+        assert!(!ready);
+        assert!(delay <= Duration::from_millis(1), "{delay:?}");
+        assert_eq!(draw(Some(t), 500), (true, Duration::MAX), "over");
     }
 
     // Dots on the screen and to a screen reader, and the text under them

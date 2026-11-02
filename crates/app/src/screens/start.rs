@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use eframe::egui::{
     Align, Color32, CursorIcon, Id, Key, Layout, Rect, Response, ScrollArea, Sense, Shape, Ui,
     UiBuilder, WidgetInfo, WidgetType, pos2, vec2,
@@ -35,9 +37,11 @@ pub struct Start {
     // The hosts this PC joined before, newest first, as read when this
     // screen was made.
     pub known: Vec<KnownHost>,
-    // The known host whose row is open, what is typed in its field, and
-    // whether the field still has to take focus.
+    // The known host whose row is open, when it opened or this screen came
+    // back from Settings, what is typed in its field, and whether the field
+    // still has to take focus.
     pub opened: Option<[u8; 32]>,
+    pub opened_at: Option<Instant>,
     pub address: String,
     pub focus_address: bool,
     pub address_error: Option<String>,
@@ -86,12 +90,13 @@ pub enum Choice {
 impl Start {
     // Clicking a row opens it with its own address in the field; clicking
     // it again, or another, closes it.
-    fn toggle(&mut self, key: [u8; 32]) {
+    fn toggle(&mut self, key: [u8; 32], now: Instant) {
         if self.opened == Some(key) {
             self.opened = None;
             return;
         }
         self.opened = Some(key);
+        self.opened_at = Some(now);
         self.address = self
             .known
             .iter()
@@ -187,7 +192,7 @@ pub fn show(
                 }
                 field_error(ui, "Join", start.join_error.as_deref());
 
-                if let Some(known) = known_hosts(ui, start) {
+                if let Some(known) = known_hosts(ui, start, Instant::now()) {
                     choice = Some(known);
                 }
                 choice
@@ -263,7 +268,7 @@ fn field_row(ui: &mut Ui, verb: &str, field: impl FnOnce(&mut Ui) -> Response) -
 // The hosts joined before, only when there are any. A row joins from its
 // Join button, or from Enter while it has focus; clicking anywhere else on
 // it opens its address in place.
-fn known_hosts(ui: &mut Ui, start: &mut Start) -> Option<Choice> {
+fn known_hosts(ui: &mut Ui, start: &mut Start, now: Instant) -> Option<Choice> {
     let shown = !start.known.is_empty() || start.forgot.is_some() || start.known_error.is_some();
     if !shown {
         return None;
@@ -281,10 +286,10 @@ fn known_hosts(ui: &mut Ui, start: &mut Start) -> Option<Choice> {
         let tone = opened.then(|| (ui.painter().add(Shape::Noop), ui.cursor().top()));
         match host_row(ui, &start.known[i]) {
             Some(Row::Join) => choice = Some(Choice::Rejoin(key)),
-            Some(Row::Toggle) => start.toggle(key),
+            Some(Row::Toggle) => start.toggle(key, now),
             None => {}
         }
-        if opened && let Some(picked) = address(ui, start, key) {
+        if opened && let Some(picked) = address(ui, start, key, now) {
             choice = Some(picked);
         }
         if let Some((slot, top)) = tone {
@@ -366,8 +371,10 @@ fn host_row(ui: &mut Ui, host: &KnownHost) -> Option<Row> {
 // example is a help line rather than a placeholder, which the field cut short
 // at the default width; the label already names the field. The name row
 // stays on the block's top edge, so opening a row moves nothing, and Save
-// sits 8 above the block's bottom to match.
-fn address(ui: &mut Ui, start: &mut Start, key: [u8; 32]) -> Option<Choice> {
+// sits 8 above the block's bottom to match. A row opened while one above it is
+// open does move up as that one closes, and its Save and Forget come to lie
+// where it was, under a second click, so they wait until the list has settled.
+fn address(ui: &mut Ui, start: &mut Start, key: [u8; 32], now: Instant) -> Option<Choice> {
     ui.add_space(STEP);
     controls::text(ui, messages::ADDRESS_OR_NAME, theme::body(), ASH);
     ui.add_space(STEP);
@@ -395,24 +402,24 @@ fn address(ui: &mut Ui, start: &mut Start, key: [u8; 32]) -> Option<Choice> {
         None => under_field(ui, messages::MANUAL_HELP, ASH),
     }
     ui.add_space(FIELD_GAP);
-    let mut choice = None;
-    ui.horizontal(|ui| {
-        // Save is the field's Enter target, and shows it with the control
-        // fill for as long as the row is open, not only while the field has
-        // focus: otherwise it is a box while typing and then a lone word,
-        // set in from the field above it, once focus moves on.
-        let save = Button::new("Save").on(true).show(ui);
-        if save.clicked() || entered(ui, &field) {
-            choice = Some(Choice::SaveAddress(key));
-        }
-        if Button::new("Forget")
-            .role(Role::Destructive)
-            .show(ui)
-            .clicked()
-        {
-            choice = Some(Choice::Forget(key));
-        }
-    });
+    let settled = controls::settled(ui, start.opened_at, now);
+    // Save is the field's Enter target, and shows it with the control fill
+    // for as long as the row is open once it has settled, not only while the
+    // field has focus: otherwise it is a box while typing and then a lone
+    // word, set in from the field above it, once focus moves on.
+    let save = Button::new("Save").on(true).enabled(settled);
+    let forget = Button::new("Forget")
+        .role(Role::Destructive)
+        .enabled(settled);
+    let mut choice = match controls::buttons(ui, &[save, forget], CONTROL_HEIGHT) {
+        Some(0) => Some(Choice::SaveAddress(key)),
+        Some(_) => Some(Choice::Forget(key)),
+        None => None,
+    };
+    // A key press in the field does not wait: nothing moves under a key.
+    if entered(ui, &field) {
+        choice = Some(Choice::SaveAddress(key));
+    }
     if just_opened {
         let bottom = pos2(field.rect.right(), ui.cursor().top());
         ui.scroll_to_rect(Rect::from_min_max(field.rect.min, bottom), None);
@@ -480,10 +487,14 @@ fn entered(ui: &Ui, field: &Response) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use eframe::egui::accesskit::Role;
-    use eframe::egui::{Context, RawInput, pos2};
+    use eframe::egui::{Context, Event, Modifiers, PlatformOutput, RawInput, pos2};
+    use std::time::Duration;
+
+    use crate::controls::tests::{frame, press, release};
+    use crate::screens::room::tests::{test_friend, test_room};
 
     // What a screen reader is given for the start screen: each node's role
     // and its words.
@@ -546,5 +557,127 @@ mod tests {
         let nodes = spoken(None);
         assert!(!has(&nodes, Role::Button, "Download"), "{nodes:?}");
         assert!(has(&nodes, Role::Button, "Host"), "{nodes:?}");
+    }
+
+    // Two hosts joined over loopback and read back from the file.
+    fn two_known_hosts() -> Vec<KnownHost> {
+        let dir = std::env::temp_dir().join(format!("booth-app-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let friend_dir = dir.join("friend");
+        std::fs::create_dir_all(&friend_dir).unwrap();
+        for name in ["first", "second"] {
+            let host_dir = dir.join(name);
+            std::fs::create_dir_all(&host_dir).unwrap();
+            let host = test_room(&host_dir);
+            test_friend(&host, &friend_dir).leave();
+            host.leave();
+        }
+        let known = room::Room::known_hosts(&friend_dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(known.len(), 2);
+        known
+    }
+
+    pub(crate) fn places(output: &PlatformOutput, label: &str) -> Vec<Rect> {
+        output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit is on")
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.label() == Some(label))
+            .filter_map(|(_, node)| node.bounds())
+            .map(|bounds| {
+                Rect::from_min_max(
+                    pos2(bounds.x0 as f32, bounds.y0 as f32),
+                    pos2(bounds.x1 as f32, bounds.y1 as f32),
+                )
+            })
+            .collect()
+    }
+
+    // With a row open above it, a row clicked moves up as that one closes,
+    // and its Save and Forget come to lie where it was. The second click of a
+    // double click there presses neither, nor does a press made in the wait
+    // and let go after, and both work once the wait is over. Enter in the
+    // field does not wait.
+    #[test]
+    fn a_second_click_on_a_row_that_moved_up_presses_nothing() {
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let known = two_known_hosts();
+        let (above, clicked) = (*known[0].host_key(), *known[1].host_key());
+        let mut start = Start {
+            known,
+            ..Start::default()
+        };
+        let t = Instant::now();
+        let at = |ms: u64| t + Duration::from_millis(ms);
+        let draw = |start: &mut Start, events: Vec<Event>, ms: u64| {
+            frame(&ctx, events, |ui| {
+                controls::page(ui, |ui| known_hosts(ui, start, at(ms)))
+            })
+        };
+
+        // Where Forget and Save lie with that row open, and that the same
+        // place is on the row while the other one is open.
+        start.toggle(clicked, at(0));
+        draw(&mut start, Vec::new(), 1000);
+        let (_, output) = draw(&mut start, Vec::new(), 1000);
+        let forget = places(&output, "Forget")[0].center();
+        let save = places(&output, "Save")[0].center();
+        start.toggle(above, at(1000));
+        draw(&mut start, Vec::new(), 2000);
+        let (_, output) = draw(&mut start, Vec::new(), 2000);
+        let row = places(&output, "Join")
+            .into_iter()
+            .max_by(|a, b| a.top().total_cmp(&b.top()))
+            .unwrap();
+        for aim in [forget, save] {
+            assert!(row.y_range().contains(aim.y), "{row:?} {aim:?}");
+        }
+
+        // The first click opens it.
+        draw(&mut start, press(forget), 3000);
+        let (choice, _) = draw(&mut start, release(forget), 3016);
+        assert!(choice.is_none());
+        assert_eq!(start.opened, Some(clicked));
+        let (_, output) = draw(&mut start, Vec::new(), 3032);
+        assert_eq!(places(&output, "Forget")[0].center(), forget);
+
+        for (ms, events) in [
+            (3100, press(forget)),
+            (3116, release(forget)),
+            (3150, press(save)),
+            (3166, release(save)),
+            (3400, press(forget)),
+            (3520, release(forget)),
+        ] {
+            let (choice, _) = draw(&mut start, events, ms);
+            assert!(choice.is_none(), "at {ms} ms");
+        }
+
+        draw(&mut start, press(forget), 3600);
+        let (choice, _) = draw(&mut start, release(forget), 3616);
+        assert!(matches!(choice, Some(Choice::Forget(key)) if key == clicked));
+        draw(&mut start, press(save), 3700);
+        let (choice, _) = draw(&mut start, release(save), 3716);
+        assert!(matches!(choice, Some(Choice::SaveAddress(key)) if key == clicked));
+
+        // Close it and open it again: Enter saves while the buttons wait.
+        start.toggle(clicked, at(4000));
+        start.toggle(clicked, at(4000));
+        draw(&mut start, Vec::new(), 4000);
+        draw(&mut start, Vec::new(), 4016);
+        let enter = vec![Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }];
+        let (choice, _) = draw(&mut start, enter, 4032);
+        assert!(matches!(choice, Some(Choice::SaveAddress(key)) if key == clicked));
     }
 }

@@ -669,7 +669,11 @@ impl App {
         let Screen::Settings { start, .. } = &mut self.screen else {
             return;
         };
-        let start = std::mem::take(start);
+        let mut start = std::mem::take(start);
+        // A row left open brings its Save and Forget back under the bar's two
+        // buttons, and the second click of a double click, where they act at
+        // once.
+        start.opened_at = Some(Instant::now());
         self.hotkeys.capture(false);
         // Replacing the screen drops its audio part: the device watch stops,
         // and the meter's stream is stopped on a thread of its own, so a
@@ -1846,6 +1850,52 @@ mod tests {
             Screen::Start(start) | Screen::Settings { start, .. } => start,
             _ => panic!("no start screen"),
         }
+    }
+
+    // Forget works before Settings opens, and takes no click straight after
+    // it closes, when a second click on Save or Cancel can land there.
+    #[test]
+    fn a_second_click_on_leaving_settings_forgets_nothing() {
+        use crate::controls::tests::{frame, press, release};
+        let dir = fresh_dir("forget-after-settings");
+        let host_dir = dir.join("host");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let host = room_tests::test_room(&host_dir);
+        room_tests::test_friend(&host, &dir).leave();
+        host.leave();
+        let known = Room::known_hosts(&dir).unwrap();
+        let key = *known[0].host_key();
+        let mut start = Start {
+            known,
+            opened: Some(key),
+            ..Start::default()
+        };
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let draw = |start: &mut Start, events| {
+            frame(&ctx, events, |ui| start::show(ui, start, None, &[], None))
+        };
+        draw(&mut start, Vec::new());
+        let (_, output) = draw(&mut start, Vec::new());
+        let forget = start::tests::places(&output, "Forget")[0].center();
+        draw(&mut start, press(forget));
+        let (choice, _) = draw(&mut start, release(forget));
+        assert!(matches!(choice, Some(Choice::Forget(k)) if k == key));
+
+        let mut app = app_in_settings(&dir, start, |_| {});
+        let closed = Instant::now();
+        app.close_settings();
+        let Screen::Start(start) = &mut app.screen else {
+            panic!("no start screen");
+        };
+        assert_eq!(start.opened, Some(key));
+        assert!(start.opened_at >= Some(closed));
+        draw(start, press(forget));
+        let (choice, _) = draw(start, release(forget));
+        // These frames are real time, and a slow PC may take them past the wait.
+        assert!(choice.is_none() || closed.elapsed() >= Duration::from_millis(500));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The settings go in and the list fails after them. Neither Save again
