@@ -132,20 +132,37 @@ pub struct Settings {
     check_for_new_versions: bool,
 }
 
+// A hotkey in the file that went back to its default, because a press of it
+// would also have set off `with`, on `with_was` at that point: as the file had
+// it, or its default if it had gone back already.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GaveWay {
+    pub action: Action,
+    pub was: Chord,
+    pub with: Action,
+    pub with_was: Chord,
+}
+
 impl Settings {
     // A missing file is a first run. Anything else that goes wrong costs the
     // setting it touches and a log line, never the start: a settings file
-    // is no reason for Booth not to open.
-    pub fn load(dir: &Path) -> (Settings, Vec<String>) {
+    // is no reason for Booth not to open. A key that gave way is handed back
+    // as well, since the person talks with it and the log may not exist.
+    pub fn load(dir: &Path) -> (Settings, Vec<String>, Vec<GaveWay>) {
         let path = dir.join(FILE);
         match read(&path) {
-            Ok(bytes) => parse(&bytes),
+            Ok(bytes) => {
+                let (mut settings, mut problems) = parse(&bytes);
+                let gave_way = settle_hotkeys(&mut settings, &mut problems);
+                (settings, problems, gave_way)
+            }
             Err(err) => (
                 Settings::default(),
                 vec![format!(
                     "settings: could not read {}: {err}; using the defaults",
                     path.display()
                 )],
+                Vec::new(),
             ),
         }
     }
@@ -812,13 +829,19 @@ fn parse(bytes: &[u8]) -> (Settings, Vec<String>) {
             Err(why) => problems.push(format!("settings: line {number} skipped: {why}")),
         }
     }
-    // Booth never saves two actions on one key. A clash comes from editing by
-    // hand, or from a newer version giving a new action, as its default, a
-    // key chosen earlier for another. Only an action moved off its default
-    // gives way, so the rest of what was chosen stays; of two moved ones,
-    // which was meant is anyone's guess, so both do.
+    (settings, problems)
+}
+
+// Booth never saves two actions on one key. A clash comes from editing by
+// hand, or from a newer version giving a new action, as its default, a key
+// chosen earlier for another. Only an action moved off its default gives way,
+// so the rest of what was chosen stays; of two moved ones, which was meant is
+// anyone's guess, so both do.
+fn settle_hotkeys(settings: &mut Settings, problems: &mut Vec<String>) -> Vec<GaveWay> {
+    let mut gave_way = Vec::new();
     while let Some((one, other)) = settings.hotkeys.first_conflict() {
         let chord = settings.hotkeys.chord(one);
+        let other_chord = settings.hotkeys.chord(other);
         let moved: Vec<Action> = [one, other]
             .into_iter()
             .filter(|action| settings.hotkeys.chord(*action) != action.default_chord())
@@ -836,6 +859,17 @@ fn parse(bytes: &[u8]) -> (Settings, Vec<String>) {
         }
         let mut back = Vec::new();
         for action in moved {
+            let (with, with_was) = if action == one {
+                (other, other_chord)
+            } else {
+                (one, chord)
+            };
+            gave_way.push(GaveWay {
+                action,
+                was: settings.hotkeys.chord(action),
+                with,
+                with_was,
+            });
             settings.hotkeys.set(action, action.default_chord());
             back.push(format!(
                 "{} goes back to {}",
@@ -850,7 +884,7 @@ fn parse(bytes: &[u8]) -> (Settings, Vec<String>) {
             back.join(" and ")
         ));
     }
-    (settings, problems)
+    gave_way
 }
 
 #[cfg(test)]
@@ -886,10 +920,16 @@ mod tests {
         settings
     }
 
+    fn settled(bytes: &[u8]) -> (Settings, Vec<String>) {
+        let (mut settings, mut problems) = parse(bytes);
+        settle_hotkeys(&mut settings, &mut problems);
+        (settings, problems)
+    }
+
     #[test]
     fn a_missing_file_is_the_defaults_and_no_complaint() {
         let folder = Folder::new("missing");
-        let (settings, problems) = Settings::load(&folder.0);
+        let (settings, problems, _) = Settings::load(&folder.0);
         assert_eq!(settings, Settings::default());
         assert_eq!(settings.address_name(), None);
         assert!(problems.is_empty(), "{problems:?}");
@@ -903,7 +943,7 @@ mod tests {
             fs::read_to_string(folder.file()).unwrap(),
             "address_name = myroom.example.net\r\n"
         );
-        let (settings, problems) = Settings::load(&folder.0);
+        let (settings, problems, _) = Settings::load(&folder.0);
         assert_eq!(settings.address_name(), Some("myroom.example.net"));
         assert!(problems.is_empty(), "{problems:?}");
 
@@ -932,7 +972,7 @@ mod tests {
             b"name = Andr\xE9\r\naddress_name = a.example.net\r\n",
         )
         .unwrap();
-        let (settings, problems) = Settings::load(&folder.0);
+        let (settings, problems, _) = Settings::load(&folder.0);
         assert_eq!(settings.address_name(), Some("a.example.net"));
         assert_eq!(problems, ["settings: line 1 skipped: it is not UTF-8 text"]);
         named("b.example.net").save(&folder.0).unwrap();
@@ -1023,7 +1063,7 @@ mod tests {
         // Windows will not open a folder as a file, which stands in for a
         // file another program holds open without sharing.
         fs::create_dir(folder.file()).unwrap();
-        let (settings, problems) = Settings::load(&folder.0);
+        let (settings, problems, _) = Settings::load(&folder.0);
         assert_eq!(settings, Settings::default());
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(
@@ -1032,6 +1072,136 @@ mod tests {
         );
         let err = named("a.example.net").save(&folder.0).unwrap_err();
         assert!(matches!(err, SaveError::Read { .. }), "{err}");
+    }
+
+    // Saved by an older version, before pause sharing had Ctrl+Shift+F9. Push
+    // to talk also runs with more modifiers down, so that press would set off
+    // both, and it goes back. The log says so, and so does what is handed on
+    // for the start screen.
+    #[test]
+    fn a_key_that_gave_way_is_handed_back() {
+        let folder = Folder::new("gave-way");
+        fs::write(
+            folder.file(),
+            "hotkey_push_to_talk = F9\r\nhotkey_stats_panel = F10\r\n",
+        )
+        .unwrap();
+        let (settings, problems, gave_way) = Settings::load(&folder.0);
+        assert_eq!(
+            settings.hotkeys().chord(Action::PushToTalk),
+            Action::PushToTalk.default_chord()
+        );
+        assert_eq!(
+            settings.hotkeys().chord(Action::StatsPanel).to_string(),
+            "F10"
+        );
+        assert_eq!(
+            problems,
+            [
+                "settings: push to talk and pause sharing, resume (press twice) are on one key, F9; push to talk goes back to Right Ctrl"
+            ]
+        );
+        assert_eq!(
+            gave_way,
+            [GaveWay {
+                action: Action::PushToTalk,
+                was: "F9".parse().unwrap(),
+                with: Action::PauseShare,
+                with_was: "Ctrl+Shift+F9".parse().unwrap(),
+            }]
+        );
+
+        // Both moved: each is told, with the other.
+        fs::write(folder.file(), "hotkey_mute = F8\r\nhotkey_deafen = F8\r\n").unwrap();
+        let (_, _, gave_way) = Settings::load(&folder.0);
+        let f8: Chord = "F8".parse().unwrap();
+        assert_eq!(
+            gave_way,
+            [
+                GaveWay {
+                    action: Action::Mute,
+                    was: f8,
+                    with: Action::Deafen,
+                    with_was: f8,
+                },
+                GaveWay {
+                    action: Action::Deafen,
+                    was: f8,
+                    with: Action::Mute,
+                    with_was: f8,
+                },
+            ]
+        );
+
+        // Only the one moved off its default gives way, here the second named.
+        fs::write(folder.file(), "hotkey_deafen = Ctrl+Shift+M\r\n").unwrap();
+        let (_, _, gave_way) = Settings::load(&folder.0);
+        assert_eq!(
+            gave_way,
+            [GaveWay {
+                action: Action::Deafen,
+                was: "Ctrl+Shift+M".parse().unwrap(),
+                with: Action::Mute,
+                with_was: "Ctrl+Shift+M".parse().unwrap(),
+            }]
+        );
+
+        // Two moved, on two chords of one key: each is told the other's.
+        fs::write(
+            folder.file(),
+            "hotkey_push_to_talk = F5\r\nhotkey_mute = Ctrl+F5\r\n",
+        )
+        .unwrap();
+        let (_, _, gave_way) = Settings::load(&folder.0);
+        assert_eq!(
+            gave_way,
+            [
+                GaveWay {
+                    action: Action::PushToTalk,
+                    was: "F5".parse().unwrap(),
+                    with: Action::Mute,
+                    with_was: "Ctrl+F5".parse().unwrap(),
+                },
+                GaveWay {
+                    action: Action::Mute,
+                    was: "Ctrl+F5".parse().unwrap(),
+                    with: Action::PushToTalk,
+                    with_was: "F5".parse().unwrap(),
+                },
+            ]
+        );
+
+        // In a chain the second is told where the first went back to, not
+        // where the file had it.
+        fs::write(
+            folder.file(),
+            "hotkey_mute = Ctrl+Shift+S\r\nhotkey_deafen = Ctrl+Shift+M\r\n",
+        )
+        .unwrap();
+        let (_, _, gave_way) = Settings::load(&folder.0);
+        assert_eq!(
+            gave_way,
+            [
+                GaveWay {
+                    action: Action::Mute,
+                    was: "Ctrl+Shift+S".parse().unwrap(),
+                    with: Action::Share,
+                    with_was: "Ctrl+Shift+S".parse().unwrap(),
+                },
+                GaveWay {
+                    action: Action::Deafen,
+                    was: "Ctrl+Shift+M".parse().unwrap(),
+                    with: Action::Mute,
+                    with_was: "Ctrl+Shift+M".parse().unwrap(),
+                },
+            ]
+        );
+
+        // A plain F9 on mute sets off nothing else, and nothing is said.
+        fs::write(folder.file(), "hotkey_mute = F9\r\n").unwrap();
+        let (settings, problems, gave_way) = Settings::load(&folder.0);
+        assert_eq!(settings.hotkeys().chord(Action::Mute).to_string(), "F9");
+        assert!(problems.is_empty() && gave_way.is_empty(), "{problems:?}");
     }
 
     #[test]
@@ -1066,7 +1236,7 @@ mod tests {
             fs::read_to_string(folder.file()).unwrap(),
             "name = Mara\r\nport = 41010\r\nstun_servers = stun.example.org:3478, [2001:db8::3]:3478\r\naddress_name = myroom.example.net\r\n"
         );
-        let (loaded, problems) = Settings::load(&folder.0);
+        let (loaded, problems, _) = Settings::load(&folder.0);
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(loaded, settings);
         assert_eq!(loaded.name(), Some("Mara"));
@@ -1184,7 +1354,7 @@ mod tests {
             fs::read_to_string(folder.file()).unwrap(),
             format!("video_upload = 15\r\ninput_device = {mic}\r\n")
         );
-        let (loaded, problems) = Settings::load(&folder.0);
+        let (loaded, problems, _) = Settings::load(&folder.0);
         assert_eq!(problems.len(), 1, "only video_upload: {problems:?}");
         assert_eq!(
             loaded.device(Direction::Input),
@@ -1231,7 +1401,7 @@ mod tests {
             fs::read_to_string(folder.file()).unwrap(),
             "talk_mode = open_mic\r\nconstant_rate_voice = off\r\n"
         );
-        let (loaded, problems) = Settings::load(&folder.0);
+        let (loaded, problems, _) = Settings::load(&folder.0);
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(loaded, settings);
 
@@ -1270,7 +1440,7 @@ mod tests {
             fs::read_to_string(folder.file()).unwrap(),
             "open_mic_sensitivity = -35\r\n"
         );
-        let (loaded, _) = Settings::load(&folder.0);
+        let (loaded, _, _) = Settings::load(&folder.0);
         assert_eq!(loaded.sensitivity_db(), -35);
         settings.set_sensitivity_db(-90);
         assert_eq!(settings.sensitivity_db(), -60);
@@ -1342,7 +1512,7 @@ mod tests {
             fs::read_to_string(folder.file()).unwrap(),
             "hotkey_push_to_talk = Shift+Right Ctrl\r\nhotkey_mute = F9\r\n"
         );
-        let (loaded, problems) = Settings::load(&folder.0);
+        let (loaded, problems, _) = Settings::load(&folder.0);
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(loaded.hotkeys(), hotkeys);
 
@@ -1366,7 +1536,7 @@ mod tests {
             fs::read_to_string(folder.file()).unwrap(),
             "hotkey_panic = Ctrl+Alt+End\r\n"
         );
-        let (loaded, problems) = Settings::load(&folder.0);
+        let (loaded, problems, _) = Settings::load(&folder.0);
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(
             loaded.hotkeys().chord(Action::Panic).to_string(),
@@ -1429,11 +1599,11 @@ mod tests {
 
     #[test]
     fn key_on_another_default_goes_back() {
-        let (settings, problems) = parse(b"hotkey_mute = F9\nhotkey_deafen = Ctrl+Shift+M\n");
+        let (settings, problems) = settled(b"hotkey_mute = F9\nhotkey_deafen = Ctrl+Shift+M\n");
         assert_eq!(settings.hotkeys().chord(Action::Mute).to_string(), "F9");
         assert!(problems.is_empty(), "{problems:?}");
 
-        let (settings, problems) = parse(b"hotkey_deafen = Ctrl+Shift+M\n");
+        let (settings, problems) = settled(b"hotkey_deafen = Ctrl+Shift+M\n");
         assert_eq!(settings.hotkeys(), Bindings::default());
         assert_eq!(
             problems,
@@ -1454,7 +1624,7 @@ mod tests {
             "hotkey_push_to_talk = Shift+Right Ctrl\r\nhotkey_mute = Ctrl+Shift+S\r\nhotkey_stats_panel = F10\r\n",
         )
         .unwrap();
-        let (settings, problems) = Settings::load(&folder.0);
+        let (settings, problems, _) = Settings::load(&folder.0);
         assert_eq!(
             problems,
             [
@@ -1481,7 +1651,7 @@ mod tests {
     // next.
     #[test]
     fn moves_back_in_a_chain() {
-        let (settings, problems) = parse(
+        let (settings, problems) = settled(
             b"hotkey_mute = Ctrl+Shift+S\nhotkey_deafen = Ctrl+Shift+M\nhotkey_push_to_talk = Shift+Right Ctrl\n",
         );
         let mut expected = Bindings::default();
@@ -1499,7 +1669,7 @@ mod tests {
     // Only editing by hand puts two moved actions on one key.
     #[test]
     fn two_moved_on_one_key() {
-        let (settings, problems) = parse(
+        let (settings, problems) = settled(
             b"hotkey_mute = F9\nhotkey_deafen = F9\nhotkey_push_to_talk = Shift+Right Ctrl\n",
         );
         let mut expected = Bindings::default();
@@ -1530,7 +1700,7 @@ mod tests {
             fs::read_to_string(folder.file()).unwrap(),
             "video_upload_mbits = 40\r\nvsync_in_viewer = on\r\nhide_strip_in_fullscreen = on\r\nshare_monitor = \\\\.\\DISPLAY2\r\nshare_key_opens_list = on\r\n"
         );
-        let (loaded, problems) = Settings::load(&folder.0);
+        let (loaded, problems, _) = Settings::load(&folder.0);
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(loaded, settings);
 
@@ -1568,7 +1738,7 @@ mod tests {
             "video_upload = 15\r\nvideo_upload_mbits = 30\r\nviewer_vsync = on\r\n",
         )
         .unwrap();
-        let (mut settings, problems) = Settings::load(&folder.0);
+        let (mut settings, problems, _) = Settings::load(&folder.0);
         assert_eq!(settings.upload_mbits(), 30);
         assert!(!settings.vsync());
         assert_eq!(problems.len(), 2, "{problems:?}");
@@ -1591,7 +1761,7 @@ mod tests {
             fs::read_to_string(folder.file()).unwrap(),
             "check_for_new_versions = on\r\n"
         );
-        let (loaded, problems) = Settings::load(&folder.0);
+        let (loaded, problems, _) = Settings::load(&folder.0);
         assert!(problems.is_empty(), "{problems:?}");
         assert!(loaded.check_for_new_versions());
 

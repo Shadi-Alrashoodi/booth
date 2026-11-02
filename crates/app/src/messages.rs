@@ -12,7 +12,7 @@ use voice::audio::{Echo, Microphone};
 
 use crate::elevated::Exit;
 use crate::running::{self, PortHolder};
-use crate::settings::{self, SaveError};
+use crate::settings::{self, GaveWay, SaveError};
 use crate::update::RELEASES_PAGE;
 use crate::volumes::Problem;
 use crate::win;
@@ -546,13 +546,39 @@ pub fn hotkey_label(action: Action) -> &'static str {
     }
 }
 
-pub fn key_used(other: Action) -> String {
-    let what = match other {
+fn in_a_sentence(action: Action) -> &'static str {
+    match action {
+        Action::Share => "sharing",
+        Action::PauseShare => "pausing a share",
         Action::Panic => "the panic key",
+        Action::ShowPanel => "showing the panel",
         Action::StatsPanel => "the stats panel",
-        other => other.name(),
+        action => action.name(),
+    }
+}
+
+pub fn key_used(other: Action) -> String {
+    format!("That key is already used for {}.", in_a_sentence(other))
+}
+
+// One start screen line for each key that went back to its default as
+// settings.txt was read. The other key is named, since Settings has no row on
+// F9 when the clash was with Ctrl+Shift+F9. Not through sentence, which breaks
+// a line at a semicolon, and a chord can end in one.
+pub fn key_gave_way(gave: &GaveWay) -> String {
+    let with = in_a_sentence(gave.with);
+    let why = if gave.with_was == gave.was {
+        format!("the same key as {with}")
+    } else {
+        format!("which clashed with {} for {with}", gave.with_was)
     };
-    format!("That key is already used for {what}.")
+    let (first, rest) = in_a_sentence(gave.action).split_at(1);
+    format!(
+        "{}{rest} was on {}, {why}. It is back on {}. Change either in Settings.",
+        first.to_uppercase(),
+        gave.was,
+        gave.action.default_chord()
+    )
 }
 
 pub fn wants_control(name: &str) -> String {
@@ -892,7 +918,7 @@ mod tests {
         assert_eq!(key_used(Action::Mute), "That key is already used for mute.");
         assert_eq!(
             key_used(Action::ShowPanel),
-            "That key is already used for show or hide the panel."
+            "That key is already used for showing the panel."
         );
         assert_eq!(
             key_used(Action::StatsPanel),
@@ -900,7 +926,7 @@ mod tests {
         );
         assert_eq!(
             key_used(Action::Share),
-            "That key is already used for share (press twice) or stop sharing."
+            "That key is already used for sharing."
         );
         assert_eq!(
             key_used(Action::Panic),
@@ -1142,6 +1168,62 @@ mod tests {
             assert!(!seen.contains(&text), "{err} says the same as another");
             seen.push(text);
         }
+    }
+
+    #[test]
+    fn the_line_for_a_key_that_gave_way() {
+        let pause_key = "Ctrl+Shift+F9".parse().unwrap();
+        let push_to_talk = GaveWay {
+            action: Action::PushToTalk,
+            was: "F9".parse().unwrap(),
+            with: Action::PauseShare,
+            with_was: pause_key,
+        };
+        assert_eq!(
+            key_gave_way(&push_to_talk),
+            "Push to talk was on F9, which clashed with Ctrl+Shift+F9 for pausing a share. It is back on Right Ctrl. Change either in Settings."
+        );
+        let panic = GaveWay {
+            action: Action::Panic,
+            was: "F9".parse().unwrap(),
+            with: Action::PauseShare,
+            with_was: pause_key,
+        };
+        assert_eq!(
+            key_gave_way(&panic),
+            "The panic key was on F9, which clashed with Ctrl+Shift+F9 for pausing a share. It is back on Ctrl+Shift+End. Change either in Settings."
+        );
+        let mute = GaveWay {
+            action: Action::Mute,
+            was: "F8".parse().unwrap(),
+            with: Action::Deafen,
+            with_was: "F8".parse().unwrap(),
+        };
+        assert_eq!(
+            key_gave_way(&mute),
+            "Mute was on F8, the same key as deafen. It is back on Ctrl+Shift+M. Change either in Settings."
+        );
+        let share = GaveWay {
+            action: Action::Share,
+            was: "F8".parse().unwrap(),
+            with: Action::ShowPanel,
+            with_was: "F8".parse().unwrap(),
+        };
+        assert_eq!(
+            key_gave_way(&share),
+            "Sharing was on F8, the same key as showing the panel. It is back on Ctrl+Shift+S. Change either in Settings."
+        );
+        // Two moved, the other one on the semicolon key.
+        let on_semicolon = GaveWay {
+            action: Action::Mute,
+            was: "Ctrl+;".parse().unwrap(),
+            with: Action::PushToTalk,
+            with_was: ";".parse().unwrap(),
+        };
+        assert_eq!(
+            key_gave_way(&on_semicolon),
+            "Mute was on Ctrl+;, which clashed with ; for push to talk. It is back on Ctrl+Shift+M. Change either in Settings."
+        );
     }
 
     // The log file's line names booth.log and nothing of the folder it is

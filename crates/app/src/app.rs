@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::fs::File;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,7 +35,7 @@ use crate::screens::room::{InRoom, Step, own_share_on, share_offered};
 use crate::screens::settings::{self as settings_screen, Draft, Press, Refused};
 use crate::screens::start::{self, Choice, Start};
 use crate::screens::stats;
-use crate::settings::{DEFAULT_PORT, Settings};
+use crate::settings::{DEFAULT_PORT, GaveWay, Settings};
 use crate::sound::SettingsAudio;
 use crate::strip::{self, Sweep};
 use crate::theme::{self, WINDOW};
@@ -116,6 +117,8 @@ pub struct Setup {
     // --port, which wins over the setting for this run: it is how two
     // copies share one PC for testing.
     port_given: Option<u16>,
+    // Keys that went back to their defaults as settings.txt was read.
+    gave_way: Vec<GaveWay>,
 }
 
 impl Setup {
@@ -1285,10 +1288,8 @@ impl eframe::App for App {
                             let allowed =
                                 matches!(self.firewall.state(), Some(FirewallState::Allowed(_)));
                             let hint = self.not_now.filter(|_| !allowed);
-                            let mut lines: Vec<String> =
-                                hint.map(String::from).into_iter().collect();
-                            lines.extend(self.damaged.iter().map(messages::damaged));
-                            lines.extend(self.unusable.iter().map(|(_, line)| line.clone()));
+                            let lines =
+                                start_lines(hint, &self.setup, &self.damaged, &self.unusable);
                             let update = self.update.shown();
                             choice = start::show(ui, start, blocked, &lines, update.as_ref());
                         }
@@ -1452,8 +1453,34 @@ pub enum NotStarted {
     BroughtForward,
 }
 
-// A settings line that could not be used goes to the log and costs nothing
-// else.
+// What the start screen says for this run. A key that gave way is said until
+// Settings has moved it or the other key, each of which reading the file left
+// on its default: after that the line's "back on" or its clash is not true.
+fn start_lines(
+    hint: Option<&'static str>,
+    setup: &Result<Setup, String>,
+    damaged: &[DamagedList],
+    unusable: &[(List, String)],
+) -> Vec<String> {
+    let mut lines: Vec<String> = hint.map(String::from).into_iter().collect();
+    if let Ok(setup) = setup {
+        let hotkeys = setup.settings.hotkeys();
+        lines.extend(
+            setup
+                .gave_way
+                .iter()
+                .filter(|gave| {
+                    hotkeys.chord(gave.action) == gave.action.default_chord()
+                        && hotkeys.chord(gave.with) == gave.with.default_chord()
+                })
+                .map(messages::key_gave_way),
+        );
+    }
+    lines.extend(damaged.iter().map(messages::damaged));
+    lines.extend(unusable.iter().map(|(_, line)| line.clone()));
+    lines
+}
+
 pub fn load(args: &Args, backlog: &mut Backlog) -> Result<Setup, NotStarted> {
     let shown = |err: keys::KeyError| NotStarted::Blocked(messages::sentence(&err.to_string()));
     let data_dir = keys::data_dir(args.profile.as_deref()).map_err(shown)?;
@@ -1479,7 +1506,20 @@ pub fn load(args: &Args, backlog: &mut Backlog) -> Result<Setup, NotStarted> {
     let identity = Identity::load_or_create(&data_dir).map_err(shown)?;
     #[cfg(feature = "memstats")]
     crate::memstats::start(&data_dir);
-    let (settings, problems) = Settings::load(&data_dir);
+    Ok(setup_from(args, data_dir, held, identity, backlog))
+}
+
+// A settings line that could not be used goes to the log and costs nothing
+// else, but for a key that gave way, which the start screen says too. Apart
+// from load, which takes the real profile's lock, for the tests.
+fn setup_from(
+    args: &Args,
+    data_dir: PathBuf,
+    held: Option<File>,
+    identity: Identity,
+    backlog: &mut Backlog,
+) -> Setup {
+    let (settings, problems, gave_way) = Settings::load(&data_dir);
     for problem in problems {
         backlog.add(problem);
     }
@@ -1488,6 +1528,7 @@ pub fn load(args: &Args, backlog: &mut Backlog) -> Result<Setup, NotStarted> {
         identity: Arc::new(identity),
         settings,
         port_given: args.port,
+        gave_way,
         config: Config {
             log: args.log.then(|| data_dir.join("booth.log")),
             data_dir,
@@ -1523,7 +1564,7 @@ pub fn load(args: &Args, backlog: &mut Backlog) -> Result<Setup, NotStarted> {
         ));
     }
     setup.apply_settings();
-    Ok(setup)
+    setup
 }
 
 #[cfg(test)]
@@ -1544,6 +1585,7 @@ mod tests {
             identity: Arc::new(Identity::generate()),
             settings: Settings::default(),
             port_given: None,
+            gave_way: Vec::new(),
             config: Config {
                 log: None,
                 data_dir: dir.to_path_buf(),
@@ -1812,6 +1854,103 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // What load hands over, with no profile's lock: the line for a key that
+    // gave way.
+    #[test]
+    fn the_start_screen_has_what_reading_the_file_found() {
+        use std::fs;
+        let args = Args {
+            profile: None,
+            port: None,
+            log: false,
+            loopback: None,
+            video_loss: None,
+        };
+        let build = |dir: &Path| {
+            let mut backlog = Backlog::default();
+            Ok(setup_from(
+                &args,
+                dir.to_path_buf(),
+                None,
+                Identity::generate(),
+                &mut backlog,
+            ))
+        };
+        let dir = fresh_dir("handed-over");
+        let path = dir.join("settings.txt");
+        assert!(start_lines(None, &build(&dir), &[], &[]).is_empty());
+
+        fs::write(&path, "hotkey_push_to_talk = F9\r\n").unwrap();
+        assert_eq!(
+            start_lines(None, &build(&dir), &[], &[]),
+            [
+                "Push to talk was on F9, which clashed with Ctrl+Shift+F9 for pausing a share. It is back on Right Ctrl. Change either in Settings."
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Saved before pause sharing had Ctrl+Shift+F9. The line stays for the run
+    // while both keys are on their defaults, and goes once either has been
+    // moved, as it offers.
+    #[test]
+    fn the_start_screen_says_which_key_gave_way() {
+        use std::fs;
+        let dir = fresh_dir("gave-way");
+        fs::write(dir.join("settings.txt"), "hotkey_push_to_talk = F9\r\n").unwrap();
+        let mut setup = setup_in(&dir);
+        (setup.settings, _, setup.gave_way) = Settings::load(&dir);
+        let mut setup = Ok(setup);
+        let line = "Push to talk was on F9, which clashed with Ctrl+Shift+F9 for pausing a share. It is back on Right Ctrl. Change either in Settings.";
+        assert_eq!(start_lines(None, &setup, &[], &[]), [line]);
+        assert_eq!(
+            start_lines(
+                Some("first"),
+                &setup,
+                &[],
+                &[(List::Hosts, String::from("last"))]
+            ),
+            ["first", line, "last"]
+        );
+
+        let Ok(moved) = &mut setup else {
+            panic!("the setup is there");
+        };
+        let mut hotkeys = moved.settings.hotkeys();
+        hotkeys.set(input::Action::PushToTalk, "F8".parse().unwrap());
+        moved.settings.set_hotkeys(hotkeys);
+        assert!(start_lines(None, &setup, &[], &[]).is_empty());
+
+        // Moving the other one ends the clash as well.
+        let Ok(moved) = &mut setup else {
+            panic!("the setup is there");
+        };
+        let mut hotkeys = input::Bindings::default();
+        hotkeys.set(input::Action::PauseShare, "F8".parse().unwrap());
+        moved.settings.set_hotkeys(hotkeys);
+        assert!(start_lines(None, &setup, &[], &[]).is_empty());
+
+        // Two moved onto one key both went back, and each line is said, with
+        // nothing left clashing by then.
+        fs::write(
+            dir.join("settings.txt"),
+            "hotkey_mute = F8\r\nhotkey_deafen = F8\r\n",
+        )
+        .unwrap();
+        let Ok(both) = &mut setup else {
+            panic!("the setup is there");
+        };
+        (both.settings, _, both.gave_way) = Settings::load(&dir);
+        assert_eq!(
+            start_lines(None, &setup, &[], &[]),
+            [
+                "Mute was on F8, the same key as deafen. It is back on Ctrl+Shift+M. Change either in Settings.",
+                "Deafen was on F8, the same key as mute. It is back on Ctrl+Shift+D. Change either in Settings."
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     // The monitor picked in Share's list is a sharing setting too.
     #[test]
     fn while_controlled_the_share_key_keeps_its_monitor() {
@@ -1826,7 +1965,7 @@ mod tests {
         assert!(!dir.join("settings.txt").exists());
         remember_monitor(&mut setup, r"\\.\DISPLAY2", false, &mut backlog);
         assert_eq!(setup.settings.share_monitor(), Some(r"\\.\DISPLAY2"));
-        let (saved, _) = Settings::load(&dir);
+        let (saved, _, _) = Settings::load(&dir);
         assert_eq!(saved.share_monitor(), Some(r"\\.\DISPLAY2"));
         let _ = fs::remove_dir_all(&dir);
     }
