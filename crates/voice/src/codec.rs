@@ -12,8 +12,8 @@ pub const MAX_PACKET: usize = 128;
 
 // 5 is the lowest setting that keeps CELT's pitch pre-filter, which voiced
 // speech needs at 20 bytes a frame; above it the gain was under 0.2 dB. In a
-// release build on my PC a 5 ms frame encodes in about 35 us and a 10 ms
-// repair frame in about 180 us, far inside the 0.5 ms the voice budget gives
+// release build on my PC a 5 ms frame encodes in about 12 us and a 10 ms
+// repair frame in about 60 us, far inside the 0.5 ms the voice budget gives
 // encoding.
 const COMPLEXITY: i32 = 5;
 
