@@ -163,3 +163,202 @@ fn twenty_decoders(codec: Codec) {
         mb(after.video_memory)
     );
 }
+
+fn private_bytes() -> u64 {
+    use windows::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    let mut counters = PROCESS_MEMORY_COUNTERS_EX {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the pseudo handle of this process and a live structure of the
+    // size given, which the EX form extends.
+    unsafe {
+        K32GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut counters as *mut PROCESS_MEMORY_COUNTERS_EX as *mut PROCESS_MEMORY_COUNTERS,
+            counters.cb,
+        )
+    }
+    .ok()
+    .expect("this process's memory counters");
+    counters.PrivateUsage as u64
+}
+
+// One message of `blocks` times 255 bytes of type 5, the type FFmpeg keeps.
+fn sei(header: &[u8], blocks: usize) -> Vec<u8> {
+    let mut sei = vec![0, 0, 1];
+    sei.extend_from_slice(header);
+    sei.push(5);
+    sei.resize(sei.len() + blocks, 0xff);
+    sei.push(0);
+    sei.resize(sei.len() + blocks * 255, 0x11);
+    sei.push(0x80);
+    sei
+}
+
+// Start code and header, then ones and zeros with the stop bit and emulation
+// prevention added.
+fn h264_nal(header: u8, bits: &str) -> Vec<u8> {
+    let bits: Vec<u8> = bits
+        .bytes()
+        .chain(*b"1")
+        .map(|bit| bit - b'0')
+        .chain([0; 7])
+        .collect();
+    let mut out = vec![0, 0, 1, header];
+    let mut zeros = 0;
+    for byte in bits.as_chunks::<8>().0 {
+        let byte = byte.iter().fold(0, |acc, bit| acc << 1 | bit);
+        if zeros >= 2 && byte <= 3 {
+            out.push(3);
+            zeros = 0;
+        }
+        out.push(byte);
+        zeros = if byte == 0 { zeros + 1 } else { 0 };
+    }
+    out
+}
+
+fn ue(value: u32) -> String {
+    let coded = value + 1;
+    let len = 32 - coded.leading_zeros() as usize;
+    format!("{:0>width$b}", coded, width = 2 * len - 1)
+}
+
+// An SPS and PPS of their own for 640x352 in fields, and the top field of an
+// IDR with no bottom field to come, which leaves FFmpeg waiting for one.
+fn lone_field() -> Vec<u8> {
+    let sps = [
+        format!("{:08b}", 100),
+        format!("{:08b}", 0),
+        format!("{:08b}", 51),
+        ue(1),            // sps_id
+        ue(1),            // chroma_format_idc: 4:2:0
+        ue(0),            // bit_depth_luma_minus8
+        ue(0),            // bit_depth_chroma_minus8
+        "00".to_string(), // qpprime_y_zero_transform_bypass, seq_scaling_matrix_present
+        ue(0),            // log2_max_frame_num_minus4
+        ue(2),            // pic_order_cnt_type
+        ue(1),            // max_num_ref_frames
+        "0".to_string(),  // gaps_in_frame_num_allowed
+        ue(39),           // width in macroblocks less 1
+        ue(10),           // height in pairs of them less 1
+        "0".to_string(),  // frame_mbs_only
+        "0".to_string(),  // mb_adaptive_frame_field
+        "1".to_string(),  // direct_8x8_inference
+        "0".to_string(),  // frame_cropping
+        "0".to_string(),  // vui_parameters_present
+    ]
+    .concat();
+    let pps = [
+        ue(1),             // pps_id
+        ue(1),             // sps_id
+        "00".to_string(),  // entropy_coding_mode, bottom_field_pic_order_in_frame_present
+        ue(0),             // num_slice_groups_minus1
+        ue(0),             // num_ref_idx_l0_default_active_minus1
+        ue(0),             // num_ref_idx_l1_default_active_minus1
+        "000".to_string(), // weighted_pred, weighted_bipred_idc
+        ue(0),             // pic_init_qp_minus26
+        ue(0),             // pic_init_qs_minus26
+        ue(0),             // chroma_qp_index_offset
+        "000".to_string(), // deblocking_filter_control, constrained_intra_pred, redundant_pic_cnt
+    ]
+    .concat();
+    let slice = [
+        ue(0),              // first_mb_in_slice
+        ue(7),              // slice_type: all I
+        ue(1),              // pps_id
+        "0000".to_string(), // frame_num
+        "10".to_string(),   // field_pic, bottom_field
+        ue(0),              // idr_pic_id
+        "00".to_string(),   // no_output_of_prior_pics, long_term_reference
+        ue(0),              // slice_qp_delta
+    ]
+    .concat();
+    [
+        h264_nal(0x67, &sps),
+        h264_nal(0x68, &pps),
+        h264_nal(0x65, &slice),
+    ]
+    .concat()
+}
+
+// After a real IDR, frames of nothing but SEI: FFmpeg keeps every message for
+// the picture it expects, and only a flush lets go of them. A flush takes the
+// references too, so the stream waits for its next IDR. FFmpeg's H.264 decoder
+// keeps them only after a lone field, so it gets one first.
+#[test]
+fn sei_with_no_picture_goes() {
+    let _turn = common::turn();
+    let Some(gpu) = common::nvidia() else { return };
+    for (codec, header) in [(Codec::H264, vec![6u8]), (Codec::Hevc, vec![39 << 1, 1])] {
+        let Some(mut decoder) = common::decoder(&gpu, codec) else {
+            return;
+        };
+        let mut stream = Stream::new(&gpu, codec, WIDTH, HEIGHT);
+        let units: Vec<Vec<u8>> = (0..5).map(|n| stream.next(n == 3).data).collect();
+        drop(stream);
+        let picture = |decoder: &mut Decoder, n: usize| {
+            let decoded = decoder
+                .decode(&units[n])
+                .unwrap_or_else(|e| panic!("{codec} frame {n}: {e}"));
+            assert!(decoded.is_some(), "{codec} frame {n} gave no picture");
+        };
+        picture(&mut decoder, 0);
+        if codec == Codec::H264 {
+            let field = decoder.decode(&lone_field());
+            assert!(matches!(field, Ok(None)), "a lone field: {field:?}");
+        }
+        let sei = sei(&header, 3);
+        let before = private_bytes();
+        let mut top = before;
+        for _ in 0..2000 {
+            let _ = decoder.decode(&sei);
+            top = top.max(private_bytes());
+        }
+        let rise = top.saturating_sub(before);
+        println!(
+            "{codec}: 2000 frames of {} bytes of SEI, private bytes up {} KB at most",
+            sei.len(),
+            rise >> 10
+        );
+        // 1.6 MB of messages, of which 256 KB are kept at most.
+        assert!(rise < 1 << 20, "{codec}: private bytes up {rise}");
+        let after = decoder.decode(&units[1]);
+        assert!(
+            !matches!(after, Ok(Some(_))),
+            "{codec}: a P frame after the flush: {after:?}"
+        );
+        picture(&mut decoder, 3);
+        picture(&mut decoder, 4);
+    }
+}
+
+// A stream that shows pictures keeps nothing, however much SEI it has sent in
+// all: if the count did not start again at a picture, a real stream's few
+// hundred bytes with each IDR would add up to a flush and take its references.
+#[test]
+fn sei_between_pictures_stays() {
+    const ROUNDS: usize = 8;
+    let _turn = common::turn();
+    let Some(gpu) = common::nvidia() else { return };
+    for (codec, header) in [(Codec::H264, vec![6u8]), (Codec::Hevc, vec![39 << 1, 1])] {
+        let Some(mut decoder) = common::decoder(&gpu, codec) else {
+            return;
+        };
+        let mut stream = Stream::new(&gpu, codec, WIDTH, HEIGHT);
+        let units: Vec<Vec<u8>> = (0..ROUNDS).map(|_| stream.next(false).data).collect();
+        drop(stream);
+        // About 51 KB each, so eight pass the 256 KB the decoder keeps at most.
+        let sei = sei(&header, 200);
+        for (n, unit) in units.iter().enumerate() {
+            let decoded = decoder
+                .decode(unit)
+                .unwrap_or_else(|e| panic!("{codec} frame {n}: {e}"));
+            assert!(decoded.is_some(), "{codec} frame {n} gave no picture");
+            let _ = decoder.decode(&sei);
+        }
+    }
+}

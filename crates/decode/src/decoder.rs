@@ -29,6 +29,16 @@ use crate::timing::{GpuTime, Timing};
 /// 2.75 MB, so anything larger did not come through them.
 pub const MAX_ACCESS_UNIT: usize = 3 << 20;
 
+// FFmpeg keeps a unit's SEI for the picture it expects next, and with no
+// picture coming it adds the next unit's to it: HEVC after any IDR, H.264
+// after a lone field. Only a flush lets go of it. So much of the smallest
+// messages it keeps cost about 5 MB and, as it copies its list of them for
+// each one, about 5 ms for the last unit. Encoders write a few hundred bytes
+// with an IDR and a picture in every unit, so a stream comes this far only
+// when it has shown nothing for thousands of frames, and the flush takes
+// nothing from it that it still had.
+const MOST_SEI_KEPT: usize = 256 << 10;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
     H264,
@@ -123,6 +133,9 @@ pub struct Decoder {
     // where the H.264 decoder gives none, so until then HEVC access units other
     // than IDRs do not reach FFmpeg.
     had_idr: bool,
+    // Bytes of SEI handed to FFmpeg since it last showed a picture or was
+    // flushed, kept to MOST_SEI_KEPT.
+    sei_kept: usize,
     // Times the format callback chose d3d11va, each time FFmpeg set its
     // video decoder and surface pool up afresh: the first IDR, then each
     // new size or profile.
@@ -198,6 +211,7 @@ impl Decoder {
             sent: 0,
             timing: Timing::new(device, &context, &multithread),
             had_idr: false,
+            sei_kept: 0,
             setups: Cell::new(0),
         };
 
@@ -331,6 +345,7 @@ impl Decoder {
         if idr {
             // SAFETY: an open context.
             unsafe { (self.library.avcodec_flush_buffers)(self.context) };
+            self.sei_kept = 0;
         }
         self.sent += 1;
         self.choice.set(0);
@@ -341,6 +356,16 @@ impl Decoder {
         let result = self.send_and_receive(size, unit);
         if idr {
             self.had_idr = matches!(result, Ok(Some(_)));
+        }
+        self.sei_kept = match result {
+            Ok(Some(_)) | Err(DecodeError::HeldBack { .. }) => 0,
+            _ => self.sei_kept + guard::sei_bytes(self.codec, access_unit),
+        };
+        if self.sei_kept > MOST_SEI_KEPT {
+            // SAFETY: an open context.
+            unsafe { (self.library.avcodec_flush_buffers)(self.context) };
+            self.sei_kept = 0;
+            self.had_idr = false;
         }
         if let Some(timing) = &mut self.timing {
             match &result {
@@ -796,5 +821,127 @@ mod tests {
         fn any_bytes_give_an_answer(bytes in noise()) {
             hevc_idr(&bytes);
         }
+    }
+
+    // Start code and header, then ones and zeros with the stop bit and
+    // emulation prevention added.
+    fn h264_nal(header: u8, bits: &str) -> Vec<u8> {
+        let bits: Vec<u8> = bits
+            .bytes()
+            .chain(*b"1")
+            .map(|bit| bit - b'0')
+            .chain([0; 7])
+            .collect();
+        let mut out = vec![0, 0, 1, header];
+        let mut zeros = 0;
+        for byte in bits.as_chunks::<8>().0 {
+            let byte = byte.iter().fold(0, |acc, bit| acc << 1 | bit);
+            if zeros >= 2 && byte <= 3 {
+                out.push(3);
+                zeros = 0;
+            }
+            out.push(byte);
+            zeros = if byte == 0 { zeros + 1 } else { 0 };
+        }
+        out
+    }
+
+    fn ue(value: u32) -> String {
+        let coded = value + 1;
+        let len = 32 - coded.leading_zeros() as usize;
+        format!("{:0>width$b}", coded, width = 2 * len - 1)
+    }
+
+    // An SPS for 640x368 that asks for two frames of reordering, its PPS, and an
+    // IDR slice of made-up picture data, which only the GPU reads.
+    fn asks_for_reordering() -> Vec<u8> {
+        let sps = [
+            format!("{:08b}{:08b}{:08b}", 100, 0, 51),
+            ue(0),                  // sps_id
+            ue(1),                  // chroma_format_idc: 4:2:0
+            ue(0),                  // bit_depth_luma_minus8
+            ue(0),                  // bit_depth_chroma_minus8
+            "00".to_string(),       // qpprime_y_zero_transform_bypass, seq_scaling_matrix_present
+            ue(0),                  // log2_max_frame_num_minus4
+            ue(2),                  // pic_order_cnt_type
+            ue(2),                  // max_num_ref_frames
+            "0".to_string(),        // gaps_in_frame_num_allowed
+            ue(39),                 // width in macroblocks less 1
+            ue(22),                 // height in macroblocks less 1
+            "1".to_string(),        // frame_mbs_only
+            "1".to_string(),        // direct_8x8_inference
+            "0".to_string(),        // frame_cropping
+            "1".to_string(),        // vui_parameters_present
+            "00000000".to_string(), // everything in the VUI up to the next flag
+            "11".to_string(),       // bitstream_restriction, motion_vectors_over_pic_boundaries
+            ue(0),                  // max_bytes_per_pic_denom
+            ue(0),                  // max_bits_per_mb_denom
+            ue(16),                 // log2_max_mv_length_horizontal
+            ue(16),                 // log2_max_mv_length_vertical
+            ue(2),                  // max_num_reorder_frames
+            ue(2),                  // max_dec_frame_buffering
+        ]
+        .concat();
+        let pps = [
+            ue(0),             // pps_id
+            ue(0),             // sps_id
+            "00".to_string(),  // entropy_coding_mode, bottom_field_pic_order_in_frame_present
+            ue(0),             // num_slice_groups_minus1
+            ue(0),             // num_ref_idx_l0_default_active_minus1
+            ue(0),             // num_ref_idx_l1_default_active_minus1
+            "000".to_string(), // weighted_pred, weighted_bipred_idc
+            ue(0),             // pic_init_qp_minus26
+            ue(0),             // pic_init_qs_minus26
+            ue(0),             // chroma_qp_index_offset
+            "000".to_string(), // deblocking_filter_control, constrained_intra_pred, redundant_pic_cnt
+        ]
+        .concat();
+        let slice = [
+            ue(0),              // first_mb_in_slice
+            ue(7),              // slice_type: all I
+            ue(0),              // pps_id
+            "0000".to_string(), // frame_num
+            ue(0),              // idr_pic_id
+            "00".to_string(),   // no_output_of_prior_pics, long_term_reference
+            ue(0),              // slice_qp_delta
+            "10101100".repeat(64),
+        ]
+        .concat();
+        [
+            h264_nal(0x67, &sps),
+            h264_nal(0x68, &pps),
+            h264_nal(0x65, &slice),
+        ]
+        .concat()
+    }
+
+    // A flush lets go of what FFmpeg kept, so what was counted goes with it, or
+    // the next SEI would flush again for nothing. By then the references have
+    // gone anyway, so nothing outside shows that flush and this reads the count.
+    #[test]
+    fn a_flush_for_reordering_starts_the_sei_count_again() {
+        let adapters = capture::adapters().unwrap_or_else(|e| panic!("{e}"));
+        let Some(adapter) = adapters.iter().find(|a| a.vendor_id == 0x10de) else {
+            println!("skipped: no NVIDIA GPU on this PC");
+            return;
+        };
+        let device = capture::device_on(adapter).unwrap_or_else(|e| panic!("{e}"));
+        let mut decoder = match Decoder::new(&device, Codec::H264) {
+            Ok(decoder) => decoder,
+            Err(err @ (DecodeError::Missing { .. } | DecodeError::Unsupported { .. })) => {
+                println!("skipped: {err}");
+                return;
+            }
+            Err(err) => panic!("{err}"),
+        };
+        let sei = [&[0u8, 0, 1, 6, 5, 16][..], &[0x11; 16], &[0x80]].concat();
+        let _ = decoder.decode(&sei);
+        assert_eq!(decoder.sei_kept, sei.len() - 3);
+        let answer = decoder.decode(&asks_for_reordering());
+        assert!(
+            matches!(answer, Err(DecodeError::HeldBack { .. })),
+            "{answer:?}"
+        );
+        assert_eq!(decoder.sei_kept, 0);
     }
 }

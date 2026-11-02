@@ -165,6 +165,15 @@ pub(crate) fn check_hevc(access_unit: &[u8]) -> Result<(), DecodeError> {
     Ok(())
 }
 
+// A unit check_unit has passed, so the walk is short: what FFmpeg may have kept
+// of a unit that gave no picture (src/decoder.rs).
+pub(crate) fn sei_bytes(codec: Codec, access_unit: &[u8]) -> usize {
+    annexb::after_start_codes(access_unit)
+        .filter(|&data| is_sei(codec, &Nal { data }))
+        .map(<[u8]>::len)
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,5 +842,25 @@ mod tests {
             agrees_with_the_rule(&idr(&sps))?;
             agrees_with_the_rule(&[pps(), sps.clone(), slice(TRAIL)].concat())?;
         }
+    }
+
+    #[test]
+    fn sei_bytes_add_up() {
+        let h264 = [
+            unit(&[7], 9),
+            unit(&[6], 50),
+            unit(&H264_IDR, 9),
+            unit(&[6], 244),
+        ]
+        .concat();
+        assert_eq!(sei_bytes(Codec::H264, &h264), 51 + 245);
+        let hevc = [
+            unit(&[39 << 1, 1], 8),
+            unit(&HEVC_IDR, 9),
+            unit(&[40 << 1, 1], 18),
+        ]
+        .concat();
+        assert_eq!(sei_bytes(Codec::Hevc, &hevc), 10 + 20);
+        assert_eq!(sei_bytes(Codec::Hevc, &unit(&HEVC_IDR, 9)), 0);
     }
 }
