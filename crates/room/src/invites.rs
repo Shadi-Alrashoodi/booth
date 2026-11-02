@@ -13,7 +13,7 @@ const MAX_IN_INVITE: usize = 8;
 // A room holds seven clients, eight people with the host, so this is room for
 // every friend's PC and then some. Without a cap, someone holding a leaked 24 h code could mint keys all
 // day and push real friends out of the host's key table.
-const KEYS_PER_MULTI_USE: usize = 32;
+pub(crate) const KEYS_PER_MULTI_USE: usize = 32;
 
 pub(crate) enum Local {
     Discover(Vec<LocalAddr>),

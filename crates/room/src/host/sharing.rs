@@ -43,9 +43,10 @@ const ENDED_GRACE: Duration = Duration::from_secs(1);
 // kept this long after they leave: longer than the slowest bucket takes to
 // fill from empty, so leaving and joining again in a loop gets nothing that
 // waiting would not. Only a full handshake adds one; the cap is for a
-// program that joins and leaves in a loop.
+// program that joins and leaves in a loop, and stands above the keys one
+// multi-use invite lets in, so going round those pushes none of them out.
 const KEPT_FOR: Duration = Duration::from_secs(10);
-const MOST_KEPT: usize = 16;
+const MOST_KEPT: usize = 64;
 // A friend's share passed on over internet paths may take this many times
 // the upload setting, a second of it at once: a share keeping to its cap
 // sends about 112 percent of it with the parity, and IDRs a quarter more.

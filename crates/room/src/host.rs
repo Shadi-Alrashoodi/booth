@@ -7907,6 +7907,35 @@ mod tests {
         assert_eq!(spent(&mut rig.host.peers[0], later), [false; 3]);
     }
 
+    // Going round every key one invite lets in, one in the room at a time,
+    // pushes none of their limits out.
+    #[test]
+    fn rejoin_keeps_limits_round_all_of_an_invites_keys() {
+        let mut now = Instant::now();
+        let mut rig = Rig::new(now);
+        let mut guests: Vec<Guest> = (0..crate::invites::KEYS_PER_MULTI_USE)
+            .map(|_| Guest::new())
+            .collect();
+        for guest in &mut guests {
+            // No faster than initiations from one address may come.
+            now += Duration::from_millis(100);
+            guest.join(&mut rig, "Friend", now);
+            let says = &mut rig.host.peers[0].says;
+            while says.take(now, chat::SAYS_PER_SECOND, chat::SAY_BURST) {}
+            guest.say(&mut rig, &Message::Bye, now);
+            guest.left();
+        }
+
+        now += Duration::from_millis(100);
+        guests[0].join(&mut rig, "Friend", now);
+        let says = &mut rig.host.peers[0].says;
+        let burst = chat::SAY_BURST as usize;
+        let lines = (0..burst)
+            .filter(|_| says.take(now, chat::SAYS_PER_SECOND, chat::SAY_BURST))
+            .count();
+        assert!(lines < burst, "{lines}");
+    }
+
     // A client watching hears of a new frame rate from the roster; this
     // host's own viewer has to be told.
     #[test]
