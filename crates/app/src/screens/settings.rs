@@ -77,6 +77,10 @@ pub struct Draft {
     // Why a Remove or Unblock could not be written, or the known devices
     // could not be read. Shown with them, not under a field.
     pub list_error: Option<String>,
+    // Save just failed, and the first reason drawn comes into view: Save is
+    // on the bar whatever part of the list shows, so the line can be far from
+    // the press.
+    pub show_reason: bool,
 }
 
 // Which fields the last Save found wrong, each with its own line.
@@ -131,6 +135,7 @@ impl Draft {
             refused: Refused::default(),
             error: None,
             list_error: None,
+            show_reason: false,
         }
     }
 
@@ -234,7 +239,8 @@ pub fn show(ui: &mut Ui, draft: &mut Draft, audio: &mut SettingsAudio) -> Option
         scroll.show(ui, |ui| {
             controls::page(ui, |ui| {
                 if draft.locked {
-                    controls::prose(ui, messages::SETTINGS_LOCKED, theme::body(), WARN);
+                    let said = controls::prose(ui, messages::SETTINGS_LOCKED, theme::body(), WARN);
+                    in_view(&mut draft.show_reason, &said);
                     ui.add_space(SECTION_GAP);
                 }
                 fields.push(name(ui, draft));
@@ -252,7 +258,8 @@ pub fn show(ui: &mut Ui, draft: &mut Draft, audio: &mut SettingsAudio) -> Option
                 }
                 if let Some(error) = &draft.list_error {
                     ui.add_space(FIELD_GAP);
-                    controls::prose(ui, error.as_str(), theme::body(), BAD);
+                    let said = controls::prose(ui, error.as_str(), theme::body(), BAD);
+                    in_view(&mut draft.show_reason, &said);
                 }
             });
         });
@@ -323,7 +330,8 @@ fn network(ui: &mut Ui, draft: &mut Draft) -> [Response; 2] {
         draft.refused.port = false;
     }
     if draft.refused.port {
-        line(ui, messages::PORT_REFUSED, BAD);
+        let said = line(ui, messages::PORT_REFUSED, BAD);
+        in_view(&mut draft.show_reason, &said);
     }
 
     ui.add_space(FIELD_GAP);
@@ -339,7 +347,8 @@ fn network(ui: &mut Ui, draft: &mut Draft) -> [Response; 2] {
         draft.refused.stun_line = None;
     }
     if let Some(at) = draft.refused.stun_line {
-        line(ui, &messages::stun_refused(at), BAD);
+        let said = line(ui, &messages::stun_refused(at), BAD);
+        in_view(&mut draft.show_reason, &said);
     } else if draft.stun_servers.trim().is_empty() {
         line(ui, messages::NO_STUN, ASH);
     }
@@ -359,7 +368,8 @@ fn network(ui: &mut Ui, draft: &mut Draft) -> [Response; 2] {
         draft.refused.address_name = false;
     }
     if draft.refused.address_name {
-        line(ui, messages::ADDRESS_NAME_REFUSED, BAD);
+        let said = line(ui, messages::ADDRESS_NAME_REFUSED, BAD);
+        in_view(&mut draft.show_reason, &said);
     } else {
         line(ui, messages::ADDRESS_NAME_ABOUT, ASH);
     }
@@ -381,7 +391,8 @@ fn network(ui: &mut Ui, draft: &mut Draft) -> [Response; 2] {
         }
     }
     if let Some(error) = &draft.error {
-        line(ui, error.as_str(), BAD);
+        let said = line(ui, error.as_str(), BAD);
+        in_view(&mut draft.show_reason, &said);
     }
     [port, address]
 }
@@ -730,9 +741,15 @@ fn labelled(ui: &mut Ui, id: &str, text: &mut String, label: &str, chars: usize)
 }
 
 // A help line or an error, half a step under the control it belongs to.
-fn line(ui: &mut Ui, text: &str, color: eframe::egui::Color32) {
+fn line(ui: &mut Ui, text: &str, color: eframe::egui::Color32) -> Response {
     ui.add_space(HALF_STEP);
-    controls::prose(ui, text, theme::caption(), color);
+    controls::prose(ui, text, theme::caption(), color)
+}
+
+fn in_view(show_reason: &mut bool, said: &Response) {
+    if std::mem::take(show_reason) {
+        said.scroll_to_me(None);
+    }
 }
 
 // Only on a PC that has hosted and has any. Each one on two lines, since a
@@ -817,6 +834,9 @@ fn with_button(ui: &mut Ui, rect: Rect, button: Button, left: impl FnOnce(&mut U
 mod tests {
     use super::*;
     use eframe::egui::{Context, RawInput, ViewportId, ViewportInfo, pos2};
+    use voice::audio::fake::{Fake, Setup as FakeSetup};
+
+    use crate::sound::tests::fake_audio;
 
     fn typed(address_name: &str) -> Draft {
         Draft {
@@ -1224,6 +1244,73 @@ mod tests {
         assert!(next.check_for_new_versions());
         let again = Draft::new(&next, KnownDevices::default(), String::new());
         assert!(again.check_for_new_versions);
+    }
+
+    // Where the line is drawn: None when no such line was drawn at all.
+    fn line_at(
+        ctx: &Context,
+        draft: &mut Draft,
+        audio: &mut SettingsAudio,
+        words: &str,
+    ) -> Option<(f32, f32)> {
+        let (press, output) =
+            crate::controls::tests::frame(ctx, Vec::new(), |ui| show(ui, draft, audio).is_some());
+        assert!(!press);
+        let nodes = output.accesskit_update.expect("accesskit is on").nodes;
+        nodes
+            .iter()
+            .find(|(_, node)| node.label().or(node.value()) == Some(words))
+            .and_then(|(_, node)| node.bounds())
+            .map(|bounds| (bounds.y0 as f32, bounds.y1 as f32))
+    }
+
+    // Save is on the bar under the list, so the reason a Save failed can be
+    // out of sight either way. Each reason here starts from the far end of
+    // the list, and the list's own line, drawn last, gives way to it.
+    #[test]
+    fn a_failed_save_brings_its_reason_into_view() {
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let fake = Fake::new(FakeSetup::default(), &[("a", "Headset A")], Some("a"));
+        let mut draft = typed("");
+        let mut audio = fake_audio(&ctx, &fake, &draft.input);
+        let (top, bottom) = (theme::TITLE_ROW, 640.0 - BAR_HEIGHT);
+        let in_sight = |(from, to): (f32, f32)| from >= top && to <= bottom;
+        let list_error = "Could not save devices.bin.";
+        let stun = messages::stun_refused(1);
+        let settings_error = "Could not write settings.txt.";
+        let mut comes_into_view = |draft: &mut Draft, words: &str| {
+            draft.show_reason = true;
+            // A pass to ask, a pass for the list to take it, and one to look.
+            line_at(&ctx, draft, &mut audio, words);
+            assert!(!draft.show_reason, "{words}");
+            line_at(&ctx, draft, &mut audio, words);
+            let at = line_at(&ctx, draft, &mut audio, words).unwrap();
+            assert!(in_sight(at), "{words}: at {at:?}");
+        };
+
+        type Set = fn(&mut Draft);
+        let cases: [(&str, Set); 5] = [
+            (messages::SETTINGS_LOCKED, |draft| draft.locked = true),
+            (messages::PORT_REFUSED, |draft| draft.refused.port = true),
+            (&stun, |draft| draft.refused.stun_line = Some(1)),
+            (messages::ADDRESS_NAME_REFUSED, |draft| {
+                draft.refused.address_name = true;
+            }),
+            (settings_error, |draft| {
+                draft.error = Some(String::from("Could not write settings.txt."));
+            }),
+        ];
+        for (words, set) in cases {
+            draft.list_error = Some(String::from(list_error));
+            draft.locked = false;
+            draft.refused = Refused::default();
+            draft.error = None;
+            comes_into_view(&mut draft, list_error);
+            set(&mut draft);
+            comes_into_view(&mut draft, words);
+        }
     }
 
     #[test]

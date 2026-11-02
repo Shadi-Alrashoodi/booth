@@ -653,6 +653,7 @@ impl App {
             self.backlog.add(hotkeys::bindings_line(&after));
         }
         if !saved {
+            draft.show_reason = true;
             return;
         }
         self.close_settings();
@@ -1864,6 +1865,47 @@ mod tests {
             assert_eq!(mute(&app), f9, "{cancel}");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    // Refused, or settings.txt not written: the hotkeys stay on what the
+    // settings still say, and the screen brings up why.
+    #[test]
+    fn a_save_that_changed_nothing_leaves_the_hotkeys() {
+        let f9: Chord = "F9".parse().unwrap();
+        let dir = fresh_dir("hotkeys-refused");
+        let mut app = app_in_settings(&dir, Start::default(), |draft| {
+            draft.hotkeys.set(Action::Mute, f9);
+            draft.port = String::from("80");
+        });
+        let reason_due = |app: &App| match &app.screen {
+            Screen::Settings { draft, .. } => draft.show_reason,
+            _ => panic!("the screen closed"),
+        };
+        assert!(!reason_due(&app));
+        app.save_settings();
+        assert!(reason_due(&app), "a refused field");
+        assert_eq!(app.hotkeys.last_given(), input::Bindings::default());
+
+        let Screen::Settings { draft, .. } = &mut app.screen else {
+            panic!("the screen closed");
+        };
+        draft.show_reason = false;
+        draft.port = DEFAULT_PORT.to_string();
+        std::fs::create_dir(dir.join("settings.txt")).unwrap();
+        app.save_settings();
+        assert!(reason_due(&app), "settings.txt not written");
+        assert_eq!(app.hotkeys.last_given(), input::Bindings::default());
+        std::fs::remove_dir(dir.join("settings.txt")).unwrap();
+
+        let Screen::Settings { draft, .. } = &mut app.screen else {
+            panic!("the screen closed");
+        };
+        draft.show_reason = false;
+        app.flags = Arc::new(Flags::controlled_for_tests());
+        app.save_settings();
+        assert!(reason_due(&app), "this pc is controlled");
+        assert_eq!(app.hotkeys.last_given(), input::Bindings::default());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // While this PC is controlled, Save refuses a change to the panic key,
