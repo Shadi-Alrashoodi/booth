@@ -1159,9 +1159,9 @@ impl Audience for Watchers<'_> {
         // and what it plays then is not the sharer's to send: the PC sound
         // stops as for a pause by hand, before anything says paused. A
         // minimized window, a monitor taken, changing or gone keep it, and
-        // keep it stopped once it is: a monitor asleep on the lock screen
-        // can leave the desktop, and only a picture says it is the sharer's
-        // again.
+        // keep it stopped once it is: a monitor still gone when the lock
+        // screen closes says it left, and only a picture says it is the
+        // sharer's again.
         if matches!(
             reason,
             PauseReason::SecureDesktop | PauseReason::Disconnected
@@ -1577,7 +1577,7 @@ mod tests {
             watchers.resumed();
             assert!(!sound.paused(), "{reason}");
         }
-        // The monitor asleep on the lock screen leaves the desktop.
+        // The monitor still gone when the lock screen closes.
         watchers.paused(&PauseReason::SecureDesktop);
         watchers.paused(&PauseReason::Missing);
         assert!(sound.paused());

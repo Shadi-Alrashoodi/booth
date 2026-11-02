@@ -107,6 +107,10 @@ pub struct Capture {
     // count the tries.
     #[cfg(test)]
     refuse: Option<PauseReason>,
+    // What a look finds for a monitor that is not listed, which a refusal
+    // would not get as far as.
+    #[cfg(test)]
+    look: Option<PauseReason>,
     #[cfg(test)]
     reopens: u32,
 }
@@ -223,6 +227,8 @@ impl Capture {
             #[cfg(test)]
             refuse: None,
             #[cfg(test)]
+            look: None,
+            #[cfg(test)]
             reopens: 0,
         })
     }
@@ -279,7 +285,8 @@ impl Capture {
                 if let Some(reason) = self.reopen()? {
                     // Told again only when the reason changes in kind: a
                     // monitor that left the desktop has a deadline the
-                    // others do not.
+                    // others do not, and a lock after it left stops the PC
+                    // sound, which its leaving does not.
                     let told = self.paused.as_ref().map(mem::discriminant);
                     if told == Some(mem::discriminant(&reason)) {
                         return Ok(Next::Idle);
@@ -499,6 +506,26 @@ impl Capture {
         crate::desktop_away().is_some()
     }
 
+    // A monitor that is not listed gets no further than find(), so Desktop
+    // Duplication is not there to say the lock screen came up meanwhile. A
+    // look that could not ask counts as a lost session, as for a window
+    // share: only an answer that the session is active keeps the PC sound.
+    fn missing_reason(&self) -> PauseReason {
+        match self.look() {
+            None => PauseReason::Missing,
+            Some(PauseReason::Changing(_)) => PauseReason::Disconnected,
+            Some(reason) => reason,
+        }
+    }
+
+    fn look(&self) -> Option<PauseReason> {
+        #[cfg(test)]
+        if self.look.is_some() {
+            return self.look.clone();
+        }
+        crate::desktop_away()
+    }
+
     fn drop_pending(&mut self) {
         if self.pending.take().is_some() {
             self.cap.drop_held();
@@ -710,13 +737,13 @@ impl Capture {
         }
         let now = Instant::now();
         if !self.missing.due(now) {
-            return Ok(Some(PauseReason::Missing));
+            return Ok(Some(self.missing_reason()));
         }
         let output = match find(&self.monitor.id) {
             Ok((_, output)) => output,
             Err(err) if err.kind() == ErrorKind::MonitorGone => {
                 return match self.missing.missed(now) {
-                    Missed::Wait => Ok(Some(PauseReason::Missing)),
+                    Missed::Wait => Ok(Some(self.missing_reason())),
                     Missed::GiveUp => Err(err),
                 };
             }
@@ -913,6 +940,7 @@ mod tests {
     use std::sync::{Mutex, MutexGuard};
 
     use super::*;
+    use crate::missing::{LOOK_EVERY, LOOKS};
 
     // Windows allows one duplication of a monitor per process, and these
     // tests run side by side in one, so they take turns.
@@ -1327,5 +1355,65 @@ mod tests {
         ));
         assert!(capture.pending.is_none() && capture.duplication.is_none());
         assert_eq!(capture.cap.held_until(), None);
+    }
+
+    // A monitor that left the desktop never reaches Desktop Duplication, the
+    // only thing that would say the secure desktop came up, so each try looks
+    // at the desktop, between the looks for the monitor and at them. Told so,
+    // the share lets go of its picture and the PC sound stops; back on the
+    // user's desktop, as this PC's is while the test runs, it says the
+    // monitor again. The look changes nothing of the wait for the monitor.
+    #[test]
+    fn a_missing_monitor_says_when_the_desktop_goes_away() {
+        let _turn = desktop_turn();
+        let Some(mut capture) = primary_capture() else {
+            return;
+        };
+        capture.duplication = None;
+        capture.monitor.id.device_name = String::from("not a listed monitor");
+        assert!(matches!(
+            capture.next().unwrap(),
+            Next::Paused(PauseReason::Missing)
+        ));
+        assert!(matches!(capture.next().unwrap(), Next::Idle));
+        capture.look = Some(PauseReason::SecureDesktop);
+        assert!(matches!(
+            capture.next().unwrap(),
+            Next::Paused(PauseReason::SecureDesktop)
+        ));
+        assert!(matches!(capture.next().unwrap(), Next::Idle));
+        capture.look = None;
+        assert!(matches!(
+            capture.next().unwrap(),
+            Next::Paused(PauseReason::Missing)
+        ));
+        // A look that could not ask stops the PC sound as a lost session does.
+        capture.look = Some(PauseReason::Changing(String::from("a test could not ask")));
+        assert!(matches!(
+            capture.next().unwrap(),
+            Next::Paused(PauseReason::Disconnected)
+        ));
+        capture.look = None;
+        assert!(matches!(
+            capture.next().unwrap(),
+            Next::Paused(PauseReason::Missing)
+        ));
+
+        // The next call is due a look for the monitor.
+        thread::sleep(LOOK_EVERY);
+        capture.look = Some(PauseReason::Disconnected);
+        assert!(matches!(
+            capture.next().unwrap(),
+            Next::Paused(PauseReason::Disconnected)
+        ));
+
+        // The first try and the one just now each missed it, so the next due
+        // look is the 31st, the desktop away or not.
+        for _ in 0..LOOKS - 2 {
+            capture.missing.missed(Instant::now());
+        }
+        thread::sleep(LOOK_EVERY);
+        let gave_up = capture.next().expect_err("the wait ran out");
+        assert_eq!(gave_up.kind(), ErrorKind::MonitorGone);
     }
 }

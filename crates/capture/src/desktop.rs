@@ -1,8 +1,10 @@
 // Whether Windows shows this session's own desktop. Desktop Duplication
 // refuses the secure desktop and a disconnected session, which a monitor's
 // capture reports as a pause, though only once it asks for a picture: one
-// it held through a rest asks here first. Windows.Graphics.Capture goes on
-// without a word, so a window share asks here.
+// it held through a rest asks here first, and one whose monitor left the
+// desktop, which has nothing to ask, asks here instead.
+// Windows.Graphics.Capture goes on without a word, so a window share asks
+// here.
 
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
@@ -100,7 +102,8 @@ fn name(desktop: HDESK, into: &mut [u16; NAME]) -> Option<&[u16]> {
 // about, a call into another process that takes about 35 us here, and the
 // answer kept for ASK_EVERY. Only an answer that it is active counts: a
 // question that fails keeps the PC sound off rather than sending what may
-// be a PC left alone, and says why.
+// be a PC left alone. A window share logs why; a monitor that left the
+// desktop reports a lost session.
 fn session_away() -> Option<PauseReason> {
     static SESSION: OnceLock<Option<u32>> = OnceLock::new();
     static ASKED: Mutex<Option<(Instant, Option<PauseReason>)>> = Mutex::new(None);

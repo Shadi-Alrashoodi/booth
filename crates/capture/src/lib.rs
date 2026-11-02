@@ -152,7 +152,8 @@ pub enum PauseReason {
     SecureDesktop,
     // Other programs hold every duplication Windows allows for the monitor.
     Taken,
-    // The Windows session is disconnected or locked from Remote Desktop.
+    // The Windows session is disconnected or locked from Remote Desktop, or
+    // a look that could not ask, with the monitor gone.
     Disconnected,
     // Anything else Windows answered while the desktop was changing, or a
     // window share's look that could not ask whether the session is
@@ -183,7 +184,7 @@ impl fmt::Display for PauseReason {
             ),
             PauseReason::Missing => write!(
                 f,
-                "the monitor left the desktop: it was turned off, went to sleep or was unplugged. Sharing goes on if it is back within {} s",
+                "the monitor left the desktop: it was turned off, went to sleep or was unplugged. Sharing goes on if it is back within {} s of leaving",
                 (missing::LOOK_EVERY * missing::LOOKS).as_secs()
             ),
         }
