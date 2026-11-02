@@ -752,6 +752,9 @@ impl App {
             }
             None => return,
         }
+        if in_room.picking() {
+            return;
+        }
         // After a region or window share the key opens the list instead, in
         // later rooms and runs too, so a press never shows more than the
         // person last chose.
@@ -1954,6 +1957,38 @@ mod tests {
         assert!(app.raise);
         assert!(room_tests::list_open(in_room(&mut app)));
 
+        close_room(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // While the picker is up the key starts nothing and opens nothing, the
+    // list after a window or a region included. One press still stops a share.
+    #[test]
+    fn the_share_key_starts_nothing_while_the_picker_is_up() {
+        let dir = fresh_dir("key-picking");
+        let ctx = Context::default();
+        for list_next in [false, true] {
+            let mut app = app_in_room(&dir);
+            if list_next {
+                app.take_step(Some(Step::ListNext));
+            }
+            let answer = room_tests::picker_open(in_room(&mut app));
+            press_share_key_twice(&mut app, &ctx);
+            thread::sleep(Duration::from_millis(100));
+            let own = in_room(&mut app).room.view().share.own;
+            assert!(!own_share_on(&own), "{list_next}: {own:?}");
+            assert!(!room_tests::list_open(in_room(&mut app)), "{list_next}");
+            assert!(!app.raise, "{list_next}");
+            drop(answer);
+            close_room(app);
+        }
+        let mut app = app_in_room(&dir);
+        in_room(&mut app).room.share(30, None);
+        share_goes(&mut app, true);
+        let answer = room_tests::picker_open(in_room(&mut app));
+        app.share_key(Instant::now(), &ctx);
+        share_goes(&mut app, false);
+        drop(answer);
         close_room(app);
         let _ = std::fs::remove_dir_all(&dir);
     }
