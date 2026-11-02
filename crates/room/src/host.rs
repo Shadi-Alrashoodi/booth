@@ -78,7 +78,9 @@ const COPY_WINDOW: Duration = Duration::from_secs(1);
 const STAMP_FLOOR: Duration = Duration::from_secs(24 * 60 * 60);
 // How long the sessions of someone who said Bye are still recognised. The
 // second copy of the Bye leaves right behind the first; this also covers a
-// ping or two that was already on a slow path.
+// ping or two that was already on a slow path. A friend let go for silence
+// said no Bye and goes on sending until their own lost_after runs out, so
+// theirs are recognised for that much longer.
 const LEFT_GRACE: Duration = Duration::from_secs(5);
 const JUST_LEFT_KEPT: usize = 64;
 // After this PC's public address changed, the paste field says for this
@@ -424,8 +426,9 @@ pub(crate) struct Host {
     // their port test from outside needs.
     booth_lines: PerSource,
     other_lines: PerSource,
-    // Session indexes of people who just said Bye, and until when. The Bye
-    // goes out twice and its second copy lands after they are gone.
+    // Session indexes of people who just left, and until when: a Bye goes out
+    // twice and its second copy lands after they are gone, and a friend let
+    // go for silence goes on sending for a while.
     just_left: Vec<(u32, Instant)>,
     // Friends this room turned away for their version, so the chat says it
     // once each, however often they try again.
@@ -1112,6 +1115,7 @@ impl Host {
             self.talk.forget(&peer.key, now);
             self.note_lost(peer.key, peer.last_heard, now);
             self.left_share(&peer.key, now, socket);
+            self.keep_left(&peer.sessions, lost_after + LEFT_GRACE, now);
             self.keep_limits(peer, now);
         }
         changed |= self.change_step(now);
@@ -2394,8 +2398,9 @@ impl Host {
             .iter()
             .position(|p| p.session.local_index() == index)
         else {
-            // The second copy of a Bye, or a packet that was on its way when
-            // they left. Not junk, and nothing to write down.
+            // The second copy of a Bye, a packet that was on its way when
+            // they left, or one from a friend let go for silence who has not
+            // given up yet. Not junk, and nothing to write down.
             if self.left_just_now(index, now) {
                 return false;
             }
@@ -3151,7 +3156,7 @@ impl Host {
     fn let_go(&mut self, i: usize, now: Instant, socket: &Socket) {
         let gone = self.peers.remove(i);
         self.talk.forget(&gone.key, now);
-        self.keep_left(&gone.sessions, now);
+        self.keep_left(&gone.sessions, LEFT_GRACE, now);
         self.pending.retain(|p| p.key != gone.key);
         if let Some(record) = self.keys.get_mut(&gone.key) {
             record.last_seen = now;
@@ -3293,14 +3298,13 @@ impl Host {
         self.log.is_on() && self.other_lines.allow(from.ip(), now, &self.log)
     }
 
-    fn keep_left(&mut self, sessions: &Sessions, now: Instant) {
+    fn keep_left(&mut self, sessions: &Sessions, grace: Duration, now: Instant) {
         self.just_left.retain(|(_, until)| now < *until);
         for session in [&sessions.current, &sessions.previous]
             .into_iter()
             .flatten()
         {
-            self.just_left
-                .push((session.local_index(), now + LEFT_GRACE));
+            self.just_left.push((session.local_index(), now + grace));
         }
         // Only a full handshake per entry can add one, so this stays small;
         // the cap is for a program that joins and leaves in a loop.
@@ -4620,6 +4624,39 @@ mod tests {
                 .any(|line| line.ends_with("data for an unknown session, dropped")),
             "{lines:?}"
         );
+    }
+
+    // A friend's uplink goes while the host's pings still reach them: the
+    // host lets them go, and their program keeps sending on its session
+    // until its own lost_after. Those are a friend's packets, not junk.
+    #[test]
+    fn late_packets_from_a_lost_friend_are_quiet() {
+        let start = Instant::now();
+        let (log, captured) = Log::capture(256);
+        let mut rig = Rig::with_log(start, log);
+        let mut ana = Guest::new();
+        ana.join(&mut rig, "Ana", start);
+        let from = ana.wire.addr();
+        let lost_after = rig.host.timers.lost_after;
+        let lost = start + lost_after;
+        rig.tick(lost);
+        assert!(rig.host.peers.is_empty());
+
+        let session = ana.session.as_mut().expect("joined");
+        let packets: Vec<Vec<u8>> = (0..3).map(|n| ping(session, n)).collect();
+        let bad = rig.host.drops.bad;
+        rig.deliver(&packets[0], from, lost + Duration::from_secs(1));
+        rig.deliver(&packets[1], from, lost + lost_after);
+        assert_eq!(rig.host.drops.bad, bad);
+        let lines = captured.lines();
+        assert!(
+            !lines.iter().any(|line| line.contains("unknown session")),
+            "{lines:?}"
+        );
+
+        // Past what a Bye gets from when they stopped, it is a guess again.
+        rig.deliver(&packets[2], from, lost + lost_after + LEFT_GRACE);
+        assert_eq!(rig.host.drops.bad, bad + 1);
     }
 
     // A friend who rekeyed leaves two sessions behind, and the list stays at

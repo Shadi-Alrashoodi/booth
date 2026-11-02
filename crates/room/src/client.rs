@@ -663,13 +663,12 @@ impl Client {
 
     // Instant counted the time this PC was asleep, when the host could not be
     // heard. A host that stayed awake lets this PC go at lost_after, and
-    // from then drops its packets as for an unknown session; asleep for
-    // nearly that long, the network coming back after the wake can take the
-    // rest. Then a new handshake, which works either way: what this PC
-    // watches is asked for again behind its Hello, as when a session runs
-    // out, and the host's silence counts from the wake. A shorter sleep
-    // keeps the session, which also keeps this PC's own share and remote
-    // control. True when the view changed.
+    // from then drops its packets; asleep for nearly that long, the network
+    // coming back after the wake can take the rest. Then a new handshake,
+    // which works either way: what this PC watches is asked for again behind
+    // its Hello, as when a session runs out, and the host's silence counts
+    // from the wake. A shorter sleep keeps the session, which also keeps this
+    // PC's own share and remote control. True when the view changed.
     pub(crate) fn slept(&mut self, asleep: Duration, now: Instant, socket: &Socket) -> bool {
         if self.state == LinkState::Closed {
             return false;
