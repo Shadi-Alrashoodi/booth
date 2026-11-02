@@ -390,11 +390,11 @@ fn invalidation_keeps_frames_coming() {
     assert_eq!(viewer.reassembler.numbers().skipped, 1);
 }
 
-// Right after an IDR, a frame lost with its header is guessed from the
-// headers of frames that are not IDRs, and on a stream that invalidates the
-// sharer invalidates it and the frames after it keep coming. The IDR's own
-// header counts for nothing, whatever it says. Frame 2's wait runs out before
-// frame 3 comes, so no later header is in when it drops.
+// Right after an IDR, a frame lost with its header leaves it to the next
+// header, and on a stream that invalidates the sharer invalidates it and the
+// frames after it keep coming. The IDR's own header counts for nothing,
+// whatever it says. Frame 2's wait runs out before frame 3 comes, so no later
+// header is in when it drops.
 #[test]
 fn drop_after_an_idr_on_an_invalidating_stream() {
     let now = Instant::now();
@@ -424,8 +424,8 @@ fn drop_after_an_idr_on_an_invalidating_stream() {
 // A dropped frame whose own header says IDR holds the frames after it until
 // the next IDR, even on a stream that invalidates: nothing before an IDR is
 // kept to predict from. An IDR lost with its header cannot be told from any
-// other frame, so it is guessed like one, and the viewer's own ask for an
-// IDR covers it when nothing decodes.
+// other frame, so the next header decides as for one, and the viewer's own
+// ask for an IDR covers it when nothing decodes.
 #[test]
 fn a_dropped_idr_holds_until_the_next_idr() {
     let now = Instant::now();
@@ -1004,6 +1004,68 @@ fn drop_before_any_header() {
             assert_eq!((later, skipped), (vec![], 2));
         }
     }
+}
+
+// What the encoder does after a loss changes at an IDR when the sharer falls
+// back to the software encoder. A frame lost with its header after that is
+// left to the next header, and no header from before the change holds the
+// frames after it for an IDR that encoder has no need to send.
+#[test]
+fn a_lost_header_after_the_encoder_changed() {
+    let now = Instant::now();
+    let at = |n: u32| now + FPS_120 * n;
+    let changed = || {
+        let mut viewer = Viewer::new(FPS_120);
+        let before = frame_of(facts(1, false, false), 3, 20);
+        assert_eq!(viewer.send(&before, &[], at(1)), [Out::Frame(1)]);
+        let idr = frame_of(facts(2, true, true), 3, 20);
+        assert_eq!(viewer.send(&idr, &[], at(2)), [Out::Frame(2)]);
+        viewer
+    };
+    let sent = |number: u32| frame_of(facts(number, false, true), 3, 20);
+
+    // Frame 3 never shows, and frame 4 overtakes it without its first shard.
+    let mut viewer = changed();
+    assert_eq!(
+        viewer.send(&sent(4), &[0], at(4)),
+        [
+            Out::Dropped(3, 3, Overtaken),
+            Out::Repaired(4),
+            Out::Recover(3, 3)
+        ]
+    );
+    assert_eq!(viewer.reassembler.numbers().skipped, 0);
+
+    // Frame 3 loses its first shard and more, and its wait runs out before
+    // frame 4 comes.
+    let mut viewer = changed();
+    assert_eq!(viewer.send(&sent(3), &[0, 1], at(3)), []);
+    assert_eq!(
+        viewer.expire(at(3) + WAIT_120),
+        [Out::Dropped(3, 3, Deadline), Out::Recover(3, 3)]
+    );
+    assert_eq!(
+        viewer.send(&sent(4), &[], at(3) + WAIT_120 + MS),
+        [Out::Frame(4)]
+    );
+    assert_eq!(viewer.reassembler.numbers().skipped, 0);
+
+    // The stream moves far ahead. The first packet there only says it may
+    // have, and is not kept, so the frames skipped have no header to go by.
+    let mut viewer = changed();
+    let moved = sent(9000);
+    viewer.knows(&moved);
+    assert_eq!(viewer.push(&moved.packets[0], at(3)).0, Arrival::Far);
+    assert_eq!(
+        viewer.push(&moved.packets[1], at(3)),
+        (Arrival::Kept, vec![Out::Recover(3, 8999)])
+    );
+    assert_eq!(viewer.push(&moved.packets[2], at(3)).1, []);
+    assert_eq!(
+        viewer.push(&moved.packets[3], at(3)).1,
+        [Out::Repaired(9000)]
+    );
+    assert_eq!(viewer.reassembler.numbers().skipped, 0);
 }
 
 // Whole frames of a stream that jumps around the way a hostile or broken

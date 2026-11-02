@@ -71,8 +71,10 @@ pub struct FrameFacts {
     pub idr: bool,
     // The encoder invalidates references, so losing a frame that is not an
     // IDR leaves the ones after it decodable; false for an encoder that
-    // needs an IDR after any loss. The same on every frame of a stream, IDRs
-    // included: a lost IDR needs the next one whatever this says.
+    // needs an IDR after any loss. It can change from one frame to the next,
+    // when the sharer moves to another encoder or the software encoder waits
+    // before it recovers again. A lost IDR needs the next one whatever this
+    // says.
     pub survives_loss: bool,
     // The access unit is HEVC; H.264 when false.
     pub hevc: bool,

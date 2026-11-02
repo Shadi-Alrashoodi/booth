@@ -226,8 +226,8 @@ impl Asks {
 
     // `held` is the reassembler's count of frames held back for an IDR. The
     // safety net for a hold the sharer's answer does not end: the
-    // reassembler guesses what a frame lost with its header does from the
-    // frames before it, and an encoder that invalidates answers the recover
+    // reassembler takes what a frame lost with its header does from the
+    // frame after it, and an encoder that invalidates answers the recover
     // request with no IDR at all. Nothing would show again until some other
     // IDR. The reassembler holds frames only after a drop, so there is
     // always a frame for the IDR to come after.
@@ -768,8 +768,8 @@ mod tests {
     // parity covers, and frame 1's wait runs out before frame 2 comes. That
     // takes a late frame 2 at 120 fps, and none at 100 or less, where the
     // wait is one frame interval. Every header says what the encoder does,
-    // and IDR 0's does not count for the guess, so frame 2's header decides:
-    // NVENC invalidates frame 1 and frame 2 comes out. Before, IDR 0's
+    // and frame 1's never came, so frame 2's decides: NVENC invalidates
+    // frame 1 and frame 2 comes out. Before, IDR 0's
     // header said an IDR was needed, the reassembler held frame 2, and only
     // the viewer's IDR ask moved the picture again.
     #[test]

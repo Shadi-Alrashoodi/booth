@@ -217,9 +217,9 @@ enum Hold {
     No,
     // A dropped frame broke the ones after it.
     UntilIdr,
-    // A frame was dropped before the header of any frame but an IDR said
-    // what the encoder does after a loss. The next header says: an encoder
-    // that invalidates references would never send the IDR a hold waits for.
+    // A frame was lost with its header. The next header says what the encoder
+    // does after a loss: an encoder that invalidates references would never
+    // send the IDR a hold waits for.
     UntilKnown,
 }
 
@@ -261,11 +261,6 @@ pub struct Reassembler {
     out: Vec<u8>,
     events: VecDeque<Queued>,
     hold: Hold,
-    // What the newest header of a frame that is not an IDR said, for a
-    // dropped frame that never showed its own. An IDR's header is left out:
-    // losing an IDR says nothing about losing the frames after it. None
-    // before any such header has been read.
-    survives_loss: Option<bool>,
     gathered: Option<(u32, u32)>,
     last_recover: Option<Instant>,
     stray: Option<u32>,
@@ -291,7 +286,6 @@ impl Reassembler {
             out: Vec::new(),
             events: VecDeque::new(),
             hold: Hold::No,
-            survives_loss: None,
             gathered: None,
             last_recover: None,
             stray: None,
@@ -468,8 +462,7 @@ impl Reassembler {
         // dropped; the stream then goes on from where it is.
         if skipped < 1 << 31 {
             if skipped > 0 {
-                let survives = self.survives_loss;
-                self.note_drop(next, start.wrapping_sub(1), survives);
+                self.note_drop(next, start.wrapping_sub(1), None);
             }
             self.next = Some(start);
         }
@@ -574,9 +567,6 @@ impl Reassembler {
         pending.last_at = now;
         if index == 0 {
             pending.flags = read_flags(packet.shard);
-            if let Some((false, survives)) = pending.flags {
-                self.survives_loss = Some(survives);
-            }
         }
         Arrival::Kept
     }
@@ -696,13 +686,12 @@ impl Reassembler {
                 } else {
                     why
                 };
-                let survives = self.survives(pending.flags);
+                let survives = survives(pending.flags);
                 self.retire_dropped(pending, now);
                 self.count_drop(number, why, survives);
             } else {
                 unseen += 1;
-                let survives = self.survives_loss;
-                self.count_drop(number, why, survives);
+                self.count_drop(number, why, None);
             }
         }
         if unseen > 0 {
@@ -718,25 +707,12 @@ impl Reassembler {
         while !self.pending.is_empty() {
             let pending = self.pending.remove(0);
             let number = pending.number;
-            let survives = self.survives(pending.flags);
+            let survives = survives(pending.flags);
             self.retire_dropped(pending, now);
             self.count_drop(number, DropReason::Overtaken, survives);
             self.next = Some(number.wrapping_add(1));
         }
         self.started = true;
-    }
-
-    // Whether the frames after a dropped one still decode. Its own header
-    // says, when its first shard came: nothing before an IDR is kept to
-    // predict from, so a lost IDR needs the next one whatever the encoder.
-    // A frame whose header never came is guessed from the newest header of
-    // a frame that is not an IDR; the viewer asks for an IDR itself when
-    // that guess leaves it with frames it cannot decode.
-    fn survives(&self, flags: Option<(bool, bool)>) -> Option<bool> {
-        match flags {
-            Some((idr, survives)) => Some(survives && !idr),
-            None => self.survives_loss,
-        }
     }
 
     fn count_drop(&mut self, number: u32, why: DropReason, survives: Option<bool>) {
@@ -792,15 +768,12 @@ impl Reassembler {
         let assembly = now.saturating_duration_since(pending.first_at);
         let Some((mut facts, range)) = read else {
             self.numbers.protocol_errors += 1;
-            let survives = self.survives(pending.flags);
+            let survives = survives(pending.flags);
             self.retire_dropped(pending, now);
             self.count_drop(number, DropReason::Refused, survives);
             return;
         };
         facts.number = number;
-        if !facts.idr {
-            self.survives_loss = Some(facts.survives_loss);
-        }
         let stored = self.retire(pending, now, true);
         self.recycle(stored);
         if self.hold == Hold::UntilKnown {
@@ -942,6 +915,19 @@ fn mismatch(counts: (u16, u16, usize), first: (u16, u16, usize)) -> PacketError 
         shard: counts.2,
         first,
     }
+}
+
+// Whether the frames after a dropped one still decode. Its own header
+// says, when its first shard came: nothing before an IDR is kept to
+// predict from, so a lost IDR needs the next one whatever the encoder.
+// A frame whose header never came leaves it to the next header, since
+// what the encoder does can change from one frame to the next. At the
+// edges of the software encoder's wait that header can be wrong for the
+// lost frame. If it wrongly says go on, the frames shown may be broken
+// until the IDR the sharer owes for that frame. If it wrongly says hold,
+// the viewer asks for an IDR itself, as it does when frames do not decode.
+fn survives(flags: Option<(bool, bool)>) -> Option<bool> {
+    flags.map(|(idr, survives)| survives && !idr)
 }
 
 impl fmt::Debug for Reassembler {
