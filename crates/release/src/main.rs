@@ -181,6 +181,7 @@ fn sign(
             ));
         }
     }
+    signing::check_signatures_miss_key(key_path, &files)?;
     let (secret, id) = open_checked_key(key_path, app_key, rehearsal, password)?;
     for written in signing::sign_files(&secret, &files)? {
         println!("signed {} with key {id}", written.display());
@@ -207,4 +208,56 @@ fn collect_licenses(root: &Path, out: &Path) -> Result<(), String> {
         println!("check by hand: {line}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sign_never_writes_over_the_key() {
+        let folder =
+            std::env::temp_dir().join(format!("booth-release-over-key-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&folder);
+        fs::create_dir_all(&folder).unwrap();
+        let pair = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+        let key_bytes = pair.sk.to_box(None).unwrap().to_bytes();
+        let key_path = folder.join("payload.minisig");
+        fs::write(&key_path, &key_bytes).unwrap();
+        fs::write(folder.join("first"), "first").unwrap();
+        fs::write(folder.join("payload"), "payload").unwrap();
+        let app_key = pair.pk.to_base64();
+        let sign = |files: &[&str]| {
+            let files: Vec<OsString> = files.iter().map(|f| folder.join(f).into()).collect();
+            sign(
+                &key_path,
+                OsStr::new(&app_key),
+                &files,
+                false,
+                Password::Console,
+            )
+        };
+
+        // In another case too, which Windows takes for the same file.
+        for name in ["payload", "PAYLOAD"] {
+            let err = sign(&["first", name]).unwrap_err();
+            assert!(err.contains("same bytes as the key"), "{err}");
+            assert_eq!(fs::read(&key_path).unwrap(), key_bytes);
+            assert!(!folder.join("first.minisig").exists());
+        }
+
+        // A hard link has a name of its own and shares the key's bytes.
+        let hard_link = folder.join("linked.minisig");
+        fs::hard_link(&key_path, &hard_link).unwrap();
+        fs::write(folder.join("linked"), "linked").unwrap();
+        let err = sign(&["first", "linked"]).unwrap_err();
+        assert!(err.contains("same bytes as the key"), "{err}");
+        assert_eq!(fs::read(&key_path).unwrap(), key_bytes);
+        assert!(!folder.join("first.minisig").exists());
+
+        sign(&["first"]).unwrap();
+        assert!(folder.join("first.minisig").is_file());
+        assert_eq!(fs::read(&key_path).unwrap(), key_bytes);
+        let _ = fs::remove_dir_all(&folder);
+    }
 }

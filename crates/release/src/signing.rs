@@ -316,6 +316,43 @@ fn kdf_is_scrypt(line: &str) -> Option<bool> {
     }
 }
 
+fn signature_path(file: &Path) -> PathBuf {
+    let mut target = file.as_os_str().to_os_string();
+    target.push(".minisig");
+    PathBuf::from(target)
+}
+
+// sign_files replaces whatever is at a signature's path, and there is no key
+// rotation to recover a key that was written over. By what the files hold and
+// not by their paths, so another case, a short name, a link of any kind or a
+// drive that cannot give a file's real path is still seen as the key, and a
+// copy of the key with it. A key that cannot be read is for open_secret_key
+// to report.
+pub fn check_signatures_miss_key(key_path: &Path, files: &[PathBuf]) -> Result<(), String> {
+    let as_much_as_a_key = |path: &Path| {
+        let mut bytes = Vec::new();
+        File::open(path)
+            .and_then(|file| file.take(MOST_KEY_BYTES + 1).read_to_end(&mut bytes))
+            .map(|_| bytes)
+    };
+    let Ok(key) = as_much_as_a_key(key_path) else {
+        return Ok(());
+    };
+    for file in files {
+        let target = signature_path(file);
+        if as_much_as_a_key(&target).is_ok_and(|bytes| bytes == key) {
+            return Err(format!(
+                "{} holds the same bytes as the key {}, and the signature of {} would be written over it; nothing was signed, move {} or rename the file",
+                target.display(),
+                key_path.display(),
+                file.display(),
+                target.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn sign_files(key: &SecretKey, files: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     let pk = PublicKey::from_secret_key(key)
         .map_err(|err| format!("could not read the public half of the key: {err}"))?;
@@ -341,9 +378,7 @@ pub fn sign_files(key: &SecretKey, files: &[PathBuf]) -> Result<Vec<PathBuf>, St
             Some(SIGNATURE_COMMENT),
         )
         .map_err(|err| format!("could not sign {}: {err}", path.display()))?;
-        let mut target = path.clone().into_os_string();
-        target.push(".minisig");
-        let target = PathBuf::from(target);
+        let target = signature_path(path);
         fs::write(&target, signature.to_string())
             .map_err(|err| format!("could not write {}: {err}", target.display()))?;
         written.push(target);
@@ -354,10 +389,14 @@ pub fn sign_files(key: &SecretKey, files: &[PathBuf]) -> Result<Vec<PathBuf>, St
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
 
     use minisign::SignatureBox;
 
     use super::*;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     struct Folder(PathBuf);
 
@@ -591,6 +630,66 @@ mod tests {
             .unwrap();
         assert!(err.contains("inside the git repository"), "{err}");
         assert_eq!(input.position(), 0);
+    }
+
+    #[test]
+    fn sees_the_key_at_a_signature_path_by_any_name() {
+        let folder = Folder::new("over-key-names");
+        let keys = folder.0.join("keys");
+        fs::create_dir_all(&keys).unwrap();
+        let key = keys.join("payload.minisig");
+        fs::write(&key, "the key").unwrap();
+        let over_key = |key: &Path, file: PathBuf| {
+            let err = check_signatures_miss_key(key, &[file]).unwrap_err();
+            assert!(err.contains("same bytes as the key"), "{err}");
+        };
+
+        let junction = folder.0.join("junction");
+        let made = Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .args([&junction, &keys])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        over_key(&key, junction.join("payload"));
+        over_key(&junction.join("payload.minisig"), keys.join("payload"));
+
+        // canonicalize gives a hard link the name it was opened under.
+        fs::hard_link(&key, folder.0.join("hard.minisig")).unwrap();
+        over_key(&key, folder.0.join("hard"));
+
+        // A copy is what would go, not the key, so the words name the copy.
+        let copy = folder.0.join("copy.minisig");
+        fs::copy(&key, &copy).unwrap();
+        let err = check_signatures_miss_key(&key, &[folder.0.join("copy")]).unwrap_err();
+        assert!(
+            err.starts_with(&format!("{} holds the same bytes", copy.display())),
+            "{err}"
+        );
+        assert!(err.contains(&format!("move {}", copy.display())), "{err}");
+
+        // A signature from an earlier run is there to be replaced.
+        fs::write(folder.0.join("old.minisig"), "old sig").unwrap();
+        let others = [folder.0.join("old"), folder.0.join("new")];
+        assert_eq!(check_signatures_miss_key(&key, &others), Ok(()));
+        let gone = folder.0.join("gone.key");
+        assert_eq!(check_signatures_miss_key(&gone, &others), Ok(()));
+    }
+
+    #[test]
+    fn sees_a_file_symlink_to_the_key_at_a_signature_path() {
+        let folder = Folder::new("over-key-symlink");
+        let (key, _) = throwaway_key(&folder);
+        let link = folder.0.join("payload.minisig");
+        if let Err(err) = std::os::windows::fs::symlink_file(&key, &link) {
+            const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+            assert_eq!(err.raw_os_error(), Some(ERROR_PRIVILEGE_NOT_HELD), "{err}");
+            println!("skipped: a file symlink takes elevation or Developer Mode");
+            return;
+        }
+        let err = check_signatures_miss_key(&key, &[folder.0.join("payload")]).unwrap_err();
+        assert!(err.contains("same bytes as the key"), "{err}");
     }
 
     // A pipe that hands over a byte at a time and is interrupted first.
