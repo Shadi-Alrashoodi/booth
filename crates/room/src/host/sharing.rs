@@ -177,6 +177,10 @@ pub(super) struct Kept {
     // Asks for control put a request in front of the sharer, and input,
     // with its own limits.
     control: PeerControl,
+    says: Bucket,
+    voice: Bucket,
+    handshakes: Bucket,
+    voice_reports: Bucket,
     until: Instant,
 }
 
@@ -1300,13 +1304,8 @@ impl Host {
 
     // A friend left the room: their limits stay for KEPT_FOR, in case they
     // join again.
-    pub(super) fn keep_limits(
-        &mut self,
-        key: [u8; 32],
-        share: PeerShare,
-        control: PeerControl,
-        now: Instant,
-    ) {
+    pub(super) fn keep_limits(&mut self, peer: Peer, now: Instant) {
+        let key = peer.key;
         self.left_limits
             .retain(|kept| now < kept.until && kept.key != key);
         if self.left_limits.len() >= MOST_KEPT {
@@ -1314,9 +1313,13 @@ impl Host {
         }
         self.left_limits.push(Kept {
             key,
-            limits: share.limits,
-            last_idr: share.watcher.last_idr,
-            control,
+            limits: peer.share.limits,
+            last_idr: peer.share.watcher.last_idr,
+            control: peer.control,
+            says: peer.says,
+            voice: peer.voice,
+            handshakes: peer.handshakes,
+            voice_reports: peer.voice_reports,
             until: now + KEPT_FOR,
         });
     }
@@ -1332,6 +1335,10 @@ impl Host {
             peer.share.limits = kept.limits;
             peer.share.watcher.last_idr = kept.last_idr;
             peer.control = kept.control;
+            peer.says = kept.says;
+            peer.voice = kept.voice;
+            peer.handshakes = kept.handshakes;
+            peer.voice_reports = kept.voice_reports;
         }
     }
 

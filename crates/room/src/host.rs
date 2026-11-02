@@ -1112,7 +1112,7 @@ impl Host {
             self.talk.forget(&peer.key, now);
             self.note_lost(peer.key, peer.last_heard, now);
             self.left_share(&peer.key, now, socket);
-            self.keep_limits(peer.key, peer.share, peer.control, now);
+            self.keep_limits(peer, now);
         }
         changed |= self.change_step(now);
 
@@ -3159,7 +3159,7 @@ impl Host {
         self.devices.seen(&gone.key, crate::unix_now());
         self.roster_changed(now, socket);
         self.left_share(&gone.key, now, socket);
-        self.keep_limits(gone.key, gone.share, gone.control, now);
+        self.keep_limits(gone, now);
     }
 
     // A friend of another protocol cannot stay: nothing after the Hello
@@ -7763,6 +7763,75 @@ mod tests {
         );
         assert_eq!(shown, crate::remote::ASK_BURST as usize);
         assert_eq!(too_soon, 8 - shown);
+    }
+
+    // Nor fresh lines: what a friend may say runs on from where it stood, so
+    // a Bye between floods gets nothing that waiting would not.
+    #[test]
+    fn rejoin_keeps_chat_limit() {
+        let start = Instant::now();
+        let mut rig = Rig::new(start);
+        let mut ana = Guest::new();
+        ana.join(&mut rig, "Ana", start);
+        let mut bo = Guest::new();
+        bo.join(&mut rig, "Bo", start);
+
+        let burst = chat::SAY_BURST as usize;
+        let per_second = chat::SAYS_PER_SECOND as usize;
+        let later = start + Duration::from_secs(1);
+        let mut n = 0;
+        for (step, now) in [(0, start), (1, start), (2, later)] {
+            if step > 0 {
+                ana.say(&mut rig, &Message::Bye, start);
+                ana.left();
+                ana.join(&mut rig, "Ana", now);
+            }
+            for _ in 0..burst {
+                ana.chat(&mut rig, &say(&format!("line {n}")), now);
+                // The host's acks, so the window never holds a line back.
+                ana.read(now);
+                n += 1;
+            }
+        }
+
+        let want: Vec<String> = (0..burst)
+            .chain(2 * burst..2 * burst + per_second)
+            .map(|n| format!("line {n}"))
+            .collect();
+        assert_eq!(said_only(bo.said_all(&mut rig, later)), want);
+    }
+
+    // The same for the rest of what a friend sends: a bucket left empty is
+    // still empty on the way back in, and fills as if they had stayed.
+    #[test]
+    fn rejoin_keeps_voice_and_handshake_limits() {
+        let start = Instant::now();
+        let mut rig = Rig::new(start);
+        let mut ana = Guest::new();
+        ana.join(&mut rig, "Ana", start);
+
+        let spent = |peer: &mut Peer, now| {
+            [
+                !peer.voice.take(now, VOICE_PER_SECOND, VOICE_BURST),
+                !peer
+                    .voice_reports
+                    .take(now, VOICE_REPORTS_PER_SECOND, VOICE_REPORT_BURST),
+                !peer.handshakes.take(now, REKEYS_PER_SECOND, REKEY_BURST),
+            ]
+        };
+        let peer = &mut rig.host.peers[0];
+        while spent(peer, start) != [true; 3] {}
+
+        ana.say(&mut rig, &Message::Bye, start);
+        ana.left();
+        ana.join(&mut rig, "Ana", start);
+        assert_eq!(spent(&mut rig.host.peers[0], start), [true; 3]);
+
+        let later = start + Duration::from_secs(1);
+        ana.say(&mut rig, &Message::Bye, start);
+        ana.left();
+        ana.join(&mut rig, "Ana", later);
+        assert_eq!(spent(&mut rig.host.peers[0], later), [false; 3]);
     }
 
     // A client watching hears of a new frame rate from the roster; this
