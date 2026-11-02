@@ -15,8 +15,9 @@ use windows::Win32::Media::MediaFoundation::{
     IMF2DBuffer, IMFActivate, IMFAttributes, IMFDXGIDeviceManager, IMFMediaBuffer,
     IMFMediaEventGenerator, IMFSample, IMFShutdown, IMFTransform,
     MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, METransformDrainComplete, METransformHaveOutput,
-    METransformNeedInput, MF_SA_D3D11_AWARE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
-    MFMediaType_Video, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_ADAPTER_LUID, MFT_ENUM_FLAG_HARDWARE,
+    METransformNeedInput, MF_E_NOTACCEPTING, MF_SA_D3D11_AWARE, MF_TRANSFORM_ASYNC,
+    MF_TRANSFORM_ASYNC_UNLOCK, MFMediaType_Video, MFSampleExtension_Discontinuity,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_ADAPTER_LUID, MFT_ENUM_FLAG_HARDWARE,
     MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_DRAIN,
     MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
     MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
@@ -207,6 +208,15 @@ pub(crate) struct Hardware {
     held_in_a_row: u32,
     // Set once the encoder has held HELD_IN_A_ROW frames back.
     drain_every_frame: bool,
+    // Between sending a drain and METransformDrainComplete, when the encoder
+    // takes no input.
+    draining: bool,
+    // The next frame is the first since a drain, and has to say so.
+    discontinuity: bool,
+    // The stream started again and the encoder has not asked since. Its next
+    // request replaces the count: those counted were dropped with the drain
+    // or are being made again, and left in they read as it asking ahead.
+    restarted: bool,
     discarded_late_output: bool,
     format_change_logged: bool,
     drain_logged: bool,
@@ -382,6 +392,9 @@ impl Hardware {
             output_wait: GIVE_UP,
             held_in_a_row: 0,
             drain_every_frame: false,
+            draining: false,
+            discontinuity: false,
+            restarted: false,
             discarded_late_output: false,
             format_change_logged: false,
             drain_logged: false,
@@ -446,14 +459,33 @@ impl Hardware {
         Ok(sample)
     }
 
+    // Requests made before it still stand: Media Foundation's rules reset an
+    // encoder's count of them only at the end of the stream, and it need not
+    // ask again for one it has out.
     fn drain(&mut self) -> Result<(), EncodeError> {
-        self.wanted = 0;
         // SAFETY: a plain message to a streaming encoder.
         unsafe {
             self.mft
                 .transform
                 .ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)
-                .map_err(mf_error("drain the hardware encoder"))
+        }
+        .map_err(mf_error("drain the hardware encoder"))?;
+        self.draining = true;
+        Ok(())
+    }
+
+    // After METransformDrainComplete an encoder asks for no input until it
+    // hears the stream has started again.
+    fn drain_complete(&mut self) -> Result<(), EncodeError> {
+        self.draining = false;
+        self.discontinuity = true;
+        self.restarted = true;
+        // SAFETY: a plain message to a streaming encoder.
+        unsafe {
+            self.mft
+                .transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
+                .map_err(mf_error("start the hardware encoder's stream again"))
         }
     }
 
@@ -528,6 +560,7 @@ impl Hardware {
                     }
                 }
             } else if kind == METransformDrainComplete.0 as u32 {
+                self.drain_complete()?;
                 break;
             }
         }
@@ -549,10 +582,27 @@ impl Hardware {
     /// IDR. Left in the encoder, it would stop it from asking for input
     /// again. `index` is the frame about to go in.
     fn wait_for_request(&mut self, index: u64) -> Result<(), EncodeError> {
-        while self.wanted == 0 {
-            let Some((kind, status)) = self.next_event(Instant::now() + GIVE_UP)? else {
+        let deadline = Instant::now() + GIVE_UP;
+        loop {
+            let waiting = self.wanted == 0 || self.draining;
+            if !waiting && !self.restarted {
+                return Ok(());
+            }
+            // A request made on the stream starting again is read here if it
+            // has come: after the frame goes in it reads as the encoder asking
+            // ahead. It is not waited for: one that kept its request need not
+            // ask.
+            let until = if waiting { deadline } else { Instant::now() };
+            let Some((kind, status)) = self.next_event(until)? else {
+                if !waiting {
+                    return Ok(());
+                }
                 return Err(EncodeError::EncoderMisbehaved {
-                    problem: "the hardware encoder has not asked for a frame in 2 s: its driver may have stopped responding",
+                    problem: if self.draining {
+                        "the hardware encoder has not finished draining in 2 s: its driver may have stopped responding"
+                    } else {
+                        "the hardware encoder has not asked for a frame in 2 s: its driver may have stopped responding"
+                    },
                 });
             };
             if status.is_err() {
@@ -563,6 +613,10 @@ impl Hardware {
             }
             if kind == METransformNeedInput.0 as u32 {
                 self.count_request();
+                continue;
+            }
+            if kind == METransformDrainComplete.0 as u32 {
+                self.drain_complete()?;
                 continue;
             }
             if kind != METransformHaveOutput.0 as u32 {
@@ -582,7 +636,6 @@ impl Hardware {
                 }
             }
         }
-        Ok(())
     }
 
     fn stalled(&self) -> bool {
@@ -591,7 +644,8 @@ impl Hardware {
 
     fn count_request(&mut self) {
         if !self.stalled() {
-            self.wanted += 1;
+            self.wanted = if self.restarted { 1 } else { self.wanted + 1 };
+            self.restarted = false;
         }
     }
 
@@ -606,8 +660,7 @@ impl Hardware {
         }
     }
 
-    // Logged once per encoder: a drain costs the frame its wait, and only a
-    // real share shows whether the encoder asks for input again after one.
+    // Logged once per encoder: a drain costs the frame its wait.
     fn note_drain(&mut self, index: u64, held: Held, waited: Duration) {
         if self.drain_logged {
             return;
@@ -675,11 +728,27 @@ impl Encoder for Hardware {
         if asked_for_idr {
             request_idr(&self.api, self.last_index.is_none())?;
         }
+        if self.discontinuity {
+            // SAFETY: a setter on the live sample made above.
+            unsafe { sample.SetUINT32(&MFSampleExtension_Discontinuity, 1) }
+                .map_err(mf_error("describe the frame to the hardware encoder"))?;
+        }
 
-        let submitted = Instant::now();
+        let mut submitted = Instant::now();
         // SAFETY: the encoder asked for input, and the sample wraps a live
         // NV12 texture on the encoder's device.
-        unsafe { self.mft.transform.ProcessInput(0, &sample, 0) }.map_err(|source| {
+        let mut fed = unsafe { self.mft.transform.ProcessInput(0, &sample, 0) };
+        if fed.as_ref().is_err_and(|e| e.code() == MF_E_NOTACCEPTING) {
+            // It took no frame and has no request out, whatever the count
+            // here says: an encoder may drop its requests with a drain though
+            // the rules keep them. So the frame waits for a new one.
+            self.wanted = 0;
+            self.wait_for_request(frame.index)?;
+            submitted = Instant::now();
+            // SAFETY: as above.
+            fed = unsafe { self.mft.transform.ProcessInput(0, &sample, 0) };
+        }
+        fed.map_err(|source| {
             // The encoder may keep this frame as a reference though the
             // viewer never gets it.
             self.idr_next = true;
@@ -689,6 +758,7 @@ impl Encoder for Hardware {
             }
         })?;
         self.wanted -= 1;
+        self.discontinuity = false;
         let (data, ready) = self
             .wait_for_output(frame.index, submitted)
             .inspect_err(|_| self.idr_next = true)?;
@@ -844,6 +914,9 @@ fn protect(device: &ID3D11Device, api: &mut CodecApi) -> Result<(), EncodeError>
 }
 
 #[cfg(test)]
+mod scripted;
+
+#[cfg(test)]
 mod tests {
     use windows::Win32::Foundation::{E_UNEXPECTED, HMODULE};
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
@@ -981,6 +1054,68 @@ mod tests {
             "{}",
             encoder.notes()
         );
+    }
+
+    // What a real encoder does when drained and started again after every
+    // frame. The scripted tests hold Media Foundation's rules; this shows
+    // whether a driver's encoder goes on under them, and the requests it makes.
+    #[test]
+    fn drained_frames_go_on() {
+        let _turn = gpu::test_turn();
+        let Some(device) = hardware_device() else {
+            println!("skipped: no GPU on this PC, so there is no hardware encoder to test");
+            return;
+        };
+        let adapter = gpu::adapter_of(&device).unwrap_or_else(|e| panic!("{e}"));
+        let texture = nv12(&device, 1280, 720);
+        for codec in Codec::ALL {
+            let request = Request {
+                codec,
+                width: 1280,
+                height: 720,
+                fps: 60,
+            };
+            let opened = Hardware::open(
+                &device,
+                &adapter,
+                &request,
+                &Settings::default(),
+                String::new(),
+            );
+            let mut encoder = match opened {
+                Ok(encoder) => encoder,
+                Err(
+                    e @ (EncodeError::NoHardwareEncoder { .. }
+                    | EncodeError::MediaFoundationMissing),
+                ) => {
+                    println!("skipped {codec}: {e}");
+                    continue;
+                }
+                Err(e) => panic!("{e}"),
+            };
+            encoder.drain_every_frame = true;
+            for index in 0..20 {
+                let unit = encoder
+                    .encode(&Frame {
+                        texture: &texture,
+                        index,
+                        force_idr: false,
+                    })
+                    .unwrap_or_else(|e| panic!("{codec} frame {index}: {e}"));
+                println!(
+                    "{codec} frame {index}: idr {}, {} bytes, {} requests kept",
+                    unit.idr,
+                    unit.data.len(),
+                    encoder.wanted
+                );
+                assert_eq!(unit.index, index);
+                assert!(unit.idr || index > 0, "{codec}: frame 0 is an IDR");
+                assert!(
+                    encoder.wanted <= 2,
+                    "{codec} frame {index}: requests add up"
+                );
+            }
+        }
     }
 
     // A frame whose encoder changes its output format 150 ms after it went

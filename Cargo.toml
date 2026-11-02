@@ -39,6 +39,7 @@ zeroize = "1.8"
 windows-sys = "0.61"
 # For COM, which windows-sys leaves to the caller: the firewall rules.
 windows = "0.62"
+windows-core = "0.62"
 socket2 = "0.6"
 crossbeam-channel = "0.5"
 opus = "=0.4.0"

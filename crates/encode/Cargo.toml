@@ -40,3 +40,6 @@ windows = { workspace = true, features = [
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }
+# windows::core::implement names this crate, for the stand-in encoder in
+# src/mf/hardware/scripted.rs. Already in the tree through windows.
+windows-core.workspace = true
