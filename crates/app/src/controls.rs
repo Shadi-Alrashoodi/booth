@@ -1007,9 +1007,25 @@ pub fn field(
     font: FontId,
     char_limit: usize,
 ) -> Response {
+    hiding_field(ui, id, text, hint, font, char_limit, false)
+}
+
+// The same, with dots in place of the text while `hide` holds. It still takes
+// a paste and the caller's string stays whole. Copy and Cut put nothing on the
+// clipboard, and Cut still takes the text out.
+pub fn hiding_field(
+    ui: &mut Ui,
+    id: &str,
+    text: &mut String,
+    hint: &str,
+    font: FontId,
+    char_limit: usize,
+    hide: bool,
+) -> Response {
     let output = TextEdit::singleline(text)
         .id_salt(id)
         .char_limit(char_limit)
+        .password(hide)
         .hint_text(RichText::new(hint).font(theme::body()).color(FIELD_HINT))
         .font(font)
         .text_color(FIELD_TEXT)
@@ -1351,6 +1367,45 @@ pub(crate) mod tests {
             repeat: false,
             modifiers: Modifiers::NONE,
         }
+    }
+
+    // Dots on the screen and to a screen reader, and the text under them
+    // whole, a paste included.
+    #[test]
+    fn a_hiding_field_shows_dots_over_the_whole_text() {
+        use eframe::egui::accesskit;
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let mut text = String::from("booth1");
+        let mut draw = |hide, events| {
+            let (response, output) = frame(&ctx, events, |ui| {
+                hiding_field(ui, "code", &mut text, "", theme::mono(), 64, hide)
+            });
+            let nodes = output.accesskit_update.expect("a tree").nodes;
+            let values: Vec<String> = nodes
+                .iter()
+                .filter(|(_, node)| node.role() == accesskit::Role::TextRun)
+                .filter_map(|(_, node)| node.value().map(String::from))
+                .collect();
+            let password = nodes
+                .iter()
+                .any(|(_, node)| node.role() == accesskit::Role::PasswordInput);
+            (response.rect.center(), values, password)
+        };
+        let (at, values, password) = draw(false, Vec::new());
+        assert_eq!(values, ["booth1"]);
+        assert!(!password);
+        let (_, values, password) = draw(true, press(at));
+        assert_eq!(values, ["\u{2022}".repeat(6)]);
+        assert!(password);
+        draw(true, release(at));
+        let pasted = vec![Event::Paste(String::from("-r-m3k9"))];
+        let (_, values, _) = draw(true, pasted);
+        assert_eq!(values, ["\u{2022}".repeat(13)]);
+        let (_, values, _) = draw(false, Vec::new());
+        assert_eq!(values, ["booth1-r-m3k9"]);
+        assert_eq!(text, "booth1-r-m3k9");
     }
 
     fn verbs<'a>(busy: &'a str) -> [Button<'a>; 2] {

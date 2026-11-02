@@ -548,7 +548,13 @@ impl InRoom {
                     let moved = view
                         .address_changed
                         .is_some_and(|changed| changed.codes_cannot_help);
-                    self.paste_field(ui, view.paste.as_ref(), moved, view.numbers.local_port);
+                    self.paste_field(
+                        ui,
+                        view.paste.as_ref(),
+                        moved,
+                        view.numbers.local_port,
+                        addresses_hidden(&view.share),
+                    );
                 }
             });
         }
@@ -639,16 +645,27 @@ impl InRoom {
 
     // Enter hands the code to the room, which checks it and punches. The
     // one line under the field says what came of it. `moved` is this PC's
-    // own address having just changed with friends still out.
-    fn paste_field(&mut self, ui: &mut Ui, last: Option<&PasteState>, moved: bool, port: u16) {
+    // own address having just changed with friends still out. `hide` is
+    // addresses_hidden: a code holds a friend's home address and an invite
+    // pasted by mistake the way into a room, and a refused one stays here for
+    // the rest of the room, so while you share it goes to dots.
+    fn paste_field(
+        &mut self,
+        ui: &mut Ui,
+        last: Option<&PasteState>,
+        moved: bool,
+        port: u16,
+        hide: bool,
+    ) {
         ui.add_space(FIELD_GAP);
-        let field = controls::field(
+        let field = controls::hiding_field(
             ui,
             "reply code",
             &mut self.paste,
             messages::PASTE_HINT,
             theme::mono(),
             PASTE_CHARS,
+            hide,
         );
         if field.changed() {
             self.paste_error = None;
@@ -689,7 +706,7 @@ impl InRoom {
         }
         if let Some(reply) = code_in_room(view) {
             block = true;
-            if self.code_region(ui, reply) {
+            if self.code_region(ui, reply, &view.share) {
                 *step = Some(Step::NewCode);
             }
         }
@@ -712,7 +729,7 @@ impl InRoom {
             }
         });
         if let Some(reply) = view.reply.as_ref()
-            && self.code_region(ui, reply)
+            && self.code_region(ui, reply, &view.share)
         {
             *step = Some(Step::NewCode);
         }
@@ -720,24 +737,25 @@ impl InRoom {
 
     // The code block in its panel-tone region. True when New code was
     // pressed.
-    fn code_region(&mut self, ui: &mut Ui, reply: &ReplyView) -> bool {
-        controls::region(ui, |ui| self.code_block(ui, reply))
+    fn code_region(&mut self, ui: &mut Ui, reply: &ReplyView, share: &ShareView) -> bool {
+        controls::region(ui, |ui| self.code_block(ui, reply, share))
     }
 
     // The code with its Copy button, or what failed once it expired with
     // New code beside it, as New invite takes Copy's place on the host, or
     // why no code would help. The same block on the joining screen and above
     // the people list. True when New code was pressed.
-    fn code_block(&mut self, ui: &mut Ui, reply: &ReplyView) -> bool {
+    fn code_block(&mut self, ui: &mut Ui, reply: &ReplyView, share: &ShareView) -> bool {
         let mut new_code = false;
         match reply.state {
             ReplyState::Code { second_router } => {
                 controls::text(ui, messages::SEND_CODE_BACK, theme::body(), CHALK);
                 ui.add_space(STEP);
-                if code_row(ui, &reply.code, true, CHALK, &["Copy"]).is_some() {
+                let (text, mono, color, copied) = reply_text(reply, share);
+                if code_row(ui, text, mono, color, &["Copy"]).is_some() {
                     // The code holds no secret, but it does hold this PC's
                     // home address, which history has no use for.
-                    self.copy_error = win::copy_private(&reply.code)
+                    self.copy_error = win::copy_private(copied)
                         .err()
                         .map(|err| messages::copy_error(&err));
                 }
@@ -1042,17 +1060,17 @@ fn share_verb(view: &View, control_offered: bool) -> Option<ShareVerb> {
 }
 
 // Asked for counts too: one press of the share key takes back an ask the
-// host has not answered yet, and addresses_hidden hides the invite code and
-// the addresses from the ask on.
+// host has not answered yet, and addresses_hidden hides the codes, the
+// addresses and the address name from the ask on.
 pub fn own_share_on(own: &OwnShare) -> bool {
     matches!(own, OwnShare::Sharing { .. } | OwnShare::Asking { .. })
 }
 
-// The invite row and the stats panel may be on the screen being shared, and
-// a friend's view would show the host's way into the room and everyone's
-// home addresses. From the ask until the capture has closed, so no frame of
-// the share can hold one: Stop sharing turns the share Off a moment before
-// its thread lets go of the screen.
+// The invite row, the codes and the stats panel may be on the screen being
+// shared, and a friend's view would show the host's way into the room and
+// everyone's home addresses. From the ask until the capture has closed, so
+// no frame of the share can hold one: Stop sharing turns the share Off a
+// moment before its thread lets go of the screen.
 pub fn addresses_hidden(share: &ShareView) -> bool {
     own_share_on(&share.own) || share.running.is_some()
 }
@@ -1511,6 +1529,16 @@ fn invite_text<'a>(invite: &'a InviteView, share: &ShareView) -> (&'a str, bool,
         CHALK
     };
     (invite.code.as_str(), true, color)
+}
+
+// As for the invite: a reply code holds this PC's home address, and Copy still
+// copies it, so the last one is what Copy takes.
+fn reply_text<'a>(reply: &'a ReplyView, share: &ShareView) -> (&'a str, bool, Color32, &'a str) {
+    let code = reply.code.as_str();
+    if addresses_hidden(share) {
+        return (messages::HIDDEN_WHILE_SHARING, false, ASH, code);
+    }
+    (code, true, CHALK, code)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3343,6 +3371,81 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    // Neither a code in the paste field, where a refused one stays, nor this
+    // PC's own reply code goes out in a frame while you share. The field's
+    // text stays whole for Enter.
+    #[test]
+    fn no_frame_holds_a_code_while_you_share() {
+        let host = |share: &ShareView| View {
+            role: Role::Host,
+            invite: Some(invite()),
+            reply: None,
+            share: share.clone(),
+            ..in_room()
+        };
+        let client = |share: &ShareView| View {
+            share: share.clone(),
+            ..in_room()
+        };
+        let data_dir = std::env::temp_dir().join(format!("booth-app-code-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let room = Arc::new(test_room(&data_dir));
+        let target = Target::default();
+        target.enter(Arc::clone(&room));
+        let mut panel = test_in_room(&room, &target);
+        let ctx = accessible_panel();
+        let off = ShareView::default();
+        let sharing = ShareView {
+            own: OwnShare::Sharing { number: 1, fps: 60 },
+            ..ShareView::default()
+        };
+        // From the ask, and on past Stop sharing until the capture has closed.
+        let hidden_shares = [
+            ShareView {
+                own: OwnShare::Asking { fps: 60 },
+                ..ShareView::default()
+            },
+            sharing.clone(),
+            ShareView {
+                running: Some(RunningShare {
+                    software: false,
+                    paused: None,
+                    held: false,
+                }),
+                ..ShareView::default()
+            },
+        ];
+
+        let pasted = "booth1-r-q8w2e4";
+        let dots = "\u{2022}".repeat(pasted.chars().count());
+        panel.paste = String::from(pasted);
+        assert!(line_shown(&mut panel, &ctx, &host(&off), pasted));
+        assert!(!line_shown(&mut panel, &ctx, &host(&off), &dots));
+        for share in &hidden_shares {
+            let own = &share.own;
+            assert!(
+                !line_shown(&mut panel, &ctx, &host(share), pasted),
+                "{own:?}"
+            );
+            assert!(line_shown(&mut panel, &ctx, &host(share), &dots), "{own:?}");
+        }
+        assert_eq!(panel.paste, pasted);
+
+        let reply = code().code;
+        let hidden = messages::HIDDEN_WHILE_SHARING;
+        assert!(line_shown(&mut panel, &ctx, &client(&off), &reply));
+        assert!(!line_shown(&mut panel, &ctx, &client(&off), hidden));
+        assert!(!line_shown(&mut panel, &ctx, &client(&sharing), &reply));
+        assert!(line_shown(&mut panel, &ctx, &client(&sharing), hidden));
+        assert!(line_shown(&mut panel, &ctx, &client(&sharing), "Copy"));
+
+        drop(panel);
+        target.leave();
+        hotkeys::leave(room);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
     // One frame of your row's buttons.
     fn buttons_frame(
         ctx: &Context,
@@ -4014,8 +4117,8 @@ pub(crate) mod tests {
         assert_eq!(watch_word(&yours, &mara), None);
     }
 
-    // From asking to share until the capture has closed, the
-    // invite row reads "Hidden while you share" in ash in place of the code,
+    // From asking to share until the capture has closed, the invite row and
+    // a reply code read "Hidden while you share" in ash in place of the code,
     // by the same rule as the stats panel's address lines. Copy stays, and
     // copies the code itself.
     #[test]
@@ -4079,6 +4182,13 @@ pub(crate) mod tests {
             assert_eq!(invite_text(&invite(), &share), shown(CHALK), "{own:?}");
             assert_eq!(invite_text(&used, &share), shown(ASH), "{own:?}");
             assert_eq!(invite_text(&expired, &share), shown(ASH), "{own:?}");
+            let reply = "booth1-r-m3k9q7";
+            let row = if hide {
+                (hidden.0, hidden.1, hidden.2, reply)
+            } else {
+                (reply, true, CHALK, reply)
+            };
+            assert_eq!(reply_text(&code(), &share), row, "{own:?}");
         }
     }
 
