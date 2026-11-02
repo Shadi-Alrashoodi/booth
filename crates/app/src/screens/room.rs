@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::emath::GuiRounding;
 use eframe::egui::{
     Align, Color32, Context, CursorIcon, InputState, Key, Layout, Modifiers, Rect, Response,
-    ScrollArea, Sense, Stroke, Ui, WidgetInfo, WidgetType, vec2,
+    ScrollArea, Sense, Stroke, Ui, Vec2, WidgetInfo, WidgetType, vec2,
 };
 use invite::ReplyCode;
 use room::view::{
@@ -1467,6 +1467,7 @@ fn invite_text<'a>(invite: &'a InviteView, share: &ShareView) -> (&'a str, bool,
     (invite.code.as_str(), true, color)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VoicePress {
     Mute,
     Deafen,
@@ -1695,28 +1696,8 @@ impl InRoom {
             width,
             |ui| row_name(ui, person, Slot::of(person, Some(voice)), word, false, dim),
             |ui| {
-                let layout = Layout::left_to_right(Align::Center);
-                ui.allocate_ui_with_layout(vec2(width, rect.height()), layout, |ui| {
-                    for (i, (text, color)) in buttons.iter().enumerate() {
-                        let button = Button::new(text).color(*color);
-                        if hold && i == 0 {
-                            let response = button.min_width(hold_width).show(ui);
-                            held = response.is_pointer_button_down_on();
-                            continue;
-                        }
-                        let mute = i == usize::from(hold);
-                        // A toggle that is on keeps the control fill, so a
-                        // muted microphone shows without reading the word.
-                        let on = if mute { voice.muted } else { voice.deafened };
-                        if button.on(on).enabled(!ended).show(ui).clicked() && !ended {
-                            pressed = Some(if mute {
-                                VoicePress::Mute
-                            } else {
-                                VoicePress::Deafen
-                            });
-                        }
-                    }
-                });
+                let size = vec2(width, rect.height());
+                (held, pressed) = voice_buttons(ui, &buttons, hold, hold_width, size, voice, ended);
             },
         );
         if hold && let Some(held) = self.hold.drawn(held) {
@@ -1728,6 +1709,53 @@ impl InRoom {
             None => {}
         }
     }
+}
+
+// Your row's buttons left to right. Whether Hold to talk is down, and which of
+// the others was pressed.
+fn voice_buttons(
+    ui: &mut Ui,
+    buttons: &[(&'static str, Color32)],
+    hold: bool,
+    hold_width: f32,
+    size: Vec2,
+    voice: &Voice,
+    ended: bool,
+) -> (bool, Option<VoicePress>) {
+    let mut held = false;
+    let mut pressed = None;
+    let layout = Layout::left_to_right(Align::Center);
+    ui.allocate_ui_with_layout(size, layout, |ui| {
+        for (i, (text, color)) in buttons.iter().enumerate() {
+            let button = Button::new(text).color(*color);
+            if hold && i == 0 {
+                // egui counts a press on a button that senses only clicks
+                // until it can no longer be a click: 0.8 s, or 6 points of
+                // movement. One that senses drags too is down until the
+                // mouse is let go, the pointer leaves the window or Esc is
+                // pressed, which takes effect once that limit has passed.
+                // A release egui never hears is your_row's to catch.
+                let response = button
+                    .min_width(hold_width)
+                    .show(ui)
+                    .interact(Sense::drag());
+                held = response.is_pointer_button_down_on();
+                continue;
+            }
+            let mute = i == usize::from(hold);
+            // A toggle that is on keeps the control fill, so a muted
+            // microphone shows without reading the word.
+            let on = if mute { voice.muted } else { voice.deafened };
+            if button.on(on).enabled(!ended).show(ui).clicked() && !ended {
+                pressed = Some(if mute {
+                    VoicePress::Mute
+                } else {
+                    VoicePress::Deafen
+                });
+            }
+        }
+    });
+    (held, pressed)
 }
 
 const HOLD: &str = "Hold to talk";
@@ -1888,7 +1916,7 @@ fn row_rect(ui: &mut Ui, height: f32) -> Rect {
 mod tests {
     use super::*;
     use crate::theme::Role::{Primary, Secondary};
-    use eframe::egui::{Event, TouchDeviceId, TouchId, TouchPhase, pos2};
+    use eframe::egui::{Event, PlatformOutput, Pos2, TouchDeviceId, TouchId, TouchPhase, pos2};
     use room::ReplyRefused;
     use room::view::{
         ControlView, CurrentShare, NoSound, Numbers, Party, Paused, Refusal, RouterState,
@@ -3014,6 +3042,127 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    // One frame of your row's buttons.
+    fn buttons_frame(
+        ctx: &Context,
+        hold: bool,
+        events: Vec<Event>,
+    ) -> ((bool, Option<VoicePress>), PlatformOutput) {
+        let push = voice(TalkMode::PushToTalk);
+        crate::controls::tests::frame(ctx, events, |ui| {
+            let buttons = your_buttons(&push, false, hold);
+            let size = vec2(360.0, CONTROL_HEIGHT);
+            voice_buttons(ui, &buttons, hold, 100.0, size, &push, false)
+        })
+    }
+
+    // Where a screen reader is told the button with this word stands.
+    fn middle_of(output: &PlatformOutput, word: &str) -> Pos2 {
+        let bounds = output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit is on")
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some(word))
+            .and_then(|(_, node)| node.bounds())
+            .unwrap_or_else(|| panic!("nothing called {word}"));
+        pos2(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        )
+    }
+
+    fn accessible_panel() -> Context {
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        ctx.enable_accesskit();
+        ctx
+    }
+
+    // One frame of Hold to talk's part of your row. Whether it shows.
+    fn hold_row_frame(
+        ctx: &Context,
+        hold: &mut Hold,
+        keys: hotkeys::State,
+        windows_mouse_down: bool,
+        events: Vec<Event>,
+    ) -> (bool, PlatformOutput) {
+        let push = voice(TalkMode::PushToTalk);
+        crate::controls::tests::frame(ctx, events, |ui| {
+            hold.frame_begins();
+            let pointer_down = ui.input(|input| hold.pointer_down(input, windows_mouse_down));
+            let shown = hold_shown(&push, keys, hold.stays(pointer_down));
+            if shown {
+                let buttons = your_buttons(&push, hold.held, true);
+                let size = vec2(360.0, CONTROL_HEIGHT);
+                let (held, _) = voice_buttons(ui, &buttons, true, 100.0, size, &push, false);
+                hold.drawn(held);
+            }
+            hold.frame_ends();
+            shown
+        })
+    }
+
+    fn key_event(key: Key, pressed: bool) -> Event {
+        Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    // Held for as long as the mouse holds it, also past the time and the
+    // movement that end a click. Esc lets go, though not before the press can
+    // no longer be a click. The pointer leaving the window lets go, as egui
+    // hears no release from out there, and coming back over the button does
+    // not take up again.
+    #[test]
+    fn hold_to_talk_lasts_until_the_mouse_lets_go() {
+        use crate::controls::tests::{press, release};
+        let ctx = accessible_panel();
+        let held = |events| buttons_frame(&ctx, true, events).0.0;
+        let (_, output) = buttons_frame(&ctx, true, Vec::new());
+        let at = middle_of(&output, HOLD);
+
+        assert!(held(press(at)));
+        // 1/60 s a frame.
+        for _ in 0..60 {
+            assert!(held(Vec::new()), "past 0.8 s");
+        }
+        assert!(
+            held(vec![Event::PointerMoved(at + vec2(7.0, 0.0))]),
+            "moved"
+        );
+        let off = at + vec2(0.0, 200.0);
+        assert!(held(vec![Event::PointerMoved(off)]), "off the button");
+        assert!(!held(release(off)));
+        assert!(!held(Vec::new()));
+
+        let esc = || vec![key_event(Key::Escape, true), key_event(Key::Escape, false)];
+        assert!(held(press(at)));
+        for _ in 0..60 {
+            assert!(held(Vec::new()), "past 0.8 s");
+        }
+        assert!(!held(esc()), "Esc past the click limit");
+        assert!(!held(Vec::new()), "no take-up");
+        assert!(!held(release(at)));
+
+        assert!(held(press(at)));
+        assert!(held(esc()), "Esc while it can still be a click");
+        for _ in 0..60 {
+            held(Vec::new());
+        }
+        assert!(!held(Vec::new()), "at the click limit");
+        assert!(!held(release(at)));
+
+        assert!(held(press(at)));
+        assert!(!held(vec![Event::PointerGone]));
+        assert!(!held(vec![Event::PointerMoved(at)]));
+    }
+
     // A release on the lock screen never reaches egui. Once Windows says the
     // mouse is up the button lets go, and the next click, in whatever window,
     // does not take up the press egui still counts.
@@ -3065,6 +3214,61 @@ mod tests {
         assert!(!can_last(false, Vec::new()));
         assert!(can_last(false, vec![touch(TouchPhase::Start)]));
         assert!(!can_last(false, vec![touch(TouchPhase::End)]));
+    }
+
+    // Let go out of the window, egui never hears the release and goes on
+    // counting the mouse as down. The hotkeys are live again by then, and the
+    // button has no reason to stay.
+    #[test]
+    fn hold_to_talk_goes_once_the_pointer_left_the_window() {
+        use crate::controls::tests::press;
+        let live = hotkeys::State {
+            running: true,
+            paused: false,
+        };
+        let paused = hotkeys::State {
+            paused: true,
+            ..live
+        };
+        let ctx = accessible_panel();
+        let mut hold = Hold::default();
+        let mut pass = |keys, events| hold_row_frame(&ctx, &mut hold, keys, true, events);
+        let (_, output) = pass(paused, Vec::new());
+        let at = middle_of(&output, HOLD);
+
+        assert!(pass(paused, press(at)).0);
+        assert!(pass(live, Vec::new()).0, "still held");
+        assert!(pass(live, vec![Event::PointerGone]).0, "the frame it left");
+        assert!(!pass(live, Vec::new()).0, "and gone");
+    }
+
+    // With the mouse let go on the lock screen egui still counts the press on
+    // the button. Windows saying up lets go on that frame, a click somewhere
+    // else does not take it up again, and with the hotkeys live the button goes.
+    #[test]
+    fn hold_to_talk_goes_once_windows_says_the_mouse_is_up() {
+        use crate::controls::tests::press;
+        let live = hotkeys::State {
+            running: true,
+            paused: false,
+        };
+        let paused = hotkeys::State {
+            paused: true,
+            ..live
+        };
+        let ctx = accessible_panel();
+        let mut hold = Hold::default();
+        let (_, output) = hold_row_frame(&ctx, &mut hold, paused, true, Vec::new());
+        let at = middle_of(&output, HOLD);
+
+        hold_row_frame(&ctx, &mut hold, paused, true, press(at));
+        assert!(hold.held);
+        let (shown, _) = hold_row_frame(&ctx, &mut hold, paused, false, Vec::new());
+        assert!(shown && !hold.held, "let go that frame");
+        let (shown, _) = hold_row_frame(&ctx, &mut hold, paused, true, Vec::new());
+        assert!(shown && !hold.held, "a click somewhere else");
+        let (shown, _) = hold_row_frame(&ctx, &mut hold, live, false, Vec::new());
+        assert!(!shown, "and gone");
     }
 
     #[test]
