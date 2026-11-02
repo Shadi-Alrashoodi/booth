@@ -245,6 +245,31 @@ impl InRoom {
         self.monitors = None;
     }
 
+    // The share key starts nothing while the picker is up: its windows would
+    // be in the picture, and the rectangle dragged next would not count.
+    pub fn picking(&self) -> bool {
+        self.region_pick.is_some()
+    }
+
+    // From the app's logic, not from show: the panel can be minimized under
+    // the picker, and the share goes with the mouse being let go, not with
+    // the panel coming back at some later time.
+    pub fn follow_region_pick(&mut self) -> Option<Step> {
+        let answer = self.region_pick.as_ref()?.try_recv();
+        if !matches!(answer, Err(TryRecvError::Empty)) {
+            self.region_pick = None;
+        }
+        match answer {
+            Ok(Ok(Some(picked))) => {
+                let fps = monitors::fps(picked.refresh_hz);
+                self.room.share_region(fps, picked.monitor, picked.region);
+                Some(Step::ListNext)
+            }
+            Ok(Err(why)) => Some(Step::Log(why)),
+            Ok(Ok(None)) | Err(_) => None,
+        }
+    }
+
     // For the share key after a region or window share: the list, as Share
     // opens it, or why there is none.
     pub fn open_share_list(&mut self, list: Result<Vec<Monitor>, String>) -> Result<(), String> {
@@ -326,22 +351,6 @@ impl InRoom {
         // However the list went, what was under it must not move up yet.
         if self.monitors.is_none() {
             self.list_room.give_way(now);
-        }
-        if let Some(answer) = &self.region_pick {
-            match answer.try_recv() {
-                Ok(Ok(Some(picked))) => {
-                    let fps = monitors::fps(picked.refresh_hz);
-                    self.room.share_region(fps, picked.monitor, picked.region);
-                    step = Some(Step::ListNext);
-                    self.region_pick = None;
-                }
-                Ok(Err(why)) => {
-                    step = Some(Step::Log(why));
-                    self.region_pick = None;
-                }
-                Ok(Ok(None)) | Err(TryRecvError::Disconnected) => self.region_pick = None,
-                Err(TryRecvError::Empty) => {}
-            }
         }
         let waits = self.block_wait.follow(&view.share, now);
         for left in [waits.placed, waits.switch].into_iter().flatten() {
@@ -1152,7 +1161,8 @@ fn window_row(ui: &mut Ui, window: &WindowPick) -> bool {
 }
 
 impl InRoom {
-    // The picker over every monitor; body takes its answer when it comes.
+    // The picker over every monitor; follow_region_pick takes its answer when
+    // it comes.
     fn pick_region(&mut self, ctx: &Context) -> Option<Step> {
         let list = match monitors::list() {
             Ok(list) => list,
@@ -1945,6 +1955,7 @@ pub(crate) mod tests {
         ControlView, CurrentShare, NoSound, Numbers, Party, Paused, Refusal, RouterState,
         RunningShare, Strip,
     };
+    use std::sync::mpsc::{Sender, channel};
 
     // The line under Share PC sound says what it sends, why it cannot go
     // on, or, while it is on, what happened to its capture, in warn.
@@ -3068,8 +3079,46 @@ pub(crate) mod tests {
         )
     }
 
+    // As if the region picker were open, its answer still to come over the
+    // channel the caller keeps.
+    pub(crate) fn picker_open(in_room: &mut InRoom) -> Sender<Result<Option<Picked>, String>> {
+        let (answer, answered) = channel();
+        in_room.region_pick = Some(answered);
+        answer
+    }
+
     pub(crate) fn list_open(in_room: &InRoom) -> bool {
         in_room.monitors.is_some()
+    }
+
+    // A picker closed with nothing picked leaves nothing behind: no share, no
+    // line, and the share key goes on as it was.
+    #[test]
+    fn a_picker_left_with_nothing_picked_ends_quietly() {
+        let data_dir = std::env::temp_dir().join(format!("booth-app-left-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let room = Arc::new(test_room(&data_dir));
+        let target = Target::default();
+        target.enter(Arc::clone(&room));
+        let mut in_room = test_in_room(&room, &target);
+
+        let answer = picker_open(&mut in_room);
+        assert!(in_room.follow_region_pick().is_none());
+        assert!(in_room.picking(), "no answer yet");
+        answer.send(Ok(None)).unwrap();
+        assert!(in_room.follow_region_pick().is_none());
+        assert!(!in_room.picking());
+
+        drop(picker_open(&mut in_room));
+        assert!(in_room.follow_region_pick().is_none());
+        assert!(!in_room.picking());
+        assert!(!own_share_on(&room.view().share.own));
+
+        drop(in_room);
+        target.leave();
+        hotkeys::leave(room);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     // A monitor is what the share key takes next, and a window puts the list

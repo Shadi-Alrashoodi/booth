@@ -1181,10 +1181,14 @@ impl eframe::App for App {
         self.follow_update();
         self.follow_hotkeys(ctx);
         // Here, since a request waiting over a game is when it matters, and
-        // the panel is minimized then.
+        // the panel is minimized then. So can it be when the region picker
+        // answers, which starts a share with no frame to see it.
+        let mut step = None;
         let view = match &mut self.screen {
             Screen::Room(in_room) => {
+                step = in_room.follow_region_pick();
                 let view = in_room.room.view();
+                self.share_key.follow(own_share_on(&view.share.own));
                 in_room.decline_unshown(&view, self.control_offered);
                 if minimized(ctx) {
                     in_room.out_of_sight();
@@ -1205,6 +1209,7 @@ impl eframe::App for App {
         if let Some(tray) = &mut self.tray {
             tray.show(tray::look(view.as_ref(), self.control_offered));
         }
+        self.take_step(step);
         self.follow_panel_keys(ctx);
     }
 
@@ -1239,9 +1244,6 @@ impl eframe::App for App {
             if let Some(problem) = &view.list_problem {
                 self.note(problem);
             }
-            // Here and not in logic: apart from the key, only the buttons
-            // start a share, and they can be clicked only while ui runs.
-            self.share_key.follow(own_share_on(&view.share.own));
         }
 
         let mut step = None;
@@ -1951,6 +1953,53 @@ mod tests {
         app.open_list_by_key(Ok(vec![monitor]), &ctx);
         assert!(app.raise);
         assert!(room_tests::list_open(in_room(&mut app)));
+
+        close_room(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The mouse let go with the panel minimized starts the share there, with
+    // no frame run, and the share key's count follows it.
+    #[test]
+    fn a_region_picked_while_minimized_shares_at_once() {
+        let dir = fresh_dir("region-minimized");
+        let ctx = Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut app = app_in_room(&dir);
+        let answer = room_tests::picker_open(in_room(&mut app));
+
+        let at = Instant::now();
+        app.share_key(at, &ctx);
+        let _ = ctx.run_logic(&with_window(true), |ctx| {
+            eframe::App::logic(&mut app, ctx, &mut frame);
+        });
+        assert!(in_room(&mut app).picking());
+        let picked = crate::region::Picked {
+            monitor: room::MonitorId {
+                device_name: String::from(r"\\.\DISPLAY1"),
+                adapter_luid: 0,
+            },
+            refresh_hz: 60.0,
+            region: share::Region {
+                left: 0,
+                top: 0,
+                width: 256,
+                height: 256,
+            },
+        };
+        answer.send(Ok(Some(picked))).unwrap();
+        let _ = ctx.run_logic(&with_window(true), |ctx| {
+            eframe::App::logic(&mut app, ctx, &mut frame);
+        });
+        assert!(!in_room(&mut app).picking());
+        share_goes(&mut app, true);
+        assert!(Settings::load(&dir).0.share_key_opens_list());
+        let _ = ctx.run_logic(&with_window(true), |ctx| {
+            eframe::App::logic(&mut app, ctx, &mut frame);
+        });
+        // A share seen running ended the first press, which can no longer
+        // start anything.
+        assert_eq!(app.share_key.press(at, false), None);
 
         close_room(app);
         let _ = std::fs::remove_dir_all(&dir);

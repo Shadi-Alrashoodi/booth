@@ -174,9 +174,10 @@ impl ShareKey {
         }
     }
 
-    // Every frame, with the room's view. A share seen running ends a first
-    // press, so one started by the button and stopped again leaves nothing
-    // behind for the next press to finish.
+    // Each pass of the app's logic, with the room's view, a minimized panel
+    // included. A share seen running ends a first press, so one started by
+    // the button or the picker and stopped again leaves nothing behind for
+    // the next press to finish.
     pub fn follow(&mut self, sharing: bool) {
         if sharing {
             self.first = None;
