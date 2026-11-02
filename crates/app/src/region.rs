@@ -10,6 +10,7 @@
 
 use std::cell::RefCell;
 use std::io;
+use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::{mem, ptr};
@@ -244,20 +245,25 @@ fn open_window(monitor: &Monitor) -> io::Result<HWND> {
 }
 
 // IBM Plex Sans as the panel has it, from the bytes the app carries, for
-// this process alone. Added again on a second pick, which costs nothing.
-fn add_font() {
-    let bytes = theme::SANS_REGULAR;
-    let mut count = 0;
-    // SAFETY: the font's bytes live for the whole run, and Windows copies
-    // them; the count is a live out parameter.
-    unsafe {
-        AddFontMemResourceEx(
-            bytes.as_ptr() as *const _,
-            bytes.len() as u32,
-            ptr::null(),
-            &raw mut count,
-        )
-    };
+// this process alone. Once a run, on the first pick's thread: Windows keeps a
+// copy for each call until Booth closes, and every thread here can use the
+// first.
+fn add_font() -> usize {
+    static ADDED: OnceLock<usize> = OnceLock::new();
+    *ADDED.get_or_init(|| {
+        let bytes = theme::SANS_REGULAR;
+        let mut count = 0;
+        // SAFETY: the font's bytes live for the whole run, and Windows copies
+        // them; the count is a live out parameter.
+        unsafe {
+            AddFontMemResourceEx(
+                bytes.as_ptr() as *const _,
+                bytes.len() as u32,
+                ptr::null(),
+                &raw mut count,
+            ) as usize
+        }
+    })
 }
 
 // At `px` pixels high. A null answer leaves the system font, which is only
@@ -698,6 +704,14 @@ mod tests {
         picker.small = Some(hwnd);
         assert!(!picker.mouse_moved(hwnd, far));
         assert_eq!(now(&picker), Some((200, 400)));
+    }
+
+    // The handle is new with each call that adds the font.
+    #[test]
+    fn the_font_is_added_once() {
+        let first = thread::spawn(add_font).join().unwrap();
+        assert_ne!(first, 0);
+        assert_eq!(thread::spawn(add_font).join().unwrap(), first);
     }
 
     #[test]
