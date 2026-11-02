@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::emath::GuiRounding;
 use eframe::egui::{
-    Align, Color32, Context, CursorIcon, Key, Layout, Modifiers, Rect, Response, ScrollArea, Sense,
-    Stroke, Ui, WidgetInfo, WidgetType, vec2,
+    Align, Color32, Context, CursorIcon, InputState, Key, Layout, Modifiers, Rect, Response,
+    ScrollArea, Sense, Stroke, Ui, WidgetInfo, WidgetType, vec2,
 };
 use invite::ReplyCode;
 use room::view::{
@@ -114,6 +114,14 @@ impl Hold {
         self.drawn_before && (pointer_down || self.held)
     }
 
+    // Whether the mouse is down as far as can be told. If Windows says no press
+    // can be going on, the one egui still counts is over from this frame on.
+    fn pointer_down(&mut self, input: &InputState, windows_mouse_down: bool) -> bool {
+        let can_last = press_can_last(input, windows_mouse_down);
+        self.press_over |= !can_last;
+        can_last && pointer_down_in_window(input)
+    }
+
     // The button was drawn, down or not. What to tell the room, if anything.
     fn drawn(&mut self, down: bool) -> Option<bool> {
         self.drawn = true;
@@ -131,6 +139,21 @@ impl Hold {
             down
         })
     }
+}
+
+// Whether a press can still be going on. A release made on another desktop, as
+// the lock screen or an administrator prompt takes over, reaches no window here
+// and the pointer need not be said to leave, so egui's count alone could keep
+// the microphone on for good. `windows_mouse_down` says nothing of a touch,
+// which need not press a mouse button.
+fn press_can_last(input: &InputState, windows_mouse_down: bool) -> bool {
+    windows_mouse_down || input.any_touches()
+}
+
+// egui hears no release once the pointer has left the window, and goes on
+// counting the button as down until the next click in the panel.
+fn pointer_down_in_window(input: &InputState) -> bool {
+    input.pointer.any_down() && input.pointer.hover_pos().is_some()
 }
 
 pub enum Step {
@@ -1640,7 +1663,8 @@ impl InRoom {
         ended: bool,
     ) {
         let rect = row_rect(ui, CONTROL_HEIGHT);
-        let pointer_down = ui.input(|input| input.pointer.any_down());
+        let pointer_down =
+            ui.input(|input| self.hold.pointer_down(input, win::mouse_button_down()));
         let hold = !ended && hold_shown(voice, self.keys, self.hold.stays(pointer_down));
         let buttons = your_buttons(voice, self.hold.held, hold);
         // Hold to talk keeps its size when it reads Talking, so Mute and
@@ -1864,6 +1888,7 @@ fn row_rect(ui: &mut Ui, height: f32) -> Rect {
 mod tests {
     use super::*;
     use crate::theme::Role::{Primary, Secondary};
+    use eframe::egui::{Event, TouchDeviceId, TouchId, TouchPhase, pos2};
     use room::ReplyRefused;
     use room::view::{
         ControlView, CurrentShare, NoSound, Numbers, Party, Paused, Refusal, RouterState,
@@ -2987,6 +3012,59 @@ mod tests {
         target.leave();
         hotkeys::leave(room);
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // A release on the lock screen never reaches egui. Once Windows says the
+    // mouse is up the button lets go, and the next click, in whatever window,
+    // does not take up the press egui still counts.
+    #[test]
+    fn a_press_windows_says_is_over_stays_over() {
+        use crate::controls::tests::{frame, press, release};
+        let ctx = Context::default();
+        let at = pos2(10.0, 10.0);
+        let mut hold = Hold::default();
+        let mut pass = |windows_mouse_down, events| {
+            frame(&ctx, events, |ui| {
+                let pointer_down = ui.input(|input| hold.pointer_down(input, windows_mouse_down));
+                let egui_down = ui.input(|input| input.pointer.any_down());
+                (pointer_down, hold.drawn(egui_down))
+            })
+            .0
+        };
+        assert_eq!(pass(true, press(at)), (true, Some(true)));
+        assert_eq!(pass(false, Vec::new()), (false, Some(false)), "that frame");
+        assert_eq!(pass(false, Vec::new()), (false, None));
+        assert_eq!(
+            pass(true, Vec::new()),
+            (true, None),
+            "a click somewhere else"
+        );
+        assert_eq!(pass(true, release(at)), (false, None));
+        assert_eq!(pass(true, press(at)), (true, Some(true)), "a new press");
+    }
+
+    // A finger on the button is down with no mouse button down in Windows.
+    #[test]
+    fn a_touch_can_last_with_the_mouse_up() {
+        use crate::controls::tests::frame;
+        let ctx = Context::default();
+        let touch = |phase| Event::Touch {
+            device_id: TouchDeviceId(1),
+            id: TouchId(1),
+            phase,
+            pos: pos2(10.0, 10.0),
+            force: None,
+        };
+        let can_last = |windows, events| {
+            frame(&ctx, events, |ui| {
+                ui.input(|input| press_can_last(input, windows))
+            })
+            .0
+        };
+        assert!(can_last(true, Vec::new()));
+        assert!(!can_last(false, Vec::new()));
+        assert!(can_last(false, vec![touch(TouchPhase::Start)]));
+        assert!(!can_last(false, vec![touch(TouchPhase::End)]));
     }
 
     #[test]

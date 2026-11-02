@@ -27,8 +27,8 @@ use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpeci
 use windows_sys::Win32::System::WindowsProgramming::GetUserNameW;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_PROCESSKEY, VK_RMENU, VK_RWIN,
-    VK_SHIFT,
+    GetAsyncKeyState, GetKeyState, VK_CONTROL, VK_LBUTTON, VK_LWIN, VK_MBUTTON, VK_MENU,
+    VK_PROCESSKEY, VK_RBUTTON, VK_RMENU, VK_RWIN, VK_SHIFT, VK_XBUTTON1, VK_XBUTTON2,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, HWND_TOP, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW,
@@ -195,6 +195,16 @@ fn modifiers(down: impl Fn(u16) -> bool) -> [Modifiers; 2] {
         (true, false) => [ctrl; 2],
         (true, true) => [ctrl, held],
     }
+}
+
+// The mouse now, whichever button is primary, as this goes by the physical
+// buttons. Windows says up for all of them while the lock screen or an
+// administrator prompt has the input, as that desktop is not this one.
+pub fn mouse_button_down() -> bool {
+    [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2]
+        .into_iter()
+        // SAFETY: takes a virtual key code and only reads Windows' key state.
+        .any(|vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
 }
 
 // The title bar in the window tone with chalk text, and the border in the
