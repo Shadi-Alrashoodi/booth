@@ -637,7 +637,9 @@ impl App {
     }
 
     // A refused field or a failed write keeps the screen open with the
-    // reason under it, and what was typed stays for another try.
+    // reason under it, and what was typed stays for another try. Settings
+    // that went in before a list failed count now: a later Save finds them
+    // already there, and Cancel does not look.
     fn save_settings(&mut self) {
         let (Ok(setup), Screen::Settings { draft, .. }) = (&mut self.setup, &mut self.screen)
         else {
@@ -645,12 +647,13 @@ impl App {
         };
         let before = setup.settings.hotkeys();
         draft.stop_waiting();
-        if !save_draft(setup, draft, &mut self.backlog, self.flags.controlled()) {
-            return;
-        }
+        let saved = save_draft(setup, draft, &mut self.backlog, self.flags.controlled());
         let after = setup.settings.hotkeys();
         if after != before && self.hotkeys.set_bindings(after) {
             self.backlog.add(hotkeys::bindings_line(&after));
+        }
+        if !saved {
+            return;
         }
         self.close_settings();
     }
@@ -1812,6 +1815,55 @@ mod tests {
         });
         assert_eq!(fake.record().at_once, 1);
         assert!(!hearing(&app));
+    }
+
+    // On the settings screen with fake sound, as the start screen left it.
+    fn app_in_settings(dir: &Path, start: Start, change: impl FnOnce(&mut Draft)) -> App {
+        let setup = setup_in(dir);
+        let mut draft = Draft::new(&setup.settings, KnownDevices::default(), String::new());
+        change(&mut draft);
+        let fake = Fake::new(FakeSetup::default(), &[("a", "Headset A")], Some("a"));
+        let audio = sound::tests::fake_audio(&Context::default(), &fake, &draft.input);
+        test_app(
+            Ok(setup),
+            Screen::Settings {
+                draft: Box::new(draft),
+                start,
+                audio: Box::new(audio),
+            },
+        )
+    }
+
+    // The settings go in and the list fails after them. Neither Save again
+    // nor Cancel finds a change after that, so the new key has to reach the
+    // hotkeys here, or the old one goes on working until Booth restarts.
+    #[test]
+    fn a_save_that_fails_on_a_list_still_moves_the_hotkeys() {
+        let f9: Chord = "F9".parse().unwrap();
+        let mute = |app: &App| app.hotkeys.last_given().chord(Action::Mute);
+        for cancel in [false, true] {
+            let dir = fresh_dir(&format!("hotkeys-list-{cancel}"));
+            let mut app = app_in_settings(&dir, Start::default(), |draft| {
+                draft.hotkeys.set(Action::Mute, f9);
+                draft.removed.push([7; 32]);
+            });
+            std::fs::create_dir(dir.join("devices.bin")).unwrap();
+            app.save_settings();
+            assert!(matches!(app.screen, Screen::Settings { .. }));
+            assert_eq!(mute(&app), f9, "after the failed save");
+            let moved = hotkeys::bindings_line(&app.hotkeys.last_given());
+            assert!(app.backlog.texts().contains(&moved.as_str()));
+
+            std::fs::remove_dir(dir.join("devices.bin")).unwrap();
+            if cancel {
+                app.close_settings();
+            } else {
+                app.save_settings();
+            }
+            assert!(matches!(app.screen, Screen::Start(_)), "{cancel}");
+            assert_eq!(mute(&app), f9, "{cancel}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     // While this PC is controlled, Save refuses a change to the panic key,

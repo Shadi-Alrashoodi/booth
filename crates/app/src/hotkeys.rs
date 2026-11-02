@@ -351,6 +351,11 @@ impl Hotkeys {
     pub fn bindings(&self) -> Option<Bindings> {
         self.running.as_ref().map(|_| self.bindings)
     }
+
+    #[cfg(test)]
+    pub fn last_given(&self) -> Bindings {
+        self.bindings
+    }
 }
 
 // One log line per action by name while a room is open, and per pause at any
