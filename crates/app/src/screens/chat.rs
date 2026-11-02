@@ -65,6 +65,8 @@ pub struct Chat {
     times: Times,
     heights: Heights,
     names: Names,
+    // Where the lines were scrolled to on the last frame.
+    offset: f32,
 }
 
 impl Chat {
@@ -77,6 +79,7 @@ impl Chat {
             times: Times::default(),
             heights: Heights::default(),
             names: Names::default(),
+            offset: 0.0,
         }
     }
 
@@ -135,11 +138,20 @@ impl Chat {
     // Stuck to the newest line until someone scrolls up; then it stays
     // where they are until they scroll back down.
     fn history(&mut self, ui: &mut Ui, lines: &[Arc<ChatLine>]) -> ScrollAreaOutput<()> {
-        ScrollArea::vertical()
+        let mut area = ScrollArea::vertical()
             .id_salt("chat")
             .stick_to_bottom(true)
-            .auto_shrink(false)
-            .show_viewport(ui, |ui, viewport| self.lines(ui, lines, viewport))
+            .auto_shrink(false);
+        // The offset is a number of points, not a place in the text, so when
+        // old lines leave it comes down with what is left. Stuck, the area
+        // goes back to the newest line by itself.
+        let moved = self.heights.moved_up(lines);
+        if moved > 0.0 {
+            area = area.vertical_scroll_offset((self.offset - moved).max(0.0));
+        }
+        let output = area.show_viewport(ui, |ui, viewport| self.lines(ui, lines, viewport));
+        self.offset = output.state.offset.y;
+        output
     }
 
     // An empty chat says nothing: the composer's "Message" is the verb.
@@ -156,6 +168,7 @@ impl Chat {
         self.heights.update(ui, lines, width, &mut self.times);
         // Every name line is one row of the same height.
         let name_height = self.name_galley(ui, &lines[0], width).size().y;
+        self.heights.name = name_height;
 
         // The lines in view, and where the first of them starts, the space
         // above it included.
@@ -453,9 +466,38 @@ fn spacing(lines: &[Arc<ChatLine>], i: usize) -> (f32, bool) {
 struct Heights {
     width: f32,
     lines: VecDeque<(Arc<ChatLine>, f32)>,
+    // How tall a name line was on the last frame.
+    name: f32,
 }
 
 impl Heights {
+    // How far up the lines still in `lines` sit against the last frame, for
+    // those that left at the front. The first one kept also loses the space
+    // above it, and may gain a name line. When none is kept there is no place
+    // to hold on to.
+    fn moved_up(&self, lines: &[Arc<ChatLine>]) -> f32 {
+        let kept = lines.first().and_then(|first| {
+            self.lines
+                .iter()
+                .position(|(line, _)| Arc::ptr_eq(line, first))
+        });
+        let Some(kept @ 1..) = kept else {
+            return 0.0;
+        };
+        let before: Vec<Arc<ChatLine>> = self
+            .lines
+            .iter()
+            .take(kept + 1)
+            .map(|(line, _)| Arc::clone(line))
+            .collect();
+        let above = |lines: &[Arc<ChatLine>], i: usize| {
+            let (gap, named) = spacing(lines, i);
+            gap + if named { self.name } else { 0.0 }
+        };
+        let left: f32 = (0..kept).map(|i| above(&before, i) + self.lines[i].1).sum();
+        left + above(&before, kept) - above(lines, 0)
+    }
+
     fn update(&mut self, ui: &Ui, lines: &[Arc<ChatLine>], width: f32, times: &mut Times) {
         if self.width != width {
             self.width = width;
@@ -550,7 +592,9 @@ mod bidi_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eframe::egui::{Context, Event, Key, Modifiers, MouseWheelUnit, RawInput, TouchPhase};
+    use eframe::egui::{
+        Context, Event, Key, Modifiers, MouseWheelUnit, RawInput, Shape, TouchPhase,
+    };
     use room::view::Level;
 
     fn line(author: u8, text: &str) -> Arc<ChatLine> {
@@ -802,10 +846,15 @@ mod tests {
             let measured: Vec<f32> = heights.lines.iter().map(|(_, h)| *h).collect();
             assert_eq!(measured[..5], [BODY_LINE; 5]);
             assert!(measured[5] >= 3.0 * BODY_LINE, "{}", measured[5]);
+            assert_eq!(heights.moved_up(&lines), 0.0);
 
             let first_kept = Arc::clone(&heights.lines[2].0);
             lines.drain(..2);
             lines.push(line(3, "late"));
+            assert_eq!(
+                heights.moved_up(&lines),
+                2.0 * BODY_LINE + 2.0 * MESSAGE_GAP
+            );
             heights.update(ui, &lines, 280.0, &mut times);
             assert_eq!(heights.lines.len(), lines.len());
             assert!(Arc::ptr_eq(&heights.lines[0].0, &first_kept));
@@ -819,6 +868,7 @@ mod tests {
 
             // Another room's lines share nothing with these.
             let other: Vec<Arc<ChatLine>> = (0..3).map(|n| line(9, &n.to_string())).collect();
+            assert_eq!(heights.moved_up(&other), 0.0);
             heights.update(ui, &other, 1000.0, &mut times);
             assert_eq!(heights.lines.len(), 3);
             assert!(Arc::ptr_eq(&heights.lines[0].0, &other[0]));
@@ -848,6 +898,33 @@ mod tests {
         )
     }
 
+    // egui spreads a wheel turn over a few frames.
+    fn settle(ctx: &Context, chat: &mut Chat, lines: &[Arc<ChatLine>]) -> (f32, f32) {
+        let mut last = scrolled(ctx, chat, lines, Vec::new());
+        for _ in 0..100 {
+            let now = scrolled(ctx, chat, lines, Vec::new());
+            if now == last {
+                return now;
+            }
+            last = now;
+        }
+        panic!("the chat never came to rest: {last:?}");
+    }
+
+    // A turn of the wheel with the mouse over the chat, up for a positive
+    // number of points.
+    fn wheel(points: f32) -> Vec<Event> {
+        vec![
+            Event::PointerMoved(pos2(100.0, 300.0)),
+            Event::MouseWheel {
+                unit: MouseWheelUnit::Point,
+                delta: vec2(0.0, points),
+                phase: TouchPhase::Move,
+                modifiers: Modifiers::NONE,
+            },
+        ]
+    }
+
     // The chat stays at the newest line as lines come, until someone scrolls
     // up; then it stays where they are.
     #[test]
@@ -858,44 +935,152 @@ mod tests {
         let mut lines: Vec<Arc<ChatLine>> = (0..60)
             .map(|n| line(1 + n % 2, &format!("line {n}")))
             .collect();
-        // egui spreads a wheel turn over a few frames.
-        let settle = |chat: &mut Chat, lines: &[Arc<ChatLine>]| {
-            let mut last = scrolled(&ctx, chat, lines, Vec::new());
-            for _ in 0..100 {
-                let now = scrolled(&ctx, chat, lines, Vec::new());
-                if now == last {
-                    return now;
-                }
-                last = now;
-            }
-            panic!("the chat never came to rest: {last:?}");
-        };
-        let (offset, most) = settle(&mut chat, &lines);
+        let (offset, most) = settle(&ctx, &mut chat, &lines);
         assert!(most > 0.0, "{most}");
         assert_eq!(offset, most);
 
         lines.push(line(3, "a new line"));
-        let (offset, grown) = settle(&mut chat, &lines);
+        let (offset, grown) = settle(&ctx, &mut chat, &lines);
         assert!(grown > most, "{grown} {most}");
         assert_eq!(offset, grown);
 
-        let wheel = vec![
-            Event::PointerMoved(pos2(100.0, 300.0)),
-            Event::MouseWheel {
-                unit: MouseWheelUnit::Point,
-                delta: vec2(0.0, 200.0),
-                phase: TouchPhase::Move,
-                modifiers: Modifiers::NONE,
-            },
-        ];
-        scrolled(&ctx, &mut chat, &lines, wheel);
-        let (up, _) = settle(&mut chat, &lines);
+        scrolled(&ctx, &mut chat, &lines, wheel(200.0));
+        let (up, _) = settle(&ctx, &mut chat, &lines);
         assert!(up < grown - 100.0, "{up} {grown}");
 
         lines.push(line(1, "one more while you read back"));
-        let (held, more) = settle(&mut chat, &lines);
+        let (held, more) = settle(&ctx, &mut chat, &lines);
         assert!(more > grown, "{more} {grown}");
         assert_eq!(held, up);
+    }
+
+    // How far down the window this text is drawn on one frame of the history.
+    fn drawn_at(ctx: &Context, chat: &mut Chat, lines: &[Arc<ChatLine>], text: &str) -> f32 {
+        let input = RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(360.0, 640.0))),
+            ..RawInput::default()
+        };
+        let output = ctx.run_ui(input, |ui| {
+            chat.history(ui, lines);
+        });
+        let y = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                Shape::Text(shape) if shape.galley.text() == text => Some(shape.pos.y),
+                _ => None,
+            });
+        output.drop_without_applying_deltas();
+        y.expect("the line is in view")
+    }
+
+    // `first`, then 60 lines of two alternating authors, the first of them
+    // person 1.
+    fn history_after(first: Vec<Arc<ChatLine>>) -> Vec<Arc<ChatLine>> {
+        let rest = (0..60).map(|n| line(1 + n % 2, &format!("line {n}")));
+        first.into_iter().chain(rest).collect()
+    }
+
+    fn twenty_rows() -> String {
+        "the east door\n".repeat(19) + "the east door"
+    }
+
+    // A full history drops its oldest lines as new ones come. Someone reading
+    // back keeps the same text at the same place on screen, whatever left:
+    // what moved is the lines gone with the gap and the name line of the next
+    // one, less the name line that one has as the first.
+    #[test]
+    fn scrolled_up_the_text_stays_put_as_old_lines_leave() {
+        let cases = [
+            ("a line and a new author", vec![], 1, 52.0),
+            (
+                "a line of one author's run",
+                vec![line(2, "oldest"), line(2, "next")],
+                1,
+                26.0,
+            ),
+            ("a line of 20 rows", vec![line(2, &twenty_rows())], 1, 394.0),
+            ("three lines at once", vec![], 3, 156.0),
+            (
+                "a line from the room",
+                vec![system(1, "person 1 left", LineKind::System)],
+                1,
+                34.0,
+            ),
+        ];
+        for (case, first, leaving, moved) in cases {
+            let ctx = Context::default();
+            theme::apply(&ctx);
+            let mut chat = Chat::new();
+            let mut lines = history_after(first);
+            settle(&ctx, &mut chat, &lines);
+            scrolled(&ctx, &mut chat, &lines, wheel(300.0));
+            let (up, most) = settle(&ctx, &mut chat, &lines);
+            assert!(up < most - 200.0, "{case}: {up} {most}");
+            let before = drawn_at(&ctx, &mut chat, &lines, "line 50");
+
+            lines.drain(..leaving);
+            lines.extend((0..leaving).map(|_| line(3, "a new line")));
+            let (offset, _) = settle(&ctx, &mut chat, &lines);
+            assert_eq!(offset, up - moved, "{case}");
+            let after = drawn_at(&ctx, &mut chat, &lines, "line 50");
+            assert_eq!(after, before, "{case}");
+        }
+    }
+
+    // Close to the end, more can leave than comes. The end then comes up to
+    // the offset as it stood, which would stick the chat to the newest line
+    // again for someone who scrolled up.
+    #[test]
+    fn near_the_end_a_tall_line_leaving_does_not_stick_the_chat() {
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        let mut chat = Chat::new();
+        let mut lines = history_after(vec![line(2, &twenty_rows())]);
+        settle(&ctx, &mut chat, &lines);
+        scrolled(&ctx, &mut chat, &lines, wheel(100.0));
+        let (up, most) = settle(&ctx, &mut chat, &lines);
+        assert_eq!(most - up, 100.0);
+
+        lines.remove(0);
+        lines.push(line(3, "a new line"));
+        let (held, most) = settle(&ctx, &mut chat, &lines);
+        assert_eq!(most - held, 152.0);
+
+        lines.push(line(1, "one more"));
+        let (still, more) = settle(&ctx, &mut chat, &lines);
+        assert!(more > most, "{more} {most}");
+        assert_eq!(still, held);
+    }
+
+    // Stuck to the newest line, the chat stays there when the oldest leaves,
+    // and someone at the very top stays at the top.
+    #[test]
+    fn at_either_end_the_chat_stays_there_as_old_lines_leave() {
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        let mut chat = Chat::new();
+        let mut lines = history_after(vec![]);
+        settle(&ctx, &mut chat, &lines);
+        for _ in 0..3 {
+            lines.remove(0);
+            lines.push(line(3, "a new line"));
+            let (offset, most) = settle(&ctx, &mut chat, &lines);
+            assert_eq!(offset, most);
+        }
+
+        scrolled(&ctx, &mut chat, &lines, wheel(100_000.0));
+        let (top, _) = settle(&ctx, &mut chat, &lines);
+        assert_eq!(top, 0.0);
+        let first = lines[0].text.clone();
+        let before = drawn_at(&ctx, &mut chat, &lines, &first);
+        lines.remove(0);
+        lines.push(line(3, "a new line"));
+        let next = lines[0].text.clone();
+        assert_eq!(drawn_at(&ctx, &mut chat, &lines, &next), before);
+        let (top, most) = settle(&ctx, &mut chat, &lines);
+        assert_eq!(top, 0.0);
+        assert!(most > 0.0, "{most}");
     }
 
     fn key(key: Key, modifiers: Modifiers) -> Event {
