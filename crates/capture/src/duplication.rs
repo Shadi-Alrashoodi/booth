@@ -28,7 +28,7 @@ use crate::convert::{Converter, Layout, Plan, Region, Target};
 use crate::device;
 use crate::error::{CaptureError, ErrorKind, is_device_lost, meaning};
 use crate::missing::{Missed, Missing};
-use crate::monitors::{Monitor, Rotation, find};
+use crate::monitors::{Monitor, Rotation, describe_output, find};
 use crate::{CursorKind, CursorShape, CursorUpdate, Frame, Next, Options, PauseReason};
 
 // How long next() waits for a change before it answers Idle, and how often
@@ -882,15 +882,39 @@ fn duplicate(
         )));
     }
     let rotation = Rotation::from_dxgi(desc.Rotation);
-    let plan = fitted(
+    // Not `monitor`'s size: that is from when the share opened, and the monitor
+    // can have turned since. In physical pixels, as open_in made sure.
+    let now = describe_output(&output).map_err(Refused::Failed)?;
+    let plan = mode_plan(
         (desc.ModeDesc.Width, desc.ModeDesc.Height),
         rotation,
+        (now.width, now.height),
         options,
         region,
         name,
     )
     .map_err(Refused::Failed)?;
     Ok((duplication, plan))
+}
+
+// The plan before there is a picture. Windows reports a turned monitor's mode
+// upright, the size the monitor has on the desktop, but its textures come as
+// the panel scans them, and fitted takes the texture's size. A mode of any
+// other size stays as it came; the first texture has the last word either way.
+fn mode_plan(
+    mode: (u32, u32),
+    rotation: Rotation,
+    desktop: (u32, u32),
+    options: Options,
+    region: Option<(Region, (u32, u32))>,
+    name: &str,
+) -> Result<Plan, CaptureError> {
+    let texture = if rotation.swaps_sides() && mode == desktop {
+        (mode.1, mode.0)
+    } else {
+        mode
+    };
+    fitted(texture, rotation, options, region, name)
 }
 
 // The plan for a picture of this size and rotation: all of it, or a region
@@ -1169,6 +1193,79 @@ mod tests {
         );
         assert_eq!(update.scale, scale_x);
         assert!(update.visible && update.shape.is_none());
+    }
+
+    // A turned monitor's plan at open is the one its first picture makes, so
+    // nothing is made twice, and a region drawn on it opens.
+    #[test]
+    fn a_turned_monitor_opens_with_the_plan_of_its_first_picture() {
+        let options = Options::default();
+        let name = "the monitor";
+        let region = Region {
+            left: 100,
+            top: 1000,
+            width: 400,
+            height: 400,
+        };
+        for rotation in [Rotation::Rotate90, Rotation::Rotate270] {
+            for (mode, texture) in [((1080, 1920), (1920, 1080)), ((2160, 3840), (3840, 2160))] {
+                let whole = mode_plan(mode, rotation, mode, options, None, name).unwrap();
+                assert_eq!((whole.width, whole.height), (810, 1440), "{mode:?}");
+                assert_eq!(
+                    whole,
+                    fitted(texture, rotation, options, None, name).unwrap()
+                );
+                let drawn = Some((region, mode));
+                let part = mode_plan(mode, rotation, mode, options, drawn, name).unwrap();
+                assert_eq!((part.width, part.height), (400, 400), "{mode:?}");
+                assert_eq!(part.crop, (100, 1000), "{mode:?}");
+                assert_eq!(
+                    part,
+                    fitted(texture, rotation, options, drawn, name).unwrap()
+                );
+            }
+        }
+        // Without a quarter turn the mode is the texture's size already.
+        for rotation in [Rotation::Identity, Rotation::Rotate180] {
+            let mode = (1920, 1080);
+            let plan = mode_plan(mode, rotation, mode, options, None, name).unwrap();
+            assert_eq!((plan.source_width, plan.source_height), mode);
+            assert_eq!((plan.upright_width, plan.upright_height), mode);
+        }
+        // A mode reported as the panel scans it needs no turn.
+        let desktop = (1080, 1920);
+        let drawn = Some((region, desktop));
+        let plan = mode_plan(
+            (1920, 1080),
+            Rotation::Rotate90,
+            desktop,
+            options,
+            drawn,
+            name,
+        );
+        let plan = plan.unwrap();
+        assert_eq!((plan.source_width, plan.source_height), (1920, 1080));
+        // Another size than the region was drawn on is still refused.
+        let other = mode_plan(
+            (720, 1280),
+            Rotation::Rotate90,
+            desktop,
+            options,
+            drawn,
+            name,
+        );
+        assert!(other.is_err_and(|err| err.to_string().contains("Share the region again")));
+        // Turned after a region was drawn on it, where the region would still
+        // fit: its old shape is refused at open, not at the first picture.
+        let inside = Region {
+            left: 100,
+            top: 100,
+            width: 400,
+            height: 400,
+        };
+        let old = Some((inside, (1920, 1080)));
+        let turned = mode_plan(desktop, Rotation::Rotate90, desktop, options, old, name);
+        assert!(turned.is_err_and(|err| err.to_string().contains("Share the region again")));
     }
 
     // A region share's pictures are the region's size, its pointer is in
