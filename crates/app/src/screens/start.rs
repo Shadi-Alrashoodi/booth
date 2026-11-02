@@ -102,6 +102,14 @@ impl Start {
         self.address_error = None;
         self.focus_address = true;
     }
+
+    // A room that could not open may have said to change the port, with the
+    // old one in the sentence. Host or Join says it again if it still holds.
+    pub fn settings_changed(&mut self) {
+        self.host_error = None;
+        self.join_error = None;
+        self.known_error = None;
+    }
 }
 
 // `blocked` is why this PC cannot host or join at all (the identity key could

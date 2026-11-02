@@ -560,6 +560,7 @@ impl App {
                 });
                 let mut start = std::mem::take(start);
                 start.opened = None;
+                start.known_error = None;
                 self.screen = self.start(start);
             }
             Err(err) => {
@@ -592,6 +593,7 @@ impl App {
                 let mut start = std::mem::take(start);
                 start.opened = None;
                 start.forgot = Some(messages::forgot(&room));
+                start.known_error = None;
                 self.screen = self.start(start);
             }
             Err(err) => {
@@ -641,15 +643,19 @@ impl App {
     // that went in before a list failed count now: a later Save finds them
     // already there, and Cancel does not look.
     fn save_settings(&mut self) {
-        let (Ok(setup), Screen::Settings { draft, .. }) = (&mut self.setup, &mut self.screen)
+        let (Ok(setup), Screen::Settings { draft, start, .. }) =
+            (&mut self.setup, &mut self.screen)
         else {
             return;
         };
-        let before = setup.settings.hotkeys();
+        let before = setup.settings.clone();
         draft.stop_waiting();
         let saved = save_draft(setup, draft, &mut self.backlog, self.flags.controlled());
+        if setup.settings != before {
+            start.settings_changed();
+        }
         let after = setup.settings.hotkeys();
-        if after != before && self.hotkeys.set_bindings(after) {
+        if after != before.hotkeys() && self.hotkeys.set_bindings(after) {
             self.backlog.add(hotkeys::bindings_line(&after));
         }
         if !saved {
@@ -1835,6 +1841,13 @@ mod tests {
         )
     }
 
+    fn start_of(app: &App) -> &Start {
+        match &app.screen {
+            Screen::Start(start) | Screen::Settings { start, .. } => start,
+            _ => panic!("no start screen"),
+        }
+    }
+
     // The settings go in and the list fails after them. Neither Save again
     // nor Cancel finds a change after that, so the new key has to reach the
     // hotkeys here, or the old one goes on working until Booth restarts.
@@ -1905,6 +1918,107 @@ mod tests {
         app.save_settings();
         assert!(reason_due(&app), "this pc is controlled");
         assert_eq!(app.hotkeys.last_given(), input::Bindings::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn with_errors() -> Start {
+        Start {
+            host_error: Some(String::from("host")),
+            join_error: Some(String::from("join")),
+            known_error: Some(String::from("known")),
+            ..Start::default()
+        }
+    }
+
+    // "Change the port in settings", with the old port in the sentence, goes
+    // once the settings have changed, a Save that failed on a list after them
+    // included. Save with no change and Cancel leave the sentence true.
+    #[test]
+    fn a_change_in_settings_ends_the_start_screen_s_errors() {
+        let gone = |app: &App| {
+            let start = start_of(app);
+            [&start.host_error, &start.join_error, &start.known_error].map(Option::is_none)
+        };
+        let dir = fresh_dir("start-errors");
+
+        let mut app = app_in_settings(&dir, with_errors(), |_| {});
+        app.save_settings();
+        assert!(matches!(app.screen, Screen::Start(_)));
+        assert_eq!(gone(&app), [false; 3], "nothing changed");
+
+        let port = |draft: &mut Draft| draft.port = String::from("41010");
+        let mut app = app_in_settings(&dir, with_errors(), port);
+        app.close_settings();
+        assert_eq!(gone(&app), [false; 3], "cancelled");
+
+        let mut app = app_in_settings(&dir, with_errors(), |draft| {
+            draft.port = String::from("80");
+        });
+        app.save_settings();
+        assert_eq!(gone(&app), [false; 3], "refused");
+
+        let mut app = app_in_settings(&dir, with_errors(), port);
+        std::fs::create_dir(dir.join("settings.txt")).unwrap();
+        app.save_settings();
+        assert_eq!(gone(&app), [false; 3], "not written");
+        std::fs::remove_dir(dir.join("settings.txt")).unwrap();
+
+        let mut app = app_in_settings(&dir, with_errors(), port);
+        app.save_settings();
+        assert!(matches!(app.screen, Screen::Start(_)));
+        assert_eq!(gone(&app), [true; 3], "saved");
+        std::fs::remove_file(dir.join("settings.txt")).unwrap();
+
+        let mut app = app_in_settings(&dir, with_errors(), |draft| {
+            port(draft);
+            draft.removed.push([7; 32]);
+        });
+        std::fs::create_dir(dir.join("devices.bin")).unwrap();
+        app.save_settings();
+        assert!(matches!(app.screen, Screen::Settings { .. }));
+        app.close_settings();
+        assert_eq!(gone(&app), [true; 3], "saved, then the list failed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The red line under the list is about the last rejoin or Forget, so a
+    // Forget that fails and then works, or an address saved, ends it.
+    #[test]
+    fn a_known_host_step_that_works_ends_the_last_error() {
+        let host_dir = fresh_dir("known-error-host");
+        let dir = fresh_dir("known-error-friend");
+        let host = room_tests::test_room(&host_dir);
+        room_tests::test_friend(&host, &dir).leave();
+        host.leave();
+        let known = Room::known_hosts(&dir).unwrap();
+        let key = *known[0].host_key();
+        let list = dir.join("hosts.bin");
+        let aside = dir.join("hosts.bin.aside");
+
+        let mut app = test_app(
+            Ok(setup_in(&dir)),
+            Screen::Start(Start {
+                known,
+                known_error: Some(String::from("the last rejoin")),
+                ..Start::default()
+            }),
+        );
+        app.save_address(key);
+        assert_eq!(start_of(&app).known_error, None, "an address saved");
+
+        std::fs::rename(&list, &aside).unwrap();
+        std::fs::create_dir(&list).unwrap();
+        app.forget(key);
+        assert!(start_of(&app).known_error.is_some());
+        assert_eq!(start_of(&app).forgot, None);
+
+        std::fs::remove_dir(&list).unwrap();
+        std::fs::rename(&aside, &list).unwrap();
+        app.forget(key);
+        assert!(start_of(&app).forgot.is_some());
+        assert_eq!(start_of(&app).known_error, None, "forgotten");
+        assert!(start_of(&app).known.is_empty());
+        let _ = std::fs::remove_dir_all(&host_dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
