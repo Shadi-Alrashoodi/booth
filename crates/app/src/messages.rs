@@ -776,6 +776,15 @@ pub fn settings_error(err: &SaveError) -> String {
     let close_it = "Close any program that has the file open, then press Save again.";
     let file = settings::FILE;
     match err {
+        // Closing a program would not help, and Windows said nothing: the
+        // words are Booth's own.
+        SaveError::Read { source, .. } | SaveError::Write { source, .. }
+            if source.kind() == io::ErrorKind::FileTooLarge =>
+        {
+            format!(
+                "Could not save {file}: {source}. Make it smaller or delete it, then press Save again."
+            )
+        }
         SaveError::Read { source, .. } => format!(
             "Could not read {file}, so saving now could lose what else is in it. Windows said: {}. {close_it}",
             os_text(&source.to_string())
@@ -1159,6 +1168,10 @@ mod tests {
                 path: dir.join("settings.txt"),
                 source: denied(),
             },
+            SaveError::Read {
+                path: dir.join("settings.txt"),
+                source: io::Error::new(io::ErrorKind::FileTooLarge, "it is too big"),
+            },
         ];
         let mut seen = Vec::new();
         for err in &failures {
@@ -1172,6 +1185,18 @@ mod tests {
             assert!(!seen.contains(&text), "{err} says the same as another");
             seen.push(text);
         }
+        let too_big = settings_error(&failures[3]);
+        assert_eq!(
+            too_big,
+            "Could not save settings.txt: it is too big. Make it smaller or delete it, then press Save again."
+        );
+        // What would be too big to read back is said the same way, and no
+        // full disk is blamed.
+        let would_be = settings_error(&SaveError::Write {
+            path: dir.join("settings.txt"),
+            source: io::Error::new(io::ErrorKind::FileTooLarge, "it is too big"),
+        });
+        assert_eq!(would_be, too_big);
     }
 
     #[test]

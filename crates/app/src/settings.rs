@@ -5,7 +5,7 @@
 
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -82,6 +82,10 @@ const KEYS: [&str; 26] = [
 const PUSH_TO_TALK: &str = "push_to_talk";
 const OPEN_MIC: &str = "open_mic";
 const BOM: &[u8] = b"\xEF\xBB\xBF";
+// What Booth writes is a few KB at most; a file much bigger is not its own, and
+// is not read whole. Each line of it costs more in memory than its bytes, and
+// a broken one a log line that stays for the run.
+const MOST_BYTES: u64 = 64 * 1024;
 
 pub const DEFAULT_PORT: u16 = 41000;
 // Ports below 1024 are the IANA well-known range. Windows lets any process
@@ -408,7 +412,19 @@ impl Settings {
             path: path.clone(),
             source,
         })?;
-        replace(dir, &path, &self.merge(&old))?;
+        let new = self.merge(&old);
+        // Merging can make the file longer, each line getting its \r. Written,
+        // it would be refused at the next start.
+        if new.len() as u64 > MOST_BYTES {
+            return Err(SaveError::Write {
+                path,
+                source: io::Error::new(
+                    io::ErrorKind::FileTooLarge,
+                    "this save would take it over 64 KB, more than Booth reads",
+                ),
+            });
+        }
+        replace(dir, &path, &new)?;
         if self.unread {
             for key in KEYS {
                 if !self.at_default(key) && !self.saved_keys.contains(&key) {
@@ -738,11 +754,20 @@ impl std::error::Error for SaveError {
 
 // Nothing there reads as an empty file.
 pub(crate) fn read(path: &Path) -> io::Result<Vec<u8>> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(bytes),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(err) => Err(err),
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let mut bytes = Vec::new();
+    file.take(MOST_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MOST_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            "it is over 64 KB, more than Booth ever writes",
+        ));
     }
+    Ok(bytes)
 }
 
 // Written in full next to the old file, flushed to disk, then renamed over
@@ -1206,6 +1231,60 @@ mod tests {
         assert_eq!(loaded.address_name(), None);
         assert_eq!(loaded.name(), Some("Mara"));
         assert!(loaded.vsync());
+    }
+
+    // Under the limit a file full of nothing is read as ever, and over it no
+    // line of it is looked at. Saving cannot go on without reading what else
+    // is in it, so the file stays until someone has dealt with it.
+    #[test]
+    fn a_file_over_the_limit_is_not_read() {
+        let folder = Folder::new("too-big");
+        let at_limit = vec![b'\n'; MOST_BYTES as usize];
+        fs::write(folder.file(), &at_limit).unwrap();
+        let (settings, problems, _) = Settings::load(&folder.0);
+        assert!(!settings.unread);
+        assert!(problems.is_empty(), "{problems:?}");
+
+        let over = vec![b'\n'; MOST_BYTES as usize + 1];
+        fs::write(folder.file(), &over).unwrap();
+        let (settings, problems, _) = Settings::load(&folder.0);
+        assert!(settings.unread);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0]
+                .ends_with("it is over 64 KB, more than Booth ever writes; using the defaults"),
+            "{problems:?}"
+        );
+        let err = named("a.example.net").save(&folder.0).unwrap_err();
+        let SaveError::Read { source, .. } = &err else {
+            panic!("{err}");
+        };
+        assert_eq!(source.kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(
+            crate::messages::settings_error(&err),
+            "Could not save settings.txt: it is over 64 KB, more than Booth ever writes. Make it smaller or delete it, then press Save again."
+        );
+        assert_eq!(fs::read(folder.file()).unwrap(), over);
+    }
+
+    // Each "\n" gets its "\r" in a save, so a file under the limit can come out
+    // over it, and the next start would refuse the file this one wrote.
+    #[test]
+    fn a_save_that_would_go_over_the_limit_is_refused() {
+        let folder = Folder::new("would-be-too-big");
+        let before = vec![b'\n'; MOST_BYTES as usize / 2 + 1];
+        fs::write(folder.file(), &before).unwrap();
+        let err = named("a.example.net").save(&folder.0).unwrap_err();
+        let SaveError::Write { source, .. } = &err else {
+            panic!("{err}");
+        };
+        assert_eq!(source.kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(
+            crate::messages::settings_error(&err),
+            "Could not save settings.txt: this save would take it over 64 KB, more than Booth reads. Make it smaller or delete it, then press Save again."
+        );
+        assert_eq!(fs::read(folder.file()).unwrap(), before);
+        assert!(!temp_path(&folder.0, &folder.file()).exists());
     }
 
     // Saved by an older version, before pause sharing had Ctrl+Shift+F9. Push
