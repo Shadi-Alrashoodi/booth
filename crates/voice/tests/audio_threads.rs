@@ -593,11 +593,38 @@ fn with_no_device_the_stream_waits_for_one() {
         (_, other) => panic!("expected NoDevice, got {other:?}"),
     }
     fake.plug("c", "USB headset");
+    let asked = Instant::now();
     fake.set_default(Some("c"));
-    assert_eq!(opened(&rx).1.device, "USB headset");
+    let (at, info) = opened(&rx);
+    assert_eq!(info.device, "USB headset");
+    assert!(at - asked < Duration::from_millis(500), "{:?}", at - asked);
     let stopping = Instant::now();
     capture.stop();
     assert!(stopping.elapsed() < Duration::from_millis(100));
+}
+
+// A stream whose watch could not be registered hears of no new default.
+// Nothing is said a second time meanwhile.
+#[test]
+fn with_no_device_and_no_watch_the_stream_still_finds_one() {
+    let fake = Fake::new(Setup::default(), &[], None);
+    let (on_event, rx) = events();
+    let capture = Capture::start_with(
+        fake.unwatched_device(),
+        Choice::Default,
+        |_: &[f32], _| {},
+        on_event,
+    )
+    .unwrap();
+    match next(&rx) {
+        (_, Event::Failed(AudioError::NoDevice(_))) => {}
+        (_, other) => panic!("expected NoDevice, got {other:?}"),
+    }
+    assert!(rx.recv_timeout(PAST_A_LOOK).is_err());
+    fake.plug("c", "USB headset");
+    fake.set_default(Some("c"));
+    assert_eq!(opened(&rx).1.device, "USB headset");
+    capture.stop();
 }
 
 // Refused when the stream starts, for a reason that passes with nobody

@@ -1096,8 +1096,8 @@ pub(crate) fn device_cancelling_echo(
 pub(crate) fn device(direction: Direction, wake: Wake) -> Result<Windows, AudioError> {
     let session = Session::new()?;
     // Without the watch the stream still runs; it only stays on the old
-    // default until it is opened again, and looks for a chosen device that
-    // went away only every LOOK_AGAIN.
+    // default until it is opened again, and looks for a device it waits for
+    // only every LOOK_AGAIN.
     let watch = session
         .watch(move |notice| match notice {
             Notice::DefaultChanged {

@@ -148,6 +148,16 @@ impl Fake {
         }
     }
 
+    // As device, for a stream whose watch could not be registered: no notice
+    // from these devices reaches it.
+    pub fn unwatched_device(
+        &self,
+    ) -> impl FnOnce(Direction, Wake) -> Result<FakeDevice, AudioError> + Send + 'static + use<>
+    {
+        let state = Arc::clone(&self.state);
+        move |direction, _| Ok(FakeDevice { state, direction })
+    }
+
     // The device goes away. As on Windows, a stream on it stops being
     // signalled, and only fails when it is read, written or checked. The
     // devices-changed notice goes at once; the default stays as it was:

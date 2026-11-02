@@ -880,7 +880,9 @@ impl Run<'_> {
                 Err(err) => {
                     let wait =
                         *self.choice == Choice::Default && matches!(err, AudioError::NoDevice(_));
-                    events(Event::Failed(err));
+                    if !wait || new_reason(&mut said, &err) {
+                        events(Event::Failed(err));
+                    }
                     if wait && self.wait_for_default() {
                         continue;
                     }
@@ -1030,15 +1032,20 @@ impl Run<'_> {
     }
 
     // With no device at all there is nothing to open until Windows names a
-    // new default, so the thread sleeps until it does. False when asked to
-    // stop.
+    // new default, so the thread sleeps until it does, or LOOK_AGAIN, for a
+    // stream whose watch could not be registered and hears of no default.
+    // False when asked to stop.
     fn wait_for_default(&self) -> bool {
+        let until = Instant::now() + LOOK_AGAIN;
         loop {
-            match self.rx.recv() {
-                Ok(Control::DefaultChanged(Some(_))) => return true,
+            let left = until.saturating_duration_since(Instant::now());
+            match self.rx.recv_timeout(left) {
+                Ok(Control::DefaultChanged(Some(_))) | Err(RecvTimeoutError::Timeout) => {
+                    return true;
+                }
                 Ok(Control::DefaultChanged(None)) => {}
                 Ok(Control::DevicesChanged) => self.noticed(),
-                Ok(Control::Stop) | Err(_) => return false,
+                Ok(Control::Stop) | Err(RecvTimeoutError::Disconnected) => return false,
             }
         }
     }
