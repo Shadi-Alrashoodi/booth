@@ -668,6 +668,7 @@ fn rig(mode: Mode) -> Option<Rig> {
         discontinuity: false,
         restarted: false,
         late_frame: false,
+        idr_asks_ignored: 0,
         discarded_late_output: false,
         format_change_logged: false,
         drain_logged: false,
@@ -1108,4 +1109,65 @@ fn no_frame_goes_in_while_a_late_one_is_out() {
     }
     assert!(started.elapsed() >= GIVE_UP);
     assert_eq!(rig.script.fed().len(), 2);
+}
+
+// An encoder that takes the request and answers with something else leaves
+// every viewer waiting with no error anywhere, so it goes the way of one that
+// refuses. A request answered clears the count, and frames not asked for do not.
+#[test]
+fn ignored_idr_asks_fail_the_encoder() {
+    let Some(mut rig) = rig(Mode::Prompt) else {
+        return;
+    };
+    rig.first_frame();
+    rig.script.state.borrow_mut().ignores_idr_asks = true;
+    for (index, force_idr) in [(1, true), (2, false), (3, true)] {
+        let unit = rig
+            .encode_with(index, force_idr)
+            .unwrap_or_else(|e| panic!("frame {index}: {e}"));
+        assert!(!unit.idr);
+    }
+    rig.script.state.borrow_mut().ignores_idr_asks = false;
+    let answered = rig
+        .encode_with(4, true)
+        .unwrap_or_else(|e| panic!("frame 4: {e}"));
+    assert!(answered.idr);
+
+    rig.script.state.borrow_mut().ignores_idr_asks = true;
+    let asks = rig.script.state.borrow().idr_asks;
+    for index in [5, 6] {
+        rig.encode_with(index, true)
+            .unwrap_or_else(|e| panic!("frame {index}: {e}"));
+    }
+    match rig.encode_with(7, true) {
+        Err(EncodeError::EncoderMisbehaved { problem }) => {
+            assert!(problem.contains("requests for an IDR"), "{problem}");
+        }
+        Ok(_) => panic!("frame 7 came back"),
+        Err(e) => panic!("frame 7: {e}"),
+    }
+    assert!(rig.encoder.idr_next);
+    assert_eq!(rig.script.state.borrow().idr_asks, asks + 3);
+}
+
+// The same with a request that stays set, as after a lost frame: asked on
+// every frame, it fails on the third.
+#[test]
+fn a_recovery_the_encoder_ignores_fails_it() {
+    let Some(mut rig) = rig(Mode::Prompt) else {
+        return;
+    };
+    rig.first_frame();
+    rig.script.state.borrow_mut().ignores_idr_asks = true;
+    assert_eq!(rig.encoder.recover(0), Recovery::Idr);
+    for index in [1, 2] {
+        let unit = rig
+            .encode(index)
+            .unwrap_or_else(|e| panic!("frame {index}: {e}"));
+        assert!(!unit.idr);
+    }
+    assert!(matches!(
+        rig.encode(3),
+        Err(EncodeError::EncoderMisbehaved { .. })
+    ));
 }

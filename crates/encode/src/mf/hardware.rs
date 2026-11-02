@@ -43,6 +43,9 @@ const HELD: Duration = Duration::from_millis(100);
 // Frames held back in a row before every frame is drained. One slow frame,
 // a GPU stall while a game loads, is not an encoder that holds frames.
 const HELD_IN_A_ROW: u32 = 3;
+// Asks for an IDR that brought none before the encoder counts as ignoring
+// them. A request applies to the next frame in, and viewers wait for it.
+const IDR_ASKS_IGNORED: u32 = 3;
 
 // Why a frame is drained out of the encoder instead of waited for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +222,8 @@ pub(crate) struct Hardware {
     restarted: bool,
     // encode() gave up on a frame that is still in the encoder.
     late_frame: bool,
+    // Asks for an IDR that brought none, since the last IDR.
+    idr_asks_ignored: u32,
     discarded_late_output: bool,
     format_change_logged: bool,
     drain_logged: bool,
@@ -398,6 +403,7 @@ impl Hardware {
             discontinuity: false,
             restarted: false,
             late_frame: false,
+            idr_asks_ignored: 0,
             discarded_late_output: false,
             format_change_logged: false,
             drain_logged: false,
@@ -795,6 +801,15 @@ impl Encoder for Hardware {
         }
         if idr {
             self.idr_next = false;
+            self.idr_asks_ignored = 0;
+        } else if asked_for_idr {
+            self.idr_asks_ignored += 1;
+            if self.idr_asks_ignored >= IDR_ASKS_IGNORED {
+                self.idr_next = true;
+                return Err(EncodeError::EncoderMisbehaved {
+                    problem: "the hardware encoder took 3 requests for an IDR and answered none, and a viewer starts and recovers only at an IDR: update the graphics driver",
+                });
+            }
         }
         self.encoded += 1;
         Ok(AccessUnit {
