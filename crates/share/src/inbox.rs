@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 use capture::CursorUpdate;
 use net::pace::Signal;
@@ -31,7 +32,7 @@ const MOST_ENCODE_TIMES: usize = 256;
 
 #[derive(Default)]
 struct Waiting {
-    packets: VecDeque<Vec<u8>>,
+    packets: VecDeque<(Instant, Vec<u8>)>,
     spare: Vec<Vec<u8>>,
     cursor: Option<CursorUpdate>,
     // How the update waiting came, as Taken has it.
@@ -99,7 +100,11 @@ impl Inbox {
         }
         let mut buffer = waiting.spare.pop().unwrap_or_default();
         buffer.extend_from_slice(packet);
-        waiting.packets.push_back(buffer);
+        // A frame's wait counts from here: the viewer's thread can be behind
+        // the thread that hands packets over by more than the wait. Read
+        // under the lock, so has_packets finds every packet from before it
+        // was called.
+        waiting.packets.push_back((Instant::now(), buffer));
         // The viewer takes everything each time it wakes, so one wake per
         // batch is enough.
         let first = waiting.packets.len() == 1;
@@ -213,11 +218,11 @@ impl Inbox {
         &self.wake
     }
 
-    // Swaps the waiting packets into `batch`. The buffers of the batch
-    // before go back to be filled again.
-    pub(crate) fn take(&self, batch: &mut VecDeque<Vec<u8>>) -> Taken {
+    // Swaps the waiting packets into `batch`, each with the time it came. The
+    // buffers of the batch before go back to be filled again.
+    pub(crate) fn take(&self, batch: &mut VecDeque<(Instant, Vec<u8>)>) -> Taken {
         let mut waiting = self.lock();
-        for mut buffer in batch.drain(..) {
+        for (_, mut buffer) in batch.drain(..) {
             if waiting.spare.len() < MAX_SPARE {
                 buffer.clear();
                 waiting.spare.push(buffer);
@@ -350,14 +355,14 @@ mod tests {
             batch
                 .iter()
                 .enumerate()
-                .all(|(n, packet)| packet[..] == (n as u32).to_le_bytes())
+                .all(|(n, (_, packet))| packet[..] == (n as u32).to_le_bytes())
         );
         assert_eq!(inbox.overflow(), 3);
         // The next take hands the buffers back for reuse.
         inbox.packet(&[7]);
         inbox.take(&mut batch);
         assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0], [7]);
+        assert_eq!(batch[0].1, [7]);
     }
 
     #[test]

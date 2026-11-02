@@ -307,6 +307,8 @@ impl Reassembler {
         self.wait = interval.max(SHORTEST_WAIT);
     }
 
+    // `now` is when the packet came, not when the caller got to it: a wait
+    // runs from arrivals, and the caller's thread can fall behind them.
     // Events from the call before are gone once this is called.
     pub fn push(&mut self, packet: &[u8], now: Instant) -> Arrival {
         self.events.clear();
@@ -318,6 +320,8 @@ impl Reassembler {
         arrival
     }
 
+    // Every packet that came before `now` must have been pushed by then, or
+    // a frame it would have finished goes.
     pub fn expire(&mut self, now: Instant) {
         self.events.clear();
         self.run(now);

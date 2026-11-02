@@ -590,6 +590,39 @@ fn next_wake(
     .fold(next, Instant::min)
 }
 
+// One wake's packets, each at the time it came, and then what has run out.
+// Nothing runs out while packets wait in the inbox, as they can finish a frame:
+// the first of them has set the wake, so the loop comes straight back. The time
+// is read before the inbox is asked, so any packet from before it is found.
+fn feed<T>(
+    reassembler: &mut Reassembler,
+    batch: &VecDeque<(Instant, Vec<u8>)>,
+    inbox: &Inbox,
+    to: &mut T,
+    over: impl Fn(&T) -> bool,
+    mut event: impl FnMut(&mut T, Event<'_>) -> Result<(), String>,
+) -> Result<(), String> {
+    for (came, packet) in batch {
+        // A batch can be thousands of one-packet frames, and a hostile
+        // stream's can each take FFmpeg tens of ms.
+        if over(to) {
+            break;
+        }
+        reassembler.push(packet, *came);
+        while let Some(out) = reassembler.event() {
+            event(to, out)?;
+        }
+    }
+    let now = Instant::now();
+    if !inbox.has_packets() {
+        reassembler.expire(now);
+        while let Some(out) = reassembler.event() {
+            event(to, out)?;
+        }
+    }
+    Ok(())
+}
+
 impl Screen {
     // Opens the window and the decoder on the window's device. Nothing is
     // shown until run().
@@ -717,6 +750,7 @@ impl Screen {
         let mut next_strip = began + STRIP_EVERY;
         let mut next_second = began + SECOND;
         let mut batch = VecDeque::new();
+        let inbox = Arc::clone(&self.inbox);
         loop {
             if self.over() {
                 break;
@@ -764,21 +798,14 @@ impl Screen {
                 self.set_control(control);
             }
             self.follow_mouse_mode();
-            for packet in &batch {
-                // A batch can be thousands of one-packet frames, and a hostile
-                // stream's can each take FFmpeg tens of ms.
-                if self.over() {
-                    break;
-                }
-                reassembler.push(packet, Instant::now());
-                while let Some(event) = reassembler.event() {
-                    self.event(event, report)?;
-                }
-            }
-            reassembler.expire(Instant::now());
-            while let Some(event) = reassembler.event() {
-                self.event(event, report)?;
-            }
+            feed(
+                &mut reassembler,
+                &batch,
+                &inbox,
+                &mut self,
+                Screen::over,
+                |screen, event| screen.event(event, report),
+            )?;
             self.after_events(&reassembler, report);
             let now = Instant::now();
             if let Some(update) = self.hold.ran_out(now) {
@@ -1450,7 +1477,11 @@ fn refuses_the_stream(err: &DecodeError) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use channels::video::{FrameFacts, Packetizer};
+    use net::pace::Woken;
+
     use super::*;
+    use crate::PAYLOAD_INTERNET;
 
     #[test]
     fn only_a_refusal_of_the_stream_counts_toward_stopping() {
@@ -1787,6 +1818,131 @@ mod tests {
         assert_eq!(hold.ran_out(woke - Duration::from_millis(1)), None);
         assert_eq!(hold.ran_out(woke).map(|update| update.x), Some(1));
         assert_eq!(wake(&hold), strip, "drawn");
+    }
+
+    // A wait long enough that this test's own thread falling behind between
+    // two packets does not run it out, and a sleep past it.
+    const FED_WAIT: Duration = Duration::from_millis(200);
+    const PAST_THE_WAIT: Duration = Duration::from_millis(220);
+
+    // The packets of a frame of three data shards and one parity shard.
+    fn three_shards() -> Vec<Vec<u8>> {
+        let facts = FrameFacts {
+            number: 1,
+            idr: true,
+            survives_loss: true,
+            ..FrameFacts::default()
+        };
+        let mut packetizer = Packetizer::new(PAYLOAD_INTERNET).unwrap();
+        let packets = packetizer.packetize(&facts, &[7; 3000], 20).unwrap();
+        assert_eq!((packets.data(), packets.parity()), (3, 1));
+        packets.iter().map(<[u8]>::to_vec).collect()
+    }
+
+    // What feed hands out from what the inbox holds, as run does at a wake:
+    // how many frames came out and how many were dropped.
+    fn wake(
+        reassembler: &mut Reassembler,
+        inbox: &Inbox,
+        batch: &mut VecDeque<(Instant, Vec<u8>)>,
+    ) -> (u32, u32) {
+        inbox.take(batch);
+        feed_taken(reassembler, inbox, batch)
+    }
+
+    fn feed_taken(
+        reassembler: &mut Reassembler,
+        inbox: &Inbox,
+        batch: &VecDeque<(Instant, Vec<u8>)>,
+    ) -> (u32, u32) {
+        let mut out = (0, 0);
+        feed(
+            reassembler,
+            batch,
+            inbox,
+            &mut out,
+            |_| false,
+            |out, event| {
+                match event {
+                    Event::Frame(_) => out.0 += 1,
+                    Event::Dropped { .. } => out.1 += 1,
+                    Event::Recover { .. } => {}
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        out
+    }
+
+    // The viewer's thread pushes part of a frame and then waits for a CPU for
+    // longer than a frame's wait, while the rest reaches the inbox in time.
+    // The frame is whole and comes out: the rest counts from when it came.
+    #[test]
+    fn a_frame_that_came_in_time_outlives_a_late_thread() {
+        let packets = three_shards();
+        let inbox = Inbox::new().unwrap();
+        let mut reassembler = Reassembler::new(FED_WAIT);
+        let mut batch = VecDeque::new();
+        inbox.packet(&packets[0]);
+        assert_eq!(wake(&mut reassembler, &inbox, &mut batch), (0, 0));
+        inbox.packet(&packets[1]);
+        inbox.packet(&packets[2]);
+        std::thread::sleep(PAST_THE_WAIT);
+        assert_eq!(wake(&mut reassembler, &inbox, &mut batch), (1, 0));
+        let numbers = reassembler.numbers();
+        assert_eq!((numbers.dropped(), numbers.late), (0, 0));
+    }
+
+    // Packets that came while a batch was worked through wait in the inbox
+    // when the loop looks for what has run out, and can finish a frame. Once
+    // nothing waits, a frame that had its wait goes.
+    #[test]
+    fn nothing_runs_out_while_packets_wait_in_the_inbox() {
+        let packets = three_shards();
+        let inbox = Inbox::new().unwrap();
+        let mut reassembler = Reassembler::new(FED_WAIT);
+        let mut batch = VecDeque::new();
+        inbox.packet(&packets[0]);
+        assert_eq!(wake(&mut reassembler, &inbox, &mut batch), (0, 0));
+        inbox.packet(&packets[1]);
+        inbox.packet(&packets[2]);
+        std::thread::sleep(PAST_THE_WAIT);
+        batch.clear();
+        assert_eq!(feed_taken(&mut reassembler, &inbox, &batch), (0, 0));
+        assert_eq!(wake(&mut reassembler, &inbox, &mut batch), (1, 0));
+
+        let mut reassembler = Reassembler::new(FED_WAIT);
+        inbox.packet(&packets[0]);
+        assert_eq!(wake(&mut reassembler, &inbox, &mut batch), (0, 0));
+        std::thread::sleep(PAST_THE_WAIT);
+        assert_eq!(wake(&mut reassembler, &inbox, &mut batch), (0, 1));
+    }
+
+    // When packets wait in the inbox the loop leaves what has run out for the
+    // next wake, so the first of them has to have set one. The timer is due at
+    // once, and a wait prefers the signal, so no wake means Timer.
+    #[test]
+    fn packets_left_in_the_inbox_wake_the_loop() {
+        let packets = three_shards();
+        let inbox = Inbox::new().unwrap();
+        let mut reassembler = Reassembler::new(FED_WAIT);
+        let mut batch = VecDeque::new();
+        let timer = Timer::new().unwrap();
+        let woken = || {
+            timer.set_at(Instant::now()).unwrap();
+            net::pace::wait(inbox.signal(), Some(&timer)).unwrap()
+        };
+        inbox.packet(&packets[0]);
+        assert_eq!(wake(&mut reassembler, &inbox, &mut batch), (0, 0));
+        assert_eq!(woken(), Woken::Signal, "the first packet's own");
+        assert_eq!(woken(), Woken::Timer, "none left over");
+        inbox.packet(&packets[1]);
+        inbox.packet(&packets[2]);
+        batch.clear();
+        assert_eq!(feed_taken(&mut reassembler, &inbox, &batch), (0, 0));
+        assert_eq!(woken(), Woken::Signal, "packets left behind");
+        assert_eq!(wake(&mut reassembler, &inbox, &mut batch), (1, 0));
     }
 
     // The caller's link numbers go into the strip, its loss figure in place
