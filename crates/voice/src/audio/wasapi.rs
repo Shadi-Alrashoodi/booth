@@ -22,13 +22,14 @@ use windows::Win32::Foundation::{
 use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
     AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_E_DEVICE_IN_USE, AUDCLNT_E_DEVICE_INVALIDATED,
-    AUDCLNT_E_ENGINE_PERIODICITY_LOCKED, AUDCLNT_E_RESOURCES_INVALIDATED,
-    AUDCLNT_E_SERVICE_NOT_RUNNING, AUDCLNT_E_UNSUPPORTED_FORMAT, AUDCLNT_SHAREMODE_SHARED,
-    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, DEVICE_STATE, DEVICE_STATE_ACTIVE, EDataFlow, ERole,
-    IAudioCaptureClient, IAudioClient, IAudioClient3, IAudioRenderClient, IMMDevice,
-    IMMDeviceEnumerator, IMMEndpoint, IMMNotificationClient, IMMNotificationClient_Vtbl,
-    MMDeviceEnumerator, WAVE_FORMAT_PCM, WAVEFORMATEX, eCapture, eConsole, eRender,
+    AUDCLNT_E_ENDPOINT_CREATE_FAILED, AUDCLNT_E_ENGINE_PERIODICITY_LOCKED,
+    AUDCLNT_E_RESOURCES_INVALIDATED, AUDCLNT_E_SERVICE_NOT_RUNNING, AUDCLNT_E_UNSUPPORTED_FORMAT,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, DEVICE_STATE,
+    DEVICE_STATE_ACTIVE, EDataFlow, ERole, IAudioCaptureClient, IAudioClient, IAudioClient3,
+    IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, IMMEndpoint, IMMNotificationClient,
+    IMMNotificationClient_Vtbl, MMDeviceEnumerator, WAVE_FORMAT_PCM, WAVEFORMATEX, eCapture,
+    eConsole, eRender,
 };
 use windows::Win32::Media::Audio::{
     AUDCLNT_STREAMOPTIONS_NONE, AUDIO_DUCKING_OPTIONS_DO_NOT_DUCK_OTHER_STREAMS, AUDIO_EFFECT,
@@ -837,7 +838,10 @@ fn classify(
     let code = err.code();
     if code == E_ACCESSDENIED {
         AudioError::AccessDenied(direction)
-    } else if code == AUDCLNT_E_DEVICE_INVALIDATED || code == AUDCLNT_E_RESOURCES_INVALIDATED {
+    } else if code == AUDCLNT_E_DEVICE_INVALIDATED
+        || code == AUDCLNT_E_RESOURCES_INVALIDATED
+        || code == AUDCLNT_E_ENDPOINT_CREATE_FAILED
+    {
         AudioError::Lost {
             direction,
             name: name.to_owned(),
@@ -1382,6 +1386,25 @@ mod tests {
 
     fn refusal(code: HRESULT) -> windows::core::Error {
         windows::core::Error::from_hresult(code)
+    }
+
+    // Windows' page gives it the same causes as a device invalidated: the
+    // endpoint unplugged, reconfigured, turned off or removed.
+    #[test]
+    fn an_endpoint_that_could_not_be_made_is_lost() {
+        let err = classify(
+            &refusal(AUDCLNT_E_ENDPOINT_CREATE_FAILED),
+            Direction::Output,
+            "Speakers",
+            "open",
+        );
+        assert_eq!(
+            err,
+            AudioError::Lost {
+                direction: Direction::Output,
+                name: String::from("Speakers"),
+            }
+        );
     }
 
     fn engine_unread() -> windows::core::Result<Option<Format>> {

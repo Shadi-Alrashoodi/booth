@@ -13,15 +13,16 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{E_NOINTERFACE, E_POINTER, S_OK};
 use windows::Win32::Media::Audio::{
-    AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_RESOURCES_INVALIDATED, AUDCLNT_E_SERVICE_NOT_RUNNING,
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
-    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, AUDIOCLIENT_ACTIVATION_PARAMS,
-    AUDIOCLIENT_ACTIVATION_PARAMS_0, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
-    AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, ActivateAudioInterfaceAsync,
-    IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Vtbl,
-    IAudioCaptureClient, IAudioClient, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
-    VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX,
+    AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_ENDPOINT_CREATE_FAILED,
+    AUDCLNT_E_RESOURCES_INVALIDATED, AUDCLNT_E_SERVICE_NOT_RUNNING, AUDCLNT_SHAREMODE_SHARED,
+    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+    AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
+    AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
+    ActivateAudioInterfaceAsync, IActivateAudioInterfaceCompletionHandler,
+    IActivateAudioInterfaceCompletionHandler_Vtbl, IAudioCaptureClient, IAudioClient,
+    PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+    WAVEFORMATEX,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Com::{BLOB, CoTaskMemAlloc, IAgileObject};
@@ -293,7 +294,9 @@ fn wait(
 // later; so is the audio service not running, which it waits out.
 pub(super) fn classify(err: &windows::core::Error, running: bool) -> AudioError {
     let code = err.code();
-    let ended = code == AUDCLNT_E_DEVICE_INVALIDATED || code == AUDCLNT_E_RESOURCES_INVALIDATED;
+    let ended = code == AUDCLNT_E_DEVICE_INVALIDATED
+        || code == AUDCLNT_E_RESOURCES_INVALIDATED
+        || code == AUDCLNT_E_ENDPOINT_CREATE_FAILED;
     let text = if code == AUDCLNT_E_SERVICE_NOT_RUNNING {
         String::from("the Windows Audio service is not running")
     } else if ended {
@@ -460,6 +463,7 @@ mod tests {
             text.ends_with("(0x80004005). Try again, and restart Windows if it keeps happening"),
             "{text}"
         );
+        assert!(said(AUDCLNT_E_ENDPOINT_CREATE_FAILED, false).0);
         // Whatever fails while it runs, it opens again a second later.
         assert!(said(E_FAIL, true).0);
         for code in [
