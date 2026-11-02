@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
-use windows::Win32::Foundation::{E_NOTIMPL, E_UNEXPECTED, HMODULE};
+use windows::Win32::Foundation::{E_FAIL, E_NOTIMPL, E_UNEXPECTED, HMODULE};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
@@ -78,6 +78,7 @@ struct State {
     asked_after_refusal: Option<Instant>,
     // It asks on every start of stream, though it has a request out.
     asks_on_every_start: bool,
+    refuses_drain: bool,
     fed: Vec<Fed>,
     refused: u32,
     starts: u32,
@@ -262,6 +263,9 @@ impl IMFTransform_Impl for Transform_Impl {
     fn ProcessMessage(&self, message: MFT_MESSAGE_TYPE, _: usize) -> windows::core::Result<()> {
         let script = &self.0;
         if message == MFT_MESSAGE_COMMAND_DRAIN {
+            if script.state.borrow().refuses_drain {
+                return Err(E_FAIL.into());
+            }
             let waits = {
                 let mut state = script.state.borrow_mut();
                 state.stopped = true;
@@ -614,6 +618,7 @@ fn rig(mode: Mode) -> Option<Rig> {
             ask_when_refused: false,
             asked_after_refusal: None,
             asks_on_every_start: false,
+            refuses_drain: false,
             fed: Vec::new(),
             refused: 0,
             starts: 0,
@@ -662,6 +667,7 @@ fn rig(mode: Mode) -> Option<Rig> {
         draining: false,
         discontinuity: false,
         restarted: false,
+        late_frame: false,
         discarded_late_output: false,
         format_change_logged: false,
         drain_logged: false,
@@ -853,4 +859,253 @@ fn a_late_drain_is_finished_before_the_next_frame() {
         rig.script.fed(),
         [fed(0, false), fed(1, false), fed(2, true), fed(3, false)]
     );
+}
+
+// A drain that empties the encoder with no frame out leaves nothing to wait
+// for on the next call.
+#[test]
+fn a_drain_with_no_frame_out_owes_nothing() {
+    let Some(mut rig) = rig(Mode::Prompt) else {
+        return;
+    };
+    rig.first_frame();
+    rig.script.set_mode(Mode::Silent);
+    rig.encoder.drain_every_frame = true;
+    rig.script.state.borrow_mut().drain_waits = true;
+    rig.give_up_on(1);
+    assert!(rig.encoder.late_frame);
+    rig.script.state.borrow_mut().held.clear();
+    rig.script.raise(METransformDrainComplete.0);
+    rig.encoder.drain_every_frame = false;
+    rig.script.set_mode(Mode::Prompt);
+    let next = rig.encode(2).unwrap_or_else(|e| panic!("frame 2: {e}"));
+    assert_eq!(next.data, coded(true, 2));
+    assert!(!rig.encoder.late_frame);
+}
+
+// The request and the output of a frame encode() gave up on come in either
+// order. With the request first, the output must not pass for the next frame's.
+#[test]
+fn a_late_output_after_the_request_is_not_the_next_frame() {
+    let Some(mut rig) = rig(Mode::Prompt) else {
+        return;
+    };
+    rig.first_frame();
+    rig.script.set_mode(Mode::Silent);
+    rig.give_up_on(1);
+
+    rig.script.set_mode(Mode::Prompt);
+    rig.script.ask();
+    rig.script.release();
+    let next = rig.encode(2).unwrap_or_else(|e| panic!("frame 2: {e}"));
+    assert_eq!(next.data, coded(true, 2), "not frame 1's, and an IDR");
+    assert_eq!(next.index, 2);
+    assert!(next.idr);
+    assert!(
+        rig.encoder.notes().contains("Discarded the output"),
+        "{}",
+        rig.encoder.notes()
+    );
+    let after = rig.encode(3).unwrap_or_else(|e| panic!("frame 3: {e}"));
+    assert_eq!(after.data, coded(false, 3));
+}
+
+// Parameter sets of the late frame in a sample of their own are not its output.
+#[test]
+fn a_late_frame_is_waited_for_past_its_parameter_sets() {
+    let Some(mut rig) = rig(Mode::Prompt) else {
+        return;
+    };
+    rig.first_frame();
+    rig.script.set_mode(Mode::Silent);
+    rig.give_up_on(1);
+
+    rig.script.set_mode(Mode::Prompt);
+    rig.script.ask();
+    rig.script.announce(vec![0, 0, 0, 1, 0x67, 1]);
+    rig.script.release();
+    let next = rig.encode(2).unwrap_or_else(|e| panic!("frame 2: {e}"));
+    assert_eq!(next.data, coded(true, 2));
+}
+
+// A drain the encoder refuses is not waited for, and the frame it was sent for
+// is still to come out.
+#[test]
+fn a_refused_drain_leaves_its_frame_to_wait_for() {
+    let Some(mut rig) = rig(Mode::Prompt) else {
+        return;
+    };
+    rig.first_frame();
+    rig.script.set_mode(Mode::Silent);
+    rig.script.state.borrow_mut().refuses_drain = true;
+    rig.encoder.drain_every_frame = true;
+    match rig.encode(1) {
+        Err(EncodeError::MediaFoundation { action, .. }) => {
+            assert_eq!(action, "drain the hardware encoder");
+        }
+        Ok(_) => panic!("frame 1 came back"),
+        Err(e) => panic!("frame 1: {e}"),
+    }
+    rig.script.state.borrow_mut().refuses_drain = false;
+    rig.encoder.drain_every_frame = false;
+
+    rig.script.set_mode(Mode::Prompt);
+    rig.script.ask();
+    rig.script.release();
+    let next = rig.encode(2).unwrap_or_else(|e| panic!("frame 2: {e}"));
+    assert_eq!(next.data, coded(true, 2), "not frame 1's, and an IDR");
+    assert_eq!(rig.script.starts(), 0);
+}
+
+// An error from the encoder, in its event or in taking the output, says nothing
+// of the frame still in it: a failed event, then an announced output not there.
+#[test]
+fn a_frame_out_when_an_error_comes_is_waited_for() {
+    for status in [E_FAIL, S_OK] {
+        let Some(mut rig) = rig(Mode::Prompt) else {
+            return;
+        };
+        rig.first_frame();
+        rig.script.set_mode(Mode::Silent);
+        rig.script
+            .events
+            .send(Event::Raised {
+                kind: METransformHaveOutput.0 as u32,
+                status,
+            })
+            .expect("the encoder is open");
+        match rig.encode(1) {
+            Err(EncodeError::MediaFoundation { .. }) => {}
+            Ok(_) => panic!("frame 1 came back"),
+            Err(e) => panic!("frame 1: {e}"),
+        }
+
+        rig.script.set_mode(Mode::Prompt);
+        rig.script.ask();
+        rig.script.release();
+        let next = rig.encode(2).unwrap_or_else(|e| panic!("frame 2: {e}"));
+        assert_eq!(next.data, coded(true, 2), "not frame 1's, and an IDR");
+    }
+}
+
+// With the late frame out and DrainComplete not, the error says what is missing.
+#[test]
+fn a_drain_that_never_finishes_says_so() {
+    let Some(mut rig) = rig(Mode::Prompt) else {
+        return;
+    };
+    rig.first_frame();
+    rig.script.set_mode(Mode::Silent);
+    rig.script.state.borrow_mut().drain_waits = true;
+    rig.encoder.drain_every_frame = true;
+    rig.give_up_on(1);
+    rig.encoder.drain_every_frame = false;
+
+    rig.script.ask();
+    rig.script.release();
+    match rig.encode(2) {
+        Err(EncodeError::EncoderMisbehaved { problem }) => {
+            assert!(problem.contains("finished draining"), "{problem}");
+        }
+        Ok(_) => panic!("frame 2 came back"),
+        Err(e) => panic!("frame 2: {e}"),
+    }
+    assert!(!rig.encoder.late_frame);
+    assert_eq!(rig.script.fed().len(), 2);
+}
+
+// With the frame out, whether the drain then stalls or an error comes, what is
+// missing is the drain. Queued ahead of the frame, these are what its wait reads.
+#[test]
+fn a_frame_out_of_an_unfinished_drain_is_not_late() {
+    for then in [None, Some(E_FAIL), Some(S_OK)] {
+        let Some(mut rig) = rig(Mode::Prompt) else {
+            return;
+        };
+        rig.first_frame();
+        rig.script.set_mode(Mode::Silent);
+        rig.script.state.borrow_mut().drain_waits = true;
+        rig.encoder.drain_every_frame = true;
+        rig.script.announce(coded(false, 1));
+        if let Some(status) = then {
+            rig.script
+                .events
+                .send(Event::Raised {
+                    kind: METransformHaveOutput.0 as u32,
+                    status,
+                })
+                .expect("the encoder is open");
+        }
+        rig.encoder.output_wait = Duration::ZERO;
+        assert!(rig.encode(1).is_err(), "frame 1 came back");
+        assert!(!rig.encoder.late_frame);
+        rig.encoder.drain_every_frame = false;
+
+        match rig.encode(2) {
+            Err(EncodeError::EncoderMisbehaved { problem }) => {
+                assert!(problem.contains("finished draining"), "{problem}");
+            }
+            Ok(_) => panic!("frame 2 came back"),
+            Err(e) => panic!("frame 2: {e}"),
+        }
+    }
+}
+
+// An encoder that keeps asking with the late frame out does not put off the
+// limit on waiting for it.
+#[test]
+fn requests_do_not_put_off_the_wait_for_a_late_frame() {
+    let Some(mut rig) = rig(Mode::Prompt) else {
+        return;
+    };
+    rig.first_frame();
+    rig.script.set_mode(Mode::Silent);
+    rig.give_up_on(1);
+
+    let events = rig.script.events.clone();
+    let started = Instant::now();
+    thread::spawn(move || {
+        while started.elapsed() < GIVE_UP * 4
+            && events
+                .send(Event::Raised {
+                    kind: METransformNeedInput.0 as u32,
+                    status: S_OK,
+                })
+                .is_ok()
+        {
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+    match rig.encode(2) {
+        Err(EncodeError::EncoderMisbehaved { problem }) => {
+            assert!(problem.contains("still holds a frame"), "{problem}");
+        }
+        Ok(_) => panic!("frame 2 came back"),
+        Err(e) => panic!("frame 2: {e}"),
+    }
+    assert!(started.elapsed() < GIVE_UP * 2, "{:?}", started.elapsed());
+    assert_eq!(rig.script.fed().len(), 2);
+}
+
+// With a request in hand and the late frame not out, no frame goes in.
+#[test]
+fn no_frame_goes_in_while_a_late_one_is_out() {
+    let Some(mut rig) = rig(Mode::Prompt) else {
+        return;
+    };
+    rig.first_frame();
+    rig.script.set_mode(Mode::Silent);
+    rig.give_up_on(1);
+
+    rig.script.ask();
+    let started = Instant::now();
+    match rig.encode(2) {
+        Err(EncodeError::EncoderMisbehaved { problem }) => {
+            assert!(problem.contains("still holds a frame"), "{problem}");
+        }
+        Ok(_) => panic!("frame 2 came back"),
+        Err(e) => panic!("frame 2: {e}"),
+    }
+    assert!(started.elapsed() >= GIVE_UP);
+    assert_eq!(rig.script.fed().len(), 2);
 }

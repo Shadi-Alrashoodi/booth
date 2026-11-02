@@ -217,6 +217,8 @@ pub(crate) struct Hardware {
     // request replaces the count: those counted were dropped with the drain
     // or are being made again, and left in they read as it asking ahead.
     restarted: bool,
+    // encode() gave up on a frame that is still in the encoder.
+    late_frame: bool,
     discarded_late_output: bool,
     format_change_logged: bool,
     drain_logged: bool,
@@ -395,6 +397,7 @@ impl Hardware {
             draining: false,
             discontinuity: false,
             restarted: false,
+            late_frame: false,
             discarded_late_output: false,
             format_change_logged: false,
             drain_logged: false,
@@ -469,15 +472,19 @@ impl Hardware {
                 .transform
                 .ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)
         }
+        // Both callers have a frame out, and undrained it stays in the encoder.
+        .inspect_err(|_| self.late_frame = true)
         .map_err(mf_error("drain the hardware encoder"))?;
         self.draining = true;
         Ok(())
     }
 
     // After METransformDrainComplete an encoder asks for no input until it
-    // hears the stream has started again.
+    // hears the stream has started again. It has nothing left, so a frame
+    // encode() timed out on is not coming either.
     fn drain_complete(&mut self) -> Result<(), EncodeError> {
         self.draining = false;
+        self.late_frame = false;
         self.discontinuity = true;
         self.restarted = true;
         // SAFETY: a plain message to a streaming encoder.
@@ -507,6 +514,7 @@ impl Hardware {
                 wait_limit(submitted, changed, self.wanted, drained, self.output_wait);
             let Some((kind, status)) = self.next_event(limit)? else {
                 let Some(held) = held else {
+                    self.late_frame = !has_slice(self.codec, &data);
                     return Err(EncodeError::NoOutput {
                         index,
                         waited: submitted.elapsed(),
@@ -534,6 +542,7 @@ impl Hardware {
                 continue;
             };
             if status.is_err() {
+                self.late_frame = !has_slice(self.codec, &data);
                 return Err(EncodeError::MediaFoundation {
                     action: "encode a frame on the hardware encoder",
                     source: status.into(),
@@ -542,7 +551,10 @@ impl Hardware {
             if kind == METransformNeedInput.0 as u32 {
                 self.count_request();
             } else if kind == METransformHaveOutput.0 as u32 {
-                let taken = self.output.take(&self.mft.transform, &self.fns)?;
+                let taken = self
+                    .output
+                    .take(&self.mft.transform, &self.fns)
+                    .inspect_err(|_| self.late_frame = !has_slice(self.codec, &data))?;
                 if self.output.format_changed() {
                     changed = Some(Instant::now());
                     self.note_format_change(index);
@@ -577,14 +589,16 @@ impl Hardware {
     }
 
     /// Waits until the encoder asks for input. The output of a frame that
-    /// encode() timed out on can still arrive here: it is discarded, since
+    /// encode() gave up on can still arrive here: it is discarded, since
     /// that frame's caller already got the error and the next frame is an
     /// IDR. Left in the encoder, it would stop it from asking for input
-    /// again. `index` is the frame about to go in.
+    /// again, and it may come after the request, so a request is not enough:
+    /// the next frame would get these bytes. `index` is the frame about to
+    /// go in.
     fn wait_for_request(&mut self, index: u64) -> Result<(), EncodeError> {
         let deadline = Instant::now() + GIVE_UP;
         loop {
-            let waiting = self.wanted == 0 || self.draining;
+            let waiting = self.wanted == 0 || self.draining || self.late_frame;
             if !waiting && !self.restarted {
                 return Ok(());
             }
@@ -598,7 +612,9 @@ impl Hardware {
                     return Ok(());
                 }
                 return Err(EncodeError::EncoderMisbehaved {
-                    problem: if self.draining {
+                    problem: if self.late_frame {
+                        "the hardware encoder still holds a frame 2 s after Booth stopped waiting for it: its driver may have stopped responding"
+                    } else if self.draining {
                         "the hardware encoder has not finished draining in 2 s: its driver may have stopped responding"
                     } else {
                         "the hardware encoder has not asked for a frame in 2 s: its driver may have stopped responding"
@@ -626,7 +642,11 @@ impl Hardware {
             if self.output.format_changed() {
                 self.note_format_change(index);
             }
-            if late.is_some() {
+            if let Some(late) = late {
+                // Parameter sets may come first, in a sample of their own.
+                if has_slice(self.codec, &late) {
+                    self.late_frame = false;
+                }
                 self.idr_next = true;
                 if !self.discarded_late_output {
                     self.discarded_late_output = true;
