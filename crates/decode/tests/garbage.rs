@@ -314,6 +314,82 @@ fn p_frames_first(codec: Codec) {
     }
 }
 
+// The search for the first picture reads one header byte, and FFmpeg skips a
+// slice it cannot use and decodes the next. So an IDR it skips in front of a P
+// frame opened the wait for an IDR and came back as a picture of whatever its
+// pool held, and the P frames after it reached FFmpeg too.
+#[test]
+fn p_frames_behind_a_bad_idr() {
+    let _turn = common::turn();
+    let Some(gpu) = common::nvidia() else { return };
+    let mut stream = Stream::new(&gpu, Codec::Hevc, WIDTH, HEIGHT);
+    let units: Vec<Vec<u8>> = (0..3).map(|_| stream.next(false).data).collect();
+    drop(stream);
+    let mut reader = Reader::new(&gpu);
+    let sets: Vec<u8> = annexb::nal_units(&units[0])
+        .filter(|nal| matches!(nal.data[0] >> 1 & 0x3f, 32..=34))
+        .flat_map(|nal| [&[0u8, 0, 0, 1][..], nal.data].concat())
+        .collect();
+    // The forbidden bit, a TemporalId FFmpeg takes as none, and a segment
+    // that is not the first of its picture with none before it.
+    for bad in [
+        &[0u8, 0, 1, 0x80 | (19 << 1), 1][..],
+        &[0, 0, 1, 19 << 1, 0, 0x2f][..],
+        &[0, 0, 1, 19 << 1, 1, 0x2f][..],
+    ] {
+        let Some(mut decoder) = common::decoder(&gpu, Codec::Hevc) else {
+            return;
+        };
+        let unit = [bad, &sets[..], &units[1][..]].concat();
+        let answer = decoder.decode(&unit);
+        assert!(matches!(answer, Ok(None)), "{bad:?}: {answer:?}");
+        let answer = decoder.decode(&units[2]);
+        assert!(matches!(answer, Ok(None)), "{bad:?}: {answer:?}");
+        for (n, unit) in units.iter().enumerate() {
+            let decoded = decoder
+                .decode(unit)
+                .unwrap_or_else(|e| panic!("{bad:?}, frame {n}: {e}"))
+                .unwrap_or_else(|| panic!("{bad:?}, frame {n} gave no picture"));
+            assert_eq!(reader.frame_number(&decoded), Some(n as u32), "{bad:?}");
+        }
+    }
+}
+
+// A decoded picture stays as it is until a decode returns another, and one of
+// these returns none.
+#[test]
+fn a_bad_idr_leaves_the_picture_shown() {
+    let _turn = common::turn();
+    let Some(gpu) = common::nvidia() else { return };
+    let mut stream = Stream::new(&gpu, Codec::Hevc, WIDTH, HEIGHT);
+    let units: Vec<Vec<u8>> = (0..2).map(|_| stream.next(false).data).collect();
+    drop(stream);
+    let mut reader = Reader::new(&gpu);
+    let Some(mut decoder) = common::decoder(&gpu, Codec::Hevc) else {
+        return;
+    };
+    let sets: Vec<u8> = annexb::nal_units(&units[0])
+        .filter(|nal| matches!(nal.data[0] >> 1 & 0x3f, 32..=34))
+        .flat_map(|nal| [&[0u8, 0, 0, 1][..], nal.data].concat())
+        .collect();
+    let shown = decoder
+        .decode(&units[0])
+        .unwrap_or_else(|e| panic!("{e}"))
+        .expect("a picture");
+    let unit = [
+        &[0u8, 0, 1, 0x80 | (19 << 1), 1][..],
+        &sets[..],
+        &units[1][..],
+    ]
+    .concat();
+    // More than FFmpeg's pool has surfaces, so one left free comes round.
+    for _ in 0..40 {
+        let answer = decoder.decode(&unit);
+        assert!(matches!(answer, Ok(None)), "{answer:?}");
+    }
+    assert_eq!(reader.frame_number(&shown), Some(0));
+}
+
 #[test]
 fn empty_and_oversized() {
     for codec in common::CODECS {

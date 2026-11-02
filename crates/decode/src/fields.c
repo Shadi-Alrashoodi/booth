@@ -236,12 +236,13 @@ void booth_packet_set(AVPacket *packet, uint8_t *data, int size, int64_t pts)
 // For AV_PIX_FMT_D3D11, data[0] is the texture and data[1] its index in the
 // array (pixfmt.h).
 int booth_frame_read(const AVFrame *frame, ID3D11Texture2D **texture, intptr_t *index, int *width,
-                     int *height, int64_t *pts)
+                     int *height, int64_t *pts, int *key)
 {
     *texture = (ID3D11Texture2D *)frame->data[0];
     *index = (intptr_t)frame->data[1];
     *width = frame->width;
     *height = frame->height;
     *pts = frame->pts;
+    *key = (frame->flags & AV_FRAME_FLAG_KEY) != 0;
     return frame->format;
 }

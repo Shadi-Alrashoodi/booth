@@ -105,8 +105,8 @@ pub struct Decoded {
 }
 
 /// FFmpeg's decoder for one stream, with d3d11va on the caller's device.
-/// Every access unit that holds a picture gives that picture back from the
-/// same call: frame threads and reordering are off, and a stream that asks
+/// A picture FFmpeg makes of an access unit comes back from the same call or
+/// not at all: frame threads and reordering are off, and a stream that asks
 /// for reordering is refused.
 pub struct Decoder {
     library: &'static Library,
@@ -291,8 +291,10 @@ impl Decoder {
     /// unit wait for the next IDR. None means no picture came out and FFmpeg
     /// gave no reason, as when every slice refers to a parameter set that was
     /// lost, or HEVC is waiting for an IDR (FFmpeg's H.264 decoder shows nothing
-    /// there either). Booth's encoders put a picture in every access unit, so
-    /// for them None is a lost frame just like an error.
+    /// there either). It also answers a picture thrown away: a P frame FFmpeg
+    /// returned from a unit that read as an IDR. Booth's encoders put a picture
+    /// in every access unit, so for them None is a lost frame just like an
+    /// error.
     ///
     /// A unit packed past what an encoder writes never reaches FFmpeg
     /// ([`DecodeError::Packed`], [`DecodeError::ManyPictures`]). Every SPS in
@@ -353,7 +355,7 @@ impl Decoder {
         if let Some(timing) = &mut self.timing {
             timing.begin(unit);
         }
-        let result = self.send_and_receive(size, unit);
+        let result = self.send_and_receive(size, unit, idr);
         if idr {
             self.had_idr = matches!(result, Ok(Some(_)));
         }
@@ -396,8 +398,14 @@ impl Decoder {
         }
     }
 
-    // The access unit is in `buffer`, `size` bytes and the padding.
-    fn send_and_receive(&mut self, size: usize, unit: u64) -> Result<Option<Decoded>, DecodeError> {
+    // The access unit is in `buffer`, `size` bytes and the padding. `idr`: its
+    // first picture reads as an IDR.
+    fn send_and_receive(
+        &mut self,
+        size: usize,
+        unit: u64,
+        idr: bool,
+    ) -> Result<Option<Decoded>, DecodeError> {
         let library = self.library;
         let started = Instant::now();
         // SAFETY: the packet points at `buffer`, size bytes and the padding.
@@ -449,7 +457,15 @@ impl Decoder {
                 unsafe { (library.av_frame_unref)(self.received) };
                 return Err(DecodeError::NotOnGpu);
             }
-            if frame.pts == self.sent {
+            // The search for the first picture reads a header byte and no
+            // more, and FFmpeg skips a slice it cannot use and decodes the
+            // next, so a P frame behind a bad IDR comes back as if it were
+            // one, predicted from whatever its pool holds. It takes nothing's
+            // place: the picture shown before it stays as it is.
+            if frame.pts == self.sent && idr && !frame.key {
+                // SAFETY: a frame of ours.
+                unsafe { (library.av_frame_unref)(self.received) };
+            } else if frame.pts == self.sent {
                 // SAFETY: two frames of ours; `shown` is empty after unref,
                 // which move_ref needs.
                 unsafe {
@@ -635,6 +651,7 @@ struct FrameFacts {
     width: c_int,
     height: c_int,
     pts: i64,
+    key: bool,
 }
 
 impl FrameFacts {
@@ -647,7 +664,9 @@ impl FrameFacts {
             width: 0,
             height: 0,
             pts: 0,
+            key: false,
         };
+        let mut key = 0;
         // SAFETY: the caller's frame and live out parameters.
         facts.format = unsafe {
             booth_frame_read(
@@ -657,8 +676,10 @@ impl FrameFacts {
                 &mut facts.width,
                 &mut facts.height,
                 &mut facts.pts,
+                &mut key,
             )
         };
+        facts.key = key != 0;
         facts
     }
 

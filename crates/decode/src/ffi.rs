@@ -89,6 +89,8 @@ unsafe extern "C" {
     pub(crate) fn booth_codec_clear_reorder(codec: *mut AVCodecContext);
     pub(crate) fn booth_packet_set(packet: *mut AVPacket, data: *mut u8, size: c_int, pts: i64);
     // Returns the frame's pixel format. `texture` is borrowed from the frame.
+    // `key` is whether FFmpeg decoded it from a picture that predicts from
+    // nothing.
     pub(crate) fn booth_frame_read(
         frame: *const AVFrame,
         texture: *mut *mut c_void,
@@ -96,5 +98,6 @@ unsafe extern "C" {
         width: *mut c_int,
         height: *mut c_int,
         pts: *mut i64,
+        key: *mut c_int,
     ) -> c_int;
 }
