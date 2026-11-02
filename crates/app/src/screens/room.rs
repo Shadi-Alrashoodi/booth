@@ -1731,6 +1731,12 @@ fn voice_buttons(
         // changed.
         let own_id = UiBuilder::new().id(ui.id().with("voice buttons"));
         ui.scope_builder(own_id, |ui| {
+            // Mute and Deafen keep their ids whether Hold to talk shows or not.
+            // A click on Mute that ends a pause is let go as Hold to talk goes,
+            // and egui would give it to whatever has Mute's id by then.
+            if !hold {
+                ui.skip_ahead_auto_ids(1);
+            }
             for (i, (text, color)) in buttons.iter().enumerate() {
                 let button = Button::new(text).color(*color);
                 if hold && i == 0 {
@@ -3306,6 +3312,49 @@ mod tests {
         draw(0, press(mute_at));
         draw(1, Vec::new());
         assert_eq!(draw(1, release(mute_at)).0.1, Some(VoicePress::Mute));
+    }
+
+    // A click on Mute or Deafen with an administrator window in front brings
+    // the panel forward, which ends the pause, and Hold to talk goes as it
+    // is let go. The click stays on the button it began on. And Hold to talk
+    // coming during a press on Mute is not held by it.
+    #[test]
+    fn mute_and_deafen_stay_themselves_as_hold_to_talk_comes_and_goes() {
+        use crate::controls::tests::{press, release};
+        for (word, pressed) in [("Mute", VoicePress::Mute), ("Deafen", VoicePress::Deafen)] {
+            let ctx = accessible_panel();
+            let (_, output) = buttons_frame(&ctx, true, Vec::new());
+            let at = middle_of(&output, word);
+            buttons_frame(&ctx, true, press(at));
+            buttons_frame(&ctx, true, Vec::new());
+            let ((_, got), _) = buttons_frame(&ctx, false, release(at));
+            assert_eq!(got, Some(pressed), "{word}");
+        }
+
+        let ctx = accessible_panel();
+        let (_, output) = buttons_frame(&ctx, false, Vec::new());
+        let at = middle_of(&output, "Mute");
+        buttons_frame(&ctx, false, press(at));
+        let ((held, _), _) = buttons_frame(&ctx, true, Vec::new());
+        assert!(!held);
+        let ((held, got), _) = buttons_frame(&ctx, true, release(at));
+        assert!(!held);
+        assert_eq!(got, Some(VoicePress::Mute));
+    }
+
+    // Tabbed to Mute, the keyboard stays on it when Hold to talk goes from
+    // before it.
+    #[test]
+    fn the_keyboard_stays_on_mute_as_hold_to_talk_goes() {
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        buttons_frame(&ctx, true, Vec::new());
+        for _ in 0..2 {
+            let tab = vec![key_event(Key::Tab, true), key_event(Key::Tab, false)];
+            buttons_frame(&ctx, true, tab);
+        }
+        let ((_, got), _) = buttons_frame(&ctx, false, vec![key_event(Key::Space, true)]);
+        assert_eq!(got, Some(VoicePress::Mute));
     }
 
     #[test]
