@@ -400,6 +400,158 @@ fn a_repeated_ack_keeps_the_backoff() {
     assert_eq!(a.next_timeout(), Some(start + ms(3175)));
 }
 
+// A full window sent at start and all of it again at 20 ms, so all of it is due
+// at 60.
+fn whole_window_resent(start: Instant, timeout: Option<Duration>) -> Reliable {
+    let mut a = Reliable::new();
+    for m in numbered(WINDOW) {
+        a.send(&m).unwrap();
+    }
+    assert_eq!(transmit_all(&mut a, start, timeout).len(), WINDOW);
+    assert_eq!(transmit_all(&mut a, start + ms(20), timeout).len(), WINDOW);
+    assert_eq!(a.next_timeout(), Some(start + ms(60)));
+    a
+}
+
+fn data_seqs(frames: &[Vec<u8>]) -> Vec<u32> {
+    frames.iter().map(|f| data_seq(f)).collect()
+}
+
+#[test]
+fn news_ends_the_backoff_of_the_oldest_message_only() {
+    let timeout = Some(ms(20));
+    let none = Ack { next: 0, bits: 0 };
+    // The oldest message left unacked, and what else is unacked behind it.
+    let cases: [(Vec<u8>, u32, Vec<u32>); 3] = [
+        (wire::data(none, 0, b"new"), 0, (1..64).collect()),
+        (
+            wire::ack_only(Ack { next: 1, bits: 0 }),
+            1,
+            (2..64).collect(),
+        ),
+        (
+            wire::ack_only(Ack { next: 0, bits: 0b1 }),
+            0,
+            (2..64).collect(),
+        ),
+    ];
+    for (news, oldest, rest) in cases {
+        let start = Instant::now();
+        let mut a = whole_window_resent(start, timeout);
+
+        a.receive(&news, start + ms(25)).unwrap();
+        assert_eq!(a.next_timeout(), Some(start + ms(45)));
+        let frames = transmit_all(&mut a, start + ms(45), timeout);
+        assert_eq!(data_seqs(&frames), [oldest]);
+
+        // The others kept their deadline and went at the time they were due.
+        assert_eq!(a.next_timeout(), Some(start + ms(60)));
+        let frames = transmit_all(&mut a, start + ms(60), timeout);
+        assert_eq!(data_seqs(&frames), rest);
+
+        // They kept their count too, so they wait 80 ms now, to 140. The
+        // oldest started over, so it waits 40 ms from 45.
+        assert_eq!(a.next_timeout(), Some(start + ms(85)));
+        let frames = transmit_all(&mut a, start + ms(85), timeout);
+        assert_eq!(data_seqs(&frames), [oldest]);
+        assert_eq!(a.next_timeout(), Some(start + ms(140)));
+    }
+}
+
+#[test]
+fn news_never_puts_the_oldest_message_off() {
+    let start = Instant::now();
+    let timeout = Some(ms(20));
+    let mut a = whole_window_resent(start, timeout);
+    let news = |seq| wire::data(Ack { next: 0, bits: 0 }, seq, b"new");
+
+    a.receive(&news(0), start + ms(25)).unwrap();
+    assert_eq!(a.next_timeout(), Some(start + ms(45)));
+    // Already on the normal timeout, so more news changes nothing.
+    a.receive(&news(1), start + ms(30)).unwrap();
+    assert_eq!(a.next_timeout(), Some(start + ms(45)));
+
+    // Sent again at 45 and due at 85. News at 84 would make that 104.
+    assert_eq!(
+        data_seqs(&transmit_all(&mut a, start + ms(45), timeout)),
+        [0]
+    );
+    assert_eq!(
+        transmit_all(&mut a, start + ms(60), timeout).len(),
+        WINDOW - 1
+    );
+    a.receive(&news(2), start + ms(84)).unwrap();
+    assert_eq!(a.next_timeout(), Some(start + ms(85)));
+}
+
+#[test]
+fn news_leaves_a_message_never_resent_on_its_timer() {
+    let start = Instant::now();
+    let mut a = Reliable::new();
+    a.send(b"first send").unwrap();
+    transmit_all(&mut a, start, None);
+    assert_eq!(a.next_timeout(), Some(start + ms(200)));
+
+    // A round trip is known now, and the timer it would set is sooner.
+    assert!(transmit_all(&mut a, start + ms(10), Some(ms(20))).is_empty());
+    let news = wire::data(Ack { next: 0, bits: 0 }, 0, b"new");
+    a.receive(&news, start + ms(10)).unwrap();
+    assert_eq!(a.next_timeout(), Some(start + ms(200)));
+}
+
+#[test]
+fn path_recovered_ends_the_backoff_of_the_whole_window() {
+    let start = Instant::now();
+    let timeout = Some(ms(20));
+    let mut a = whole_window_resent(start, timeout);
+
+    a.path_recovered(start + ms(25));
+    assert_eq!(a.next_timeout(), Some(start + ms(45)));
+    assert_eq!(transmit_all(&mut a, start + ms(45), timeout).len(), WINDOW);
+    // All of them started over, so they wait 40 ms from 45, not 80.
+    assert_eq!(a.next_timeout(), Some(start + ms(85)));
+}
+
+// An outage too short for path_recovered. With 25 ms to wait and 10 ms for the
+// round trip, each message goes 35 ms after the one before it, until the ones
+// still waiting reach the deadline the outage gave them, 3175.
+#[test]
+fn a_short_outage_brings_the_window_back_one_message_at_a_time() {
+    let start = Instant::now();
+    let timeout = Some(ms(25));
+    let mut a = Reliable::new();
+    for m in numbered(WINDOW) {
+        a.send(&m).unwrap();
+    }
+    for at in [0, 25, 75, 175, 375, 775, 1575] {
+        assert_eq!(
+            transmit_all(&mut a, start + ms(at), timeout).len(),
+            WINDOW,
+            "at {at} ms"
+        );
+    }
+    assert_eq!(a.next_timeout(), Some(start + ms(3175)));
+
+    let none = Ack { next: 0, bits: 0 };
+    a.receive(&wire::data(none, 0, b"new"), start + ms(1580))
+        .unwrap();
+    for seq in 0..45 {
+        let due = start + ms(1605 + 35 * u64::from(seq));
+        assert_eq!(a.next_timeout(), Some(due), "message {seq}");
+        assert_eq!(data_seqs(&transmit_all(&mut a, due, timeout)), [seq]);
+        let ack = wire::ack_only(Ack {
+            next: seq + 1,
+            bits: 0,
+        });
+        a.receive(&ack, due + ms(10)).unwrap();
+    }
+
+    let deadline = start + ms(3175);
+    assert_eq!(a.next_timeout(), Some(deadline));
+    let frames = transmit_all(&mut a, deadline, timeout);
+    assert_eq!(data_seqs(&frames), (45..64).collect::<Vec<u32>>());
+}
+
 #[test]
 fn delivers_within_a_round_trip_once_an_outage_ends() {
     let timeout = Some(ms(25));

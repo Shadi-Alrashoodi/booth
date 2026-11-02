@@ -34,7 +34,8 @@ struct Sent {
     // When it first went out, for the ack delay.
     first_sent: Instant,
     deadline: Instant,
-    // Reset when the path comes back; `resent` is not.
+    // Reset when the path comes back, and on the oldest message by news;
+    // `resent` is not.
     retransmits: u32,
     resent: bool,
     acked: bool,
@@ -58,8 +59,8 @@ pub struct Reliable {
     // is the span the window limits, not the count of unacked messages.
     in_flight: VecDeque<Sent>,
     send_base: u32,
-    // The timeout from the last poll_transmit. path_recovered needs one and
-    // is not given one.
+    // The timeout from the last poll_transmit. path_recovered and receive need
+    // one and are not given one.
     last_base: Duration,
 
     expected: u32,
@@ -139,9 +140,17 @@ impl Reliable {
         // Only a frame that tells us something new counts as the path
         // working. A repeat of the last ack is also what a receiver whose
         // application stopped reading sends back, and resetting on that would
-        // turn the backoff into a steady stream of retransmissions.
-        if news {
-            self.path_recovered(now);
+        // turn the backoff into a steady stream of retransmissions. News ends
+        // the backoff of the oldest message only, which apply_ack leaves
+        // unacked at the front: a receiver working slowly through a window, or
+        // a slow uplink, brings news all along, and resetting the rest on that
+        // would send the whole window again every timeout.
+        if news
+            && let Some(oldest) = self.in_flight.front_mut()
+            && oldest.retransmits > 0
+        {
+            oldest.deadline = oldest.deadline.min(now + self.last_base);
+            oldest.retransmits = 0;
         }
         Ok(())
     }
@@ -151,7 +160,11 @@ impl Reliable {
     /// whose retransmissions backed off during the outage go out one normal
     /// timeout from now instead of up to 2 s later. Not for every packet:
     /// while the peer's application is not reading, the backoff is what keeps
-    /// retransmissions down to one every 2 s.
+    /// retransmissions down to one every 2 s, and while it reads slowly, what
+    /// keeps the whole window from going again every timeout. Until this call
+    /// comes, if an outage is long enough for one at all, news alone ends the
+    /// backoff: messages behind the oldest go one per timeout and round trip
+    /// as each becomes the oldest, or at their own deadline if that is sooner.
     pub fn path_recovered(&mut self, now: Instant) {
         let deadline = now + self.last_base;
         for sent in &mut self.in_flight {

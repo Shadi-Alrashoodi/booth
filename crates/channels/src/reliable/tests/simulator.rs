@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use proptest::prelude::*;
 
-use super::ms;
+use super::{ms, numbered};
 use crate::reliable::{
     MAX_FRAME, MAX_MESSAGE, MAX_QUEUED, Reliable, ReliableCounters, ReliableError, WINDOW,
 };
@@ -470,6 +470,106 @@ fn stalled_reader_on_a_hostile_network() {
             outcome.most_waiting_on_b >= MAX_QUEUED,
             "seed {seed}: the queue never filled, at most {} waited",
             outcome.most_waiting_on_b
+        );
+    }
+}
+
+struct OneAtATime {
+    delivered_ms: u64,
+    retransmissions: u64,
+}
+
+// `count` messages from a to b, with one frame through every `cost_us`: a slow
+// uplink, or a far end that takes that long over each frame. Every copy waits
+// behind the ones before it, so what a sends again holds up what it has not
+// sent yet. Nothing is lost, and b acks what it takes, 1 ms back.
+fn one_frame_at_a_time(count: usize, cost_us: u64, timeout: Duration) -> OneAtATime {
+    let base = Instant::now();
+    let conditions = Conditions {
+        duplicate: 0,
+        delay_us: 1_000,
+        jitter_us: 0,
+        ..Conditions::lossy(0)
+    };
+    let mut rng = Rng(0);
+    let mut a = Reliable::new();
+    let mut b = Reliable::new();
+    let mut ab = Link::default();
+    let mut ba = Link::default();
+    let sent = numbered(count);
+    for message in &sent {
+        a.send(message).unwrap();
+    }
+    let mut got = Vec::new();
+    let mut delivered_us = 0;
+    let mut line_free_us = 0;
+    let mut now_us = 0;
+
+    loop {
+        let now = base + Duration::from_micros(now_us);
+        for frame in ab.take_due(now_us) {
+            b.receive(&frame, now).unwrap();
+        }
+        for frame in ba.take_due(now_us) {
+            a.receive(&frame, now).unwrap();
+        }
+        while let Some(message) = b.next_delivered() {
+            got.push(message);
+            delivered_us = now_us;
+        }
+        while let Some(frame) = a.poll_transmit(now, Some(timeout)) {
+            line_free_us = line_free_us.max(now_us) + cost_us;
+            ab.in_transit.push(Reverse((line_free_us, ab.order, frame)));
+            ab.order += 1;
+        }
+        while let Some(frame) = b.poll_transmit(now, None) {
+            ba.put(frame, now_us, &conditions, &mut rng);
+        }
+
+        let next = [
+            ab.next_due(),
+            ba.next_due(),
+            a.next_timeout().map(|t| micros_after(base, t)),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let Some(next) = next else {
+            break;
+        };
+        assert!(next > now_us, "time must move forward");
+        now_us = next;
+    }
+    assert_eq!(got, sent);
+    OneAtATime {
+        delivered_ms: delivered_us / 1000,
+        retransmissions: a.counters().retransmissions,
+    }
+}
+
+// A large pointer shape with the timer at its 20 ms floor. The whole window
+// takes far longer than that to cross the slower links. Apart from the oldest,
+// a message goes again only when its own doubling timer runs out, so up to the
+// 2 s cap its copies grow with the logarithm of the wait, not with the acks
+// that come back meanwhile. The limit is on the average over all the messages.
+#[test]
+fn slow_line_resends_a_bounded_number_of_copies() {
+    let count = 256;
+    for cost_us in [500, 1_000, 2_000, 4_000, 8_000] {
+        let slow = one_frame_at_a_time(count, cost_us, ms(20));
+        println!(
+            "one frame every {cost_us} us: {count} messages in {} simulated ms, {} retransmissions",
+            slow.delivered_ms, slow.retransmissions
+        );
+        assert!(
+            slow.retransmissions <= 8 * count as u64,
+            "one frame every {cost_us} us: {} retransmissions",
+            slow.retransmissions
+        );
+        assert!(
+            slow.delivered_ms <= 8 * count as u64 * cost_us / 1000,
+            "one frame every {cost_us} us: delivered in {} ms",
+            slow.delivered_ms
         );
     }
 }
