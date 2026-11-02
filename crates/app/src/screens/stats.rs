@@ -194,7 +194,8 @@ struct Line {
     label: &'static str,
     value: String,
     level: Level,
-    // The value is "Hidden while you share" in place of an address or a path.
+    // The value is "Hidden while you share" in place of an address, an address
+    // name or a path.
     hidden: bool,
     // The value is a person's name, set in Plex Sans as names are
     // everywhere else, not in the mono of the readings.
@@ -332,9 +333,10 @@ impl Lines {
         }
     }
 
-    // A line that can hold an IP address, this PC's or a friend's, or a
-    // path under the Windows profile. The label stays while you share, so
-    // the panel keeps its shape as a share starts and stops.
+    // A line that can hold an IP address, this PC's or a friend's, a name
+    // that leads to one, or a path under the Windows profile. The label stays
+    // while you share, so the panel keeps its shape as a share starts and
+    // stops.
     fn private(&mut self, label: &'static str, value: Option<String>) {
         if !self.hide_addresses {
             self.add(label, value);
@@ -533,7 +535,8 @@ fn build(
         out.private("New address", Some(change.to.to_string()));
     }
     if let Some(name) = &n.address_name {
-        out.add("Address name", Some(name.name.clone()));
+        // One lookup of the name gives what the line under it hides.
+        out.private("Address name", Some(name.name.clone()));
         // Whatever the lookup said: its answer names the addresses it
         // refused as well as the ones it took.
         out.private("Name points to", points_to(name));
@@ -1727,9 +1730,9 @@ mod tests {
         (off, on)
     }
 
-    // While you share, the lines that show an IP address read "Hidden while
-    // you share" in ash, and every other line, the Video group included,
-    // stays as it was.
+    // While you share, the lines that show an IP address or the name that
+    // leads to one read "Hidden while you share" in ash, and every other line,
+    // the Video group included, stays as it was.
     #[test]
     fn addresses_read_hidden_while_you_share() {
         let addresses = [
@@ -1738,6 +1741,7 @@ mod tests {
             "Mapped address",
             "Old address",
             "New address",
+            "Address name",
             "Name points to",
         ];
         let n = addressed();
@@ -1758,10 +1762,24 @@ mod tests {
                 }
             }
             // Nothing else holds one of them either.
-            for ip in ["203.0.113.5", "203.0.113.9", "198.51.100.7", "192.0.2.44"] {
-                assert!(off.iter().any(|line| line.value.contains(ip)), "{ip}");
+            for private in [
+                "203.0.113.5",
+                "203.0.113.9",
+                "198.51.100.7",
+                "192.0.2.44",
+                "myroom.example.net",
+            ] {
+                assert!(
+                    off.iter().any(|line| line.value.contains(private)),
+                    "{private}"
+                );
                 for line in &on {
-                    assert!(!line.value.contains(ip), "{}: {}", line.label, line.value);
+                    assert!(
+                        !line.value.contains(private),
+                        "{}: {}",
+                        line.label,
+                        line.value
+                    );
                 }
             }
             let video = on.iter().find(|line| line.label == "Encoder");
