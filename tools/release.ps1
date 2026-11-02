@@ -700,11 +700,13 @@ Assert-NoBuildFolder @(Get-ChildItem -LiteralPath $dist -File)
 # The update check reads this strictly (crates\app\src\update\manifest.rs):
 # these five keys once each, the installer's two together or not at all, and
 # nothing else. It downloads only the zip; the installer's lines are there
-# for checking a download by hand, as the release notes say.
+# for checking a download by hand, as the release notes say. The date names
+# the invariant culture because a date otherwise comes out in the calendar of
+# this PC's regional format, and every copy refuses a year like 1448.
 $latest = Join-Path $dist 'latest.txt'
 $latestLines = @(
     "version = $version",
-    "published = $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd'))",
+    "published = $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture))",
     "zip = $name.zip",
     "sha256 = $sha256",
     "url = $releasesPage/download/v$version/$name.zip"
