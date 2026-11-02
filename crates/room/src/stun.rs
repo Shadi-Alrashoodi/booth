@@ -190,25 +190,26 @@ impl Stun {
         let Some(at) = self
             .requests
             .iter()
-            .position(|(id, server)| *id == txid && *server == from)
+            .position(|(id, server)| *id == txid && same_place(*server, from))
         else {
-            return Answer::NotOurs(if self.servers.contains(&from) {
+            let known = self.servers.iter().any(|server| same_place(*server, from));
+            return Answer::NotOurs(if known {
                 NotOurs::Late
             } else {
                 NotOurs::Stranger
             });
         };
-        self.requests.swap_remove(at);
-        self.answers.push((from, mapped));
-        log!(self.log, "stun answer from {from}: seen as {mapped}");
+        let (_, server) = self.requests.swap_remove(at);
+        self.answers.push((server, mapped));
+        log!(self.log, "stun answer from {server}: seen as {mapped}");
         // A server that sees what it saw last time says nothing new. With
         // hard mapping each server sees its own port, and taking whichever
         // came last would tell every friend new addresses every round.
         let repeat = self
             .seen
             .iter()
-            .any(|(asked, seen)| *asked == from && same_place(*seen, mapped));
-        let moved = self.compare_with_previous(from, mapped, now);
+            .any(|(asked, seen)| *asked == server && same_place(*seen, mapped));
+        let moved = self.compare_with_previous(server, mapped, now);
         match mapped {
             _ if repeat => {}
             SocketAddr::V4(v4) => {
@@ -600,8 +601,8 @@ fn seen_from_outside(mapped: SocketAddr) -> bool {
     crate::known::usable(&Candidate { kind, addr: mapped })
 }
 
-// A received IPv6 address can carry a flow label or scope the answer's
-// place does not depend on.
+// The source of a received IPv6 datagram can carry a flow label or scope the
+// address asked has not, and it is the same server all the same.
 fn same_place(a: SocketAddr, b: SocketAddr) -> bool {
     a.ip() == b.ip() && a.port() == b.port()
 }
@@ -979,6 +980,34 @@ mod tests {
         );
         let second = answer_with(&mut stun, two.addr(), outside(52001), start);
         assert!(matches!(second, Answer::Recorded));
+    }
+
+    // Windows may hand over an IPv6 source with a flow label or scope, which
+    // the address asked has not. Everything after the compare goes by the
+    // address asked, since the next round's answers are held against it.
+    #[test]
+    fn a_labelled_source_is_the_server_asked() {
+        let server: SocketAddrV6 = "[2001:db8::1]:3478".parse().unwrap();
+        let labelled = SocketAddrV6::new(*server.ip(), server.port(), 0x12345, 7);
+        let seen: SocketAddrV6 = "[2001:db8::7]:52000".parse().unwrap();
+        let answer = stun_answer_seeing(&[1; 12], SocketAddr::V6(seen));
+        let now = Instant::now();
+        let mut stun = settled(Mapping::Unknown, None);
+        stun.servers.push(SocketAddr::V6(server));
+        stun.requests.push(([1; 12], SocketAddr::V6(server)));
+
+        let taken = stun.on_answer(&answer, SocketAddr::V6(labelled), now);
+        assert!(matches!(taken, Answer::Recorded));
+        assert_eq!(stun.public_v6(), Some(seen));
+        let pair = (SocketAddr::V6(server), SocketAddr::V6(seen));
+        assert_eq!(stun.answers, [pair]);
+        assert_eq!(stun.seen, [pair]);
+
+        let again = stun.on_answer(&answer, SocketAddr::V6(labelled), now);
+        assert!(matches!(again, Answer::NotOurs(NotOurs::Late)));
+        let other = SocketAddrV6::new(*seen.ip(), server.port(), 0x12345, 7);
+        let stranger = stun.on_answer(&answer, SocketAddr::V6(other), now);
+        assert!(matches!(stranger, Answer::NotOurs(NotOurs::Stranger)));
     }
 
     fn rounds(captured: &crate::log::Captured) -> Vec<String> {
