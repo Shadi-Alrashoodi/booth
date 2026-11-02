@@ -651,6 +651,14 @@ fn taken() -> AudioError {
     }
 }
 
+fn refused() -> AudioError {
+    AudioError::Windows {
+        step: String::from("open the output device (Fake speakers)"),
+        code: 0x8007_0057,
+        text: String::from("The parameter is incorrect"),
+    }
+}
+
 // Speakers that have played, ended with `ended` and refused with `refuse`
 // until the test lets them go: they say `said`, and nothing more for as long
 // as that lasts, and open with no notice from Windows.
@@ -727,6 +735,56 @@ fn speakers_come_back_after_the_audio_service_on_a_chosen_device() {
         stopped.clone(),
         &[Event::Gone(stopped)],
     );
+}
+
+// Windows refusing the format twice, as it may while a Bluetooth headset
+// switches, on a stream that has played.
+#[test]
+fn speakers_refused_after_they_played_keep_trying_under_windows_default() {
+    comes_back_after(
+        Choice::Default,
+        lost(),
+        refused(),
+        &[Event::Lost(lost()), Event::Gone(refused())],
+    );
+}
+
+#[test]
+fn speakers_refused_after_they_played_keep_trying_on_a_chosen_device() {
+    comes_back_after(
+        chosen(),
+        lost(),
+        refused(),
+        &[Event::Gone(lost()), Event::Gone(refused())],
+    );
+}
+
+// A stream that has never played ends on a refusal, as speakers refused access
+// do: nothing has shown the device can be opened, and the line says what to do.
+#[test]
+fn a_refusal_ends_a_stream_that_has_never_played() {
+    for (choice, err) in [
+        (Choice::Default, refused()),
+        (chosen(), refused()),
+        (Choice::Default, AudioError::AccessDenied(Direction::Output)),
+        (chosen(), AudioError::AccessDenied(Direction::Output)),
+    ] {
+        let fake = one_output(Setup::default());
+        fake.fail_opens(Some(err.clone()));
+        let (on_event, rx) = events();
+        let render = Render::start_with(
+            fake.device(),
+            choice,
+            |samples: &mut [f32]| samples.fill(0.0),
+            on_event,
+        )
+        .unwrap();
+        assert_eq!(next(&rx).1, Event::Failed(err));
+        assert_eq!(
+            render.thread().ended().recv_timeout(Duration::from_secs(3)),
+            Err(RecvTimeoutError::Disconnected)
+        );
+    }
 }
 
 // The line says the latest reason, and a reason that comes back after another

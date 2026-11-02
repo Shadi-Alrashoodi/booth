@@ -840,6 +840,7 @@ impl Run<'_> {
         // A stream waiting for a device has said why, and says nothing more
         // until it opens again or the reason changes.
         let mut said = None;
+        let mut played = false;
         loop {
             let seen = self.notices.get();
             let opening = Instant::now();
@@ -858,9 +859,15 @@ impl Run<'_> {
                 }
                 // A device chosen in settings that is unplugged or turned off
                 // opens once it is back, as Windows default does. Any device
-                // opens once Windows gives it again.
+                // opens once Windows gives it again. A stream that has played
+                // and is refused now keeps trying too: that may only be
+                // passing, as a Bluetooth headset's microphone has refused
+                // while it switches, and speakers in a room have no other way
+                // to try again short of leaving.
                 Err(err)
-                    if err.comes_back() || (*self.choice != Choice::Default && err.is_away()) =>
+                    if err.comes_back()
+                        || (*self.choice != Choice::Default && err.is_away())
+                        || (played && matches!(err, AudioError::Windows { .. })) =>
                 {
                     if new_reason(&mut said, &err) {
                         events(Event::Gone(err));
@@ -913,6 +920,7 @@ impl Run<'_> {
             let end = match work.start(&mut stream) {
                 Ok(()) => {
                     said = None;
+                    played = true;
                     self.shared.set_info(Some(info.clone()));
                     events(Event::Opened(info.clone()));
                     self.pump(&mut stream, work, &info.id)
