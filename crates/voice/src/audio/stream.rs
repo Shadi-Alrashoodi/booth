@@ -27,10 +27,12 @@ const WAIT: Duration = Duration::from_millis(20);
 pub const REOPEN_AFTER: Duration = Duration::from_secs(1);
 // Windows documents process loopback, which PC sound needs, from this build.
 pub const PC_SOUND_BUILD: u32 = 20348;
-// A device chosen in settings that is away is tried again whenever Windows
-// says the devices changed, and at least this often: a format change in the
-// sound settings ends a stream with no such notice, and a stream whose
-// watch could not be registered gets none at all.
+// A device chosen in settings that is away, or any device Windows will not
+// give for now, is tried again whenever Windows says the devices changed, and
+// at least this often: a format change in the sound settings ends a stream
+// with no such notice, a program letting go of a device or the audio service
+// coming back gives none, and a stream whose watch could not be registered
+// gets none at all, so Windows default with no device looks this often too.
 pub const LOOK_AGAIN: Duration = Duration::from_secs(2);
 // The queued average follows the last 16 or so writes.
 const QUEUED_SHIFT: u32 = 4;
@@ -142,12 +144,14 @@ pub enum Event {
     // default. The stream opens again on the default in REOPEN_AFTER.
     Lost(AudioError),
     // The device chosen in settings is not there: unplugged or turned off
-    // when the stream opened, or since. Said once; the stream opens it again
-    // once it is back, with Opened.
+    // when the stream opened, or since. Or, on any device, Windows will not
+    // give it for now (AudioError::comes_back), or refuses it on a stream
+    // that has played. Said once for each reason; the stream opens it again
+    // once it can, with Opened.
     Gone(AudioError),
     // Could not open, or failed on a chosen device. The stream has ended,
-    // except under Windows default with no device at all, where it opens as
-    // soon as Windows has a default again.
+    // except under Windows default with no device at all, where it says so
+    // once and opens as soon as Windows has a default again.
     Failed(AudioError),
 }
 
@@ -833,9 +837,9 @@ struct Run<'a> {
 
 impl Run<'_> {
     fn run<D: Device>(&self, device: &mut D, work: &mut Work, events: &mut dyn FnMut(Event)) {
-        // A chosen device that is away has said so, and says nothing more
-        // until it opens again.
-        let mut away = false;
+        // A stream waiting for a device has said why, and says nothing more
+        // until it opens again or the reason changes.
+        let mut said = None;
         loop {
             let seen = self.notices.get();
             let opening = Instant::now();
@@ -845,6 +849,7 @@ impl Run<'_> {
                 // Bluetooth headset does when it switches profiles, is a
                 // loss like any other.
                 Err(err) if *self.choice == Choice::Default && err.is_lost() => {
+                    said = None;
                     events(Event::Lost(err));
                     if self.pause(REOPEN_AFTER) {
                         continue;
@@ -852,10 +857,12 @@ impl Run<'_> {
                     return;
                 }
                 // A device chosen in settings that is unplugged or turned off
-                // opens once it is back, as Windows default does.
-                Err(err) if *self.choice != Choice::Default && err.is_away() => {
-                    if !away {
-                        away = true;
+                // opens once it is back, as Windows default does. Any device
+                // opens once Windows gives it again.
+                Err(err)
+                    if err.comes_back() || (*self.choice != Choice::Default && err.is_away()) =>
+                {
+                    if new_reason(&mut said, &err) {
                         events(Event::Gone(err));
                     }
                     if self.wait_for_devices(seen) {
@@ -905,7 +912,7 @@ impl Run<'_> {
             }
             let end = match work.start(&mut stream) {
                 Ok(()) => {
-                    away = false;
+                    said = None;
                     self.shared.set_info(Some(info.clone()));
                     events(Event::Opened(info.clone()));
                     self.pump(&mut stream, work, &info.id)
@@ -922,6 +929,7 @@ impl Run<'_> {
                 End::Switch => {}
                 End::Error(err) => match self.choice {
                     Choice::Default => {
+                        said = None;
                         events(Event::Lost(err));
                         if !self.pause(REOPEN_AFTER) {
                             return;
@@ -931,9 +939,8 @@ impl Run<'_> {
                     // changed since this open. The unplug that ended it
                     // usually has already, so the next open comes at once
                     // and finds a quick replug.
-                    Choice::Device(_) if err.is_lost() => {
-                        if !away {
-                            away = true;
+                    Choice::Device(_) if err.is_lost() || err.comes_back() => {
+                        if new_reason(&mut said, &err) {
                             events(Event::Gone(err));
                         }
                         if !self.wait_for_devices(seen) {
@@ -1028,15 +1035,18 @@ impl Run<'_> {
         }
     }
 
-    // A chosen device found away by the open made after `seen` notices:
-    // until Windows says the devices changed since, or LOOK_AGAIN. False when
-    // asked to stop.
+    // A device found away or refused by the open made after `seen` notices:
+    // until Windows says the devices changed since, or names a new default
+    // for a stream that follows it, or LOOK_AGAIN. False when asked to stop.
     fn wait_for_devices(&self, seen: u64) -> bool {
         let until = Instant::now() + LOOK_AGAIN;
         while self.notices.get() == seen {
             let left = until.saturating_duration_since(Instant::now());
             match self.rx.recv_timeout(left) {
                 Ok(Control::Stop) | Err(RecvTimeoutError::Disconnected) => return false,
+                Ok(Control::DefaultChanged(Some(_))) if *self.choice == Choice::Default => {
+                    return true;
+                }
                 Ok(Control::DefaultChanged(_)) => {}
                 Ok(Control::DevicesChanged) => self.noticed(),
                 Err(RecvTimeoutError::Timeout) => return true,
@@ -1044,6 +1054,18 @@ impl Run<'_> {
         }
         true
     }
+}
+
+// Whether a stream that waits has yet to say this. A device unplugged is one
+// reason however the open finds it away.
+fn new_reason(said: &mut Option<AudioError>, err: &AudioError) -> bool {
+    let same = said
+        .as_ref()
+        .is_some_and(|before| before == err || (before.is_away() && err.is_away()));
+    if !same {
+        *said = Some(err.clone());
+    }
+    !same
 }
 
 #[cfg(test)]

@@ -8,12 +8,15 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::RecvTimeoutError;
 use voice::audio::fake::{Fake, Setup};
 use voice::audio::{
-    AudioError, Capture, Choice, Event, LOOK_AGAIN, PcSound, REOPEN_AFTER, Render, StreamInfo,
+    AudioError, Capture, Choice, Direction, Event, LOOK_AGAIN, PcSound, REOPEN_AFTER, Render,
+    StreamInfo,
 };
 
 const PERIOD: u32 = 128;
 // 128 frames at 48 kHz.
 const PERIOD_TIME: Duration = Duration::from_nanos(2_666_667);
+// A stream that waits has looked again at least once by then.
+const PAST_A_LOOK: Duration = LOOK_AGAIN.saturating_add(Duration::from_millis(300));
 
 fn events() -> (
     impl FnMut(Event) + Send + 'static,
@@ -338,6 +341,28 @@ fn a_chosen_device_that_goes_away_opens_again_once_it_is_back() {
     capture.stop();
 }
 
+// Said once for each time it goes away, not once for the stream.
+#[test]
+fn a_chosen_device_that_goes_away_twice_says_so_twice() {
+    let fake = one_output(Setup::default());
+    let (on_event, rx) = events();
+    let render = Render::start_with(
+        fake.device(),
+        chosen(),
+        |samples: &mut [f32]| samples.fill(0.0),
+        on_event,
+    )
+    .unwrap();
+    for _ in 0..2 {
+        opened(&rx);
+        fake.unplug("out");
+        assert_eq!(next(&rx).1, Event::Gone(lost()));
+        fake.plug("out", "Fake speakers");
+    }
+    opened(&rx);
+    render.stop();
+}
+
 // A headset's microphone and speakers on the same devices, both waiting for
 // it: one plug opens both.
 #[test]
@@ -573,6 +598,201 @@ fn with_no_device_the_stream_waits_for_one() {
     let stopping = Instant::now();
     capture.stop();
     assert!(stopping.elapsed() < Duration::from_millis(100));
+}
+
+// Refused when the stream starts, for a reason that passes with nobody
+// touching Booth: said once, looked at again with no notice from Windows, and
+// opened once it can.
+fn waits_out_a_refusal(err: AudioError) {
+    for choice in [Choice::Default, Choice::Device(String::from("mic"))] {
+        let fake = one_mic(Setup::default());
+        fake.fail_opens(Some(err.clone()));
+        let (on_event, rx) = events();
+        let capture =
+            Capture::start_with(fake.device(), choice, |_: &[f32], _| {}, on_event).unwrap();
+        assert_eq!(next(&rx).1, Event::Gone(err.clone()));
+        assert!(rx.recv_timeout(PAST_A_LOOK).is_err());
+        assert!(capture.thread().running());
+        fake.fail_opens(None);
+        assert_eq!(opened(&rx).1.id, "mic");
+        capture.stop();
+    }
+}
+
+#[test]
+fn a_device_a_program_holds_opens_once_the_program_lets_go() {
+    waits_out_a_refusal(AudioError::InUse {
+        direction: Direction::Input,
+        name: String::from("Fake microphone"),
+    });
+}
+
+#[test]
+fn a_stopped_audio_service_is_waited_out() {
+    waits_out_a_refusal(AudioError::ServiceStopped(Direction::Input));
+}
+
+#[test]
+fn a_microphone_opens_once_access_is_allowed() {
+    waits_out_a_refusal(AudioError::AccessDenied(Direction::Input));
+}
+
+fn lost() -> AudioError {
+    AudioError::Lost {
+        direction: Direction::Output,
+        name: String::from("Fake speakers"),
+    }
+}
+
+fn taken() -> AudioError {
+    AudioError::InUse {
+        direction: Direction::Output,
+        name: String::from("Fake speakers"),
+    }
+}
+
+// Speakers that have played, ended with `ended` and refused with `refuse`
+// until the test lets them go: they say `said`, and nothing more for as long
+// as that lasts, and open with no notice from Windows.
+fn comes_back_after(choice: Choice, ended: AudioError, refuse: AudioError, said: &[Event]) {
+    let fake = one_output(Setup::default());
+    let (on_event, rx) = events();
+    let render = Render::start_with(
+        fake.device(),
+        choice,
+        |samples: &mut [f32]| samples.fill(0.0),
+        on_event,
+    )
+    .unwrap();
+    opened(&rx);
+    fake.fail_opens(Some(refuse));
+    fake.fail_streams(Some(ended));
+    for event in said {
+        assert_eq!(next(&rx).1, *event);
+    }
+    assert!(rx.recv_timeout(PAST_A_LOOK).is_err());
+    assert!(render.thread().running());
+    fake.fail_streams(None);
+    fake.fail_opens(None);
+    opened(&rx);
+    render.stop();
+}
+
+fn chosen() -> Choice {
+    Choice::Device(String::from("out"))
+}
+
+// A program takes the device in exclusive mode: Windows ends the stream as a
+// device gone, and says it is in use until the program lets go. The line
+// follows, so it does not stay on unplugged.
+#[test]
+fn speakers_a_program_takes_come_back_under_windows_default() {
+    comes_back_after(
+        Choice::Default,
+        lost(),
+        taken(),
+        &[Event::Lost(lost()), Event::Gone(taken())],
+    );
+}
+
+#[test]
+fn speakers_a_program_takes_come_back_on_a_chosen_device() {
+    comes_back_after(
+        chosen(),
+        lost(),
+        taken(),
+        &[Event::Gone(lost()), Event::Gone(taken())],
+    );
+}
+
+// The audio service stops under a running stream, and is not back yet at the
+// next open.
+#[test]
+fn speakers_come_back_after_the_audio_service_under_windows_default() {
+    let stopped = AudioError::ServiceStopped(Direction::Output);
+    comes_back_after(
+        Choice::Default,
+        stopped.clone(),
+        stopped.clone(),
+        &[Event::Lost(stopped.clone()), Event::Gone(stopped)],
+    );
+}
+
+#[test]
+fn speakers_come_back_after_the_audio_service_on_a_chosen_device() {
+    let stopped = AudioError::ServiceStopped(Direction::Output);
+    comes_back_after(
+        chosen(),
+        stopped.clone(),
+        stopped.clone(),
+        &[Event::Gone(stopped)],
+    );
+}
+
+// The line says the latest reason, and a reason that comes back after another
+// is said again.
+#[test]
+fn a_stream_that_waits_says_each_change_of_reason() {
+    let fake = one_output(Setup::default());
+    fake.fail_opens(Some(taken()));
+    let (on_event, rx) = events();
+    let render = Render::start_with(
+        fake.device(),
+        Choice::Default,
+        |samples: &mut [f32]| samples.fill(0.0),
+        on_event,
+    )
+    .unwrap();
+    assert_eq!(next(&rx).1, Event::Gone(taken()));
+    // Gone while it was being opened.
+    fake.fail_opens(Some(lost()));
+    assert_eq!(next(&rx).1, Event::Lost(lost()));
+    fake.fail_opens(Some(taken()));
+    assert_eq!(next(&rx).1, Event::Gone(taken()));
+    // Opens, and is gone again before it starts.
+    fake.fail_streams(Some(lost()));
+    fake.fail_opens(None);
+    assert_eq!(next(&rx).1, Event::Lost(lost()));
+    fake.fail_opens(Some(taken()));
+    assert_eq!(next(&rx).1, Event::Gone(taken()));
+    fake.fail_opens(Some(AudioError::NoDevice(Direction::Output)));
+    assert_eq!(
+        next(&rx).1,
+        Event::Failed(AudioError::NoDevice(Direction::Output))
+    );
+    fake.fail_streams(None);
+    fake.fail_opens(None);
+    fake.set_default(Some("out"));
+    opened(&rx);
+    render.stop();
+}
+
+// A stream on Windows default that waits for a device Windows will not give
+// follows a new default at once, as a running one does.
+#[test]
+fn a_new_default_ends_the_wait_for_a_refused_device() {
+    let fake = Fake::new(
+        Setup::default(),
+        &[("a", "Headset A"), ("b", "Speakers B")],
+        Some("a"),
+    );
+    fake.fail_opens(Some(taken()));
+    let (on_event, rx) = events();
+    let render = Render::start_with(
+        fake.device(),
+        Choice::Default,
+        |samples: &mut [f32]| samples.fill(0.0),
+        on_event,
+    )
+    .unwrap();
+    assert_eq!(next(&rx).1, Event::Gone(taken()));
+    fake.fail_opens(None);
+    let asked = Instant::now();
+    fake.set_default(Some("b"));
+    let (at, info) = opened(&rx);
+    assert_eq!(info.id, "b");
+    assert!(at - asked < Duration::from_millis(500), "{:?}", at - asked);
+    render.stop();
 }
 
 #[test]

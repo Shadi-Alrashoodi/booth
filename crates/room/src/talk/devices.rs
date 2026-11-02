@@ -609,7 +609,7 @@ fn on_event(shared: Arc<Shared>, log: Log, side: Side) -> impl FnMut(Event) + Se
             Event::Gone(err) => {
                 log!(
                     log,
-                    "voice: {} not there, opened again once it is back: {err}",
+                    "voice: {} not open, opened again once Windows gives it: {err}",
                     side.word()
                 );
                 *lock(status) = Status {

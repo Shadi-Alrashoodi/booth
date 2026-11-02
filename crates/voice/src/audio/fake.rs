@@ -71,6 +71,9 @@ struct State {
     glitch: AtomicBool,
     // Every open fails with this, as Windows refusing the stream would.
     refuse: Mutex<Option<AudioError>>,
+    // Every stream fails with this when it is read, written or checked, as
+    // one Windows closed does.
+    broken: Mutex<Option<AudioError>>,
     record: Mutex<Record>,
     // Off for a fake left running for hours, where a record of every
     // sample would be the biggest thing in the process.
@@ -126,6 +129,7 @@ impl Fake {
                 unstamped: AtomicBool::new(false),
                 glitch: AtomicBool::new(false),
                 refuse: Mutex::new(None),
+                broken: Mutex::new(None),
                 record: Mutex::new(Record::default()),
                 recording,
             }),
@@ -184,6 +188,11 @@ impl Fake {
     // Every open from now on fails with `err`; None lets them work again.
     pub fn fail_opens(&self, err: Option<AudioError>) {
         *lock(&self.state.refuse) = err;
+    }
+
+    // Every stream fails with `err` from now on; None lets them work again.
+    pub fn fail_streams(&self, err: Option<AudioError>) {
+        *lock(&self.state.broken) = err;
     }
 
     pub fn record(&self) -> Record {
@@ -325,6 +334,9 @@ impl FakeStream {
     }
 
     fn present(&self) -> Result<(), AudioError> {
+        if let Some(err) = lock(&self.state.broken).clone() {
+            return Err(err);
+        }
         if self.plugged_in() {
             Ok(())
         } else {

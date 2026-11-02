@@ -85,6 +85,19 @@ impl AudioError {
         )
     }
 
+    // Windows will not give the device for now, for a reason that can pass
+    // with nobody touching Booth: a program lets go of it, the audio service
+    // comes back, microphone access is allowed again. That setting is about
+    // microphones; speakers refused access are told to start Booth again.
+    pub fn comes_back(&self) -> bool {
+        matches!(
+            self,
+            AudioError::InUse { .. }
+                | AudioError::ServiceStopped(_)
+                | AudioError::AccessDenied(Direction::Input)
+        )
+    }
+
     pub fn direction(&self) -> Option<Direction> {
         match self {
             AudioError::NoDevice(direction)
