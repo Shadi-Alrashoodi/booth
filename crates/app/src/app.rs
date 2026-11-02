@@ -1131,9 +1131,16 @@ impl eframe::App for App {
                 }
                 Some(view)
             }
-            Screen::Checking | Screen::Firewall(_) | Screen::Start(_) | Screen::Settings { .. } => {
+            // A minimized window shows no meter, so its microphone is closed
+            // until the window is back and ui runs again.
+            Screen::Settings { draft, audio, .. } => {
+                if minimized(ctx) {
+                    let echo = draft.echo_cancellation && winver::cancels_echo();
+                    audio.follow(&draft.input, &draft.output, echo, false);
+                }
                 None
             }
+            Screen::Checking | Screen::Firewall(_) | Screen::Start(_) => None,
         };
         if let Some(tray) = &mut self.tray {
             tray.show(tray::look(view.as_ref(), self.control_offered));
@@ -1229,12 +1236,10 @@ impl eframe::App for App {
                             if draft.locked {
                                 draft.stop_waiting();
                             }
-                            // A minimized window shows no meter, so its
-                            // microphone is closed until the window is back.
-                            let showing =
-                                ui.input(|input| input.viewport().minimized != Some(true));
+                            // ui runs only for a window on screen: minimized,
+                            // only logic does.
                             let echo = draft.echo_cancellation && winver::cancels_echo();
-                            audio.follow(&draft.input, &draft.output, echo, showing);
+                            audio.follow(&draft.input, &draft.output, echo, true);
                             press = settings_screen::show(ui, draft, audio);
                             if audio.level().is_some() {
                                 ui.request_repaint_after(METER_REPAINT);
@@ -1472,6 +1477,12 @@ pub fn load(args: &Args, backlog: &mut Backlog) -> Result<Setup, NotStarted> {
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::thread;
+
+    use eframe::egui::{Pos2, RawInput, Rect, ViewportId, ViewportInfo, vec2};
+    use voice::audio::fake::{Fake, Setup as FakeSetup};
+
+    use crate::{firewall, sound};
 
     fn setup_in(dir: &Path) -> Setup {
         Setup {
@@ -1557,6 +1568,104 @@ mod tests {
             "{texts:?}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn with_window(minimized: bool) -> RawInput {
+        let mut input = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(360.0, 640.0))),
+            ..RawInput::default()
+        };
+        input.viewports.insert(
+            ViewportId::ROOT,
+            ViewportInfo {
+                minimized: Some(minimized),
+                ..ViewportInfo::default()
+            },
+        );
+        input
+    }
+
+    // Minimized, eframe calls logic and not ui. The microphone and Hear
+    // yourself stop there, and ui opens the microphone again with the window
+    // back. Hear yourself stays off until it is turned on again.
+    #[test]
+    fn settings_audio_stops_while_the_window_is_minimized() {
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        let fake = Fake::new(FakeSetup::default(), &[("a", "Headset A")], Some("a"));
+        let draft = Draft::new(&Settings::default(), KnownDevices::default(), String::new());
+        let mut audio = sound::tests::fake_audio(&ctx, &fake, &draft.input);
+        sound::tests::fake_hear(&mut audio, &fake, &draft.output);
+        let mut app = App {
+            setup: Err(String::new()),
+            screen: Screen::Settings {
+                draft: Box::new(draft),
+                start: Start::default(),
+                audio: Box::new(audio),
+            },
+            firewall: firewall::tests::quiet(),
+            backlog: Backlog::default(),
+            stats_open: false,
+            sweep: Sweep::default(),
+            scrolling: false,
+            notify: Arc::new(|| {}),
+            not_now: None,
+            damaged: Vec::new(),
+            unusable: Vec::new(),
+            hotkeys: Hotkeys::off(),
+            target: Target::default(),
+            flags: Arc::default(),
+            control_offered: false,
+            share_key: ShareKey::default(),
+            raise: false,
+            viewer_strip: Arc::default(),
+            tray: None,
+            tray_clicked: Arc::default(),
+            update: Update::off(),
+            scale: None,
+            focused: None,
+            panel_keys: Rc::default(),
+        };
+        let hearing = |app: &App| match &app.screen {
+            Screen::Settings { audio, .. } => audio.hearing(),
+            _ => panic!("the screen changed"),
+        };
+        let mut frame = eframe::Frame::_new_kittest();
+        sound::tests::wait_until("both streams open", || fake.record().at_once == 2);
+
+        // On screen, logic leaves them alone.
+        let _ = ctx.run_logic(&with_window(false), |ctx| {
+            eframe::App::logic(&mut app, ctx, &mut frame);
+        });
+        assert!(hearing(&app));
+        assert_eq!(fake.record().at_once, 2);
+
+        let _ = ctx.run_logic(&with_window(true), |ctx| {
+            eframe::App::logic(&mut app, ctx, &mut frame);
+        });
+        assert!(!hearing(&app));
+        sound::tests::wait_until("both streams close", || fake.record().at_once == 0);
+
+        // Further passes while minimized open nothing.
+        let opens = fake.record().opens.len();
+        let _ = ctx.run_logic(&with_window(true), |ctx| {
+            eframe::App::logic(&mut app, ctx, &mut frame);
+        });
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(fake.record().opens.len(), opens);
+
+        let _ = ctx.run_logic(&with_window(false), |ctx| {
+            eframe::App::logic(&mut app, ctx, &mut frame);
+        });
+        ctx.run_ui(with_window(false), |ui| {
+            eframe::App::ui(&mut app, ui, &mut frame);
+        })
+        .drop_without_applying_deltas();
+        sound::tests::wait_until("the microphone opens", || {
+            fake.record().opens.len() == opens + 1
+        });
+        assert_eq!(fake.record().at_once, 1);
+        assert!(!hearing(&app));
     }
 
     // While this PC is controlled, Save refuses a change to the panic key,

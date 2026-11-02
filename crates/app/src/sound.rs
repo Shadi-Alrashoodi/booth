@@ -81,14 +81,16 @@ impl SettingsAudio {
         &self.switches
     }
 
-    // Once a frame while the screen is up. The meter follows the device
-    // picked on the screen and is closed while the window is minimized, and
-    // a stream that ended starts again when the device lists change, which
-    // is when its device may be back. Hear yourself follows the output
-    // device, and stops with the meter or once it heard itself. With `echo`
-    // the meter's microphone asks Windows for echo cancellation, as a room
-    // would, except while Hear yourself plays: the canceller would take the
-    // voice coming back as echo and cancel the voice itself.
+    // Once a frame while the screen is up, and with `showing` false on each
+    // pass while the window is minimized and no frame is drawn. The meter
+    // follows the device picked on the screen and is closed while the window
+    // is minimized, and a stream that ended starts again when the device
+    // lists change, which is when its device may be back. Hear yourself
+    // follows the output device, and stops with the meter or once it heard
+    // itself. With `echo` the meter's microphone asks Windows for echo
+    // cancellation, as a room would, except while Hear yourself plays: the
+    // canceller would take the voice coming back as echo and cancel the voice
+    // itself.
     pub fn follow(&mut self, input: &Choice, output: &Choice, echo: bool, showing: bool) {
         match &self.speakers {
             Some(_) if !showing || self.playback.tripped() => self.hear(false, output),
@@ -96,7 +98,7 @@ impl SettingsAudio {
             _ => {}
         }
         let wish = (echo && !self.hearing()).then(|| output.id().map(str::to_owned));
-        self.mic.ask_echo(wish);
+        self.mic.ask_echo(wish, showing);
         let opened = self.mic.follow(input, showing);
         self.check.follow(input, opened);
         let lists = match &self.watch {
@@ -209,6 +211,7 @@ type Open = Arc<
 enum Stream {
     Off,
     // Handed over by the thread that starts it, with its processing's level.
+    // Also holds a stop until its thread has ended.
     Starting(Receiver<Result<(Capture, Arc<Level>), AudioError>>),
     On(Capture, Arc<Level>),
 }
@@ -293,11 +296,12 @@ impl Mic {
     }
 
     // Echo cancellation asked for or not, against which output device: the
-    // microphone opens again when that changes.
-    fn ask_echo(&mut self, echo: Option<Option<String>>) {
+    // microphone opens again when that changes, or with the window back when
+    // it is minimized or just going.
+    fn ask_echo(&mut self, echo: Option<Option<String>>, showing: bool) {
         if echo != self.echo {
             self.echo = echo;
-            if !self.hidden {
+            if showing && !self.hidden {
                 self.replace(true);
             }
         }
@@ -342,8 +346,9 @@ impl Mic {
                 repaint.request_repaint();
             });
         match spawned {
-            Ok(_) if start => self.stream = Stream::Starting(started),
-            Ok(_) => {}
+            // A stop hands nothing over, but its sender goes when its thread
+            // ends, so a start right after it waits for the stream closing.
+            Ok(_) => self.stream = Stream::Starting(started),
             // `before` went down with the thread's closure, and was stopped
             // here as it dropped.
             Err(err) if start => {
@@ -579,7 +584,7 @@ impl PeriodsAsk {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::time::{Duration, Instant};
 
     use voice::audio::fake::{Fake, Setup};
@@ -596,6 +601,35 @@ mod tests {
         })
     }
 
+    // The screen's audio part on a fake device, without the device watch.
+    pub(crate) fn fake_audio(ctx: &Context, fake: &Fake, input: &Choice) -> SettingsAudio {
+        let switches = Arc::new(Switches::new(false, true));
+        SettingsAudio {
+            watch: Err(String::from("no device watch")),
+            mic: Mic::new(ctx, fake_open(fake), Arc::clone(&switches), input),
+            check: Check::new(ctx, Arc::new(|_: &Choice| None), input),
+            lists: None,
+            playback: Playback::default(),
+            switches,
+            speakers: None,
+            speakers_problem: Arc::default(),
+        }
+    }
+
+    // Hear yourself turned on, playing on the fake device.
+    pub(crate) fn fake_hear(audio: &mut SettingsAudio, fake: &Fake, output: &Choice) {
+        audio.playback.set_on(true);
+        let playback = audio.playback.clone();
+        let render = Render::start_with(
+            fake.device(),
+            output.clone(),
+            move |out| playback.fill(out),
+            |_| {},
+        )
+        .unwrap();
+        audio.speakers = Some((output.clone(), render));
+    }
+
     // Frames as the panel draws them, every 5 ms, until `done`.
     fn frames_until(mic: &mut Mic, choice: &Choice, done: impl Fn(&Mic) -> bool) {
         let until = Instant::now() + Duration::from_secs(3);
@@ -606,7 +640,7 @@ mod tests {
         }
     }
 
-    fn wait_until(what: &str, done: impl Fn() -> bool) {
+    pub(crate) fn wait_until(what: &str, done: impl Fn() -> bool) {
         let until = Instant::now() + Duration::from_secs(1);
         while !done() {
             assert!(Instant::now() < until, "{what}: not within 1 s");
@@ -676,6 +710,66 @@ mod tests {
         wait_until("the stream closes after the screen", || {
             fake.record().at_once == 0
         });
+    }
+
+    // Minimized and back while a Bluetooth headset is still opening: the new
+    // stream waits for the old one to close, so there are never two at once.
+    #[test]
+    fn a_quick_restore_waits_for_the_stream_closing() {
+        let fake = Fake::new(
+            Setup {
+                open_time: Duration::from_millis(400),
+                ..Setup::default()
+            },
+            &[("a", "Headset A")],
+            Some("a"),
+        );
+        let mut mic = Mic::new(
+            &Context::default(),
+            fake_open(&fake),
+            Arc::new(Switches::new(false, true)),
+            &Choice::Default,
+        );
+        wait_until("the stream is opening", || fake.record().at_once == 1);
+        mic.follow(&Choice::Default, false);
+        mic.follow(&Choice::Default, true);
+        frames_until(&mut mic, &Choice::Default, |mic| mic.level().is_some());
+        let record = fake.record();
+        assert_eq!(record.opens.len(), 2);
+        assert_eq!(record.most_at_once, 1);
+    }
+
+    // Stopping Hear yourself on the pass that first sees the window minimized
+    // changes what the microphone asks for. That pass only stops the
+    // microphone, and the wish waits for the window to come back.
+    #[test]
+    fn a_minimize_starts_nothing_and_the_echo_wish_waits_for_the_window() {
+        let fake = Fake::new(Setup::default(), &[("a", "Headset A")], Some("a"));
+        let input = Choice::Default;
+        let output = Choice::Device(String::from("a"));
+        let mut audio = fake_audio(&Context::default(), &fake, &input);
+        fake_hear(&mut audio, &fake, &output);
+        wait_until("both streams open", || fake.record().at_once == 2);
+        let echoes = Arc::new(Mutex::new(Vec::new()));
+        let plain = fake_open(&fake);
+        let asked = Arc::clone(&echoes);
+        audio.mic.open = Arc::new(
+            move |choice, echo: Option<Option<String>>, processor, events| {
+                lock(&asked).push(echo.clone());
+                plain(choice, echo, processor, events)
+            },
+        );
+
+        let turn = audio.mic.turn.load(Ordering::Relaxed);
+        audio.follow(&input, &output, true, false);
+        assert!(!audio.hearing());
+        assert_eq!(audio.mic.turn.load(Ordering::Relaxed), turn + 1);
+        wait_until("both streams close", || fake.record().at_once == 0);
+        assert!(lock(&echoes).is_empty());
+
+        audio.follow(&input, &output, true, true);
+        wait_until("the microphone opens", || !lock(&echoes).is_empty());
+        assert_eq!(*lock(&echoes), [Some(Some(String::from("a")))]);
     }
 
     // A device that is not connected fails a moment after it was passed

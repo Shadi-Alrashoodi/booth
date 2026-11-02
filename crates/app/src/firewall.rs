@@ -219,11 +219,11 @@ fn look(port: u16) -> FirewallState {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use net::firewall::Profiles;
 
-    fn quiet() -> Firewall {
+    pub(crate) fn quiet() -> Firewall {
         Firewall {
             port: 41000,
             check: None,
