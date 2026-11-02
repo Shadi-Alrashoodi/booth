@@ -177,10 +177,22 @@ pub fn against_app_key(
 pub fn open_secret_key(path: &Path, password: Password) -> Result<ReleaseKey, String> {
     let absolute = std::path::absolute(path)
         .map_err(|err| format!("could not resolve {}: {err}", path.display()))?;
+    // File::open follows a file symlink, so where it leads counts as much as
+    // where it is. A key that is not there gets the read error below.
+    let real = fs::canonicalize(&absolute).unwrap_or_else(|_| absolute.clone());
     if let Some(repository) = absolute.parent().and_then(repository_around) {
         return Err(format!(
             "{} is inside the git repository at {}; move the release key out of it, check that git never took it in, and sign again",
             path.display(),
+            repository.display()
+        ));
+    }
+    if let Some(repository) = real.parent().and_then(repository_around) {
+        let real = real.to_string_lossy();
+        return Err(format!(
+            "{} leads to {}, inside the git repository at {}; move the release key out of it, check that git never took it in, and sign again",
+            path.display(),
+            real.strip_prefix(r"\\?\").unwrap_or(&real),
             repository.display()
         ));
     }
@@ -630,6 +642,47 @@ mod tests {
             .unwrap();
         assert!(err.contains("inside the git repository"), "{err}");
         assert_eq!(input.position(), 0);
+    }
+
+    // A file symlink takes elevation or Developer Mode, a junction neither, and
+    // as the last part of the path it leads out of the folder just the same.
+    #[test]
+    fn refuses_junction_into_repository() {
+        let outside = Folder::new("junction-outside");
+        let repository = Folder::new("junction-repo");
+        fs::create_dir_all(repository.0.join(".git")).unwrap();
+        fs::create_dir_all(repository.0.join("keys")).unwrap();
+        let junction = outside.0.join("booth.key");
+        let made = Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .args([&junction, &repository.0.join("keys")])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        let err = open_secret_key(&junction, Password::Console).err().unwrap();
+        assert!(err.contains("inside the git repository"), "{err}");
+        assert!(err.contains(" leads to "), "{err}");
+        assert!(!err.contains(r"\\?\"), "{err}");
+    }
+
+    #[test]
+    fn refuses_file_symlink_into_repository() {
+        let outside = Folder::new("symlink-outside");
+        let repository = Folder::new("symlink-repo");
+        fs::create_dir_all(repository.0.join(".git")).unwrap();
+        let (key, _) = throwaway_key(&repository);
+        let link = outside.0.join("booth.key");
+        if let Err(err) = std::os::windows::fs::symlink_file(&key, &link) {
+            const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+            assert_eq!(err.raw_os_error(), Some(ERROR_PRIVILEGE_NOT_HELD), "{err}");
+            println!("skipped: a file symlink takes elevation or Developer Mode");
+            return;
+        }
+        let err = open_secret_key(&link, Password::Console).err().unwrap();
+        assert!(err.contains("inside the git repository"), "{err}");
+        assert!(err.contains(" leads to "), "{err}");
+        assert!(!err.contains(r"\\?\"), "{err}");
     }
 
     #[test]
