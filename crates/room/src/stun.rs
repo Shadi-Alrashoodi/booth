@@ -55,8 +55,11 @@ pub(crate) struct Stun {
     confirmed_v4: Option<Instant>,
     confirmed_v6: Option<Instant>,
     // An address check goes on until then, or until every family this PC
-    // had an outside address in answers again.
+    // had an outside address in answers again and a move's router is told.
     check_until: Option<Instant>,
+    // A round showed an IPv4 move, and no round since has told what kind of
+    // router this PC is behind now.
+    mapping_untold: bool,
     log: Log,
 }
 
@@ -146,6 +149,7 @@ impl Stun {
             confirmed_v4: None,
             confirmed_v6: None,
             check_until: None,
+            mapping_untold: false,
             log,
         }
     }
@@ -210,6 +214,7 @@ impl Stun {
             .iter()
             .any(|(asked, seen)| *asked == server && same_place(*seen, mapped));
         let moved = self.compare_with_previous(server, mapped, now);
+        self.mapping_untold |= moved.is_some_and(|moved| moved.to.is_ipv4());
         match mapped {
             _ if repeat => {}
             SocketAddr::V4(v4) => {
@@ -232,11 +237,16 @@ impl Stun {
                 self.end_round(now);
             }
         }
+        // Later than stun_wait: that round is over, whoever else stays silent,
+        // and a client has no keepalive round to tell it later.
+        if self.phase == Phase::Settled && self.round_ends.is_none() {
+            self.decide_mapping();
+        }
         // Later than stun_wait, but before the check asked again: still the
         // answer it was asking for, so the retry and the check go.
         if self.round_ends.is_none()
             && self.check_until.is_some()
-            && self.every_family_back()
+            && self.check_answered()
             && self.end_check()
         {
             log!(
@@ -273,11 +283,12 @@ impl Stun {
     }
 
     // The address may have changed: query every server now, and again every
-    // stun_retry while a family stays silent, for up to CHECK_FOR. While a
-    // round is in flight nothing more is sent, but its queries left before
-    // the change and may come back with the old address, so their responses
-    // do not end the check and the round is retried after stun_retry anyway.
-    // Returns true when a round went out.
+    // stun_retry while a family stays silent, or after a move until a round
+    // tells the router, for up to CHECK_FOR. While a round is in flight
+    // nothing more is sent, but its queries left before the change and may
+    // come back with the old address, so their responses do not end the check
+    // and the round is retried after stun_retry anyway. Returns true when a
+    // round went out.
     pub(crate) fn check(&mut self, now: Instant, socket: &Socket) -> bool {
         if self.phase != Phase::Settled || self.servers.is_empty() {
             return false;
@@ -436,14 +447,57 @@ impl Stun {
         Some(now + every)
     }
 
+    // After a move the router can be another kind than the last round's. This
+    // waits for the round to end, because a load-balanced carrier NAT can show
+    // two servers one address and the third another. A round that cannot tell
+    // leaves the word as it was. So does a round cut short that says easy
+    // with nothing moved: those two agreeing again does not undo the third.
+    fn decide_mapping(&mut self) {
+        let mapping = stun::classify(&self.answers, Family::Ipv4);
+        if mapping == Mapping::Unknown {
+            return;
+        }
+        let silent = self.requests.iter().any(|(_, server)| server.is_ipv4());
+        if mapping == Mapping::Easy
+            && self.mapping == Mapping::Hard
+            && silent
+            && !self.mapping_untold
+        {
+            return;
+        }
+        self.mapping_untold = false;
+        if mapping != self.mapping {
+            log!(
+                self.log,
+                "stun: this pc's mapping was {} and is {} now",
+                crate::log::mapping_word(invite_mapping(self.mapping)),
+                crate::log::mapping_word(invite_mapping(mapping))
+            );
+            self.mapping = mapping;
+        }
+        // Easy means the answers agree. Answers that repeat the last round
+        // leave the address kept alone, and that can be what a server silent
+        // this round saw, good only for that server.
+        if mapping == Mapping::Easy
+            && let Some(agreed) = self.answers.iter().find_map(|(server, seen)| match seen {
+                SocketAddr::V4(seen) if server.is_ipv4() => Some(*seen),
+                _ => None,
+            })
+        {
+            self.public_v4 = Some(agreed);
+            self.public = Some(SocketAddr::V4(agreed));
+        }
+    }
+
     fn end_round(&mut self, now: Instant) {
         self.round_ends = None;
+        self.decide_mapping();
         if self.log.is_on() {
             let mapping = stun::classify(&self.answers, Family::Ipv4);
             self.note_round("stun round", mapping);
         }
         if self.check_until.is_some() {
-            if self.every_family_back() {
+            if self.check_answered() {
                 self.check_until = None;
             } else {
                 self.retry_check(now);
@@ -480,7 +534,22 @@ impl Stun {
         after_change && !self.answers.is_empty() && waiting == [false; 2]
     }
 
-    // A round of an address check ended with a family still silent.
+    // After a move the word is the old router's until a round can tell. On a
+    // client nothing else asks again, so the check goes on for that too, if
+    // the servers on the list can tell at all: easy takes two server IPs.
+    fn check_answered(&self) -> bool {
+        let mut ips = self
+            .servers
+            .iter()
+            .filter(|server| server.is_ipv4())
+            .map(SocketAddr::ip);
+        let first = ips.next();
+        let can_tell = ips.any(|ip| Some(ip) != first);
+        self.every_family_back() && !(self.mapping_untold && can_tell)
+    }
+
+    // A round of an address check ended with a family still silent, or with
+    // too few answers to tell the router after a move.
     fn retry_check(&mut self, now: Instant) {
         let Some(until) = self.check_until else {
             return;
@@ -491,6 +560,8 @@ impl Stun {
             .max(now);
         let silent = if self.answers.is_empty() {
             "no server answered"
+        } else if self.every_family_back() {
+            "too few servers answered to tell the kind of router after the move"
         } else {
             "some servers answered, but not in every family this pc had an outside address in"
         };
@@ -559,7 +630,11 @@ impl Stun {
             }
         };
         let last = last.filter(|_| self.phase == Phase::Settled)?;
-        let ports_count = now.is_ipv6() || self.mapping != Mapping::Hard;
+        // The word may still be the old router's, while this round's answers
+        // already disagree.
+        let hard = self.mapping == Mapping::Hard
+            || stun::classify(&self.answers, Family::Ipv4) == Mapping::Hard;
+        let ports_count = now.is_ipv6() || !hard;
         let other_address = last.ip() != now.ip();
         let other_port = ports_count && last.port() != now.port();
         let moved = match history {
@@ -1008,6 +1083,281 @@ mod tests {
         let other = SocketAddrV6::new(*seen.ip(), server.port(), 0x12345, 7);
         let stranger = stun.on_answer(&answer, SocketAddr::V6(other), now);
         assert!(matches!(stranger, Answer::NotOurs(NotOurs::Stranger)));
+    }
+
+    // Three far sides on addresses of their own, so agreement can say easy.
+    fn three_wires() -> [Wire; 3] {
+        [
+            Wire::new(),
+            Wire::at(Ipv4Addr::new(127, 0, 0, 3)),
+            Wire::at(Ipv4Addr::new(127, 0, 0, 4)),
+        ]
+    }
+
+    // A move to another kind of router in one room. The round that shows the
+    // move says what the new router is, the second server's other port is no
+    // second move, and a round that cannot tell leaves the word.
+    #[test]
+    fn a_later_round_decides_the_mapping_again() {
+        let socket = Socket::bind(0, Log::off()).expect("bind");
+        let [one, two, _] = three_wires();
+        let start = Instant::now();
+        let wait = Duration::from_millis(100);
+        let mut stun = Stun::new(None, wait, RETRY, start, Log::off());
+        stun.found(vec![one.addr(), two.addr()], &socket);
+        assert!(!stun.resolved(start));
+        answer_with(&mut stun, one.addr(), outside(52000), start);
+        answer_with(&mut stun, two.addr(), outside(52000), start);
+        assert_eq!(stun.router(), RouterState::Easy);
+
+        // A hotspot with hard mapping.
+        let hotspot = |port| SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 4), port);
+        assert!(stun.check(start, &socket));
+        let first = answer_with(&mut stun, one.addr(), hotspot(52100), start);
+        assert!(matches!(first, Answer::Moved(_)));
+        let second = answer_with(&mut stun, two.addr(), hotspot(52107), start);
+        assert!(matches!(second, Answer::Recorded), "one move, not two");
+        assert_eq!(stun.router(), RouterState::Hard);
+        assert_eq!(stun.mapping_word(), Some(MappingWord::Hard));
+        assert_eq!(stun.invite_mapping(), invite::Mapping::Hard);
+        assert_eq!(stun.public_for_invite(BOUND), [hotspot(BOUND)]);
+
+        // One server lost: nothing here says the router changed again.
+        let later = start + Duration::from_secs(10);
+        assert!(stun.check(later, &socket));
+        answer_with(&mut stun, one.addr(), hotspot(52100), later);
+        stun.tick(later + wait, &socket);
+        assert_eq!(stun.router(), RouterState::Hard);
+
+        // Home, with an easy router.
+        let home = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 44), 52200);
+        let back = later + Duration::from_secs(10);
+        assert!(stun.check(back, &socket));
+        answer_with(&mut stun, one.addr(), home, back);
+        assert_eq!(stun.router(), RouterState::Hard, "one answer cannot tell");
+        answer_with(&mut stun, two.addr(), home, back);
+        assert_eq!(stun.router(), RouterState::Easy);
+        assert_eq!(
+            stun.public_for_invite(BOUND),
+            [home, SocketAddrV4::new(*home.ip(), BOUND)]
+        );
+    }
+
+    // The word goes by the whole round. Two of three servers agreeing proves
+    // nothing while the third has not answered, at stun_wait or after it.
+    #[test]
+    fn the_mapping_is_decided_when_the_round_ends() {
+        let socket = Socket::bind(0, Log::off()).expect("bind");
+        let [one, two, three] = three_wires();
+        let start = Instant::now();
+        let wait = Duration::from_millis(100);
+        let mut stun = Stun::new(None, wait, RETRY, start, Log::off());
+        stun.found(vec![one.addr(), two.addr(), three.addr()], &socket);
+        assert!(!stun.resolved(start));
+        answer_with(&mut stun, one.addr(), outside(52000), start);
+        answer_with(&mut stun, two.addr(), outside(52000), start);
+        answer_with(&mut stun, three.addr(), outside(52007), start);
+        assert_eq!(stun.mapping, Mapping::Hard);
+
+        assert!(stun.check(start, &socket));
+        answer_with(&mut stun, one.addr(), outside(52000), start);
+        answer_with(&mut stun, two.addr(), outside(52000), start);
+        assert_eq!(stun.mapping, Mapping::Hard, "the third has not answered");
+        stun.tick(start + wait, &socket);
+        assert_eq!(stun.mapping, Mapping::Hard, "nothing moved");
+        assert_eq!(stun.public_for_invite(BOUND), [outside(BOUND)]);
+        // It answers late, and now every server agrees.
+        answer_with(&mut stun, three.addr(), outside(52000), start + wait);
+        assert_eq!(stun.mapping, Mapping::Easy);
+        assert_eq!(
+            stun.public_for_invite(BOUND),
+            [outside(52000), outside(BOUND)]
+        );
+    }
+
+    // After a move the old word proves nothing, so what stun_wait left of a
+    // round can say easy. What the two agree on is the address, not what the
+    // third server saw last, though their answers repeat the last they saw.
+    #[test]
+    fn a_move_lets_a_round_cut_short_say_easy() {
+        let socket = Socket::bind(0, Log::off()).expect("bind");
+        let [one, two, three] = three_wires();
+        let start = Instant::now();
+        let wait = Duration::from_millis(100);
+        let mut stun = Stun::new(None, wait, RETRY, start, Log::off());
+        stun.found(vec![one.addr(), two.addr(), three.addr()], &socket);
+        assert!(!stun.resolved(start));
+        answer_with(&mut stun, one.addr(), outside(52000), start);
+        answer_with(&mut stun, two.addr(), outside(52000), start);
+        answer_with(&mut stun, three.addr(), outside(52007), start);
+        assert_eq!(stun.mapping, Mapping::Hard);
+
+        let other = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 4), 52100);
+        let noticed = start + Duration::from_secs(10);
+        assert!(stun.check(noticed, &socket));
+        assert!(moved(answer_with(&mut stun, three.addr(), other, noticed)).is_some());
+        stun.tick(noticed + wait, &socket);
+        assert_eq!(stun.mapping, Mapping::Hard, "one answer cannot tell");
+
+        let retried = noticed + RETRY;
+        stun.tick(retried, &socket);
+        answer_with(&mut stun, one.addr(), outside(52000), retried);
+        answer_with(&mut stun, two.addr(), outside(52000), retried);
+        stun.tick(retried + wait, &socket);
+        assert_eq!(stun.mapping, Mapping::Easy);
+        assert_eq!(stun.public(), Some(SocketAddr::V4(outside(52000))));
+        assert_eq!(
+            stun.public_for_invite(BOUND),
+            [outside(52000), outside(BOUND)]
+        );
+        assert_eq!(stun.next_deadline(), None, "the check is over");
+    }
+
+    // A silent IPv6 server has no say in the IPv4 mapping.
+    #[test]
+    fn a_silent_ipv6_server_leaves_the_round_whole() {
+        let socket = Socket::bind(0, Log::off()).expect("bind");
+        let [one, two, three] = three_wires();
+        let start = Instant::now();
+        let wait = Duration::from_millis(100);
+        let mut stun = Stun::new(None, wait, RETRY, start, Log::off());
+        stun.found(vec![one.addr(), two.addr(), three.addr()], &socket);
+        assert!(!stun.resolved(start));
+        answer_with(&mut stun, one.addr(), outside(52000), start);
+        answer_with(&mut stun, two.addr(), outside(52000), start);
+        answer_with(&mut stun, three.addr(), outside(52007), start);
+        assert_eq!(stun.mapping, Mapping::Hard);
+
+        assert!(stun.check(start, &socket));
+        let silent: SocketAddr = "[2001:db8::1]:3478".parse().unwrap();
+        stun.requests.push(([9; 12], silent));
+        answer_with(&mut stun, one.addr(), outside(52000), start);
+        answer_with(&mut stun, two.addr(), outside(52000), start);
+        answer_with(&mut stun, three.addr(), outside(52000), start);
+        stun.tick(start + wait, &socket);
+        assert_eq!(stun.mapping, Mapping::Easy);
+    }
+
+    // A move in IPv6 says nothing of the IPv4 router, so it does not keep the
+    // check going for a lost IPv4 answer.
+    #[test]
+    fn an_ipv6_move_does_not_hold_the_check() {
+        let socket = Socket::bind(0, Log::off()).expect("bind");
+        let [one, two, three] = three_wires();
+        let start = Instant::now();
+        let wait = Duration::from_millis(100);
+        let mut stun = Stun::new(None, wait, RETRY, start, Log::off());
+        stun.found(vec![one.addr(), two.addr(), three.addr()], &socket);
+        assert!(!stun.resolved(start));
+        let outside_v6: SocketAddr = "[2001:db8::7]:52000".parse().unwrap();
+        answer_with(&mut stun, one.addr(), outside(52000), start);
+        answer_with(&mut stun, two.addr(), outside(52000), start);
+        answer_seeing(&mut stun, three.addr(), outside_v6, start);
+        assert_eq!(stun.router(), RouterState::Easy);
+
+        let noticed = start + Duration::from_secs(10);
+        assert!(stun.check(noticed, &socket));
+        let new_v6: SocketAddr = "[2001:db8::8]:52000".parse().unwrap();
+        assert!(moved(answer_seeing(&mut stun, three.addr(), new_v6, noticed)).is_some());
+        answer_with(&mut stun, two.addr(), outside(52000), noticed);
+        stun.tick(noticed + wait, &socket);
+        assert_eq!(stun.next_deadline(), None, "the check is over");
+    }
+
+    // The last answer of a round comes after stun_wait, even the first
+    // round's, and a client has no keepalive round to tell it later.
+    #[test]
+    fn a_late_last_answer_decides_the_mapping() {
+        let socket = Socket::bind(0, Log::off()).expect("bind");
+        let [one, two, _] = three_wires();
+        let start = Instant::now();
+        let wait = Duration::from_millis(100);
+        let mut stun = Stun::new(None, wait, RETRY, start, Log::off());
+        stun.found(vec![one.addr(), two.addr()], &socket);
+        assert!(!stun.resolved(start));
+        answer_with(&mut stun, one.addr(), outside(52000), start);
+        assert!(stun.tick(start + wait, &socket));
+        assert_eq!(stun.mapping, Mapping::Unknown);
+        answer_with(&mut stun, two.addr(), outside(52007), start + wait);
+        assert_eq!(stun.mapping, Mapping::Hard);
+    }
+
+    // A server that never answers does not keep a late one from counting.
+    #[test]
+    fn a_late_answer_decides_the_mapping_with_a_server_still_silent() {
+        let socket = Socket::bind(0, Log::off()).expect("bind");
+        let [one, two, three] = three_wires();
+        let start = Instant::now();
+        let wait = Duration::from_millis(100);
+        let mut stun = Stun::new(None, wait, RETRY, start, Log::off());
+        stun.found(vec![one.addr(), two.addr(), three.addr()], &socket);
+        assert!(!stun.resolved(start));
+        answer_with(&mut stun, one.addr(), outside(52000), start);
+        assert!(stun.tick(start + wait, &socket));
+        assert_eq!(stun.mapping, Mapping::Unknown);
+        answer_with(&mut stun, two.addr(), outside(52007), start + wait);
+        assert_eq!(stun.mapping, Mapping::Hard);
+    }
+
+    // One answer of the round that shows the move is lost, so the word is
+    // still the old router's, and a client has nothing else that asks again.
+    #[test]
+    fn a_move_asks_again_until_a_round_tells_the_router() {
+        let socket = Socket::bind(0, Log::off()).expect("bind");
+        let [one, two, _] = three_wires();
+        let start = Instant::now();
+        let wait = Duration::from_millis(100);
+        let mut stun = Stun::new(None, wait, RETRY, start, Log::off());
+        stun.found(vec![one.addr(), two.addr()], &socket);
+        assert!(!stun.resolved(start));
+        answer_with(&mut stun, one.addr(), outside(52000), start);
+        answer_with(&mut stun, two.addr(), outside(52007), start);
+        assert_eq!(stun.router(), RouterState::Hard);
+
+        let home = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 44), 52200);
+        let noticed = start + Duration::from_secs(10);
+        assert!(stun.check(noticed, &socket));
+        assert!(moved(answer_with(&mut stun, one.addr(), home, noticed)).is_some());
+        stun.tick(noticed + wait, &socket);
+        assert_eq!(stun.router(), RouterState::Hard);
+        assert_eq!(stun.next_deadline(), Some(noticed + RETRY), "no retry");
+
+        let retried = noticed + RETRY;
+        stun.tick(retried, &socket);
+        answer_with(&mut stun, one.addr(), home, retried);
+        assert_eq!(
+            stun.next_deadline(),
+            Some(retried + wait),
+            "one cannot tell"
+        );
+        answer_with(&mut stun, two.addr(), home, retried);
+        assert_eq!(stun.router(), RouterState::Easy);
+        assert_eq!(stun.next_deadline(), None, "the check is over");
+    }
+
+    // Every family is back by a late answer, but it says nothing of the router.
+    #[test]
+    fn a_late_answer_that_cannot_tell_the_router_leaves_the_retry() {
+        let socket = Socket::bind(0, Log::off()).expect("bind");
+        let [one, two, three] = three_wires();
+        let start = Instant::now();
+        let wait = Duration::from_millis(100);
+        let mut stun = Stun::new(None, wait, RETRY, start, Log::off());
+        stun.found(vec![one.addr(), two.addr(), three.addr()], &socket);
+        assert!(!stun.resolved(start));
+        let outside_v6: SocketAddr = "[2001:db8::7]:52000".parse().unwrap();
+        answer_with(&mut stun, one.addr(), outside(52000), start);
+        answer_with(&mut stun, two.addr(), outside(52000), start);
+        answer_seeing(&mut stun, three.addr(), outside_v6, start);
+        assert_eq!(stun.router(), RouterState::Easy);
+
+        let home = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 44), 52200);
+        let noticed = start + Duration::from_secs(10);
+        assert!(stun.check(noticed, &socket));
+        assert!(moved(answer_with(&mut stun, one.addr(), home, noticed)).is_some());
+        stun.tick(noticed + wait, &socket);
+        answer_seeing(&mut stun, three.addr(), outside_v6, noticed + wait);
+        assert_eq!(stun.next_deadline(), Some(noticed + RETRY));
     }
 
     fn rounds(captured: &crate::log::Captured) -> Vec<String> {

@@ -1052,10 +1052,13 @@ impl Host {
             return false;
         }
         let mut changed = false;
+        let word = self.stun.mapping_word();
         if self.stun.tick(now, socket) {
             self.stun_settled(now);
             changed = true;
         }
+        // A round that ended at stun_wait: the panel shows the word.
+        changed |= self.stun.mapping_word() != word;
         changed |= self.first_invite(now);
         self.note_load(now);
         if let Some(count) = self.cookies.capped_over(now) {
@@ -5853,6 +5856,42 @@ mod tests {
                 )
         });
         assert!(pinged, "no ping from the new address");
+    }
+
+    // A round that one server left unanswered ends at stun_wait and shows
+    // this router is hard, and the panel hears of it then.
+    #[test]
+    fn a_round_ending_at_stun_wait_shows_the_new_word() {
+        let start = Instant::now();
+        let (mut host, socket) = Rig::host(start, Log::off(), false);
+        let servers = [
+            Wire::new(),
+            Wire::at(Ipv4Addr::new(127, 0, 0, 3)),
+            Wire::at(Ipv4Addr::new(127, 0, 0, 4)),
+        ];
+        host.stun_found(servers.iter().map(Wire::addr).collect(), &socket);
+        assert!(!host.stun_resolved(start));
+        for server in &servers {
+            answer_stun(&mut host, &socket, server, OUTSIDE, start);
+        }
+
+        let noticed = start + Duration::from_secs(1);
+        host.address_changed(noticed, &socket, None);
+        let other_port = SocketAddrV4::new(*OUTSIDE.ip(), OUTSIDE.port() + 7);
+        answer_stun(&mut host, &socket, &servers[0], OUTSIDE, noticed);
+        answer_stun(&mut host, &socket, &servers[1], other_port, noticed);
+        assert_eq!(
+            host.view(noticed, 0).numbers.mapping,
+            Some(MappingWord::Easy)
+        );
+
+        let ended = noticed + host.timers.stun_wait;
+        assert!(!host.on_timer(ended - Duration::from_millis(1), &socket));
+        assert!(
+            host.on_timer(ended, &socket),
+            "the panel keeps the old word"
+        );
+        assert_eq!(host.view(ended, 0).numbers.mapping, Some(MappingWord::Hard));
     }
 
     // The paste field's line for 2 minutes while friends are reconnecting
