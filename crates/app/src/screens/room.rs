@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::emath::GuiRounding;
 use eframe::egui::{
     Align, Color32, Context, CursorIcon, InputState, Key, Layout, Modifiers, Rect, Response,
-    ScrollArea, Sense, Stroke, Ui, Vec2, WidgetInfo, WidgetType, vec2,
+    ScrollArea, Sense, Stroke, Ui, UiBuilder, Vec2, WidgetInfo, WidgetType, vec2,
 };
 use invite::ReplyCode;
 use room::view::{
@@ -1726,34 +1726,40 @@ fn voice_buttons(
     let mut pressed = None;
     let layout = Layout::left_to_right(Align::Center);
     ui.allocate_ui_with_layout(size, layout, |ui| {
-        for (i, (text, color)) in buttons.iter().enumerate() {
-            let button = Button::new(text).color(*color);
-            if hold && i == 0 {
-                // egui counts a press on a button that senses only clicks
-                // until it can no longer be a click: 0.8 s, or 6 points of
-                // movement. One that senses drags too is down until the
-                // mouse is let go, the pointer leaves the window or Esc is
-                // pressed, which takes effect once that limit has passed.
-                // A release egui never hears is your_row's to catch.
-                let response = button
-                    .min_width(hold_width)
-                    .show(ui)
-                    .interact(Sense::drag());
-                held = response.is_pointer_button_down_on();
-                continue;
+        // An id of their own: a friend's row coming or going above moves every
+        // automatic id after it, and egui drops a press on a button whose id
+        // changed.
+        let own_id = UiBuilder::new().id(ui.id().with("voice buttons"));
+        ui.scope_builder(own_id, |ui| {
+            for (i, (text, color)) in buttons.iter().enumerate() {
+                let button = Button::new(text).color(*color);
+                if hold && i == 0 {
+                    // egui counts a press on a button that senses only clicks
+                    // until it can no longer be a click: 0.8 s, or 6 points of
+                    // movement. One that senses drags too is down until the
+                    // mouse is let go, the pointer leaves the window or Esc is
+                    // pressed, which takes effect once that limit has passed.
+                    // A release egui never hears is your_row's to catch.
+                    let response = button
+                        .min_width(hold_width)
+                        .show(ui)
+                        .interact(Sense::drag());
+                    held = response.is_pointer_button_down_on();
+                    continue;
+                }
+                let mute = i == usize::from(hold);
+                // A toggle that is on keeps the control fill, so a muted
+                // microphone shows without reading the word.
+                let on = if mute { voice.muted } else { voice.deafened };
+                if button.on(on).enabled(!ended).show(ui).clicked() && !ended {
+                    pressed = Some(if mute {
+                        VoicePress::Mute
+                    } else {
+                        VoicePress::Deafen
+                    });
+                }
             }
-            let mute = i == usize::from(hold);
-            // A toggle that is on keeps the control fill, so a muted
-            // microphone shows without reading the word.
-            let on = if mute { voice.muted } else { voice.deafened };
-            if button.on(on).enabled(!ended).show(ui).clicked() && !ended {
-                pressed = Some(if mute {
-                    VoicePress::Mute
-                } else {
-                    VoicePress::Deafen
-                });
-            }
-        }
+        });
     });
     (held, pressed)
 }
@@ -3269,6 +3275,37 @@ mod tests {
         assert!(shown && !hold.held, "a click somewhere else");
         let (shown, _) = hold_row_frame(&ctx, &mut hold, live, false, Vec::new());
         assert!(!shown, "and gone");
+    }
+
+    // A friend joining moves every automatic id after their row. A long press
+    // on Hold to talk goes on all the same, and a click on Mute lands.
+    #[test]
+    fn a_row_coming_or_going_above_lets_no_press_go() {
+        use crate::controls::tests::{frame, press, release};
+        let push = voice(TalkMode::PushToTalk);
+        let ctx = accessible_panel();
+        let draw = |rows, events| {
+            frame(&ctx, events, |ui| {
+                for _ in 0..rows {
+                    ui.allocate_exact_size(Vec2::ZERO, Sense::hover());
+                }
+                let buttons = your_buttons(&push, false, true);
+                let size = vec2(360.0, CONTROL_HEIGHT);
+                voice_buttons(ui, &buttons, true, 100.0, size, &push, false)
+            })
+        };
+        let (_, output) = draw(0, Vec::new());
+        let hold_at = middle_of(&output, HOLD);
+        let mute_at = middle_of(&output, "Mute");
+
+        assert!(draw(0, press(hold_at)).0.0);
+        assert!(draw(1, Vec::new()).0.0, "a row came");
+        assert!(draw(0, Vec::new()).0.0, "and went");
+        assert!(!draw(0, release(hold_at)).0.0);
+
+        draw(0, press(mute_at));
+        draw(1, Vec::new());
+        assert_eq!(draw(1, release(mute_at)).0.1, Some(VoicePress::Mute));
     }
 
     #[test]
