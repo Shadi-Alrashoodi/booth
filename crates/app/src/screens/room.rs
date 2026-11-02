@@ -95,6 +95,9 @@ struct Hold {
     held: bool,
     drawn: bool,
     drawn_before: bool,
+    // The press egui still counts as down is over all the same, let go where
+    // egui could not hear it. Only a new press holds after it.
+    press_over: bool,
 }
 
 impl Hold {
@@ -114,7 +117,8 @@ impl Hold {
     // The button was drawn, down or not. What to tell the room, if anything.
     fn drawn(&mut self, down: bool) -> Option<bool> {
         self.drawn = true;
-        self.set(down)
+        self.press_over &= down;
+        self.set(down && !self.press_over)
     }
 
     fn frame_ends(&mut self) -> Option<bool> {
@@ -185,9 +189,15 @@ impl InRoom {
     // From the app's logic while the panel is minimized: it comes back with
     // Resume and Share PC sound waiting as if their block had just appeared,
     // so a click meant for a game as the panel comes forward neither resumes
-    // a pause nor turns PC sound on.
+    // a pause nor turns PC sound on. No frame runs to let go of Hold to talk
+    // either, and the mouse may be let go unseen, so only a new press holds
+    // when the panel is back.
     pub fn out_of_sight(&mut self) {
         self.block_wait.out_of_sight();
+        self.hold.press_over = true;
+        if let Some(held) = self.hold.set(false) {
+            self.target.button(held);
+        }
     }
 
     // The volume files' log lines since the last frame, with the paths their
@@ -2888,6 +2898,95 @@ mod tests {
         hold.frame_begins();
         assert_eq!(hold.frame_ends(), Some(false));
         assert_eq!(frame(&mut hold, live, true, true), (false, None));
+    }
+
+    // Minimized, the panel runs logic and no frames, so nothing but
+    // out_of_sight can stop the voice the button started.
+    #[test]
+    fn minimizing_lets_go_of_hold_to_talk() {
+        use room::{Candidates, Config, Devices, Lookup, Show, Timers, VideoConfig, VideoSource};
+        use voice::audio::fake::{Fake, Setup};
+        let setup = Setup {
+            period_frames: 480,
+            buffer_frames: 960,
+            ..Setup::default()
+        };
+        let fake = |id, name| Fake::new(setup, &[(id, name)], Some(id));
+        let data_dir = std::env::temp_dir().join(format!("booth-app-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let config = Config {
+            data_dir: data_dir.clone(),
+            port: 0,
+            name: String::from("Ana"),
+            stun_servers: Vec::new(),
+            candidates: Candidates::Fixed(Vec::new()),
+            punch_loopback: true,
+            timers: Timers::default(),
+            log: None,
+            address_name: None,
+            lookup: Lookup::default(),
+            watch_addresses: false,
+            voice: room::VoiceConfig {
+                devices: Devices::Fake {
+                    microphone: fake("mic", "Test microphone"),
+                    speakers: fake("out", "Test speakers"),
+                    pc_sound: fake("pc", "Test PC sound"),
+                },
+                automatic_volume: false,
+                ..room::VoiceConfig::default()
+            },
+            video_upload_kbps: room::DEFAULT_VIDEO_UPLOAD_KBPS,
+            video: VideoConfig {
+                source: VideoSource::Hooks,
+                show: Show::NoActivate,
+                ..VideoConfig::default()
+            },
+            version: invite::VERSION,
+        };
+        let identity = Arc::new(keys::Identity::generate());
+        let room = Room::host(config, identity, String::new(), Arc::new(|| {})).expect("a room");
+        let room = Arc::new(room);
+        let target = Target::default();
+        target.enter(Arc::clone(&room));
+        let mut in_room = InRoom::new(
+            Arc::clone(&room),
+            String::new(),
+            None,
+            "",
+            Default::default(),
+            target.clone(),
+            PanicKey {
+                words: String::new(),
+                flags: Default::default(),
+            },
+            Default::default(),
+        );
+        let sending_goes = |sending: bool| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while room.view().voice.sending != sending {
+                assert!(Instant::now() < deadline, "sending never went {sending}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        assert_eq!(in_room.hold.drawn(true), Some(true));
+        target.button(true);
+        sending_goes(true);
+        in_room.out_of_sight();
+        assert!(!in_room.hold.held);
+        sending_goes(false);
+        // Back with egui still counting the press, which may have been let
+        // go unseen, as frames of the row run it. Only a new press holds.
+        assert_eq!(in_room.hold.drawn(true), None);
+        assert!(!in_room.hold.held);
+        assert_eq!(in_room.hold.drawn(false), None);
+        assert_eq!(in_room.hold.drawn(true), Some(true));
+
+        drop(in_room);
+        target.leave();
+        hotkeys::leave(room);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[test]
