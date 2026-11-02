@@ -3295,11 +3295,6 @@ impl Host {
 
     fn keep_left(&mut self, sessions: &Sessions, now: Instant) {
         self.just_left.retain(|(_, until)| now < *until);
-        // Only a full handshake per entry can add one, so this stays small;
-        // the cap is for a program that joins and leaves in a loop.
-        if self.just_left.len() >= JUST_LEFT_KEPT {
-            self.just_left.remove(0);
-        }
         for session in [&sessions.current, &sessions.previous]
             .into_iter()
             .flatten()
@@ -3307,6 +3302,10 @@ impl Host {
             self.just_left
                 .push((session.local_index(), now + LEFT_GRACE));
         }
+        // Only a full handshake per entry can add one, so this stays small;
+        // the cap is for a program that joins and leaves in a loop.
+        let over = self.just_left.len().saturating_sub(JUST_LEFT_KEPT);
+        self.just_left.drain(..over);
     }
 
     fn left_just_now(&self, index: u32, now: Instant) -> bool {
@@ -4621,6 +4620,43 @@ mod tests {
                 .any(|line| line.ends_with("data for an unknown session, dropped")),
             "{lines:?}"
         );
+    }
+
+    // A friend who rekeyed leaves two sessions behind, and the list stays at
+    // its cap with both of them in it.
+    #[test]
+    fn just_left_stays_at_its_cap_when_a_leaver_rekeyed() {
+        let start = Instant::now();
+        let mut rig = Rig::new(start);
+        let mut ana = Guest::new();
+        ana.join(&mut rig, "Ana", start);
+        let secret = rig.host.keys[ana.identity.public()]
+            .secret
+            .clone()
+            .expect("the host made Ana a secret");
+        let now = start + Duration::from_secs(1);
+        let from = ana.wire.addr();
+        let rekey = ana.initiate(&mut rig, InitKind::Rekey, &secret, from, now);
+        ana.session = Some(ana.answer(rekey, now).expect("the rekey is answered"));
+        let first = ping(ana.session.as_mut().expect("rekeyed"), 0);
+        rig.deliver(&first, from, now);
+        let sessions = &rig.host.peers[0].sessions;
+        let indexes: Vec<u32> = [&sessions.current, &sessions.previous]
+            .into_iter()
+            .flatten()
+            .map(|session| session.local_index())
+            .collect();
+        assert_eq!(indexes.len(), 2);
+
+        rig.host.just_left = (0..JUST_LEFT_KEPT as u32)
+            .map(|n| (n, now + LEFT_GRACE))
+            .collect();
+        ana.say(&mut rig, &Message::Bye, now);
+        assert!(rig.host.peers.is_empty());
+        assert_eq!(rig.host.just_left.len(), JUST_LEFT_KEPT);
+        for index in indexes {
+            assert!(rig.host.left_just_now(index, now));
+        }
     }
 
     fn texts(lines: &[Arc<ChatLine>]) -> Vec<(&str, &str, bool)> {
