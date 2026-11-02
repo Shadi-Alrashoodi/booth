@@ -116,8 +116,10 @@ int booth_too_large(int codec_id, int64_t width, int64_t height)
 }
 
 // What pick_d3d11 did during one decode call, through AVCodecContext.opaque:
-// chose d3d11va, or turned the stream down and why.
-const int booth_chose_d3d11 = 1;
+// why it turned the stream down, if it did, and this bit if it chose d3d11va.
+// The bit stays through a refusal, as a setup that ran costs the same whatever
+// a later slice brings.
+const int booth_chose_d3d11 = 8;
 const int booth_refused_too_large = 2;
 // Not 8-bit 4:2:0, the one format the viewer draws (NV12). FFmpeg has no
 // hardware path for any other H.264 anyway. HEVC Main 10 decodes on most
@@ -127,27 +129,39 @@ const int booth_refused_format = 3;
 // without it: the GPU's decoder did not take the size or profile, video
 // memory ran out, or the device was lost. FFmpeg keeps the reason to itself.
 const int booth_refused_setup = 4;
+// FFmpeg asked for d3d11va a second time in one access unit. Each time is a
+// new video decoder and surfaces, up to about 283 MB, and an encoder's unit
+// is one picture of one size. The one setup before it did run.
+const int booth_refused_second_setup = 5;
 
 // FFmpeg asks each time the stream's size or profile changes (HEVC: each
 // time a different SPS takes over), and offers the software formats only
 // once d3d11va has turned the stream down. Software decode would be slow
 // and hand back CPU memory the viewer cannot present, so the stream is
-// refused instead.
+// refused instead. A refusal holds for the rest of the access unit: FFmpeg's
+// H.264 decoder asks again for each slice after it.
 static enum AVPixelFormat pick_d3d11(AVCodecContext *codec, const enum AVPixelFormat *formats)
 {
     int *choice = codec->opaque;
+    if (*choice & ~booth_chose_d3d11) {
+        return AV_PIX_FMT_NONE;
+    }
     if (booth_too_large(codec->codec_id, codec->coded_width, codec->coded_height)) {
-        *choice = booth_refused_too_large;
+        *choice |= booth_refused_too_large;
         return AV_PIX_FMT_NONE;
     }
     // FFmpeg sets it before it asks. The J format is its older name for the
     // same samples in full range.
     if (codec->sw_pix_fmt != AV_PIX_FMT_YUV420P && codec->sw_pix_fmt != AV_PIX_FMT_YUVJ420P) {
-        *choice = booth_refused_format;
+        *choice |= booth_refused_format;
         return AV_PIX_FMT_NONE;
     }
     for (; *formats != AV_PIX_FMT_NONE; formats++) {
         if (*formats == AV_PIX_FMT_D3D11) {
+            if (*choice == booth_chose_d3d11) {
+                *choice |= booth_refused_second_setup;
+                return AV_PIX_FMT_NONE;
+            }
             *choice = booth_chose_d3d11;
             return AV_PIX_FMT_D3D11;
         }

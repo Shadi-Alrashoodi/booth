@@ -112,7 +112,8 @@ pub enum DecodeError {
         what: &'static str,
     },
     /// An access unit with the start of more than one picture in it, refused
-    /// before FFmpeg saw it (src/guard.rs).
+    /// before FFmpeg saw it (src/guard.rs), or a second new size or profile
+    /// for it, which the format callback refuses (fields.c).
     ManyPictures,
     /// The stream made the decoder hold frames back to reorder them. The
     /// decoder was reset, so nothing decodes until the next IDR.

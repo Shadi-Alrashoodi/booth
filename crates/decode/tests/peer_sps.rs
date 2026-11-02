@@ -270,6 +270,147 @@ fn reordering_refused() {
     s.whole(4);
 }
 
+// A PPS with nothing in it to change how its slices read.
+fn plain_pps(pps_id: u32, sps_id: u32) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.ue(pps_id);
+    w.ue(sps_id);
+    w.flag(false); // entropy_coding_mode
+    w.flag(false); // bottom_field_pic_order_in_frame_present
+    w.ue(0); // num_slice_groups_minus1
+    w.ue(0); // num_ref_idx_l0_default_active_minus1
+    w.ue(0); // num_ref_idx_l1_default_active_minus1
+    w.flag(false); // weighted_pred
+    w.bits(0, 2); // weighted_bipred_idc
+    w.ue(0); // pic_init_qp_minus26
+    w.ue(0); // pic_init_qs_minus26
+    w.ue(0); // chroma_qp_index_offset
+    w.flag(false); // deblocking_filter_control_present
+    w.flag(false); // constrained_intra_pred
+    w.flag(false); // redundant_pic_cnt_present
+    w.nal(0x68)
+}
+
+// An IDR slice whose first macroblock is past the end of any picture. FFmpeg
+// sets itself up for its PPS's SPS before it finds that, and then the next
+// slice is the first of its picture again.
+fn slice_past_the_end(pps_id: u32, sps: &Sps) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.ue(1 << 20);
+    w.ue(7); // slice_type: all I
+    w.ue(pps_id);
+    w.bits(0, sps.log2_max_frame_num);
+    w.ue(0); // idr_pic_id
+    if sps.pic_order_cnt_type == 0 {
+        w.bits(0, sps.log2_max_pic_order_cnt_lsb);
+    }
+    w.flag(false); // no_output_of_prior_pics
+    w.flag(false); // long_term_reference
+    w.ue(0); // slice_qp_delta
+    w.nal(0x65)
+}
+
+// Slices that took turns naming two SPSs of different sizes made FFmpeg make a
+// video decoder and its surfaces for each, about 283 MB at the largest size,
+// up to thousands of times in one call, with the setup counted once.
+#[test]
+fn second_size_in_one_unit() {
+    let Some(mut s) = setup() else { return };
+    s.whole(0);
+    let other = Sps {
+        sps_id: 1,
+        ..s.sps.clone()
+    };
+    let mut unit = [
+        sps_like(&s.sps, WIDTH, HEIGHT, 8, None),
+        plain_pps(0, 0),
+        sps_like(&other, 640, 368, 8, None),
+        plain_pps(1, 1),
+    ]
+    .concat();
+    for pps_id in [1, 0, 1, 0, 1] {
+        let sps = if pps_id == 0 { &s.sps } else { &other };
+        unit.extend_from_slice(&slice_past_the_end(pps_id, sps));
+    }
+    let setups = s.decoder.setups();
+    let err = s.decoder.decode(&unit).unwrap_err();
+    println!("{err}");
+    assert!(matches!(err, DecodeError::ManyPictures), "{err:?}");
+    assert_eq!(s.decoder.setups(), setups + 1, "the one that ran counts");
+    s.whole(3);
+    s.whole(4);
+}
+
+// FFmpeg's H.264 decoder asks for a format again at the next slice after a
+// refusal, and a size it could take would have set it all up after all and
+// taken the refusal's place.
+#[test]
+fn a_refusal_holds_for_the_unit() {
+    let Some(mut s) = setup() else { return };
+    s.whole(0);
+    let other = Sps {
+        sps_id: 1,
+        ..s.sps.clone()
+    };
+    let mut unit = [
+        sps_like(&s.sps, 8192, 4608, 8, None),
+        plain_pps(0, 0),
+        sps_like(&other, 640, 368, 8, None),
+        plain_pps(1, 1),
+    ]
+    .concat();
+    unit.extend_from_slice(&slice_past_the_end(0, &s.sps));
+    unit.extend_from_slice(&slice_past_the_end(1, &other));
+    let setups = s.decoder.setups();
+    let err = s.decoder.decode(&unit).unwrap_err();
+    println!("{err}");
+    assert!(matches!(err, DecodeError::Oversized { .. }), "{err:?}");
+    assert_eq!(s.decoder.setups(), setups, "nothing set up");
+    s.whole(3);
+    s.whole(4);
+}
+
+// A setup that ran is counted when a later slice of its unit is refused for
+// its size or format, or two refused units for each good one would make three
+// video decoders with one of them counted.
+fn refused_after_a_setup(s: &mut Setup, width: u32, height: u32, depth: u32) -> DecodeError {
+    s.whole(0);
+    let other = Sps {
+        sps_id: 1,
+        ..s.sps.clone()
+    };
+    let mut unit = [
+        sps_like(&s.sps, width, height, depth, None),
+        plain_pps(0, 0),
+        sps_like(&other, 640, 368, 8, None),
+        plain_pps(1, 1),
+    ]
+    .concat();
+    unit.extend_from_slice(&slice_past_the_end(1, &other));
+    unit.extend_from_slice(&slice_past_the_end(0, &s.sps));
+    let setups = s.decoder.setups();
+    let err = s.decoder.decode(&unit).unwrap_err();
+    println!("{err}");
+    assert_eq!(s.decoder.setups(), setups + 1, "the one that ran counts");
+    s.whole(3);
+    s.whole(4);
+    err
+}
+
+#[test]
+fn oversized_after_a_setup() {
+    let Some(mut s) = setup() else { return };
+    let err = refused_after_a_setup(&mut s, 8192, 4608, 8);
+    assert!(matches!(err, DecodeError::Oversized { .. }), "{err:?}");
+}
+
+#[test]
+fn ten_bit_after_a_setup() {
+    let Some(mut s) = setup() else { return };
+    let err = refused_after_a_setup(&mut s, WIDTH, HEIGHT, 10);
+    assert!(matches!(err, DecodeError::WrongFormat { .. }), "{err:?}");
+}
+
 #[test]
 fn ten_bit_refused_as_format() {
     // FFmpeg offers no GPU format for 10-bit H.264, so the refusal must not

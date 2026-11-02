@@ -54,6 +54,7 @@ unsafe extern "C" {
     pub(crate) safe static booth_refused_too_large: c_int;
     pub(crate) safe static booth_refused_format: c_int;
     pub(crate) safe static booth_refused_setup: c_int;
+    pub(crate) safe static booth_refused_second_setup: c_int;
 
     // Hands FFmpeg one reference to each of `d3d` (an ID3D11Device) and
     // `context` (its ID3D11DeviceContext), which it releases itself.
@@ -64,8 +65,8 @@ unsafe extern "C" {
         bind_flags: c_uint,
     );
     // Takes over the reference to `device`. `choice` must outlive the codec
-    // context: FFmpeg's format callback sets it to booth_chose_d3d11, or to
-    // booth_refused_* when it turns a stream down.
+    // context: FFmpeg's format callback sets the bit booth_chose_d3d11 in it,
+    // and booth_refused_* when it turns a stream down.
     pub(crate) fn booth_codec_setup(
         codec: *mut AVCodecContext,
         device: *mut AVBufferRef,

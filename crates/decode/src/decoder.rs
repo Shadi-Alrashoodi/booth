@@ -18,7 +18,7 @@ use crate::ffi::{
     booth_codec_forget_format, booth_codec_h264, booth_codec_hevc, booth_codec_reorder,
     booth_codec_setup, booth_codec_stream, booth_device_fill, booth_error_again, booth_error_bare,
     booth_frame_read, booth_hwdevice_d3d11va, booth_packet_set, booth_padding, booth_pix_fmt_d3d11,
-    booth_refused_format, booth_refused_setup, booth_refused_too_large,
+    booth_refused_format, booth_refused_second_setup, booth_refused_setup, booth_refused_too_large,
 };
 use crate::guard;
 use crate::library::{Library, library};
@@ -108,8 +108,8 @@ pub struct Decoder {
     packet: *mut AVPacket,
     received: *mut AVFrame,
     shown: *mut AVFrame,
-    // The format callback in fields.c sets it to booth_chose_d3d11, or to
-    // why it turned a stream down. Cleared before every access unit. Boxed
+    // The format callback in fields.c sets the bit booth_chose_d3d11 in it,
+    // and why it turned a stream down. Cleared before every access unit. Boxed
     // so its address stays put for as long as FFmpeg has it.
     choice: Box<Cell<c_int>>,
     // The access unit copied with FFmpeg's zero padding after it, reused.
@@ -528,11 +528,12 @@ impl Decoder {
     // it did. FFmpeg may carry on past a refused slice without an error of
     // its own, so this is asked after every access unit.
     fn refusal(&self) -> Option<DecodeError> {
-        let why = self.choice.replace(0);
-        if why == booth_chose_d3d11 {
+        let choice = self.choice.replace(0);
+        if choice & booth_chose_d3d11 != 0 {
             self.setups.set(self.setups.get() + 1);
         }
-        if why == 0 || why == booth_chose_d3d11 {
+        let why = choice & !booth_chose_d3d11;
+        if why == 0 {
             return None;
         }
         let (mut width, mut height, mut profile, mut level) = (0, 0, 0, 0);
@@ -551,6 +552,9 @@ impl Decoder {
         let (width, height) = (width.max(0) as u32, height.max(0) as u32);
         if why == booth_refused_too_large {
             return Some(DecodeError::Oversized { width, height });
+        }
+        if why == booth_refused_second_setup {
+            return Some(DecodeError::ManyPictures);
         }
         // SAFETY: a lookup in FFmpeg's static tables; null for a profile it
         // does not know.
