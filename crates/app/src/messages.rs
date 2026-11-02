@@ -581,6 +581,10 @@ pub fn key_gave_way(gave: &GaveWay) -> String {
     )
 }
 
+// On the start screen, since what the person chose is not in force, which can
+// be no STUN, or the name sent to a room, and the log may not exist.
+pub const SETTINGS_UNREAD: &str = "Could not read settings.txt, so this run began on the default settings. Close any program that has it open, or make it smaller, then start Booth again.";
+
 pub fn wants_control(name: &str) -> String {
     format!("{} wants to control your screen.", isolated(name))
 }

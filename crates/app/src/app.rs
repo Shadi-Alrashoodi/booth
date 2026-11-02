@@ -1078,7 +1078,7 @@ fn save_draft(
     backlog: &mut Backlog,
     controlled: bool,
 ) -> bool {
-    let next = match draft.settings(&setup.settings) {
+    let mut next = match draft.settings(&setup.settings) {
         Ok(next) => next,
         Err(refused) => {
             draft.refused = refused;
@@ -1464,6 +1464,9 @@ fn start_lines(
 ) -> Vec<String> {
     let mut lines: Vec<String> = hint.map(String::from).into_iter().collect();
     if let Ok(setup) = setup {
+        if setup.settings.unread() {
+            lines.push(String::from(messages::SETTINGS_UNREAD));
+        }
         let hotkeys = setup.settings.hotkeys();
         lines.extend(
             setup
@@ -1854,8 +1857,79 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // Pressing Save again, as the line says, once the program has let go of
+    // the file: the save goes through and what this run never read stays.
+    #[test]
+    fn save_after_a_failed_read_keeps_the_file_s_lines() {
+        use std::fs;
+        let dir = fresh_dir("failed-read");
+        let path = dir.join("settings.txt");
+        fs::create_dir(&path).unwrap();
+        let mut setup = setup_in(&dir);
+        (setup.settings, _, setup.gave_way) = Settings::load(&dir);
+        fs::remove_dir(&path).unwrap();
+        fs::write(&path, "name = Mara\r\nport = 41010\r\n").unwrap();
+        let mut backlog = Backlog::default();
+        let mut draft = Draft::new(&setup.settings, KnownDevices::default(), String::new());
+        draft.vsync = true;
+        assert!(save_draft(&mut setup, &mut draft, &mut backlog, false));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "name = Mara\r\nport = 41010\r\nvsync_in_viewer = on\r\n"
+        );
+
+        // A monitor picked in Share's list saves with no Save pressed.
+        remember_monitor(&mut setup, r"\\.\DISPLAY2", false, &mut backlog);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "name = Mara\r\nport = 41010\r\nvsync_in_viewer = on\r\nshare_monitor = \\\\.\\DISPLAY2\r\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Turned on, saved, then turned off and saved: the line goes, or the next
+    // start would have what the panel says is off, the mic open or the update
+    // check going. Share's list does the same with no Save pressed.
+    #[test]
+    fn set_back_after_a_failed_read_the_line_goes() {
+        use std::fs;
+        let dir = fresh_dir("failed-read-set-back");
+        let path = dir.join("settings.txt");
+        fs::create_dir(&path).unwrap();
+        let mut setup = setup_in(&dir);
+        (setup.settings, _, setup.gave_way) = Settings::load(&dir);
+        fs::remove_dir(&path).unwrap();
+        fs::write(&path, "name = Mara\r\n").unwrap();
+        let mut backlog = Backlog::default();
+        let mut draft = Draft::new(&setup.settings, KnownDevices::default(), String::new());
+        draft.talk = TalkMode::OpenMic;
+        draft.check_for_new_versions = true;
+        assert!(save_draft(&mut setup, &mut draft, &mut backlog, false));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "name = Mara\r\ntalk_mode = open_mic\r\ncheck_for_new_versions = on\r\n"
+        );
+
+        draft.talk = TalkMode::PushToTalk;
+        draft.check_for_new_versions = false;
+        assert!(save_draft(&mut setup, &mut draft, &mut backlog, false));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "name = Mara\r\n");
+
+        remember_list_next(&mut setup, &mut backlog);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "name = Mara\r\nshare_key_opens_list = on\r\n"
+        );
+        remember_monitor(&mut setup, r"\\.\DISPLAY2", false, &mut backlog);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "name = Mara\r\nshare_monitor = \\\\.\\DISPLAY2\r\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     // What load hands over, with no profile's lock: the line for a key that
-    // gave way.
+    // gave way, and the one for a file that could not be read at all.
     #[test]
     fn the_start_screen_has_what_reading_the_file_found() {
         use std::fs;
@@ -1886,6 +1960,13 @@ mod tests {
             [
                 "Push to talk was on F9, which clashed with Ctrl+Shift+F9 for pausing a share. It is back on Right Ctrl. Change either in Settings."
             ]
+        );
+
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert_eq!(
+            start_lines(Some("first"), &build(&dir), &[], &[]),
+            ["first", messages::SETTINGS_UNREAD]
         );
         let _ = fs::remove_dir_all(&dir);
     }

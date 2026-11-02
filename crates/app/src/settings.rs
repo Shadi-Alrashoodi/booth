@@ -130,6 +130,14 @@ pub struct Settings {
     // share_monitor is.
     share_key_opens_list: bool,
     check_for_new_versions: bool,
+    // The file could not be read as Booth started, so a default here says
+    // nothing about what the file holds, and a save keeps that key's lines.
+    // Stays for the run: nothing reads the file into this again.
+    unread: bool,
+    // What the saves of such a run have written. Those lines are the run's
+    // own, so setting one of these keys back does take its line out. Empty in
+    // any other run.
+    saved_keys: Vec<&'static str>,
 }
 
 // A hotkey in the file that went back to its default, because a press of it
@@ -157,7 +165,10 @@ impl Settings {
                 (settings, problems, gave_way)
             }
             Err(err) => (
-                Settings::default(),
+                Settings {
+                    unread: true,
+                    ..Settings::default()
+                },
                 vec![format!(
                     "settings: could not read {}: {err}; using the defaults",
                     path.display()
@@ -165,6 +176,10 @@ impl Settings {
                 Vec::new(),
             ),
         }
+    }
+
+    pub fn unread(&self) -> bool {
+        self.unread
     }
 
     pub fn name(&self) -> Option<&str> {
@@ -387,13 +402,21 @@ impl Settings {
 
     // The file is read again first, so a line added by hand while Booth was
     // open is kept too.
-    pub fn save(&self, dir: &Path) -> Result<(), SaveError> {
+    pub fn save(&mut self, dir: &Path) -> Result<(), SaveError> {
         let path = dir.join(FILE);
         let old = read(&path).map_err(|source| SaveError::Read {
             path: path.clone(),
             source,
         })?;
-        replace(dir, &path, &self.merge(&old))
+        replace(dir, &path, &self.merge(&old))?;
+        if self.unread {
+            for key in KEYS {
+                if !self.at_default(key) && !self.saved_keys.contains(&key) {
+                    self.saved_keys.push(key);
+                }
+            }
+        }
+        Ok(())
     }
 
     // Each key goes in the place of its first line, so the file keeps its
@@ -407,6 +430,9 @@ impl Settings {
                 .and_then(|line| match parse_line(line) {
                     Line::Pair { key, .. } => KEYS.into_iter().find(|known| *known == key),
                     _ => None,
+                })
+                .filter(|key| {
+                    !self.unread || !self.at_default(key) || self.saved_keys.contains(key)
                 });
             match known {
                 None => {
@@ -426,6 +452,13 @@ impl Settings {
             }
         }
         out
+    }
+
+    // A key at its default is the one thing write_key leaves out.
+    fn at_default(&self, key: &str) -> bool {
+        let mut line = Vec::new();
+        self.write_key(key, &mut line);
+        line.is_empty()
     }
 
     fn write_key(&self, key: &str, out: &mut Vec<u8>) {
@@ -832,10 +865,11 @@ fn parse(bytes: &[u8]) -> (Settings, Vec<String>) {
     (settings, problems)
 }
 
-// Booth never saves two actions on one key. A clash comes from editing by
-// hand, or from a newer version giving a new action, as its default, a key
-// chosen earlier for another. Only an action moved off its default gives way,
-// so the rest of what was chosen stays; of two moved ones, which was meant is
+// Booth does not put two actions on one key in a file it has read. A clash
+// comes from editing by hand, from a newer version giving a new action, as its
+// default, a key chosen earlier for another, or from a key moved in a run that
+// could not read the file. Only an action moved off its default gives way, so
+// the rest of what was chosen stays; of two moved ones, which was meant is
 // anyone's guess, so both do.
 fn settle_hotkeys(settings: &mut Settings, problems: &mut Vec<String>) -> Vec<GaveWay> {
     let mut gave_way = Vec::new();
@@ -1064,7 +1098,14 @@ mod tests {
         // file another program holds open without sharing.
         fs::create_dir(folder.file()).unwrap();
         let (settings, problems, _) = Settings::load(&folder.0);
-        assert_eq!(settings, Settings::default());
+        assert!(settings.unread);
+        assert_eq!(
+            Settings {
+                unread: false,
+                ..settings
+            },
+            Settings::default()
+        );
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(
             problems[0].ends_with("; using the defaults"),
@@ -1072,6 +1113,99 @@ mod tests {
         );
         let err = named("a.example.net").save(&folder.0).unwrap_err();
         assert!(matches!(err, SaveError::Read { .. }), "{err}");
+    }
+
+    // The other program has let go by the time of the save. Nothing here saw
+    // what the file holds, so a key still at its default says nothing about
+    // it, and only what was changed goes in. The settings screen saves a clone,
+    // so the flag has to travel with it.
+    #[test]
+    fn a_file_read_again_after_a_failed_read_keeps_what_was_never_seen() {
+        let folder = Folder::new("unread-comes-back");
+        fs::create_dir(folder.file()).unwrap();
+        let (settings, _, _) = Settings::load(&folder.0);
+        fs::remove_dir(folder.file()).unwrap();
+        fs::write(
+            folder.file(),
+            "name = Mara\r\nport = 99\r\nport = 41010\r\nvideo_upload = 15\r\naddress_name = old.example.net\r\nhotkey_mute = F9\r\n",
+        )
+        .unwrap();
+
+        let mut next = settings.clone();
+        next.set_share_monitor(Some(r"\\.\DISPLAY2"));
+        next.set_address_name("new.example.net").unwrap();
+        next.save(&folder.0).unwrap();
+        assert_eq!(
+            fs::read_to_string(folder.file()).unwrap(),
+            "name = Mara\r\nport = 99\r\nport = 41010\r\nvideo_upload = 15\r\naddress_name = new.example.net\r\nhotkey_mute = F9\r\nshare_monitor = \\\\.\\DISPLAY2\r\n"
+        );
+
+        // The next start reads it all and is back to the usual save.
+        let (mut loaded, _, _) = Settings::load(&folder.0);
+        assert_eq!(loaded.name(), Some("Mara"));
+        assert_eq!(loaded.port(), 41010);
+        assert_eq!(loaded.hotkeys().chord(Action::Mute).to_string(), "F9");
+        assert_eq!(loaded.share_monitor(), Some(r"\\.\DISPLAY2"));
+        loaded.set_name("");
+        loaded.save(&folder.0).unwrap();
+        assert!(
+            !fs::read_to_string(folder.file())
+                .unwrap()
+                .contains("name = Mara")
+        );
+    }
+
+    // A line this run wrote is not one it never saw: set back, the key's line
+    // goes and the next start has what the panel showed. The file's other
+    // lines stay, and so does a line of a key whose only save failed.
+    #[test]
+    fn a_key_set_back_after_a_failed_read_loses_the_line_this_run_wrote() {
+        let folder = Folder::new("unread-set-back");
+        fs::create_dir(folder.file()).unwrap();
+        let (mut settings, _, _) = Settings::load(&folder.0);
+        fs::remove_dir(folder.file()).unwrap();
+        fs::write(
+            folder.file(),
+            "name = Mara\r\ncheck_for_new_versions = on\r\nvsync_in_viewer = on\r\n",
+        )
+        .unwrap();
+
+        // A folder where the new file would go stands in for a full disk.
+        fs::create_dir(temp_path(&folder.0, &folder.file())).unwrap();
+        settings.set_vsync(true);
+        assert!(settings.save(&folder.0).is_err());
+        settings.set_vsync(false);
+        fs::remove_dir(temp_path(&folder.0, &folder.file())).unwrap();
+
+        let mut next = settings.clone();
+        next.set_check_for_new_versions(true);
+        next.set_talk_mode(TalkMode::OpenMic);
+        next.set_constant_rate(false);
+        next.set_address_name("a.example.net").unwrap();
+        next.save(&folder.0).unwrap();
+        assert_eq!(
+            fs::read_to_string(folder.file()).unwrap(),
+            "name = Mara\r\ncheck_for_new_versions = on\r\nvsync_in_viewer = on\r\naddress_name = a.example.net\r\ntalk_mode = open_mic\r\nconstant_rate_voice = off\r\n"
+        );
+
+        // Each save goes through a clone of the last, as the settings screen's do.
+        let mut last = next.clone();
+        last.set_check_for_new_versions(false);
+        last.set_talk_mode(TalkMode::PushToTalk);
+        last.set_constant_rate(true);
+        last.set_address_name("").unwrap();
+        last.save(&folder.0).unwrap();
+        assert_eq!(
+            fs::read_to_string(folder.file()).unwrap(),
+            "name = Mara\r\nvsync_in_viewer = on\r\n"
+        );
+        let (loaded, _, _) = Settings::load(&folder.0);
+        assert!(!loaded.check_for_new_versions());
+        assert_eq!(loaded.talk_mode(), TalkMode::PushToTalk);
+        assert!(loaded.constant_rate());
+        assert_eq!(loaded.address_name(), None);
+        assert_eq!(loaded.name(), Some("Mara"));
+        assert!(loaded.vsync());
     }
 
     // Saved by an older version, before pause sharing had Ctrl+Shift+F9. Push
@@ -1624,7 +1758,7 @@ mod tests {
             "hotkey_push_to_talk = Shift+Right Ctrl\r\nhotkey_mute = Ctrl+Shift+S\r\nhotkey_stats_panel = F10\r\n",
         )
         .unwrap();
-        let (settings, problems, _) = Settings::load(&folder.0);
+        let (mut settings, problems, _) = Settings::load(&folder.0);
         assert_eq!(
             problems,
             [
@@ -1666,7 +1800,8 @@ mod tests {
         );
     }
 
-    // Only editing by hand puts two moved actions on one key.
+    // Editing by hand puts two moved actions on one key, and so can moving a key
+    // in a run that could not read the file.
     #[test]
     fn two_moved_on_one_key() {
         let (settings, problems) = settled(

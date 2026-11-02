@@ -126,9 +126,10 @@ impl Bindings {
             .find(|other| clash((action, chord), (*other, self.chord(*other))))
     }
 
-    // Two actions that one press would set off together, if any. Booth never
-    // saves that, but settings written by hand can hold it, and so can a key
-    // saved before a newer version made it a new action's default.
+    // Two actions that one press would set off together, if any. Booth does
+    // not put that in a file it has read, but settings written by hand can
+    // hold it, and so can a key saved before a newer version made it a new
+    // action's default, or one moved in a run that could not read the file.
     pub fn first_conflict(&self) -> Option<(Action, Action)> {
         Action::ALL.into_iter().find_map(|action| {
             self.conflict(action, self.chord(action))
