@@ -704,6 +704,10 @@ impl Screen {
         self.takes_hevc && self.takes_4k
     }
 
+    fn over(&self) -> bool {
+        self.inbox.stopped() || self.inbox.closed() || self.viewer.closed()
+    }
+
     // Until the inbox is stopped or the window closed. An error is one the
     // viewer cannot go on after: the device lost, the window broken, or the
     // GPU's decoder refusing the stream every time.
@@ -714,7 +718,7 @@ impl Screen {
         let mut next_second = began + SECOND;
         let mut batch = VecDeque::new();
         loop {
-            if self.inbox.stopped() || self.inbox.closed() || self.viewer.closed() {
+            if self.over() {
                 break;
             }
             let wake_at = next_wake(
@@ -761,6 +765,11 @@ impl Screen {
             }
             self.follow_mouse_mode();
             for packet in &batch {
+                // A batch can be thousands of one-packet frames, and a hostile
+                // stream's can each take FFmpeg tens of ms.
+                if self.over() {
+                    break;
+                }
                 reassembler.push(packet, Instant::now());
                 while let Some(event) = reassembler.event() {
                     self.event(event, report)?;
