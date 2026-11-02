@@ -4,9 +4,9 @@
 // right button or switching to another program takes nothing. The windows
 // are gone before the share opens, so they are never in it.
 //
-// Each window is one tone at one alpha with the rectangle cut out of it by a
-// colour key, so what is inside shows as it is, and the edge and the words
-// stay readable over any picture.
+// Each window is one tone at one alpha with the rectangle being dragged cut
+// out of it by a colour key, so what is inside shows as it is, and the edge
+// and the words stay readable over any picture.
 
 use std::cell::RefCell;
 use std::io;
@@ -437,9 +437,12 @@ fn paint(hwnd: HWND) {
                 },
                 colour(AMBER),
             );
-            fill(memory, rect, KEY);
-            let region = region_of(rect);
+            // Keyed pixels pass the mouse to what is under them, and only a
+            // drag in progress has it captured. A rectangle let go of is
+            // filled, so the next press lands here and starts a new drag.
             let too_small = small == Some(hwnd);
+            fill(memory, rect, if too_small { colour(WINDOW) } else { KEY });
+            let region = region_of(rect);
             let (words, tone) = if too_small {
                 (messages::region_too_small(region.width, region.height), BAD)
             } else {
@@ -571,7 +574,8 @@ fn label(dc: HDC, text: &str, at: (i32, i32), tone: Color32, pad: i32) {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW};
+    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WindowFromPoint};
 
     use super::*;
 
@@ -604,8 +608,9 @@ mod tests {
     }
 
     // A drag takes that rectangle of the monitor it was on, in its pixels;
-    // one too small is not taken, and Esc then takes nothing. The windows
-    // show for a moment on every monitor.
+    // one too small is not taken and the next press inside it stays with the
+    // picker, and Esc then takes nothing. The windows show for a moment on
+    // every monitor.
     #[test]
     fn a_drag_takes_that_region() {
         share::make_process_dpi_aware().unwrap();
@@ -636,14 +641,33 @@ mod tests {
         assert!(monitors.iter().any(|monitor| monitor.id == picked.monitor));
         let answer = pick(monitors, || {}).unwrap();
         let hwnd = window();
+        let mut inside = POINT { x: 150, y: 200 };
+        // SAFETY: a live window of the picker's thread and a live point.
+        unsafe { ClientToScreen(hwnd, &mut inside) };
+        // Windows hit tests a layered window by what it last painted.
+        let under_now = || {
+            thread::sleep(Duration::from_millis(300));
+            // SAFETY: a call with no pointers.
+            unsafe { WindowFromPoint(inside) }
+        };
+        let before = under_now();
         post(hwnd, WM_LBUTTONDOWN, 0, at(100, 50));
         post(hwnd, WM_LBUTTONUP, 0, at(200, 400));
+        let under = under_now();
         post(hwnd, WM_KEYDOWN, usize::from(VK_ESCAPE), 0);
         let picked = answer
             .recv_timeout(Duration::from_secs(3))
             .unwrap()
             .unwrap();
         assert!(picked.is_none());
+        // A window in front from the start says nothing about the picker: the
+        // dim behind a firewall prompt, which a new test program's sockets can
+        // raise, is over every topmost window.
+        if before == hwnd {
+            assert_eq!(under, hwnd);
+        } else {
+            println!("clicks not checked: another window is in front of the picker");
+        }
     }
 
     #[test]
