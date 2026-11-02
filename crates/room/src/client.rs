@@ -4581,9 +4581,13 @@ mod tests {
             name: String::from("Bo"),
         });
         // The second press finds this PC refused already, and is refused the
-        // same way.
-        for press in 1..=2 {
-            assert!(rig.client.share(120, start, &rig.socket));
+        // same way, as is the refusal alone.
+        for press in 1..=3 {
+            if press < 3 {
+                assert!(rig.client.share(120, start, &rig.socket));
+            } else {
+                assert!(rig.client.refuse_share());
+            }
             let view = rig.client.view(start, 0);
             assert_eq!(view.share.own, busy);
             let lines: Vec<(&[u8; 32], &str, &str)> = view
@@ -4602,6 +4606,10 @@ mod tests {
         let nobody = roster(None);
         let packet = rig.host.say(&mut session, &nobody, start);
         rig.deliver(&packet, start);
+        // With nothing to refuse the refusal alone asks nothing.
+        assert!(!rig.client.refuse_share());
+        assert_eq!(rig.client.screen.sharing.state(), busy);
+        assert_eq!(asks(&rig), 0);
         assert!(rig.client.share(120, start, &rig.socket));
         assert_eq!(
             rig.client.screen.sharing.state(),
@@ -4641,6 +4649,7 @@ mod tests {
             .screen
             .sharing
             .set_state(OwnShare::Sharing { number: 3, fps: 60 });
+        assert!(!rig.client.refuse_share());
         rig.client.share(90, down, &rig.socket);
         assert_eq!(
             rig.client.screen.sharing.state(),
@@ -4665,6 +4674,20 @@ mod tests {
             OwnShare::Refused(Refusal::NotLive)
         );
         assert_eq!(sent(&rig), 0, "an ask went out with the link down");
+
+        rig.client.screen.sharing.set_state(OwnShare::Off);
+        assert!(rig.client.refuse_share());
+        assert_eq!(
+            rig.client.screen.sharing.state(),
+            OwnShare::Refused(Refusal::NotLive)
+        );
+        assert_eq!(sent(&rig), 0);
+
+        // A room that has ended refuses nothing any more.
+        rig.client.screen.sharing.set_state(OwnShare::Off);
+        rig.client.state = LinkState::Closed;
+        assert!(!rig.client.refuse_share());
+        assert_eq!(rig.client.screen.sharing.state(), OwnShare::Off);
     }
 
     // A new watcher's ask that comes ahead of the facts that count them

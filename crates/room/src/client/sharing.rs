@@ -58,24 +58,7 @@ impl Client {
             }
             OwnShare::Asking { .. } => false,
             OwnShare::Off | OwnShare::Refused(_) => {
-                if self.state != LinkState::Live || self.sessions.current.is_none() {
-                    self.share_refused(Refusal::NotLive);
-                    return true;
-                }
-                // The host would refuse it with the same line, a round trip
-                // later. A share that started since the last roster is the
-                // host's to refuse.
-                let own = *self.identity.public();
-                if let Some((entry, _)) =
-                    sharer_of(&self.roster).filter(|(entry, _)| entry.key != own)
-                {
-                    let (key, name) = (entry.key, entry.name.clone());
-                    log!(
-                        self.log,
-                        "share: not asked, the roster says {} shares already",
-                        keys::fingerprint(&key)
-                    );
-                    self.refused_busy(key, name);
+                if self.refused_here() {
                     return true;
                 }
                 self.screen.sharing.set_state(OwnShare::Asking { fps });
@@ -87,6 +70,39 @@ impl Client {
             self.send_share_start(fps, now, socket);
         }
         true
+    }
+
+    fn refused_here(&mut self) -> bool {
+        if self.state != LinkState::Live || self.sessions.current.is_none() {
+            self.share_refused(Refusal::NotLive);
+            return true;
+        }
+        // The host would refuse it with the same line, a round trip later. A
+        // share that started since the last roster is the host's to refuse.
+        let own = *self.identity.public();
+        let Some((entry, _)) = sharer_of(&self.roster).filter(|(entry, _)| entry.key != own) else {
+            return false;
+        };
+        let (key, name) = (entry.key, entry.name.clone());
+        log!(
+            self.log,
+            "share: not asked, the roster says {} shares already",
+            keys::fingerprint(&key)
+        );
+        self.refused_busy(key, name);
+        true
+    }
+
+    // Share's refusal alone: no ask goes out if the other share has just
+    // ended.
+    pub(crate) fn refuse_share(&mut self) -> bool {
+        let state = self.screen.sharing.state();
+        if self.state == LinkState::Closed
+            || matches!(state, OwnShare::Sharing { .. } | OwnShare::Asking { .. })
+        {
+            return false;
+        }
+        self.refused_here()
     }
 
     pub(crate) fn stop_sharing(&mut self, now: Instant, socket: &Socket) -> bool {

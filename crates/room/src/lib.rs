@@ -420,6 +420,15 @@ impl Room {
             .share(fps.clamp(1, control::MAX_FPS), Shown::Window(window));
     }
 
+    /// What share says when it refuses, for a key that must not start
+    /// anything: the system line and `share.own` as share gives them, and
+    /// nothing at all when share would have gone ahead. So with the other
+    /// share ending at that very moment no ask goes out and nothing is
+    /// shown.
+    pub fn refuse_share(&self) {
+        self.threads.refuse_share();
+    }
+
     /// Needs no answer: the share is over for everyone at once, and its
     /// thread stops capturing at its next frame, or within 100 ms on a still
     /// screen. Leaving the room stops it before anything else.

@@ -240,6 +240,41 @@ fn one_share_at_a_time() {
     );
 }
 
+// The panel's share key asks only for this while the list has no Share to
+// offer: the same line as a refused ask, and nothing starts once the other
+// share has ended.
+#[test]
+fn a_refusal_alone_starts_nothing() {
+    let (host, friends, _) = room_of(&["Mara", "Ana", "Bo"], timers());
+    let (ana, bo) = (&friends[0], &friends[1]);
+    let share = shares(ana, 60);
+    let line = String::from("Ana is sharing. One share at a time.");
+    for member in [&host, bo] {
+        sees(member, share);
+        member.room().refuse_share();
+        let refused = member.wait_for(WAIT, "the line", |v| system_lines(v).contains(&line));
+        assert_eq!(
+            refused.share.own,
+            OwnShare::Refused(Refusal::Busy {
+                name: String::from("Ana")
+            })
+        );
+    }
+
+    ana.room().stop_sharing();
+    for member in [&host, bo] {
+        member.wait_for(WAIT, "Ana stopped", |v| v.share.current.is_none());
+        let lines = system_lines(&member.view()).len();
+        member.room().refuse_share();
+        member.holds_for(Duration::from_millis(200), "nothing goes out", |v| {
+            number(v).is_none()
+                && v.share.current.is_none()
+                && !matches!(v.share.own, OwnShare::Asking { .. })
+                && system_lines(v).len() == lines
+        });
+    }
+}
+
 #[test]
 fn share_ends_when_its_sharer_leaves_or_is_lost() {
     let (host, mut friends, invite) = room_of(&["Mara", "Ana", "Bo"], timers());

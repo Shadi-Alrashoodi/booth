@@ -289,9 +289,7 @@ impl Host {
                     "share: this host asked to share while {} shares, refused",
                     keys::fingerprint(&key)
                 );
-                let refusal = Refusal::Busy { name: name.clone() };
-                self.system_line(key, name, refusal.sentence());
-                self.screen.sharing.set_state(OwnShare::Refused(refusal));
+                self.refused_busy(key, name);
             }
             None => {
                 let number = self.start_share(own, fps, now, socket);
@@ -301,6 +299,25 @@ impl Host {
                 self.tell_facts(now, socket);
             }
         }
+        true
+    }
+
+    fn refused_busy(&mut self, key: [u8; 32], name: String) {
+        let refusal = Refusal::Busy { name: name.clone() };
+        self.system_line(key, name, refusal.sentence());
+        self.screen.sharing.set_state(OwnShare::Refused(refusal));
+    }
+
+    // Share's refusal alone: nothing starts if the other share has just
+    // ended.
+    pub(crate) fn refuse_share(&mut self) -> bool {
+        let own = *self.identity.public();
+        let other = self.live.as_ref().map(|live| live.sharer);
+        let Some(key) = other.filter(|sharer| *sharer != own && !self.closed) else {
+            return false;
+        };
+        let name = self.name_of(&key);
+        self.refused_busy(key, name);
         true
     }
 

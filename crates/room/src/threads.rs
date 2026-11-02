@@ -272,6 +272,13 @@ impl Side {
         }
     }
 
+    fn refuse_share(&mut self) -> bool {
+        match self {
+            Side::Host(host) => host.refuse_share(),
+            Side::Client(client) => client.refuse_share(),
+        }
+    }
+
     fn stop_sharing(&mut self, now: Instant, socket: &Socket) -> bool {
         match self {
             Side::Host(host) => host.stop_sharing(now, socket),
@@ -696,6 +703,10 @@ impl Threads {
             self.sharing.set_shown(shown);
         }
         self.with_side(|side, now, socket| side.share(fps, now, socket));
+    }
+
+    pub(crate) fn refuse_share(&self) {
+        self.with_side(|side, _, _| side.refuse_share());
     }
 
     // The share's PC sound stops at the press, as Share sound turned off
