@@ -104,6 +104,16 @@ pub enum DecodeError {
     TooManySps {
         count: usize,
     },
+    /// An access unit packed past what any encoder writes, refused before
+    /// FFmpeg saw it (src/guard.rs). `what` reads after "more than `most`",
+    /// for the log; the sentence this makes for the person leaves them out.
+    Packed {
+        most: usize,
+        what: &'static str,
+    },
+    /// An access unit with the start of more than one picture in it, refused
+    /// before FFmpeg saw it (src/guard.rs).
+    ManyPictures,
     /// The stream made the decoder hold frames back to reorder them. The
     /// decoder was reset, so nothing decodes until the next IDR.
     HeldBack {
@@ -247,6 +257,14 @@ impl fmt::Display for DecodeError {
                 f,
                 "a video frame carries {count} HEVC sequence headers (SPS) where a Booth stream carries one, so it was dropped before decoding. The sharer's Booth may be damaged: they can unzip it again"
             ),
+            DecodeError::Packed { .. } => write!(
+                f,
+                "a video frame is packed with far more than a screen share normally holds, so it was dropped before decoding. The sharer's Booth may be damaged: they can unzip it again"
+            ),
+            DecodeError::ManyPictures => write!(
+                f,
+                "a video frame carries more than one picture, which no Booth stream does, so it was dropped. The sharer's Booth may be damaged: they can unzip it again"
+            ),
             DecodeError::HeldBack { frames } => {
                 let held = if *frames == 1 {
                     "1 frame".to_string()
@@ -298,6 +316,19 @@ mod tests {
         assert_eq!(
             text,
             "the screen share is 8192x4608, larger than the 4096x2304 Booth shows at most. The sharer can share at a smaller size"
+        );
+    }
+
+    #[test]
+    fn packed_text_has_no_counts_or_stream_terms() {
+        let text = DecodeError::Packed {
+            most: 1024,
+            what: "emulation prevention bytes in more than 64 NAL units",
+        }
+        .to_string();
+        assert_eq!(
+            text,
+            "a video frame is packed with far more than a screen share normally holds, so it was dropped before decoding. The sharer's Booth may be damaged: they can unzip it again"
         );
     }
 

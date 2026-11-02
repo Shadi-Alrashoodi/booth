@@ -117,10 +117,11 @@ pub struct Decoder {
     sent: i64,
     timing: Option<Timing>,
     // Whether an IDR has given a picture since the decoder was made or
-    // flushed. FFmpeg's HEVC decoder with output-corrupt (fields.c) makes a
-    // picture out of whatever its pool holds for a P frame with nothing to
-    // predict from, where the H.264 decoder gives none, so until then HEVC
-    // access units other than IDRs do not reach FFmpeg.
+    // flushed. A packed unit or a refused IDR clears it too, with no flush.
+    // FFmpeg's HEVC decoder with output-corrupt (fields.c) makes a picture out
+    // of whatever its pool holds for a P frame with nothing to predict from,
+    // where the H.264 decoder gives none, so until then HEVC access units other
+    // than IDRs do not reach FFmpeg.
     had_idr: bool,
     // Times the format callback chose d3d11va, each time FFmpeg set its
     // video decoder and surface pool up afresh: the first IDR, then each
@@ -271,18 +272,20 @@ impl Decoder {
     }
 
     /// Decodes one access unit (Annex B, the whole frame) and returns its
-    /// picture at once. An error is about this access unit only; the
-    /// decoder goes on with the next. None means no picture came out and
-    /// FFmpeg gave no reason, as when every slice refers to a parameter set
-    /// that was lost, or no IDR has decoded since the decoder was made or
-    /// last reset (HEVC; FFmpeg's H.264 decoder shows nothing there either).
-    /// Booth's encoders put a picture in every access unit, so for them None
-    /// is a lost frame just like an error.
+    /// picture at once. An error is about this access unit only and the
+    /// decoder goes on with the next, though in HEVC the frames after a refused
+    /// unit wait for the next IDR. None means no picture came out and FFmpeg
+    /// gave no reason, as when every slice refers to a parameter set that was
+    /// lost, or HEVC is waiting for an IDR (FFmpeg's H.264 decoder shows nothing
+    /// there either). Booth's encoders put a picture in every access unit, so
+    /// for them None is a lost frame just like an error.
     ///
-    /// Every SPS in an HEVC access unit is read in Rust first, and a unit
-    /// with one past the size Booth shows ([`DecodeError::Oversized`]) or one
-    /// that does not read ([`DecodeError::UnreadableSps`]) never reaches
-    /// FFmpeg. One with more than 16 is refused before any is read
+    /// A unit packed past what an encoder writes never reaches FFmpeg
+    /// ([`DecodeError::Packed`], [`DecodeError::ManyPictures`]). Every SPS in
+    /// an HEVC access unit is read in Rust first, and a unit with one past
+    /// the size Booth shows ([`DecodeError::Oversized`]) or one that does not
+    /// read ([`DecodeError::UnreadableSps`]) never reaches FFmpeg either. One
+    /// with more than 16 is refused before any is read
     /// ([`DecodeError::TooManySps`]).
     pub fn decode(&mut self, access_unit: &[u8]) -> Result<Option<Decoded>, DecodeError> {
         if access_unit.is_empty() {
@@ -293,6 +296,12 @@ impl Decoder {
                 size: access_unit.len(),
             });
         }
+        // First, as what comes after it walks from start code to start code
+        // and this stops at the first too many. In HEVC the frames after a
+        // refused unit may predict from it, so they wait for the next IDR.
+        guard::check_unit(self.codec, access_unit).inspect_err(|_| {
+            self.had_idr = false;
+        })?;
         let idr = self.codec == Codec::Hevc && hevc_idr(access_unit);
         if self.codec == Codec::Hevc && !idr && !self.had_idr {
             return Ok(None);

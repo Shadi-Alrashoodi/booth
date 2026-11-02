@@ -948,6 +948,14 @@ impl Screen {
         if setups > 0 && self.decoder.setups() > setups {
             self.set_up_again(number)?;
         }
+        // The sentence is for the person. What was too many is for the log.
+        if let Err(DecodeError::Packed { most, what }) = &result
+            && self.numbers.decode_failed < FAILURES_LOGGED
+        {
+            report(Report::Line(Line::Log(format!(
+                "frame {number} carries more than {most} {what}"
+            ))));
+        }
         let decoded = match result {
             Ok(Some(decoded)) => decoded,
             Ok(None) => {
@@ -1425,6 +1433,8 @@ fn refuses_the_stream(err: &DecodeError) -> bool {
             | DecodeError::Oversized { .. }
             | DecodeError::UnreadableSps
             | DecodeError::TooManySps { .. }
+            | DecodeError::Packed { .. }
+            | DecodeError::ManyPictures
             | DecodeError::NotOnGpu
     )
 }
@@ -1446,6 +1456,12 @@ mod tests {
         // do it again: asking for an IDR would loop.
         assert!(refuses_the_stream(&DecodeError::UnreadableSps));
         assert!(refuses_the_stream(&DecodeError::TooManySps { count: 40 }));
+        let packed = DecodeError::Packed {
+            most: 64,
+            what: "NAL units",
+        };
+        assert!(refuses_the_stream(&packed));
+        assert!(refuses_the_stream(&DecodeError::ManyPictures));
         let damaged = DecodeError::Damaged {
             detail: String::from("invalid data"),
         };

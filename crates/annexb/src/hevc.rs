@@ -315,7 +315,9 @@ fn sps_starts(w: &[u8], i: usize) -> u8 {
 /// nal_unit_type after the first 00 00 01 that is followed by a picture's
 /// type, below 32: what the frame starts with. The unit is searched a block
 /// at a time, since walking 3 MiB of the smallest NAL units one start code
-/// at a time takes up to about 1 ms.
+/// at a time takes up to about 1 ms. A start code in front of padding costs a
+/// block more, about 10 ms for 3 MiB of them, so a caller with a friend's bytes
+/// counts them first with [`after_start_codes`](super::after_start_codes).
 pub fn first_picture(access_unit: &[u8]) -> Option<u8> {
     let mut from = 0;
     loop {

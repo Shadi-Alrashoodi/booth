@@ -13,13 +13,140 @@
 // One with 16 is still read whole: 16 of the heaviest SPS this reader takes
 // cost about 0.9 ms, past the quarter millisecond a unit is meant to cost
 // here.
+//
+// In both codecs FFmpeg does all of a unit in one call nothing can interrupt,
+// and part of what it sets aside stays until the decoder goes, so a unit that
+// holds more than an encoder writes is refused too, before any of it is read.
+// Counting takes one pass over the unit, which stops at the first too many.
 
+use annexb::{Nal, hevc};
+
+use crate::decoder::Codec;
 use crate::error::DecodeError;
 use crate::ffi::{booth_codec_hevc, booth_too_large};
 
 // HEVC numbers SPSs 0 to 15, so no stream needs more in one access unit.
 // Booth's encoders put one in front of each IDR.
 const MOST_SPS: usize = 16;
+
+// FFmpeg keeps a slot for every NAL unit a unit ever had in that place, about
+// 4 KB each, so 2.75 MB of the smallest NAL units committed about 2.9 GB in
+// one call and kept it until the watch ended.
+//
+// What encoders write is set by the slices. NVENC writes one, or several on a
+// refreshing frame on a GPU that can neither invalidate nor refresh in a single
+// slice, which is not measured. Windows' software encoder writes one per 96
+// lines, up to 16 from 1536 lines on, behind an access unit delimiter, an SPS, a
+// PPS and two SEIs. Nothing asks the encoders of AMD and Intel for slices, and
+// they cannot be run here. So the limit is what can reach the GPU: FFmpeg's
+// d3d11va takes 32 slices a picture in H.264 and loses the rest, and takes 256
+// in HEVC and fails the frame at the next, which is how tests/failed.rs fails
+// one. No picture with more ever showed whole on any copy of Booth.
+const MOST_SLICES_H264: usize = 32;
+const MOST_SLICES_HEVC: usize = 256;
+const MOST_OTHER_UNITS: usize = 32;
+
+// A slot also keeps its list of the NAL unit's emulation prevention bytes at
+// the longest it ever was, up to 4 MiB, so a hostile stream can grow one slot
+// with each large unit. Past this many NAL units a unit may hold no more than
+// this many of those bytes, about what every slot starts with, so what can
+// stay is 64 times 4 MiB in either codec: 256 MiB, about what a stream's
+// surfaces take. Encoders write a few of them per MB, so an encoder would have
+// to cut a picture past 64 NAL units and pad it with zeros as well.
+const MOST_UNITS_ESCAPED: usize = 64;
+const MOST_ESCAPES: usize = 1024;
+
+// VPSs and PPSs in HEVC, whose SPSs have their own limit, SPSs and PPSs in
+// H.264. Every encoder here puts one of each in front of an IDR, and FFmpeg
+// works each PPS out as it comes. The longest an HEVC one takes is about 3.6 ms,
+// with a tile for every block of an 8192x1152 picture, the longest and thinnest
+// the size limit lets through at its full area (fields.c), so 8 take about 29
+// ms. Two that take turns get past its check for a PPS it has already.
+const MOST_SETS: usize = 8;
+
+// Each one starts a picture: in H.264 a slice with first_mb_in_slice 0 ends the
+// one before it and sends it to the GPU, about 390,000 times in one unit, and
+// in HEVC first_slice_segment_in_pic_flag zeroes a picture's tables again and
+// takes its surfaces after a start that failed.
+const MOST_PICTURES: usize = 1;
+
+// FFmpeg copies its list of the SEI messages it keeps for each message, so one
+// unit full of the smallest took 1.2 s. 64 KB of them take at most about 2 ms,
+// the most in the messages it allocates for and throws away. Encoders write
+// about 300 bytes with an IDR.
+const MOST_SEI: usize = 64 << 10;
+
+fn is_sei(codec: Codec, nal: &Nal<'_>) -> bool {
+    match codec {
+        Codec::H264 => nal.kind() == annexb::NAL_SEI,
+        Codec::Hevc => matches!(hevc::kind(nal), hevc::PREFIX_SEI | hevc::SUFFIX_SEI),
+    }
+}
+
+pub(crate) fn check_unit(codec: Codec, access_unit: &[u8]) -> Result<(), DecodeError> {
+    let most_units = MOST_OTHER_UNITS
+        + match codec {
+            Codec::H264 => MOST_SLICES_H264,
+            Codec::Hevc => MOST_SLICES_HEVC,
+        };
+    let (mut units, mut sets, mut pictures, mut sei) = (0, 0, 0, 0);
+    for data in annexb::after_start_codes(access_unit) {
+        units += 1;
+        if units > most_units {
+            return Err(DecodeError::Packed {
+                most: most_units,
+                what: "NAL units",
+            });
+        }
+        let nal = Nal { data };
+        // The byte after a NAL unit's header is the slice's own: an emulation
+        // prevention byte comes only after two zero bytes, and no header a
+        // decoder takes ends in a zero byte.
+        let (set, picture) = match codec {
+            Codec::H264 => (
+                matches!(nal.kind(), annexb::NAL_SPS | annexb::NAL_PPS),
+                nal.is_slice() && data.get(1).is_some_and(|byte| byte & 0x80 != 0),
+            ),
+            Codec::Hevc => (
+                matches!(hevc::kind(&nal), hevc::VPS | hevc::PPS),
+                hevc::is_slice(&nal) && data.get(2).is_some_and(|byte| byte & 0x80 != 0),
+            ),
+        };
+        sets += usize::from(set);
+        if sets > MOST_SETS {
+            return Err(DecodeError::Packed {
+                most: MOST_SETS,
+                what: "parameter sets",
+            });
+        }
+        pictures += usize::from(picture);
+        if pictures > MOST_PICTURES {
+            return Err(DecodeError::ManyPictures);
+        }
+        if is_sei(codec, &nal) {
+            sei += data.len();
+            if sei > MOST_SEI {
+                return Err(DecodeError::Packed {
+                    most: MOST_SEI,
+                    what: "bytes of SEI",
+                });
+            }
+        }
+    }
+    if units > MOST_UNITS_ESCAPED
+        && access_unit
+            .windows(3)
+            .filter(|w| *w == [0, 0, 3])
+            .nth(MOST_ESCAPES)
+            .is_some()
+    {
+        return Err(DecodeError::Packed {
+            most: MOST_ESCAPES,
+            what: "emulation prevention bytes in more than 64 NAL units",
+        });
+    }
+    Ok(())
+}
 
 pub(crate) fn check_hevc(access_unit: &[u8]) -> Result<(), DecodeError> {
     let count = annexb::hevc::sps_count(access_unit);
@@ -49,7 +176,6 @@ mod tests {
     const PPS: [u8; 2] = [34 << 1, 1];
     const IDR: [u8; 2] = [19 << 1, 1];
     const TRAIL: [u8; 2] = [1 << 1, 1];
-    const SEI: [u8; 2] = [39 << 1, 1];
 
     // Bits of an RBSP, most significant first.
     struct Writer {
@@ -149,6 +275,8 @@ mod tests {
             (3840, 2160),
             (5120, 1440),
             (4096, 2304),
+            (8192, 1152),
+            (1152, 8192),
         ] {
             let unit = idr(&sps(width, height));
             assert!(check_hevc(&unit).is_ok(), "{width}x{height}");
@@ -161,8 +289,17 @@ mod tests {
     fn size_past_the_limit() {
         // The size that made FFmpeg commit about 165 MB, one four times the
         // area Booth takes, one past the limit only once FFmpeg rounds its
-        // pool up to 128, and one row of blocks past 4096x2304.
-        for (width, height) in [(16384, 16000), (8192, 4608), (648, 14384), (4096, 2320)] {
+        // pool up to 128, one row of blocks past 4096x2304, and ones with room
+        // in the area that are past 8192 on a side.
+        for (width, height) in [
+            (16384, 16000),
+            (8192, 4608),
+            (1168, 7312),
+            (4096, 2320),
+            (73728, 128),
+            (8200, 128),
+            (128, 8200),
+        ] {
             let refused = check_hevc(&idr(&sps(width, height)));
             assert!(
                 matches!(refused, Err(DecodeError::Oversized { width: w, height: h }) if (w, h) == (width, height)),
@@ -330,18 +467,20 @@ mod tests {
         (best, answer)
     }
 
-    // The guard's own time, which is what is held to the quarter millisecond,
-    // and with decode's search for the first picture in front of it, which
-    // together are all decode reads of a unit before FFmpeg sees it. The
-    // search adds up to about 0.12 ms and is only printed.
+    // The SPS guard's own time, which is what is held to the quarter
+    // millisecond, and with the count and decode's search for the first
+    // picture in front of it, which together are all decode reads of a unit
+    // before FFmpeg sees it. Those two add up to about 0.2 ms and are only
+    // printed.
     fn timed(name: &str, unit: &[u8]) -> (Duration, Result<(), DecodeError>) {
         let (took, answer) = fastest(unit, check_hevc);
         let (with_search, _) = fastest(unit, |unit| {
+            check_unit(Codec::Hevc, unit)?;
             std::hint::black_box(hevc_idr(unit));
             check_hevc(unit)
         });
         println!(
-            "{name}, {} bytes: {answer:?} in {:.3} ms, {:.3} ms with the search for the first picture",
+            "{name}, {} bytes: {answer:?} in {:.3} ms, {:.3} ms with the count and the search for the first picture",
             unit.len(),
             took.as_secs_f64() * 1000.0,
             with_search.as_secs_f64() * 1000.0
@@ -375,22 +514,256 @@ mod tests {
             assert!(held(took), "{took:?}");
         }
         // Units with no SPS: a P frame, which is every frame but an IDR, and
-        // one of nothing but the smallest SEIs, which decode searches to the
-        // end for a picture.
-        for (name, piece) in [("A P frame", slice(TRAIL)), ("SEIs", vec![0, 0, 1, SEI[0]])] {
-            let mut unit = Vec::new();
-            fill_to_the_limit(&mut unit, &piece);
+        // one NAL unit that is no picture, which decode searches to the end
+        // for a picture.
+        for (name, header) in [("A P frame", TRAIL), ("No picture", [0x46, 1])] {
+            let mut unit = vec![0, 0, 1, header[0], header[1]];
+            fill_to_the_limit(&mut unit, &[0xff]);
             let (took, answer) = timed(name, &unit);
             assert!(answer.is_ok());
             assert!(held(took), "{took:?}");
         }
         // The most a unit that passes can cost: 16 of the heaviest SPSs and
-        // the rest in the smallest SEIs. Reading the 16 takes about 0.9 ms,
-        // past the quarter millisecond, so it is only printed.
+        // the rest in one NAL unit. Reading the 16 takes about 0.9 ms, past
+        // the quarter millisecond, so it is only printed.
         let mut worst = heaviest_sps().repeat(MOST_SPS);
-        fill_to_the_limit(&mut worst, &[0, 0, 1, SEI[0]]);
-        let (_, answer) = timed("16 of the heaviest SPS, then SEIs", &worst);
+        fill_to_the_limit(&mut worst, &[0xff]);
+        let (_, answer) = timed("16 of the heaviest SPS, then one long NAL unit", &worst);
         assert!(answer.is_ok());
+    }
+
+    // Start code and header, then `body` bytes of 0x55.
+    fn unit(header: &[u8], body: usize) -> Vec<u8> {
+        let mut out = vec![0, 0, 1];
+        out.extend_from_slice(header);
+        out.resize(out.len() + body, 0x55);
+        out
+    }
+
+    const H264_SLICE: [u8; 2] = [0x41, 0x55];
+    const H264_FIRST_SLICE: [u8; 2] = [0x41, 0x88];
+    const H264_IDR: [u8; 2] = [0x65, 0x88];
+    const HEVC_SLICE: [u8; 3] = [1 << 1, 1, 0x55];
+    const HEVC_FIRST_SLICE: [u8; 3] = [1 << 1, 1, 0x88];
+    const HEVC_IDR: [u8; 3] = [19 << 1, 1, 0x88];
+
+    fn refused_as(unit: &[u8], codec: Codec, what: &str) {
+        match check_unit(codec, unit) {
+            Err(DecodeError::Packed { what: said, .. }) if said == what => {}
+            other => panic!("{codec}, {} bytes, for {what}: {other:?}", unit.len()),
+        }
+    }
+
+    // As Windows' software encoder writes them at the most, measured; the
+    // other encoders here write fewer of each.
+    #[test]
+    fn real_units_pass() {
+        let mut idr = [
+            unit(&[9, 0x10], 0),
+            unit(&[7], 26),
+            unit(&[8], 3),
+            unit(&[6], 50),
+            unit(&[6], 244),
+            unit(&H264_IDR, 1000),
+        ]
+        .concat();
+        for _ in 1..16 {
+            idr.extend_from_slice(&unit(&[0x65, 0x55], 100_000));
+        }
+        assert!(check_unit(Codec::H264, &idr).is_ok());
+        // NVENC's, with nothing but an IDR slice behind the parameter sets.
+        let idr = [
+            unit(&[32 << 1, 1], 20),
+            unit(&[33 << 1, 1], 40),
+            unit(&[34 << 1, 1], 7),
+            unit(&HEVC_IDR, 100_000),
+        ]
+        .concat();
+        assert!(check_unit(Codec::Hevc, &idr).is_ok());
+        assert!(check_unit(Codec::Hevc, &unit(&HEVC_FIRST_SLICE, 9)).is_ok());
+        assert!(check_unit(Codec::H264, &unit(&H264_FIRST_SLICE, 9)).is_ok());
+    }
+
+    // Each of 2.75 MB's worth would have kept about 4 KB in FFmpeg for the
+    // rest of the watch.
+    #[test]
+    fn nal_units_past_the_limit() {
+        let aud = unit(&[9], 0);
+        for (codec, most, piece) in [
+            (Codec::H264, 64, aud),
+            (Codec::Hevc, 288, unit(&[0x46, 1], 0)),
+        ] {
+            assert!(check_unit(codec, &piece.repeat(most)).is_ok(), "{codec}");
+            refused_as(&piece.repeat(most + 1), codec, "NAL units");
+            refused_as(
+                &piece.repeat(MAX_ACCESS_UNIT / piece.len()),
+                codec,
+                "NAL units",
+            );
+            // Padding and headers FFmpeg skips each take a slot's place first.
+            refused_as(&[0u8, 0, 1].repeat(most + 1), codec, "NAL units");
+            refused_as(&[0u8, 0, 1, 0xff].repeat(most + 1), codec, "NAL units");
+        }
+    }
+
+    #[test]
+    fn slices_up_to_what_reaches_the_gpu() {
+        // 32 of H.264's and 32 others, and what tests/failed.rs fails a frame
+        // with: HEVC's 256 slices past the first behind three parameter sets.
+        let others = unit(&[6], 9).repeat(31);
+        let slices = unit(&H264_SLICE, 9).repeat(32);
+        let full = [&unit(&H264_IDR, 9)[..], &others, &slices].concat();
+        assert!(check_unit(Codec::H264, &full).is_ok());
+        let sets = [
+            unit(&[32 << 1, 1], 9),
+            unit(&[33 << 1, 1], 9),
+            unit(&[34 << 1, 1], 9),
+        ]
+        .concat();
+        let slices = unit(&HEVC_SLICE, 9).repeat(256);
+        let failing = [&sets[..], &unit(&HEVC_FIRST_SLICE, 9), &slices].concat();
+        assert!(check_unit(Codec::Hevc, &failing).is_ok());
+    }
+
+    #[test]
+    fn escapes_past_64_units() {
+        let run = |escapes: usize| [0u8, 0, 3].repeat(escapes);
+        let slice = unit(&HEVC_SLICE, 9);
+        let with = |units: usize, escapes: usize| {
+            [
+                &unit(&HEVC_IDR, 9)[..],
+                &run(escapes),
+                &slice.repeat(units - 1),
+            ]
+            .concat()
+        };
+        assert!(check_unit(Codec::Hevc, &with(65, 1024)).is_ok());
+        let what = "emulation prevention bytes in more than 64 NAL units";
+        refused_as(&with(65, 1025), Codec::Hevc, what);
+        // As many as a padded frame can have, in as many units as an encoder
+        // might cut one into.
+        assert!(check_unit(Codec::Hevc, &with(64, 500_000)).is_ok());
+    }
+
+    #[test]
+    fn parameter_sets_past_the_limit() {
+        // Alternating so that FFmpeg's check for one it has already does not
+        // save it, wherever they are in the unit, with the forbidden bit too.
+        let hevc = |kind: u8| unit(&[kind << 1, 1], 9);
+        let idr = unit(&HEVC_IDR, 9);
+        let eight = [hevc(34).repeat(4), hevc(32).repeat(4)].concat();
+        assert!(check_unit(Codec::Hevc, &[&eight[..], &idr].concat()).is_ok());
+        for ninth in [hevc(34), hevc(32), unit(&[(34 << 1) | 0x80, 1], 9)] {
+            let late = [&eight[..], &idr, &ninth].concat();
+            refused_as(&late, Codec::Hevc, "parameter sets");
+        }
+        // An SPS has MOST_SPS of its own in HEVC, read in check_hevc.
+        let sixteen = hevc(33).repeat(MOST_SPS);
+        assert!(check_unit(Codec::Hevc, &[&eight[..], &sixteen, &idr].concat()).is_ok());
+
+        let idr = unit(&H264_IDR, 9);
+        let eight = [unit(&[0x67], 9).repeat(2), unit(&[0x68], 9).repeat(6)].concat();
+        assert!(check_unit(Codec::H264, &[&eight[..], &idr].concat()).is_ok());
+        for ninth in [unit(&[0x67], 9), unit(&[0x68], 9), unit(&[0x08], 9)] {
+            let late = [&eight[..], &idr, &ninth].concat();
+            refused_as(&late, Codec::H264, "parameter sets");
+        }
+    }
+
+    #[test]
+    fn more_than_one_picture() {
+        let many = |first: &[u8], second: &[u8], codec: Codec| {
+            let refused = check_unit(codec, &[unit(first, 9), unit(second, 9)].concat());
+            assert!(
+                matches!(refused, Err(DecodeError::ManyPictures)),
+                "{refused:?}"
+            );
+        };
+        many(&H264_IDR, &H264_IDR, Codec::H264);
+        many(&H264_FIRST_SLICE, &H264_IDR, Codec::H264);
+        many(&H264_IDR, &H264_FIRST_SLICE, Codec::H264);
+        many(&H264_FIRST_SLICE, &[0x61, 0x88], Codec::H264);
+        many(&HEVC_IDR, &HEVC_IDR, Codec::Hevc);
+        many(&HEVC_IDR, &HEVC_FIRST_SLICE, Codec::Hevc);
+        // Any slice type, which FFmpeg sorts out for itself after this.
+        many(&HEVC_FIRST_SLICE, &[9 << 1, 1, 0x80], Codec::Hevc);
+        // The other slices of a picture are the rest of that picture, and a
+        // slice cut short has no flag to read.
+        let rest = [
+            &unit(&H264_IDR, 9)[..],
+            &unit(&H264_SLICE, 9),
+            &[0, 0, 1, 0x41],
+        ]
+        .concat();
+        assert!(check_unit(Codec::H264, &rest).is_ok());
+        let rest = [
+            &unit(&HEVC_IDR, 9)[..],
+            &unit(&HEVC_SLICE, 9),
+            &[0, 0, 1, 2, 1],
+        ]
+        .concat();
+        assert!(check_unit(Codec::Hevc, &rest).is_ok());
+        // An SEI whose first byte has the same bit set is no picture.
+        let sei = [&unit(&H264_IDR, 9)[..], &unit(&[6, 0x88], 9)].concat();
+        assert!(check_unit(Codec::H264, &sei).is_ok());
+    }
+
+    #[test]
+    fn sei_past_the_limit() {
+        for (codec, headers) in [
+            (Codec::H264, vec![vec![6]]),
+            (Codec::Hevc, vec![vec![39 << 1, 1], vec![40 << 1, 1]]),
+        ] {
+            for header in headers {
+                let whole = unit(&header, MOST_SEI - header.len());
+                assert!(check_unit(codec, &whole).is_ok(), "{codec}");
+                refused_as(
+                    &unit(&header, MOST_SEI + 1 - header.len()),
+                    codec,
+                    "bytes of SEI",
+                );
+                // In pieces.
+                let half = unit(&header, MOST_SEI / 2 - header.len());
+                assert!(check_unit(codec, &half.repeat(2)).is_ok(), "{codec}");
+                let more = [&half.repeat(2)[..], &unit(&header, 0)].concat();
+                refused_as(&more, codec, "bytes of SEI");
+            }
+        }
+    }
+
+    // One pass, and a unit that holds too many costs what the count read of it.
+    // Past 64 NAL units it costs a look for its escapes too, which is only
+    // printed, since no encoder comes here.
+    #[test]
+    fn count_in_one_pass() {
+        const QUARTER_MS: Duration = Duration::from_micros(250);
+        let held = |took: Duration| cfg!(debug_assertions) || took < QUARTER_MS;
+        let timed = |name: &str, unit: &[u8]| {
+            let (took, answer) = fastest(unit, |unit| check_unit(Codec::Hevc, unit).map(drop));
+            println!(
+                "{name}, {} bytes: {answer:?} in {:.3} ms",
+                unit.len(),
+                took.as_secs_f64() * 1000.0
+            );
+            took
+        };
+        let mut long = vec![0, 0, 1, TRAIL[0], TRAIL[1]];
+        fill_to_the_limit(&mut long, &[0xff]);
+        let mut padding = Vec::new();
+        fill_to_the_limit(&mut padding, &[0, 0, 1]);
+        let mut smallest = Vec::new();
+        fill_to_the_limit(&mut smallest, &[0, 0, 1, 0x46, 1]);
+        for (name, unit) in [
+            ("One long slice", &long),
+            ("Padding", &padding),
+            ("The smallest NAL units", &smallest),
+        ] {
+            let took = timed(name, unit);
+            assert!(held(took), "{name}: {took:?}");
+        }
+        let mut most = unit(&[0x46, 1], 0).repeat(288);
+        fill_to_the_limit(&mut most, &[0xff]);
+        timed("288 NAL units", &most);
     }
 
     // Start codes and SPS headers mixed into the noise, so the noise reaches
@@ -439,6 +812,8 @@ mod tests {
         #[test]
         fn random_bytes_never_panic(bytes in noise()) {
             agrees_with_the_rule(&bytes)?;
+            let _ = check_unit(Codec::H264, &bytes);
+            let _ = check_unit(Codec::Hevc, &bytes);
         }
 
         #[test]

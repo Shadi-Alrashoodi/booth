@@ -86,8 +86,13 @@ void booth_device_fill(AVBufferRef *device, ID3D11Device *d3d, ID3D11DeviceConte
 // FFmpeg rounds an HEVC pool up to 128 in both directions rather than 16
 // (libavcodec/dxva2.c), so for HEVC the limit counts 16x16 blocks of the
 // size rounded that way, which bounds the pool the same. Rounded by 16 alone,
-// a 648x14384 HEVC picture would pass and get a 768x14464 pool, about 330 MB.
+// a 1168x7312 HEVC picture would pass and get a 1280x7424 pool, past the limit.
 // 4096x2304 is exactly the limit in both codecs.
+//
+// HEVC also stops at 8192 on a side, past anything a share sends. What FFmpeg
+// does for a PPS with a tile for every block goes with the blocks across plus
+// down as well as their number, so at this same area it took about 21 ms at
+// 73728x128, where it takes about 3 ms at 4096x2304 and 3.6 ms at 8192x1152.
 //
 // FFmpeg's H.264 decoder asks for a format before it sizes anything for a
 // new SPS. Its HEVC decoder first sizes its own tables by the SPS in CPU
@@ -101,6 +106,9 @@ const int booth_max_macroblocks = 36864;
 // format callback would refuse.
 int booth_too_large(int codec_id, int64_t width, int64_t height)
 {
+    if (codec_id == AV_CODEC_ID_HEVC && (width > 8192 || height > 8192)) {
+        return 1;
+    }
     int64_t round = codec_id == AV_CODEC_ID_HEVC ? 128 : 16;
     int64_t across = (width + round - 1) / round * round / 16;
     int64_t down = (height + round - 1) / round * round / 16;
