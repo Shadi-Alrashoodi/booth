@@ -79,7 +79,10 @@ impl Args {
 }
 
 fn main() -> ExitCode {
-    // Before anything else, so an older Windows gets a sentence rather than a
+    // First, whatever this run turns out to be: the panel's graphics DLLs are
+    // asked for by bare name as the window opens.
+    win::system_dlls_only();
+    // Before the rest, so an older Windows gets a sentence rather than a
     // failure somewhere in capture, audio or the window.
     if let Some(problem) = winver::this_pc().and_then(winver::too_old) {
         eprintln!("booth: {problem}");
@@ -90,10 +93,9 @@ fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     #[cfg(feature = "memstats")]
     let args = memstats::take_flags(args);
-    // First, before any window, profile or key: this may be the process the
+    // Before any window, profile or key: this may be the process the
     // administrator prompt started.
     if elevated::asked_for(&args) {
-        win::system_dlls_only();
         if cfg!(feature = "store") {
             eprintln!(
                 "booth: the Store package brings its own firewall rule, so {} does nothing in this copy",
@@ -582,6 +584,14 @@ fn native_options(panel_keys: Rc<RefCell<PanelKeys>>) -> eframe::NativeOptions {
 mod tests {
     use super::*;
 
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetModuleFileNameW, GetModuleHandleW, LoadLibraryExW,
+    };
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
     fn parse(args: &[&str]) -> Result<Args, String> {
         parse_args(args.iter().map(OsString::from))
     }
@@ -980,6 +990,128 @@ mod tests {
                 parse(args).err(),
                 Some(format!("{first} works only with --loopback")),
                 "{args:?}"
+            );
+        }
+    }
+
+    // wgpu's DX12 backend asks for these by bare name as the window opens,
+    // through libloading, which gives LoadLibraryExW no flags.
+    const BARE_NAMES: [&str; 2] = ["d3d12.dll", "dxcompiler.dll"];
+    const PLANTED: &str = "BOOTH_APP_PLANTED";
+
+    fn system32() -> PathBuf {
+        let mut path = [0u16; 1024];
+        // SAFETY: a buffer with its length.
+        let len = unsafe { GetSystemDirectoryW(path.as_mut_ptr(), path.len() as u32) } as usize;
+        assert!(len > 0 && len < path.len(), "no System32 folder");
+        PathBuf::from(String::from_utf16_lossy(&path[..len]))
+    }
+
+    #[test]
+    fn planted_dlls_stay_out_of_a_plain_start_and_the_helper() {
+        // Given the test's options, a release build's main shows a box and
+        // waits for someone to close it.
+        if cfg!(not(debug_assertions)) {
+            println!("skipped: main shows a box in a release build, so this runs in debug only");
+            return;
+        }
+        // The search order lasts as long as the process, and the exe's own
+        // folder is the one to plant in, so a link to this test exe runs the
+        // check from a scratch folder.
+        let folder = std::env::temp_dir().join(format!("booth-app-planted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let this_exe = std::env::current_exe().unwrap();
+        let exe = folder.join(this_exe.file_name().unwrap());
+        if std::fs::hard_link(&this_exe, &exe).is_err() {
+            std::fs::copy(&this_exe, &exe).unwrap();
+        }
+        // Any small DLL will do: what shows is the folder it came from.
+        for name in BARE_NAMES {
+            std::fs::copy(system32().join("version.dll"), folder.join(name)).unwrap();
+        }
+        // System32 rarely has dxcompiler.dll, so these two are next in line
+        // for it.
+        let current = folder.join("current");
+        let on_path = folder.join("on-path");
+        for place in [&current, &on_path] {
+            std::fs::create_dir(place).unwrap();
+            std::fs::copy(system32().join("version.dll"), place.join("dxcompiler.dll")).unwrap();
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::iter::once(on_path).chain(std::env::split_paths(&path));
+        let path = std::env::join_paths(path).unwrap();
+        let start = |extra: &[&str]| {
+            Command::new(&exe)
+                .args([
+                    "tests::main_beside_planted_dlls",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .args(extra)
+                .current_dir(&current)
+                .env("PATH", &path)
+                .env(PLANTED, "1")
+                .output()
+                .unwrap()
+        };
+        let plain = start(&[]);
+        // The tests take what follows -- as one more name to look for. main
+        // sees the flag among other options, which the helper refuses before
+        // it touches the firewall.
+        let helper = start(&["--", elevated::FLAG]);
+        let _ = std::fs::remove_dir_all(&folder);
+        for output in [&plain, &helper] {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            println!("{stdout}{}", String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success(), "{}", output.status);
+            assert!(stdout.contains("1 passed"), "the check did not run");
+        }
+        assert!(
+            String::from_utf8_lossy(&helper.stderr).contains(elevated::FLAG),
+            "main did not take the flag"
+        );
+    }
+
+    #[test]
+    #[ignore = "run by planted_dlls_stay_out_of_a_plain_start_and_the_helper in a process of its own"]
+    fn main_beside_planted_dlls() {
+        // Run alone, as --include-ignored does, nothing is planted and there
+        // is nothing to check.
+        if std::env::var_os(PLANTED).is_none() {
+            return;
+        }
+        let wide = |name: &str| -> Vec<u16> { name.encode_utf16().chain([0]).collect() };
+        for name in BARE_NAMES {
+            // SAFETY: a zero terminated name that lives across the call; the
+            // handle is not kept.
+            let module = unsafe { GetModuleHandleW(wide(name).as_ptr()) };
+            assert!(module.is_null(), "{name} is loaded already");
+        }
+        // The test's own options are not Booth's, so main stops at them, or
+        // the helper does, past what every run does first and before any
+        // window.
+        let _ = super::main();
+        let system = system32();
+        for name in BARE_NAMES {
+            // SAFETY: as above, and no search flags, as libloading passes. The
+            // module stays loaded until the process ends.
+            let module = unsafe { LoadLibraryExW(wide(name).as_ptr(), std::ptr::null_mut(), 0) };
+            if module.is_null() {
+                // Most PCs have no dxcompiler.dll in System32.
+                assert!(!system.join(name).is_file(), "{name} did not load");
+                continue;
+            }
+            let mut path = [0u16; 1024];
+            // SAFETY: a loaded module and a buffer with its length.
+            let len = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) };
+            let path = String::from_utf16_lossy(&path[..len as usize]);
+            println!("{name} came from {path}");
+            assert_eq!(
+                path.to_lowercase(),
+                system.join(name).to_string_lossy().to_lowercase()
             );
         }
     }

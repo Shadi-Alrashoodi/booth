@@ -3,8 +3,8 @@
 // from System32 only (crates/app/build.rs); these two are the one exception,
 // and their own imports of Windows DLLs come from System32 too. Nothing else
 // is searched: not PATH, not the working directory, and not the exe's folder
-// for anything but these two. A missing DLL is an error message for the viewer,
-// never a failed start.
+// for anything but these two and the one way round crates/app/src/win.rs names.
+// A missing DLL is an error message for the viewer, never a failed start.
 
 use std::ffi::{CStr, c_char, c_int, c_uint};
 use std::path::{Path, PathBuf};

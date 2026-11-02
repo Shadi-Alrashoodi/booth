@@ -369,9 +369,14 @@ pub fn rights() -> Rights {
     }
 }
 
-// For the elevated helper, before it does anything: what it loads from here
-// on comes from System32, never from the folder the exe sits in, which the
-// user can write to. The exe's own imports are covered by build.rs.
+// For every run, before it does anything: what it loads by bare name from here
+// on comes from System32, not from the current folder, PATH or the folder the
+// exe sits in, which the user can write to. wgpu asks for d3d12.dll and
+// dxcompiler.dll by bare name. System32 rarely has dxcompiler.dll, and without
+// it wgpu uses FXC, as it already does on most PCs. One way round is left: for
+// a WinRT class Windows does not have, windows-core passes its own flags and
+// looks beside the exe. The exe's own imports are covered by build.rs, and
+// FFmpeg is loaded by full path.
 pub fn system_dlls_only() {
     // SAFETY: takes one flag and touches no memory of ours. It fails only
     // for flags Windows does not know, and this one it has known since 8.
