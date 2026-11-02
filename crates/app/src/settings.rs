@@ -45,11 +45,13 @@ const VIDEO_UPLOAD_MBITS: &str = "video_upload_mbits";
 const VSYNC_IN_VIEWER: &str = "vsync_in_viewer";
 const HIDE_STRIP_IN_FULLSCREEN: &str = "hide_strip_in_fullscreen";
 const SHARE_MONITOR: &str = "share_monitor";
+// Off unless a window or a region was picked last; only on is saved.
+const SHARE_KEY_OPENS_LIST: &str = "share_key_opens_list";
 // Off unless the user turns it on, since a check shows GitHub this PC's
 // address. Only on is saved.
 const CHECK_FOR_NEW_VERSIONS: &str = "check_for_new_versions";
 // Every key this version knows, in the order a save adds the missing ones.
-const KEYS: [&str; 25] = [
+const KEYS: [&str; 26] = [
     NAME,
     PORT,
     STUN_SERVERS,
@@ -74,6 +76,7 @@ const KEYS: [&str; 25] = [
     VSYNC_IN_VIEWER,
     HIDE_STRIP_IN_FULLSCREEN,
     SHARE_MONITOR,
+    SHARE_KEY_OPENS_LIST,
     CHECK_FOR_NEW_VERSIONS,
 ];
 const PUSH_TO_TALK: &str = "push_to_talk";
@@ -122,6 +125,10 @@ pub struct Settings {
     // The Windows name of the monitor picked last in Share's list, for the
     // share key. Written from inside a room, when it is picked.
     share_monitor: Option<String>,
+    // The last thing picked there was a window or a region, so the share key
+    // opens the list rather than show a whole monitor. Written as
+    // share_monitor is.
+    share_key_opens_list: bool,
     check_for_new_versions: bool,
 }
 
@@ -334,6 +341,7 @@ impl Settings {
             || self.vsync != other.vsync
             || self.hide_strip != other.hide_strip
             || self.share_monitor != other.share_monitor
+            || self.share_key_opens_list != other.share_key_opens_list
     }
 
     pub fn share_monitor(&self) -> Option<&str> {
@@ -342,6 +350,14 @@ impl Settings {
 
     pub fn set_share_monitor(&mut self, device: Option<&str>) {
         self.share_monitor = device.map(str::to_owned);
+    }
+
+    pub fn share_key_opens_list(&self) -> bool {
+        self.share_key_opens_list
+    }
+
+    pub fn set_share_key_opens_list(&mut self, on: bool) {
+        self.share_key_opens_list = on;
     }
 
     pub fn check_for_new_versions(&self) -> bool {
@@ -413,6 +429,7 @@ impl Settings {
             VSYNC_IN_VIEWER => self.vsync.then(|| String::from("on")),
             HIDE_STRIP_IN_FULLSCREEN => self.hide_strip.then(|| String::from("on")),
             SHARE_MONITOR => self.share_monitor.clone(),
+            SHARE_KEY_OPENS_LIST => self.share_key_opens_list.then(|| String::from("on")),
             CHECK_FOR_NEW_VERSIONS => self.check_for_new_versions.then(|| String::from("on")),
             key => hotkey_action(key).and_then(|action| {
                 let chord = self.hotkeys.chord(action);
@@ -541,6 +558,17 @@ impl Settings {
             }
             SHARE_MONITOR => {
                 self.share_monitor = monitor_name(value)?;
+            }
+            SHARE_KEY_OPENS_LIST => {
+                self.share_key_opens_list = match value {
+                    "on" => true,
+                    "off" => false,
+                    _ => {
+                        return Err(format!(
+                            "{SHARE_KEY_OPENS_LIST} is on or off; pick what to share again after Share"
+                        ));
+                    }
+                };
             }
             key => {
                 if let Some(action) = hotkey_action(key) {
@@ -1371,6 +1399,7 @@ mod tests {
         assert!(changed(
             &|next| next.set_share_monitor(Some(r"\\.\DISPLAY2"))
         ));
+        assert!(changed(&|next| next.set_share_key_opens_list(true)));
         // The upload at its default, saved or not, is no change.
         assert!(!changed(&|next| next.set_upload_mbits(DEFAULT_UPLOAD_MBITS)));
         assert!(!changed(&|next| next.set_name("Tom")));
@@ -1495,10 +1524,11 @@ mod tests {
         settings.set_vsync(true);
         settings.set_hide_strip(true);
         settings.set_share_monitor(Some(r"\\.\DISPLAY2"));
+        settings.set_share_key_opens_list(true);
         settings.save(&folder.0).unwrap();
         assert_eq!(
             fs::read_to_string(folder.file()).unwrap(),
-            "video_upload_mbits = 40\r\nvsync_in_viewer = on\r\nhide_strip_in_fullscreen = on\r\nshare_monitor = \\\\.\\DISPLAY2\r\n"
+            "video_upload_mbits = 40\r\nvsync_in_viewer = on\r\nhide_strip_in_fullscreen = on\r\nshare_monitor = \\\\.\\DISPLAY2\r\nshare_key_opens_list = on\r\n"
         );
         let (loaded, problems) = Settings::load(&folder.0);
         assert!(problems.is_empty(), "{problems:?}");
@@ -1508,12 +1538,13 @@ mod tests {
         settings.set_vsync(false);
         settings.set_hide_strip(false);
         settings.set_share_monitor(None);
+        settings.set_share_key_opens_list(false);
         assert_eq!(settings, Settings::default());
         settings.save(&folder.0).unwrap();
         assert_eq!(fs::read_to_string(folder.file()).unwrap(), "");
         // Written by hand, the defaults read back as the defaults.
         let (loaded, problems) =
-            parse(b"video_upload_mbits = 15\nvsync_in_viewer = off\nhide_strip_in_fullscreen = off\nshare_monitor =\n");
+            parse(b"video_upload_mbits = 15\nvsync_in_viewer = off\nhide_strip_in_fullscreen = off\nshare_monitor =\nshare_key_opens_list = off\n");
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(loaded, Settings::default());
     }
@@ -1584,7 +1615,7 @@ mod tests {
     #[test]
     fn unknown_sharing_values() {
         let text = format!(
-            "video_upload_mbits = 81\nvideo_upload_mbits = fast\nvsync_in_viewer = yes\nhide_strip_in_fullscreen = 1\nshare_monitor = a\u{7}b\nshare_monitor = {}\n",
+            "video_upload_mbits = 81\nvideo_upload_mbits = fast\nvsync_in_viewer = yes\nhide_strip_in_fullscreen = 1\nshare_monitor = a\u{7}b\nshare_monitor = {}\nshare_key_opens_list = yes\n",
             "x".repeat(65)
         );
         let (settings, problems) = parse(text.as_bytes());
@@ -1598,6 +1629,7 @@ mod tests {
                 "settings: line 4 skipped: hide_strip_in_fullscreen is on or off; set it again in settings",
                 "settings: line 5 skipped: share_monitor is not a monitor name Windows gives; pick the monitor again after Share",
                 "settings: line 6 skipped: share_monitor is not a monitor name Windows gives; pick the monitor again after Share",
+                "settings: line 7 skipped: share_key_opens_list is on or off; pick what to share again after Share",
             ]
         );
     }

@@ -30,7 +30,7 @@ use crate::remote::{Flags, Guard};
 use crate::running::{self, Lock};
 use crate::screens::control::PanicKey;
 use crate::screens::firewall::{self as firewall_screen, Answer, Ask};
-use crate::screens::room::{InRoom, Step, own_share_on};
+use crate::screens::room::{InRoom, Step, own_share_on, share_offered};
 use crate::screens::settings::{self as settings_screen, Draft, Press, Refused};
 use crate::screens::start::{self, Choice, Start};
 use crate::screens::stats;
@@ -752,11 +752,11 @@ impl App {
             }
             None => return,
         }
-        // After a region share the key opens the list instead, so a press never
-        // shows more than the person last chose.
-        if in_room.list_next() {
-            in_room.open_share_list();
-            self.show_panel(ctx);
+        // After a region or window share the key opens the list instead, in
+        // later rooms and runs too, so a press never shows more than the
+        // person last chose.
+        if setup.settings.share_key_opens_list() {
+            self.open_list_by_key(monitors::list(), ctx);
             return;
         }
         in_room.close_monitors();
@@ -775,9 +775,52 @@ impl App {
         in_room.room.share(fps, monitor);
     }
 
+    // The panel comes forward only for a list that stays. With Share not on
+    // offer the next frame would close it, so the room says why in the chat
+    // instead, which starts nothing even if the other share has just ended.
+    fn open_list_by_key(&mut self, list: Result<Vec<room::Monitor>, String>, ctx: &Context) {
+        let Screen::Room(in_room) = &mut self.screen else {
+            return;
+        };
+        if !share_offered(&in_room.room.view(), self.control_offered) {
+            in_room.room.refuse_share();
+            return;
+        }
+        match in_room.open_share_list(list) {
+            Ok(()) => self.show_panel(ctx),
+            Err(err) => self.backlog.add(format!("share key: {err}")),
+        }
+    }
+
     fn remember_monitor(&mut self, device: &str) {
         if let Ok(setup) = &mut self.setup {
             remember_monitor(setup, device, self.flags.controlled(), &mut self.backlog);
+        }
+    }
+
+    fn remember_list_next(&mut self) {
+        if let Ok(setup) = &mut self.setup {
+            remember_list_next(setup, &mut self.backlog);
+        }
+    }
+
+    fn take_step(&mut self, step: Option<Step>) {
+        match step {
+            Some(Step::Leave) => self.leave(),
+            Some(Step::NewInvite { multi_use }) => {
+                if let Screen::Room(in_room) = &self.screen {
+                    in_room.room.new_invite(multi_use);
+                }
+            }
+            Some(Step::NewCode) => {
+                if let Screen::Room(in_room) = &self.screen {
+                    in_room.room.new_code();
+                }
+            }
+            Some(Step::Remember(device)) => self.remember_monitor(&device),
+            Some(Step::ListNext) => self.remember_list_next(),
+            Some(Step::Log(line)) => self.backlog.add(line),
+            None => {}
         }
     }
 
@@ -903,9 +946,10 @@ fn start_hotkeys(
 // Kept for the share key the moment it is picked, from inside a room, where
 // settings cannot be opened. A write that fails keeps it for this run and
 // says so in the log. While this PC is controlled it is a sharing setting
-// like the others and takes no change, whoever clicked.
+// like the others and takes no change, whoever clicked, so if a window or a
+// region was picked last the key still opens the list.
 fn remember_monitor(setup: &mut Setup, device: &str, controlled: bool, backlog: &mut Backlog) {
-    if setup.settings.share_monitor() == Some(device) {
+    if setup.settings.share_monitor() == Some(device) && !setup.settings.share_key_opens_list() {
         return;
     }
     if controlled {
@@ -915,10 +959,26 @@ fn remember_monitor(setup: &mut Setup, device: &str, controlled: bool, backlog: 
         return;
     }
     setup.settings.set_share_monitor(Some(device));
+    setup.settings.set_share_key_opens_list(false);
     match setup.settings.save(&setup.config.data_dir) {
         Ok(()) => backlog.add(format!("settings: the share key takes {device} now")),
         Err(err) => backlog.add(format!(
             "settings: {err}; the share key takes {device} until Booth closes"
+        )),
+    }
+}
+
+// Kept the same way when a window or a region is picked. Being controlled does
+// not stop this one: it can only make the key show less. Each pick writes it
+// again, since a file left without it gives a whole monitor after a restart.
+fn remember_list_next(setup: &mut Setup, backlog: &mut Backlog) {
+    let new = !setup.settings.share_key_opens_list();
+    setup.settings.set_share_key_opens_list(true);
+    match setup.settings.save(&setup.config.data_dir) {
+        Ok(()) if new => backlog.add(String::from("settings: the share key opens the list now")),
+        Ok(()) => {}
+        Err(err) => backlog.add(format!(
+            "settings: {err}; the share key opens the list until Booth closes"
         )),
     }
 }
@@ -1316,22 +1376,7 @@ impl eframe::App for App {
                 self.backlog.add(line);
             }
         }
-        match step {
-            Some(Step::Leave) => self.leave(),
-            Some(Step::NewInvite { multi_use }) => {
-                if let Screen::Room(in_room) = &self.screen {
-                    in_room.room.new_invite(multi_use);
-                }
-            }
-            Some(Step::NewCode) => {
-                if let Screen::Room(in_room) = &self.screen {
-                    in_room.room.new_code();
-                }
-            }
-            Some(Step::Remember(device)) => self.remember_monitor(&device),
-            Some(Step::Log(line)) => self.backlog.add(line),
-            None => {}
-        }
+        self.take_step(step);
         // Change or Save pressed on this frame starts or ends a wait.
         self.follow_capture();
         self.follow_panel_keys(ui.ctx());
@@ -1482,6 +1527,7 @@ mod tests {
     use eframe::egui::{Pos2, RawInput, Rect, ViewportId, ViewportInfo, vec2};
     use voice::audio::fake::{Fake, Setup as FakeSetup};
 
+    use crate::screens::room::tests as room_tests;
     use crate::{firewall, sound};
 
     fn setup_in(dir: &Path) -> Setup {
@@ -1570,6 +1616,75 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    fn test_app(setup: Result<Setup, String>, screen: Screen) -> App {
+        App {
+            setup,
+            screen,
+            firewall: firewall::tests::quiet(),
+            backlog: Backlog::default(),
+            stats_open: false,
+            sweep: Sweep::default(),
+            scrolling: false,
+            notify: Arc::new(|| {}),
+            not_now: None,
+            damaged: Vec::new(),
+            unusable: Vec::new(),
+            hotkeys: Hotkeys::off(),
+            target: Target::default(),
+            flags: Arc::default(),
+            control_offered: false,
+            share_key: ShareKey::default(),
+            raise: false,
+            viewer_strip: Arc::default(),
+            tray: None,
+            tray_clicked: Arc::default(),
+            update: Update::off(),
+            scale: None,
+            focused: None,
+            panel_keys: Rc::default(),
+        }
+    }
+
+    fn fresh_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("booth-app-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // In a room that shares nothing by itself, so no monitor or encoder opens.
+    fn app_in_room(dir: &Path) -> App {
+        let mut app = test_app(Ok(setup_in(dir)), Screen::Checking);
+        app.enter(room_tests::test_room(dir));
+        app
+    }
+
+    fn in_room(app: &mut App) -> &mut InRoom {
+        match &mut app.screen {
+            Screen::Room(in_room) => in_room,
+            _ => panic!("not in a room"),
+        }
+    }
+
+    fn share_goes(app: &mut App, on: bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while own_share_on(&in_room(app).room.view().share.own) != on {
+            assert!(Instant::now() < deadline, "the share never went {on}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    // Two presses of the share key within a second.
+    fn press_share_key_twice(app: &mut App, ctx: &Context) {
+        let at = Instant::now();
+        app.share_key(at, ctx);
+        app.share_key(at + Duration::from_millis(100), ctx);
+    }
+
+    fn close_room(mut app: App) {
+        app.leave();
+    }
+
     fn with_window(minimized: bool) -> RawInput {
         let mut input = RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(360.0, 640.0))),
@@ -1596,36 +1711,14 @@ mod tests {
         let draft = Draft::new(&Settings::default(), KnownDevices::default(), String::new());
         let mut audio = sound::tests::fake_audio(&ctx, &fake, &draft.input);
         sound::tests::fake_hear(&mut audio, &fake, &draft.output);
-        let mut app = App {
-            setup: Err(String::new()),
-            screen: Screen::Settings {
+        let mut app = test_app(
+            Err(String::new()),
+            Screen::Settings {
                 draft: Box::new(draft),
                 start: Start::default(),
                 audio: Box::new(audio),
             },
-            firewall: firewall::tests::quiet(),
-            backlog: Backlog::default(),
-            stats_open: false,
-            sweep: Sweep::default(),
-            scrolling: false,
-            notify: Arc::new(|| {}),
-            not_now: None,
-            damaged: Vec::new(),
-            unusable: Vec::new(),
-            hotkeys: Hotkeys::off(),
-            target: Target::default(),
-            flags: Arc::default(),
-            control_offered: false,
-            share_key: ShareKey::default(),
-            raise: false,
-            viewer_strip: Arc::default(),
-            tray: None,
-            tray_clicked: Arc::default(),
-            update: Update::off(),
-            scale: None,
-            focused: None,
-            panel_keys: Rc::default(),
-        };
+        );
         let hearing = |app: &App| match &app.screen {
             Screen::Settings { audio, .. } => audio.hearing(),
             _ => panic!("the screen changed"),
@@ -1728,6 +1821,139 @@ mod tests {
         let (saved, _) = Settings::load(&dir);
         assert_eq!(saved.share_monitor(), Some(r"\\.\DISPLAY2"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // The list stays what the share key opens after a window or a region is
+    // picked, in the next room and the next run, until a monitor is picked.
+    #[test]
+    fn a_window_or_region_stays_the_choice_between_rooms() {
+        let dir = fresh_dir("list-next");
+        let ctx = Context::default();
+        let mut app = app_in_room(&dir);
+        app.take_step(Some(Step::ListNext));
+        assert!(Settings::load(&dir).0.share_key_opens_list());
+
+        app.leave();
+        app.enter(room_tests::test_room(&dir));
+        press_share_key_twice(&mut app, &ctx);
+        thread::sleep(Duration::from_millis(100));
+        let own = in_room(&mut app).room.view().share.own;
+        assert!(!own_share_on(&own), "{own:?}");
+        let listed = monitors::list().is_ok_and(|list| !list.is_empty());
+        assert_eq!(app.raise, listed, "the panel comes forward with the list");
+        assert_eq!(room_tests::list_open(in_room(&mut app)), listed);
+
+        // A monitor picked ends it, the same monitor as before included.
+        app.take_step(Some(Step::Remember(String::from(r"\\.\DISPLAY2"))));
+        assert!(!Settings::load(&dir).0.share_key_opens_list());
+        app.take_step(Some(Step::ListNext));
+        app.take_step(Some(Step::Remember(String::from(r"\\.\DISPLAY2"))));
+        assert!(!Settings::load(&dir).0.share_key_opens_list());
+        press_share_key_twice(&mut app, &ctx);
+        share_goes(&mut app, true);
+
+        close_room(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // While controlled a monitor picked changes nothing, so the key does not
+    // go back to a whole monitor. A window or a region is kept, as it only
+    // makes the key show less.
+    #[test]
+    fn while_controlled_the_share_key_does_not_widen() {
+        let dir = fresh_dir("list-controlled");
+        let mut setup = setup_in(&dir);
+        let mut backlog = Backlog::default();
+        remember_list_next(&mut setup, &mut backlog);
+        assert!(setup.settings.share_key_opens_list());
+        let saved = std::fs::read(dir.join("settings.txt")).unwrap();
+        remember_monitor(&mut setup, r"\\.\DISPLAY2", true, &mut backlog);
+        assert!(setup.settings.share_key_opens_list());
+        assert_eq!(setup.settings.share_monitor(), None);
+        assert_eq!(std::fs::read(dir.join("settings.txt")).unwrap(), saved);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A file left without the flag gives a whole monitor after a restart, so
+    // a write that failed is tried again at the next pick. The log hears of a
+    // pick only when it changed something or could not be kept.
+    #[test]
+    fn the_next_pick_writes_a_list_next_that_could_not_be_written() {
+        let dir = fresh_dir("list-write");
+        let not_a_folder = dir.join("a file");
+        std::fs::write(&not_a_folder, b"").unwrap();
+        let mut setup = setup_in(&not_a_folder);
+        let mut backlog = Backlog::default();
+        remember_list_next(&mut setup, &mut backlog);
+        assert!(setup.settings.share_key_opens_list());
+        assert_eq!(backlog.texts().len(), 1);
+        assert!(backlog.texts()[0].ends_with("until Booth closes"));
+
+        setup.config.data_dir = dir.clone();
+        remember_list_next(&mut setup, &mut backlog);
+        assert!(Settings::load(&dir).0.share_key_opens_list());
+        assert_eq!(backlog.texts().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // With Share not on offer the list would not stay, so the panel does not
+    // come forward. While a friend shares, the room gives its one line.
+    #[test]
+    fn the_share_key_shows_no_list_while_a_friend_shares() {
+        let dir = fresh_dir("list-busy");
+        let friend_dir = fresh_dir("list-busy-friend");
+        let ctx = Context::default();
+        let mut app = app_in_room(&dir);
+        app.take_step(Some(Step::ListNext));
+        let friend = room_tests::test_friend(&in_room(&mut app).room, &friend_dir);
+        friend.share(30, None);
+        let room = Arc::clone(&in_room(&mut app).room);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while room.view().share.current.is_none() {
+            assert!(Instant::now() < deadline, "the friend's share never showed");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        press_share_key_twice(&mut app, &ctx);
+        let view = room.view();
+        assert!(!app.raise);
+        assert!(!room_tests::list_open(in_room(&mut app)));
+        assert!(!own_share_on(&view.share.own), "{:?}", view.share.own);
+        let line = "Bo is sharing. One share at a time.";
+        assert!(view.chat.iter().any(|said| said.text == line));
+
+        friend.leave();
+        drop(room);
+        close_room(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&friend_dir);
+    }
+
+    // No list to show: the log says why, and the panel stays where it is.
+    #[test]
+    fn the_share_key_brings_the_panel_only_for_a_list() {
+        let dir = fresh_dir("list-none");
+        let ctx = Context::default();
+        let mut app = app_in_room(&dir);
+
+        app.open_list_by_key(Err(String::from("no list")), &ctx);
+        assert!(app.backlog.texts().contains(&"share key: no list"));
+        app.open_list_by_key(Ok(Vec::new()), &ctx);
+        assert!(
+            app.backlog
+                .texts()
+                .contains(&"share key: no monitor is attached")
+        );
+        assert!(!app.raise);
+        assert!(!room_tests::list_open(in_room(&mut app)));
+
+        let monitor = monitors::tests::monitor(r"\\.\DISPLAY1", 0, true);
+        app.open_list_by_key(Ok(vec![monitor]), &ctx);
+        assert!(app.raise);
+        assert!(room_tests::list_open(in_room(&mut app)));
+
+        close_room(app);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

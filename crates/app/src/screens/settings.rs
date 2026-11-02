@@ -1208,8 +1208,10 @@ mod tests {
         // The monitor picked from inside a room is carried over as it was.
         let mut picked = Settings::default();
         picked.set_share_monitor(Some(r"\\.\DISPLAY2"));
+        picked.set_share_key_opens_list(true);
         let kept = typed("").settings(&picked).unwrap();
         assert_eq!(kept.share_monitor(), Some(r"\\.\DISPLAY2"));
+        assert!(kept.share_key_opens_list());
     }
 
     // Off until turned on, and Save keeps what was picked.

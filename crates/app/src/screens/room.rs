@@ -13,7 +13,7 @@ use room::view::{
     InviteView, LinkState, MappingWord, NameView, Notice, OwnShare, OwnSound, PasteState, Person,
     ReplyState, ReplyView, Role, ShareView, TalkMode, View, Voice,
 };
-use room::{MOST_VOLUME, Room};
+use room::{MOST_VOLUME, Monitor, Room};
 use voice::audio::{AudioError, Choice};
 
 use crate::controls::{self, Button, Lead};
@@ -72,9 +72,6 @@ pub struct InRoom {
     list_room: ListRoom,
     // The region picker's answer, while it is open.
     region_pick: Option<Receiver<Result<Option<Picked>, String>>>,
-    // The share started last from the panel was a region or a window: the
-    // share key then opens the list rather than show a whole monitor.
-    list_next: bool,
     panic: PanicKey,
     allow_wait: AllowWait,
     block_wait: BlockWait,
@@ -163,6 +160,9 @@ pub enum Step {
     // A monitor was picked from the list, and its Windows name goes in the
     // settings for the share key.
     Remember(String),
+    // A window or a region was picked, and from now on the share key opens
+    // the list rather than show a whole monitor.
+    ListNext,
     // For the log, which the panel has no line for.
     Log(String),
 }
@@ -198,7 +198,6 @@ impl InRoom {
             region_pick: None,
             windows: Vec::new(),
             list_room: ListRoom::default(),
-            list_next: false,
             panic,
             allow_wait: AllowWait::default(),
             block_wait: BlockWait::default(),
@@ -246,22 +245,19 @@ impl InRoom {
         self.monitors = None;
     }
 
-    pub fn list_next(&self) -> bool {
-        self.list_next
-    }
-
     // For the share key after a region or window share: the list, as Share
-    // opens it.
-    pub fn open_share_list(&mut self) {
-        if let Ok(list) = monitors::list()
-            && !list.is_empty()
-        {
-            if self.monitors.is_some() {
-                self.list_room.refilled(Instant::now());
-            }
-            self.monitors = Some(monitors::picks(&list));
-            self.windows = window_picks();
+    // opens it, or why there is none.
+    pub fn open_share_list(&mut self, list: Result<Vec<Monitor>, String>) -> Result<(), String> {
+        let list = list?;
+        if list.is_empty() {
+            return Err(String::from("no monitor is attached"));
         }
+        if self.monitors.is_some() {
+            self.list_room.refilled(Instant::now());
+        }
+        self.monitors = Some(monitors::picks(&list));
+        self.windows = window_picks();
+        Ok(())
     }
 
     pub fn show(
@@ -323,35 +319,8 @@ impl InRoom {
                 ui.ctx().request_repaint_after(left);
             }
             self.list_room.measured(ui.cursor().top() - top);
-            match picked {
-                Some(RowPick::Monitor(i)) => {
-                    let pick = &picks[i];
-                    self.room.share(pick.fps, Some(pick.id.clone()));
-                    step = Some(Step::Remember(pick.id.device_name.clone()));
-                    self.monitors = None;
-                    self.list_next = false;
-                }
-                Some(RowPick::Region) => {
-                    self.monitors = None;
-                    step = self.pick_region(ui.ctx());
-                }
-                Some(RowPick::Window(i)) => {
-                    let id = self.windows[i].id;
-                    if id.exists() {
-                        let fps = room::window_monitor(id).map_or(monitors::MOST_FPS, |monitor| {
-                            monitors::fps(monitor.refresh_hz)
-                        });
-                        self.room.share_window(fps, id);
-                        self.monitors = None;
-                        self.list_next = true;
-                    } else {
-                        // Closed since the list was taken: a list as it is
-                        // now, rather than a share that cannot start.
-                        self.windows = window_picks();
-                        self.list_room.refilled(now);
-                    }
-                }
-                None => {}
+            if let Some(picked) = picked {
+                step = self.row_picked(picked, now, ui.ctx()).or(step);
             }
         }
         // However the list went, what was under it must not move up yet.
@@ -363,7 +332,7 @@ impl InRoom {
                 Ok(Ok(Some(picked))) => {
                     let fps = monitors::fps(picked.refresh_hz);
                     self.room.share_region(fps, picked.monitor, picked.region);
-                    self.list_next = true;
+                    step = Some(Step::ListNext);
                     self.region_pick = None;
                 }
                 Ok(Err(why)) => {
@@ -436,6 +405,39 @@ impl InRoom {
         self.chat
             .show(ui, &view.chat, &view.people, &self.room, composer(view));
         step
+    }
+
+    fn row_picked(&mut self, picked: RowPick, now: Instant, ctx: &Context) -> Option<Step> {
+        match picked {
+            RowPick::Monitor(i) => {
+                let pick = &self.monitors.as_ref()?[i];
+                self.room.share(pick.fps, Some(pick.id.clone()));
+                let device = pick.id.device_name.clone();
+                self.monitors = None;
+                Some(Step::Remember(device))
+            }
+            RowPick::Region => {
+                self.monitors = None;
+                self.pick_region(ctx)
+            }
+            RowPick::Window(i) => {
+                let id = self.windows[i].id;
+                if id.exists() {
+                    let fps = room::window_monitor(id).map_or(monitors::MOST_FPS, |monitor| {
+                        monitors::fps(monitor.refresh_hz)
+                    });
+                    self.room.share_window(fps, id);
+                    self.monitors = None;
+                    Some(Step::ListNext)
+                } else {
+                    // Closed since the list was taken: a list as it is
+                    // now, rather than a share that cannot start.
+                    self.windows = window_picks();
+                    self.list_room.refilled(now);
+                    None
+                }
+            }
+        }
     }
 
     // Share opens the list of monitors, Region and the windows under the
@@ -979,6 +981,11 @@ impl VerbWords {
             None => button,
         }
     }
+}
+
+// Whether the title row offers Share itself now, and with it the list.
+pub fn share_offered(view: &View, control_offered: bool) -> bool {
+    share_verb(view, control_offered) == Some(ShareVerb::Share)
 }
 
 // None while the room is over, and on a client that lost the host, which
@@ -1929,7 +1936,7 @@ fn row_rect(ui: &mut Ui, height: f32) -> Rect {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::theme::Role::{Primary, Secondary};
     use eframe::egui::{Event, PlatformOutput, Pos2, TouchDeviceId, TouchId, TouchPhase, pos2};
@@ -2969,10 +2976,43 @@ mod tests {
         assert_eq!(frame(&mut hold, live, true, true), (false, None));
     }
 
-    // Minimized, the panel runs logic and no frames, so nothing but
-    // out_of_sight can stop the voice the button started.
-    #[test]
-    fn minimizing_lets_go_of_hold_to_talk() {
+    // A room with fake sound that shares nothing by itself. The share key and
+    // the picker's answer can go through it with no monitor or encoder.
+    pub(crate) fn test_room(data_dir: &std::path::Path) -> Room {
+        let identity = Arc::new(keys::Identity::generate());
+        let config = test_config(data_dir, "Ana");
+        Room::host(config, identity, String::new(), Arc::new(|| {})).expect("a room")
+    }
+
+    // Joined to `host` over loopback, as Bo.
+    pub(crate) fn test_friend(host: &Room, data_dir: &std::path::Path) -> Room {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let code = loop {
+            if let Some(invite) = host.view().invite.filter(|invite| !invite.code.is_empty()) {
+                break invite.code;
+            }
+            assert!(Instant::now() < deadline, "the host made no invite");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let mut invite = invite::Invite::decode(&code).expect("the host's code decodes");
+        invite.candidates.push(invite::Candidate {
+            kind: invite::CandidateKind::Lan,
+            addr: std::net::SocketAddr::from((
+                std::net::Ipv4Addr::LOCALHOST,
+                host.view().numbers.local_port,
+            )),
+        });
+        let identity = Arc::new(keys::Identity::generate());
+        let config = test_config(data_dir, "Bo");
+        let friend = Room::join(config, identity, invite, Arc::new(|| {})).expect("a room");
+        while friend.view().strip.state != LinkState::Live {
+            assert!(Instant::now() < deadline, "the friend never got in");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        friend
+    }
+
+    fn test_config(data_dir: &std::path::Path, name: &str) -> room::Config {
         use room::{Candidates, Config, Devices, Lookup, Show, Timers, VideoConfig, VideoSource};
         use voice::audio::fake::{Fake, Setup};
         let setup = Setup {
@@ -2981,13 +3021,10 @@ mod tests {
             ..Setup::default()
         };
         let fake = |id, name| Fake::new(setup, &[(id, name)], Some(id));
-        let data_dir = std::env::temp_dir().join(format!("booth-app-hold-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&data_dir);
-        std::fs::create_dir_all(&data_dir).unwrap();
-        let config = Config {
-            data_dir: data_dir.clone(),
+        Config {
+            data_dir: data_dir.to_path_buf(),
             port: 0,
-            name: String::from("Ana"),
+            name: String::from(name),
             stun_servers: Vec::new(),
             candidates: Candidates::Fixed(Vec::new()),
             punch_loopback: true,
@@ -3012,14 +3049,12 @@ mod tests {
                 ..VideoConfig::default()
             },
             version: invite::VERSION,
-        };
-        let identity = Arc::new(keys::Identity::generate());
-        let room = Room::host(config, identity, String::new(), Arc::new(|| {})).expect("a room");
-        let room = Arc::new(room);
-        let target = Target::default();
-        target.enter(Arc::clone(&room));
-        let mut in_room = InRoom::new(
-            Arc::clone(&room),
+        }
+    }
+
+    fn test_in_room(room: &Arc<Room>, target: &Target) -> InRoom {
+        InRoom::new(
+            Arc::clone(room),
             String::new(),
             None,
             "",
@@ -3030,7 +3065,90 @@ mod tests {
                 flags: Default::default(),
             },
             Default::default(),
-        );
+        )
+    }
+
+    pub(crate) fn list_open(in_room: &InRoom) -> bool {
+        in_room.monitors.is_some()
+    }
+
+    // A monitor is what the share key takes next, and a window puts the list
+    // in its place. The desktop's own window is there in any session, so no
+    // window opens for this.
+    #[test]
+    fn a_row_picked_says_what_the_share_key_does_next() {
+        let data_dir = std::env::temp_dir().join(format!("booth-app-row-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let room = Arc::new(test_room(&data_dir));
+        let target = Target::default();
+        target.enter(Arc::clone(&room));
+        let mut in_room = test_in_room(&room, &target);
+        let ctx = Context::default();
+        let now = Instant::now();
+        let window = |id| WindowPick {
+            id,
+            title: String::new(),
+            quiet: String::new(),
+            spoken: String::new(),
+        };
+        let shares = |on: bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while own_share_on(&room.view().share.own) != on {
+                assert!(Instant::now() < deadline, "the share never went {on}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        in_room.monitors = Some(monitors::picks(&[crate::monitors::tests::monitor(
+            r"\\.\DISPLAY2",
+            0,
+            true,
+        )]));
+        let step = in_room.row_picked(RowPick::Monitor(0), now, &ctx);
+        assert!(matches!(step, Some(Step::Remember(device)) if device == r"\\.\DISPLAY2"));
+        assert!(in_room.monitors.is_none());
+        shares(true);
+        room.stop_sharing();
+        shares(false);
+
+        // Closed since the list was taken.
+        in_room.monitors = Some(Vec::new());
+        in_room.windows = vec![window(room::WindowId {
+            hwnd: 0,
+            process: 0,
+        })];
+        assert!(in_room.row_picked(RowPick::Window(0), now, &ctx).is_none());
+        assert!(in_room.monitors.is_some());
+        shares(false);
+
+        // SAFETY: a plain query with no arguments.
+        let desktop = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetDesktopWindow() };
+        in_room.windows = vec![window(room::WindowId::of(desktop as isize).unwrap())];
+        let step = in_room.row_picked(RowPick::Window(0), now, &ctx);
+        assert!(matches!(step, Some(Step::ListNext)));
+        assert!(in_room.monitors.is_none());
+        shares(true);
+        room.stop_sharing();
+        shares(false);
+
+        drop(in_room);
+        target.leave();
+        hotkeys::leave(room);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // Minimized, the panel runs logic and no frames, so nothing but
+    // out_of_sight can stop the voice the button started.
+    #[test]
+    fn minimizing_lets_go_of_hold_to_talk() {
+        let data_dir = std::env::temp_dir().join(format!("booth-app-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let room = Arc::new(test_room(&data_dir));
+        let target = Target::default();
+        target.enter(Arc::clone(&room));
+        let mut in_room = test_in_room(&room, &target);
         let sending_goes = |sending: bool| {
             let deadline = Instant::now() + Duration::from_secs(20);
             while room.view().voice.sending != sending {

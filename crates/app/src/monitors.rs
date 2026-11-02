@@ -136,7 +136,7 @@ fn places(rects: &[Place], order: &[usize]) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn place(left: i32, top: i32, width: u32, height: u32) -> Place {
@@ -199,7 +199,7 @@ mod tests {
         assert_eq!(words, ["at 0,0", "at 0,1080", "at 1920,0", "at 1920,1080"]);
     }
 
-    fn monitor(device: &str, left: i32, primary: bool) -> Monitor {
+    pub(crate) fn monitor(device: &str, left: i32, primary: bool) -> Monitor {
         Monitor {
             id: MonitorId {
                 device_name: device.to_owned(),
