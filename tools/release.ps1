@@ -607,6 +607,17 @@ function Assert-NoBuildFolder([System.IO.FileInfo[]]$Files) {
     Write-Host "none of this PC's folders in: $(($Files | ForEach-Object { $_.Name }) -join ', ')"
 }
 
+# opusic-sys's build script does not run again when cmake\static-crt.cmake
+# changes, so a target folder can keep a libopus from before that file asked
+# for /O2, and every voice frame would run it. The bytes are libopus's ec_bsr as
+# cl.exe writes it with no optimisation; with /O2 it is inlined and they are gone.
+function Assert-OptimisedLibopus([string]$Exe, [string]$TargetFolder) {
+    $unoptimised = -join ([char[]](0x89, 0x4C, 0x24, 0x08, 0x48, 0x83, 0xEC, 0x18, 0x8B, 0x44, 0x24, 0x20, 0x0F, 0xBD, 0xC0, 0x89, 0x04, 0x24, 0x8B, 0x04, 0x24, 0x48, 0x83, 0xC4, 0x18, 0xC3))
+    if ([System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes($Exe)).Contains($unoptimised)) {
+        throw "$Exe holds libopus built with no optimisation, so every voice frame would cost about three times the CPU. Build it again: run cargo clean -p opusic-sys --release --target-dir `"$TargetFolder`" and then run this script again."
+    }
+}
+
 Write-Host "Booth $version"
 
 $dist = Join-Path $root "dist\$version"
@@ -662,6 +673,7 @@ New-Item -ItemType Directory -Force $files | Out-Null
 # is quicker to hear before the long build than after it.
 Invoke-Tool 'collecting the third-party licenses' $releaseTool @('licenses', $root, $files)
 Invoke-Tool 'the release build' 'cargo' (@('build', '--release', '--locked', '-p', 'app') + $buildArgs) $buildEnvironment
+Assert-OptimisedLibopus $booth $target
 
 Copy-Item -LiteralPath $booth -Destination $files
 Copy-Item -Path (Join-Path $root 'third_party\ffmpeg\bin\*.dll') -Destination $files

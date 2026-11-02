@@ -60,6 +60,16 @@ function Write-Utf8([string]$Path, [string]$Text) {
     [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding $false))
 }
 
+# As release.ps1 does: a target folder can keep a libopus from before
+# cmake\static-crt.cmake asked for /O2. The bytes are libopus's ec_bsr as cl.exe
+# writes it with no optimisation; with /O2 it is inlined and they are gone.
+function Assert-OptimisedLibopus([string]$Exe, [string]$TargetFolder) {
+    $unoptimised = -join ([char[]](0x89, 0x4C, 0x24, 0x08, 0x48, 0x83, 0xEC, 0x18, 0x8B, 0x44, 0x24, 0x20, 0x0F, 0xBD, 0xC0, 0x89, 0x04, 0x24, 0x8B, 0x04, 0x24, 0x48, 0x83, 0xC4, 0x18, 0xC3))
+    if ([System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes($Exe)).Contains($unoptimised)) {
+        throw "$Exe holds libopus built with no optimisation, so every voice frame would cost about three times the CPU. Build it again: run cargo clean -p opusic-sys --release --target-dir `"$TargetFolder`" and then run this script again."
+    }
+}
+
 # --- Version and identity -------------------------------------------------
 
 $version = $null
@@ -154,6 +164,7 @@ New-Item -ItemType Directory -Force $layout | Out-Null
 Invoke-Tool 'the release tool build' 'cargo' (@('build', '--release', '--locked', '-p', 'release') + $buildArgs) $buildEnvironment
 Invoke-Tool 'collecting the third-party licenses' (Join-Path $target 'release\release.exe') @('licenses', $root, $layout)
 Invoke-Tool 'the store build' 'cargo' (@('build', '--release', '--locked', '-p', 'app', '--features', 'store') + $buildArgs) $buildEnvironment
+Assert-OptimisedLibopus (Join-Path $target 'release\booth.exe') $target
 
 Copy-Item -LiteralPath (Join-Path $target 'release\booth.exe') -Destination $layout
 Copy-Item -Path (Join-Path $root 'third_party\ffmpeg\bin\*.dll') -Destination $layout
