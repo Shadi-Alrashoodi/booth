@@ -268,6 +268,11 @@ if (-not (Test-Path -LiteralPath $SecretKey -PathType Leaf)) {
     throw "the release key $SecretKey does not exist. Plug in the drive it is on, or make one with the release tool's keygen."
 }
 $SecretKey = (Resolve-Path -LiteralPath $SecretKey).Path
+# The release tool refuses a key only where it finds a .git folder above it,
+# and this script empties folders in dist with or without one.
+if ($SecretKey.StartsWith($root.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    throw "the release key $SecretKey is inside $root, where a release deletes files. Nothing was deleted; move the key out of this folder, check that git never took it in, and run the release again."
+}
 
 # The key's password from Windows Credential Manager, as the UTF-8 the
 # release tool reads, or null when there is no such credential. It never
@@ -606,8 +611,6 @@ Write-Host "Booth $version"
 
 $dist = Join-Path $root "dist\$version"
 $staging = Join-Path $root 'dist\staging'
-Clear-Folder $dist
-if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
 
 # --- The crate check and the release key ---------------------------------
 
@@ -626,6 +629,25 @@ if ($Rehearsal) { $rehearsalArgs = @('--rehearsal') }
 # crates they share would be built again for each.
 Invoke-Tool 'the release tool build' 'cargo' (@('build', '--release', '--locked', '-p', 'release') + $buildArgs) $buildEnvironment
 Invoke-WithKey 'the release key check' 'check-key' @($SecretKey, $releaseKey)
+
+# Only now, and held to the key's own bytes: check-key sees through a junction
+# or a subst drive into these folders only where a .git folder is above the
+# key, and the check on the key's path sees only the name it was given. All
+# the files are hashed, since a file symlink gives a length of 0. -ErrorAction
+# on each hash because the preference at the top of this script does not reach
+# Get-FileHash, a module function, and a file it could not read would be deleted
+# as no match.
+$keyHash = (Get-FileHash -LiteralPath $SecretKey -Algorithm SHA256 -ErrorAction Stop).Hash
+foreach ($folder in @($dist, $staging)) {
+    if (-not (Test-Path -LiteralPath $folder)) { continue }
+    foreach ($file in Get-ChildItem -LiteralPath $folder -Recurse -File -Force) {
+        if ((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256 -ErrorAction Stop).Hash -eq $keyHash) {
+            throw "$($file.FullName) holds the same bytes as the release key $SecretKey, and a release deletes that file. Nothing was deleted; move it somewhere safe and run the release again."
+        }
+    }
+}
+Clear-Folder $dist
+if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
 
 # --- Third-party files, the build and the zip -----------------------------
 
