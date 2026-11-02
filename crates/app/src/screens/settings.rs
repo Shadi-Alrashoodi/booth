@@ -1,4 +1,5 @@
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use eframe::egui::{
     Align, Key, Layout, Rect, Response, ScrollArea, Sense, Ui, UiBuilder, WidgetType, vec2,
@@ -69,6 +70,17 @@ pub struct Draft {
     pub blocked: Vec<BlockedKey>,
     pub removed: Vec<[u8; 32]>,
     pub unblocked: Vec<[u8; 32]>,
+    // When Remove or Unblock last took a row off. The next row takes its
+    // place, with its button under the pointer and any key still held, so
+    // all of them wait until the list has settled.
+    list_changed: Option<Instant>,
+    // The height of the two lists, kept until then: on a page scrolled to its
+    // end, what stands above them would come down under the pointer, and the
+    // rows there do not wait.
+    list_room: f32,
+    // Whether any of that height is kept. As it goes, the rows above come down
+    // with their buttons, which wait once more.
+    list_kept: bool,
     // What an empty name means, shown in the field.
     user_name: String,
     pub refused: Refused,
@@ -131,6 +143,9 @@ impl Draft {
             blocked: known.blocked,
             removed: Vec::new(),
             unblocked: Vec::new(),
+            list_changed: None,
+            list_room: 0.0,
+            list_kept: false,
             user_name,
             refused: Refused::default(),
             error: None,
@@ -249,8 +264,7 @@ pub fn show(ui: &mut Ui, draft: &mut Draft, audio: &mut SettingsAudio) -> Option
                 hotkeys(ui, draft);
                 voice(ui, draft, audio);
                 sharing(ui, draft);
-                devices(ui, draft);
-                blocked(ui, draft);
+                lists(ui, draft, Instant::now());
                 if cfg!(feature = "store") {
                     ui.add_space(SECTION_GAP);
                     head(ui, "About");
@@ -752,22 +766,43 @@ fn in_view(show_reason: &mut bool, said: &Response) {
     }
 }
 
+fn lists(ui: &mut Ui, draft: &mut Draft, now: Instant) {
+    let top = ui.cursor().top();
+    let room_goes = draft.list_kept && controls::settled(ui, draft.list_changed, now);
+    if room_goes {
+        draft.list_changed = Some(now);
+    }
+    devices(ui, draft, now);
+    blocked(ui, draft, now);
+    let drawn = ui.cursor().top() - top;
+    if room_goes || controls::settled(ui, draft.list_changed, now) {
+        draft.list_room = drawn;
+    } else {
+        draft.list_room = draft.list_room.max(drawn);
+        ui.add_space(draft.list_room - drawn);
+    }
+    draft.list_kept = drawn < draft.list_room;
+}
+
 // Only on a PC that has hosted and has any. Each one on two lines, since a
 // 360 px column holds a name and a button or a fingerprint and a date, not
 // all four.
-fn devices(ui: &mut Ui, draft: &mut Draft) {
+fn devices(ui: &mut Ui, draft: &mut Draft, now: Instant) {
     if draft.devices.is_empty() {
         return;
     }
     ui.add_space(SECTION_GAP);
     head(ui, "Known devices");
+    let settled = controls::settled(ui, draft.list_changed, now);
     let mut removed = None;
     for (i, device) in draft.devices.iter().enumerate() {
         if i > 0 {
             ui.add_space(STEP);
         }
         let rect = row(ui, ROW_HEIGHT);
-        let remove = Button::new("Remove").role(Role::Destructive);
+        let remove = Button::new("Remove")
+            .role(Role::Destructive)
+            .enabled(settled);
         if with_button(ui, rect, remove, |ui| {
             controls::one_line(ui, &device.name, theme::body(), CHALK);
         }) {
@@ -791,19 +826,22 @@ fn devices(ui: &mut Ui, draft: &mut Draft) {
     }
     if let Some(key) = removed {
         draft.remove(key);
+        draft.list_changed = Some(now);
     }
 }
 
-fn blocked(ui: &mut Ui, draft: &mut Draft) {
+fn blocked(ui: &mut Ui, draft: &mut Draft, now: Instant) {
     if draft.blocked.is_empty() {
         return;
     }
     ui.add_space(SECTION_GAP);
     head(ui, "Blocked");
+    let settled = controls::settled(ui, draft.list_changed, now);
     let mut unblocked = None;
     for blocked in &draft.blocked {
         let rect = row(ui, ROW_HEIGHT);
-        if with_button(ui, rect, Button::new("Unblock"), |ui| {
+        let unblock = Button::new("Unblock").enabled(settled);
+        if with_button(ui, rect, unblock, |ui| {
             controls::one_line(ui, &keys::fingerprint(&blocked.key), theme::mono(), CHALK);
         }) {
             unblocked = Some(blocked.key);
@@ -811,6 +849,7 @@ fn blocked(ui: &mut Ui, draft: &mut Draft) {
     }
     if let Some(key) = unblocked {
         draft.unblock(key);
+        draft.list_changed = Some(now);
     }
 }
 
@@ -825,7 +864,7 @@ fn with_button(ui: &mut Ui, rect: Rect, button: Button, left: impl FnOnce(&mut U
     let width = button.width(ui);
     let mut pressed = false;
     controls::split_row(ui, rect, width, left, |ui| {
-        pressed = button.show(ui).clicked();
+        pressed = controls::buttons(ui, &[button], rect.height()).is_some();
     });
     pressed
 }
@@ -833,7 +872,10 @@ fn with_button(ui: &mut Ui, rect: Rect, button: Button, left: impl FnOnce(&mut U
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eframe::egui::{Context, RawInput, ViewportId, ViewportInfo, pos2};
+    use eframe::egui::{
+        Context, Event, Modifiers, PlatformOutput, Pos2, RawInput, ViewportId, ViewportInfo, pos2,
+    };
+    use std::time::Duration;
     use voice::audio::fake::{Fake, Setup as FakeSetup};
 
     use crate::sound::tests::fake_audio;
@@ -958,6 +1000,345 @@ mod tests {
         assert!(draft.blocked.is_empty());
         assert_eq!(draft.unblocked, [[7; 32]]);
         assert!(draft.removed.is_empty());
+    }
+
+    // Two devices that joined this PC, read back from the file.
+    fn two_devices(test: &str) -> KnownDevices {
+        use crate::screens::room::tests::{test_friend, test_room};
+        let dir =
+            std::env::temp_dir().join(format!("booth-app-devices-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let host_dir = dir.join("host");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        for name in ["first", "second"] {
+            let friend_dir = dir.join(name);
+            std::fs::create_dir_all(&friend_dir).unwrap();
+            let host = test_room(&host_dir);
+            test_friend(&host, &friend_dir).leave();
+            host.leave();
+        }
+        let known = room::Room::known_devices(&host_dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(known.devices.len(), 2);
+        known
+    }
+
+    // The next device takes the place of one removed, Remove and all. A
+    // second click there takes nothing, nor does a press made in the wait and
+    // let go after, and it works once the wait is over.
+    #[test]
+    fn a_second_click_on_remove_takes_no_other_device() {
+        use crate::controls::tests::{frame, press, release};
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let mut draft = Draft::new(&Settings::default(), two_devices("one"), String::new());
+        let first = draft.devices[0].key;
+        let t = Instant::now();
+        let draw = |draft: &mut Draft, events, ms| {
+            let now = t + Duration::from_millis(ms);
+            frame(&ctx, events, |ui| devices(ui, draft, now)).1
+        };
+        draw(&mut draft, Vec::new(), 0);
+        let output = draw(&mut draft, Vec::new(), 0);
+        let aim = aims(&output, "Remove")[0];
+
+        draw(&mut draft, press(aim), 100);
+        draw(&mut draft, release(aim), 116);
+        assert_eq!(draft.removed, [first]);
+        for (ms, events) in [
+            (132, Vec::new()),
+            (200, press(aim)),
+            (216, release(aim)),
+            (500, press(aim)),
+            (700, release(aim)),
+        ] {
+            draw(&mut draft, events, ms);
+            assert_eq!(draft.removed, [first], "at {ms} ms");
+        }
+        draw(&mut draft, press(aim), 800);
+        draw(&mut draft, release(aim), 816);
+        assert_eq!(draft.removed.len(), 2);
+        assert!(draft.devices.is_empty());
+    }
+
+    // Where a button with these words is on screen, from the top down.
+    fn aims(output: &PlatformOutput, label: &str) -> Vec<Pos2> {
+        let mut aims: Vec<_> = output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit is on")
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.label() == Some(label))
+            .filter_map(|(_, node)| node.bounds())
+            .map(|bounds| {
+                pos2(
+                    (bounds.x0 + bounds.x1) as f32,
+                    (bounds.y0 + bounds.y1) as f32,
+                ) / 2.0
+            })
+            .collect();
+        aims.sort_by(|a, b| a.y.total_cmp(&b.y));
+        aims
+    }
+
+    // Removing the lower device leaves the upper one where it was, and a row
+    // that goes from either list holds every row of both: a press in the wait
+    // takes nothing, at any place, and each works once the wait is over.
+    #[test]
+    fn a_row_that_went_holds_every_row_of_both_lists() {
+        use crate::controls::tests::{frame, press, release};
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let mut known = two_devices("both");
+        known.blocked = (1..=3)
+            .map(|n| BlockedKey {
+                key: [n; 32],
+                since: 1,
+            })
+            .collect();
+        let mut draft = Draft::new(&Settings::default(), known, String::new());
+        let (upper, lower) = (draft.devices[0].key, draft.devices[1].key);
+        let t = Instant::now();
+        let draw = |draft: &mut Draft, events, ms| {
+            let now = t + Duration::from_millis(ms);
+            frame(&ctx, events, |ui| lists(ui, draft, now)).1
+        };
+        let click = |draft: &mut Draft, aim, ms| {
+            draw(draft, press(aim), ms);
+            draw(draft, release(aim), ms + 16);
+            draw(draft, Vec::new(), ms + 32);
+            draw(draft, Vec::new(), ms + 32)
+        };
+
+        draw(&mut draft, Vec::new(), 0);
+        let output = draw(&mut draft, Vec::new(), 0);
+        let output = click(&mut draft, aims(&output, "Remove")[1], 100);
+        assert_eq!(draft.removed, [lower]);
+        let upper_remove = aims(&output, "Remove")[0];
+        let unblocks = aims(&output, "Unblock");
+        assert_eq!(unblocks.len(), 3);
+        for (ms, aim) in [(200, upper_remove), (300, unblocks[0]), (400, unblocks[2])] {
+            click(&mut draft, aim, ms);
+            assert_eq!(draft.removed, [lower], "at {ms} ms");
+            assert!(draft.unblocked.is_empty(), "at {ms} ms");
+        }
+
+        // The kept height goes at the end of the wait, and starts another.
+        draw(&mut draft, Vec::new(), 690);
+        click(&mut draft, unblocks[0], 700);
+        assert!(draft.unblocked.is_empty());
+
+        // Past both Unblock works, and starts a wait of its own, which holds
+        // the row that is second by then and the other list.
+        draw(&mut draft, Vec::new(), 1190);
+        let output = click(&mut draft, unblocks[0], 1200);
+        assert_eq!(draft.unblocked, [[1; 32]]);
+        let unblocks = aims(&output, "Unblock");
+        assert_eq!(unblocks.len(), 2);
+        for (ms, aim) in [(1300, unblocks[1]), (1400, upper_remove)] {
+            click(&mut draft, aim, ms);
+            assert_eq!(draft.unblocked, [[1; 32]], "at {ms} ms");
+            assert_eq!(draft.removed, [lower], "at {ms} ms");
+        }
+        draw(&mut draft, Vec::new(), 1790);
+        draw(&mut draft, Vec::new(), 2290);
+        let output = click(&mut draft, unblocks[1], 2300);
+        assert_eq!(draft.unblocked, [[1; 32], [3; 32]]);
+        let aim = aims(&output, "Remove")[0];
+        draw(&mut draft, Vec::new(), 2890);
+        draw(&mut draft, Vec::new(), 3390);
+        let output = click(&mut draft, aim, 3400);
+        assert_eq!(draft.removed, [lower, upper]);
+        assert!(aims(&output, "Remove").is_empty());
+    }
+
+    // The last device goes with the list scrolled to its end. The page keeps
+    // its height through the wait, so the row above stays put rather than
+    // come down under a second click, and it comes down once the wait is over.
+    #[test]
+    fn a_second_click_on_the_last_remove_ticks_nothing() {
+        use crate::controls::tests::{frame_at, press, release};
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let mut known = two_devices("last");
+        known.devices.truncate(1);
+        let mut draft = Draft::new(&Settings::default(), known, String::new());
+        let t = Instant::now();
+        let draw = |draft: &mut Draft, events, ms, end: bool| {
+            let now = t + Duration::from_millis(ms);
+            frame_at(&ctx, vec2(360.0, 200.0), events, |ui| {
+                let mut scroll = ScrollArea::vertical().id_salt("page").auto_shrink(false);
+                if end {
+                    scroll = scroll.vertical_scroll_offset(10_000.0);
+                }
+                scroll.show(ui, |ui| {
+                    controls::page(ui, |ui| {
+                        sharing(ui, draft);
+                        lists(ui, draft, now);
+                    })
+                });
+            })
+            .1
+        };
+        const HIDE: &str = "Hide the strip in fullscreen";
+        let row_at = |output: &PlatformOutput| {
+            let node = output
+                .accesskit_update
+                .as_ref()
+                .expect("accesskit is on")
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(HIDE))
+                .map(|(_, node)| node)
+                .expect("the row is in view");
+            let bounds = node.bounds().unwrap();
+            (bounds.y0 as f32)..(bounds.y1 as f32)
+        };
+
+        draw(&mut draft, Vec::new(), 0, true);
+        draw(&mut draft, Vec::new(), 0, false);
+        let output = draw(&mut draft, Vec::new(), 0, false);
+        let before = row_at(&output);
+        // Low on the button, where the row comes to lie.
+        let aim = aims(&output, "Remove")[0] + vec2(0.0, 12.0);
+
+        draw(&mut draft, press(aim), 100, false);
+        draw(&mut draft, release(aim), 116, false);
+        assert_eq!(draft.removed.len(), 1);
+        assert!(draft.devices.is_empty());
+        for (ms, events) in [
+            (132, Vec::new()),
+            (200, press(aim)),
+            (216, release(aim)),
+            (400, Vec::new()),
+        ] {
+            let output = draw(&mut draft, events, ms, false);
+            assert_eq!(row_at(&output), before, "at {ms} ms");
+            assert!(!draft.hide_strip, "at {ms} ms");
+        }
+
+        draw(&mut draft, Vec::new(), 700, false);
+        let output = draw(&mut draft, Vec::new(), 700, false);
+        assert!(
+            row_at(&output).contains(&aim.y),
+            "{aim:?} {:?}",
+            row_at(&output)
+        );
+    }
+
+    // The lower device goes with the list scrolled to its end. The upper one
+    // comes down onto the same place as the kept height goes, when the first
+    // wait is over, and its Remove takes no press until a wait of its own is.
+    #[test]
+    fn a_remove_that_came_down_waits_again() {
+        use crate::controls::tests::{frame_at, press, release};
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let mut draft = Draft::new(&Settings::default(), two_devices("down"), String::new());
+        let (upper, lower) = (draft.devices[0].key, draft.devices[1].key);
+        let t = Instant::now();
+        let draw = |draft: &mut Draft, events, ms, end: bool| {
+            let now = t + Duration::from_millis(ms);
+            frame_at(&ctx, vec2(360.0, 200.0), events, |ui| {
+                let mut scroll = ScrollArea::vertical().id_salt("page").auto_shrink(false);
+                if end {
+                    scroll = scroll.vertical_scroll_offset(10_000.0);
+                }
+                scroll.show(ui, |ui| {
+                    controls::page(ui, |ui| {
+                        sharing(ui, draft);
+                        lists(ui, draft, now);
+                    })
+                });
+            })
+            .1
+        };
+
+        draw(&mut draft, Vec::new(), 0, true);
+        draw(&mut draft, Vec::new(), 0, false);
+        let output = draw(&mut draft, Vec::new(), 0, false);
+        let aim = *aims(&output, "Remove").last().unwrap();
+
+        draw(&mut draft, press(aim), 100, false);
+        draw(&mut draft, release(aim), 116, false);
+        assert_eq!(draft.removed, [lower]);
+        draw(&mut draft, Vec::new(), 132, false);
+
+        draw(&mut draft, Vec::new(), 620, false);
+        let output = draw(&mut draft, Vec::new(), 636, false);
+        let came = aims(&output, "Remove");
+        assert_eq!(came.len(), 1);
+        assert!((came[0] - aim).length() < 1.0, "{came:?} {aim:?}");
+
+        for ms in [650, 1000] {
+            draw(&mut draft, press(aim), ms, false);
+            draw(&mut draft, release(aim), ms + 16, false);
+            assert_eq!(draft.removed, [lower], "at {ms} ms");
+        }
+        draw(&mut draft, Vec::new(), 1120, false);
+        draw(&mut draft, press(aim), 1130, false);
+        draw(&mut draft, release(aim), 1146, false);
+        assert_eq!(draft.removed, [lower, upper]);
+    }
+
+    // Held on a button, a key repeats into the next row's button under the
+    // same focus, every repeat a click to egui. Only a fresh press past the
+    // wait takes another row.
+    #[test]
+    fn a_key_held_on_unblock_takes_one_row() {
+        use crate::controls::tests::frame;
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let known = KnownDevices {
+            devices: Vec::new(),
+            blocked: (1..=3)
+                .map(|n| BlockedKey {
+                    key: [n; 32],
+                    since: 1,
+                })
+                .collect(),
+        };
+        let mut draft = Draft::new(&Settings::default(), known, String::new());
+        let t = Instant::now();
+        // egui takes a press of a key it holds as down for a repeat.
+        let key = |key, pressed| Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        let mut draw = |events, ms| {
+            let now = t + Duration::from_millis(ms);
+            frame(&ctx, events, |ui| blocked(ui, &mut draft, now));
+            draft.unblocked.clone()
+        };
+        draw(Vec::new(), 0);
+        draw(vec![key(Key::Tab, true), key(Key::Tab, false)], 0);
+        draw(Vec::new(), 0);
+        assert_eq!(draw(vec![key(Key::Space, true)], 100), [[1; 32]]);
+        for (ms, event) in [
+            (116, key(Key::Space, true)),
+            (150, key(Key::Space, false)),
+            (200, key(Key::Space, true)),
+            (216, key(Key::Space, false)),
+            (300, key(Key::Enter, true)),
+            (650, key(Key::Enter, true)),
+            (800, key(Key::Enter, false)),
+        ] {
+            assert_eq!(draw(vec![event], ms), [[1; 32]], "at {ms} ms");
+        }
+        assert_eq!(
+            draw(vec![key(Key::Space, true)], 900),
+            [[1; 32], [2; 32]],
+            "a fresh press"
+        );
     }
 
     #[test]
