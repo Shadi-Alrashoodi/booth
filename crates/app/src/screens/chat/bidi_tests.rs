@@ -12,9 +12,9 @@ use eframe::egui::text::{CCursorRange, CharIndex, LayoutJob};
 use eframe::egui::text_edit::TextEditState;
 use eframe::egui::text_selection::visuals::{RowVertexIndices, paint_text_selection};
 use eframe::egui::{
-    Align, Context, Event, FullOutput, Galley, Key, Modifiers, OutputCommand, PlatformOutput,
-    PointerButton, Pos2, RawInput, Rect, Response, Shape, TextFormat, Ui, UiBuilder, Visuals, pos2,
-    vec2,
+    Align, Context, Event, FullOutput, Galley, Key, Modifiers, MouseWheelUnit, OutputCommand,
+    PlatformOutput, PointerButton, Pos2, RawInput, Rect, Response, Shape, TextFormat, TouchPhase,
+    Ui, UiBuilder, Visuals, pos2, vec2,
 };
 use proptest::prelude::*;
 use room::view::{ChatLine, LineKind};
@@ -357,6 +357,111 @@ fn selection_copies_and_marks() {
             .find(|(_, galley)| galley.text() == text)
             .expect("the message was painted");
         assert_eq!(check_highlight(shown, &(from..to)), [runs], "{text}");
+    }
+}
+
+// One frame of the chat's lines with these events. Returns the painted text
+// and the output.
+fn history_frame(
+    ctx: &Context,
+    chat: &mut Chat,
+    lines: &[Arc<ChatLine>],
+    events: Vec<Event>,
+) -> (Vec<(Pos2, Arc<Galley>)>, PlatformOutput) {
+    let (_, painted, output) = frame(ctx, events, Modifiers::NONE, |ui| {
+        chat.history(ui, lines);
+    });
+    (painted, output)
+}
+
+// Frames enough for new lines and a turn of the wheel to come to rest.
+fn history_settles(ctx: &Context, chat: &mut Chat, lines: &[Arc<ChatLine>]) {
+    for _ in 0..100 {
+        history_frame(ctx, chat, lines, Vec::new());
+    }
+}
+
+fn turn_wheel(ctx: &Context, chat: &mut Chat, lines: &[Arc<ChatLine>], points: f32) {
+    let wheel = Event::MouseWheel {
+        unit: MouseWheelUnit::Point,
+        delta: vec2(0.0, points),
+        phase: TouchPhase::Move,
+        modifiers: Modifiers::NONE,
+    };
+    let events = vec![Event::PointerMoved(pos2(100.0, 300.0)), wheel];
+    history_frame(ctx, chat, lines, events);
+    history_settles(ctx, chat, lines);
+}
+
+// The chat lays out only the lines in view, so the first of them changes when
+// a line comes and when the wheel turns. A selection stays on the letters of
+// the message it was made in through all of that, and Ctrl+C copies them. Once
+// that message is out of view the selection is over and nothing is copied.
+#[test]
+fn a_selection_stays_with_its_message() {
+    for (text, from, to) in [(ENGLISH, 4, 7), (ARABIC, 0, 5)] {
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        let mut chat = Chat::new();
+        let said = |n: u8, text: String| {
+            Arc::new(ChatLine {
+                author: [1 + n % 2; 32],
+                name: format!("person {}", 1 + n % 2),
+                text,
+                at_unix_ms: 1_790_284_323_456,
+                mine: false,
+                kind: LineKind::Said,
+            })
+        };
+        let mut lines: Vec<Arc<ChatLine>> = (0..60)
+            .map(|n| {
+                let line = if n == 54 {
+                    text.to_owned()
+                } else {
+                    format!("message {n}")
+                };
+                said(n, line)
+            })
+            .collect();
+        history_settles(&ctx, &mut chat, &lines);
+        let (painted, _) = history_frame(&ctx, &mut chat, &lines, Vec::new());
+        let (origin, galley) = painted
+            .iter()
+            .find(|(_, galley)| galley.text() == text)
+            .expect("the message is in view");
+        let start = cursor_point(*origin, galley, from);
+        let end = cursor_point(*origin, galley, to);
+        history_frame(&ctx, &mut chat, &lines, press(start, true));
+        history_frame(&ctx, &mut chat, &lines, vec![Event::PointerMoved(end)]);
+        history_frame(&ctx, &mut chat, &lines, press(end, false));
+
+        let selected = chars(text, from, to);
+        let check = |chat: &mut Chat, lines: &[Arc<ChatLine>], step: &str| {
+            let (painted, output) = history_frame(&ctx, chat, lines, vec![Event::Copy]);
+            assert_eq!(copied(&output), Some(selected.as_str()), "{text}: {step}");
+            for (_, shown) in &painted {
+                let lit: usize = shown.rows.iter().map(|row| highlight(&row.row).len()).sum();
+                let want = usize::from(shown.text() == text);
+                assert_eq!(lit, want, "{text}: {step}: {}", shown.text());
+            }
+        };
+        check(&mut chat, &lines, "selected");
+
+        lines.push(said(60, String::from("a new line")));
+        history_settles(&ctx, &mut chat, &lines);
+        check(&mut chat, &lines, "after a new line");
+
+        turn_wheel(&ctx, &mut chat, &lines, 150.0);
+        check(&mut chat, &lines, "after the wheel");
+
+        lines.remove(0);
+        lines.push(said(61, String::from("another new line")));
+        history_settles(&ctx, &mut chat, &lines);
+        check(&mut chat, &lines, "after the oldest line left");
+
+        turn_wheel(&ctx, &mut chat, &lines, 2000.0);
+        let (_, output) = history_frame(&ctx, &mut chat, &lines, vec![Event::Copy]);
+        assert_eq!(copied(&output), None, "{text}: out of view");
     }
 }
 

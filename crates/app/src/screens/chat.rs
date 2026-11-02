@@ -186,7 +186,14 @@ impl Chat {
                     ui.add(Label::new(name).show_tooltip_when_elided(false));
                 }
                 if line.kind == LineKind::Said {
-                    body(ui, &line.text, width);
+                    // A selection is kept by widget id, and ids here count
+                    // from the first line in view. With no id of its own, a
+                    // message would hand its selection to another one as
+                    // that first line changes.
+                    let id = ui.id().with(Arc::as_ptr(line));
+                    ui.scope_builder(UiBuilder::new().id(id), |ui| {
+                        body(ui, &line.text, width);
+                    });
                 } else {
                     let time = self.times.get(line.at_unix_ms);
                     ui.add(Label::new(system_galley(ui, line, time, width)));
