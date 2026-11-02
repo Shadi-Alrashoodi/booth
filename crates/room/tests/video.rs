@@ -1754,6 +1754,8 @@ struct Heard {
     // When the first of them came.
     first: Option<Instant>,
     pointers: usize,
+    // Chunks of pointer shapes (Shape, kind 18).
+    shapes: usize,
     // How the share stands, as each ShareState (kind 27) and the answer to
     // its Watch (WatchAnswer, kind 29) told it.
     told: Vec<u8>,
@@ -1777,6 +1779,9 @@ impl Heard {
         for message in hand.messages() {
             if let [27, _, _, _, _, state] | [29, _, _, _, _, state, _] = message[..] {
                 self.told.push(state);
+            }
+            if message.first() == Some(&18) {
+                self.shapes += 1;
             }
         }
     }
@@ -2091,7 +2096,12 @@ impl Drop for PatternAway {
 // lets go of the last picture it kept to send again on a still screen:
 // someone who starts watching meanwhile hears the share is away and gets
 // nothing from before, and the first picture after the pause is an IDR,
-// whether someone started watching meanwhile or not.
+// whether someone started watching meanwhile or not. The same goes for the
+// capture's other reasons, also when the capture finds out only from a Watch
+// after a rest: Windows can answer any of them first, and a monitor that left
+// the desktop can be told just before the lock is. The pointer's shape and
+// place go the same way, and the shape comes with the next picture. Only a
+// minimized window keeps its picture and pointer for whoever starts watching.
 #[test]
 fn a_screen_share_keeps_no_picture_through_the_secure_desktop() {
     let _turn = turn();
@@ -2099,6 +2109,7 @@ fn a_screen_share_keeps_no_picture_through_the_secure_desktop() {
         return;
     }
     let _away = PatternAway;
+    let _pointer = PatternPointer::on();
     let small = VideoConfig {
         source: VideoSource::Pattern {
             width: 640,
@@ -2130,9 +2141,13 @@ fn a_screen_share_keeps_no_picture_through_the_secure_desktop() {
         "watched through the secure desktop: back, the first picture, an IDR, {:.0} ms after",
         first_after(&back[ANA], came)
     );
+    let changing = PauseReason::Changing(String::from("a test changes the display"));
     for (what, away) in [
         ("the secure desktop", PauseReason::SecureDesktop),
         ("a disconnected session", PauseReason::Disconnected),
+        ("a monitor that left the desktop", PauseReason::Missing),
+        ("a display changing", changing),
+        ("a monitor another program took", PauseReason::Taken),
     ] {
         PatternAway::set(Some(away));
         until_told(&mut hands, ANA, AWAY, Duration::from_millis(100));
@@ -2144,6 +2159,11 @@ fn a_screen_share_keeps_no_picture_through_the_secure_desktop() {
             joined[BO].frames.is_empty() && joined[ANA].frames.is_empty(),
             "{what}: {joined:?}"
         );
+        assert!(
+            joined[BO].pointers == 0 && joined[BO].shapes == 0,
+            "{what}: {:?}",
+            joined[BO]
+        );
         let came = Instant::now();
         PatternAway::set(None);
         let back = until_told(&mut hands, BO, LIVE, Duration::from_millis(500));
@@ -2153,8 +2173,13 @@ fn a_screen_share_keeps_no_picture_through_the_secure_desktop() {
                 "{what}, {who}: {heard:?}"
             );
         }
+        assert!(
+            back[BO].pointers > 0 && back[BO].shapes > 0,
+            "{what}: {:?}",
+            back[BO]
+        );
         println!(
-            "{what}: a watcher who came meanwhile told away, no frame in 1 s; back, the first picture, an IDR, {:.0} ms after",
+            "{what}: a watcher who came meanwhile told away, no frame, pointer or shape in 1 s; back, the first picture, an IDR, {:.0} ms after",
             first_after(&back[BO], came)
         );
         hands[BO].say(&watch(number, false));
@@ -2162,4 +2187,50 @@ fn a_screen_share_keeps_no_picture_through_the_secure_desktop() {
         // Past the host's gap between one watcher's IDR asks.
         listen(&mut hands, Duration::from_millis(600));
     }
+
+    PatternAway::set(Some(PauseReason::Minimized));
+    until_told(&mut hands, ANA, AWAY, Duration::from_millis(100));
+    hands[BO].say(&watch(number, true));
+    watched_by(&host, 2);
+    let joined = listen(&mut hands, Duration::from_secs(1));
+    assert_eq!(joined[BO].told, [AWAY], "{:?}", joined[BO]);
+    assert!(
+        joined[BO].frames.first().is_some_and(|frame| frame.1)
+            && joined[BO].pointers > 0
+            && joined[BO].shapes > 0,
+        "a minimized window's kept picture and pointer: {:?}",
+        joined[BO]
+    );
+    PatternAway::set(None);
+    until_told(&mut hands, BO, LIVE, Duration::ZERO);
+    hands[BO].say(&watch(number, false));
+    watched_by(&host, 1);
+
+    hands[ANA].say(&watch(number, false));
+    watched_by(&host, 0);
+    // Long enough for the facts to say nobody watches, so the share rests.
+    listen(&mut hands, Duration::from_millis(1500));
+    PatternAway::set(Some(PauseReason::Missing));
+    hands[ANA].say(&watch(number, true));
+    watched_by(&host, 1);
+    let rested = listen(&mut hands, Duration::from_secs(1));
+    assert_eq!(rested[ANA].told, [LIVE, AWAY], "{:?}", rested[ANA]);
+    // At most the update that hides the pointer, which says nothing of it.
+    assert!(
+        rested[ANA].frames.is_empty() && rested[ANA].pointers <= 1 && rested[ANA].shapes == 0,
+        "{:?}",
+        rested[ANA]
+    );
+    let came = Instant::now();
+    PatternAway::set(None);
+    let back = until_told(&mut hands, ANA, LIVE, Duration::from_millis(500));
+    assert!(
+        back[ANA].frames.len() >= 5 && back[ANA].frames[0].1 && back[ANA].shapes > 0,
+        "{:?}",
+        back[ANA]
+    );
+    println!(
+        "watching after a rest, the monitor gone: told live, then away, and no frame or shape in 1 s; back, the first picture, an IDR, {:.0} ms after",
+        first_after(&back[ANA], came)
+    );
 }

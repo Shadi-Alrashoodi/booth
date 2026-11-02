@@ -877,11 +877,12 @@ impl Sharer {
                 // alone: nothing from before goes out meanwhile, not even to
                 // whoever starts watching, as after a pause by hand, and the
                 // first picture after it is an IDR, which also stands in for
-                // the frames cut off on their way.
-                if matches!(
-                    reason,
-                    PauseReason::SecureDesktop | PauseReason::Disconnected
-                ) {
+                // the frames cut off on their way. Which reason a monitor's
+                // capture gives first is up to Windows: a display still
+                // changing can hide the lock, and a monitor that left the
+                // desktop can be told just before it. Only a minimized window
+                // keeps its picture: its share looks at the desktop itself.
+                if !matches!(reason, PauseReason::Minimized) {
                     self.forget_pictures();
                     self.answers.force_idr();
                 }

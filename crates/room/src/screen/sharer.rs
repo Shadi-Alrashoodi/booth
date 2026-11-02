@@ -977,6 +977,11 @@ struct Watchers<'a> {
     shape: Option<(u32, Shape)>,
     pointer: Option<(i32, i32, bool)>,
     shape_refused: bool,
+    // A monitor's capture is paused, and nothing of the pointer goes out until
+    // the next picture, as nothing of the picture does. Someone who started
+    // watching meanwhile gets the shape then.
+    away: bool,
+    shape_owed: bool,
     // Frames watchers reported lost since the rate last looked.
     lost: Lost,
     // This second's frames, for the numbers.
@@ -1004,6 +1009,8 @@ impl<'a> Watchers<'a> {
             shape: None,
             pointer: None,
             shape_refused: false,
+            away: false,
+            shape_owed: false,
             lost: Lost::default(),
             sent: Vec::new(),
             hevc: true,
@@ -1037,6 +1044,10 @@ impl<'a> Watchers<'a> {
     // under a new id, with the pointer where it is. No picture comes with
     // that pointer, so it is not marked.
     fn shape_again(&mut self) {
+        if self.away {
+            self.shape_owed = true;
+            return;
+        }
         let Some((_, shape)) = self.shape.take() else {
             return;
         };
@@ -1047,12 +1058,13 @@ impl<'a> Watchers<'a> {
     }
 
     // For a pause: the pointer the watchers last saw would stay on their
-    // picture otherwise. No picture follows it either.
+    // picture otherwise. No picture follows it either. It says nothing of
+    // where the pointer was: after a rest it can be the first thing someone
+    // who starts watching gets.
     fn hide_pointer(&mut self) {
-        let (x, y) = self.pointer.map_or((0, 0), |(x, y, _)| (x, y));
-        self.pointer = Some((x, y, false));
+        self.pointer = Some((0, 0, false));
         let id = self.shape.as_ref().map_or(0, |(id, _)| *id);
-        self.outbox.pointer(x, y, false, id, false);
+        self.outbox.pointer(0, 0, false, id, false);
     }
 }
 
@@ -1125,6 +1137,10 @@ impl Audience for Watchers<'_> {
     }
 
     fn resumed(&mut self) {
+        self.away = false;
+        if std::mem::take(&mut self.shape_owed) {
+            self.shape_again();
+        }
         // A window back from minimized on the lock screen keeps its sound
         // stopped: only the share's next look at the desktop lets it go.
         if !self.window {
@@ -1151,6 +1167,12 @@ impl Audience for Watchers<'_> {
             PauseReason::SecureDesktop | PauseReason::Disconnected
         ) {
             self.sharing.set_away(self.number, true);
+        }
+        // Which reason a monitor's capture gives first is up to Windows, so
+        // the pointer goes as the kept picture does. Only a minimized window
+        // keeps both.
+        if !matches!(reason, PauseReason::Minimized) && !std::mem::replace(&mut self.away, true) {
+            self.hide_pointer();
         }
         log!(self.log, "share {}: capture paused: {reason}", self.number);
         let paused = match reason {
@@ -1697,8 +1719,97 @@ mod tests {
             "a new watcher's"
         );
         watchers.hide_pointer();
-        assert_eq!(pointers(&reads, &mut far), [(7, false, false)], "a pause's");
+        assert_eq!(pointers(&reads, &mut far), [(0, false, false)], "a pause's");
         assert_eq!(pointers(&older, &mut older_far).len(), 3);
+    }
+
+    // A monitor's pause lets go of the pointer as of the picture: it is hidden
+    // once, without where it was, and someone who starts watching then gets
+    // nothing of it until the next picture, which brings them the shape. A
+    // minimized window keeps both, as it keeps its picture.
+    #[test]
+    fn a_pause_keeps_the_pointer_from_a_new_watcher() {
+        let wake = net::pace::Signal::new().expect("create an event");
+        let clock = crate::peer::Clock::new(Instant::now());
+        let socket = Arc::new(Socket::bind(0, Log::off()).expect("bind a socket"));
+        let sharing = Sharing::new(clock, false, Some(socket), 1000, wake);
+        let wire = Wire::new();
+        let (near, mut far) = session_pair();
+        sharing.set_outlets(vec![ShareOutlet {
+            link: Outlet {
+                sealer: near.sealer().expect("the initiator may send"),
+                to: wire.addr(),
+                sent: Arc::default(),
+            },
+            marks: true,
+        }]);
+        let log = Log::off();
+        let mut watchers = Watchers::new(&sharing, &log, 1, false);
+        let at = |x: i32, shape: Option<CursorShape>| CursorUpdate {
+            x,
+            y: 6,
+            visible: true,
+            scale: 1.0,
+            shape,
+        };
+        let arrow = CursorShape {
+            kind: CursorKind::Color,
+            width: 32,
+            height: 32,
+            pitch: 128,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            bytes: vec![7; 32 * 32 * 4],
+        };
+        watchers.cursor(at(5, Some(arrow)), true);
+        assert_eq!(pointers(&wire, &mut far), [(5, true, true)]);
+        let shape_id = |watchers: &Watchers| watchers.shape.as_ref().map(|(id, _)| *id);
+        let starts_watching = |watchers: &mut Watchers| {
+            sharing.answer(Answer::Idr { seen: None });
+            watchers.back(&mut Vec::new());
+            assert!(watchers.started_watching());
+        };
+
+        for reason in [
+            PauseReason::SecureDesktop,
+            PauseReason::Disconnected,
+            PauseReason::Missing,
+            PauseReason::Taken,
+            PauseReason::Changing(String::from("a test changes the display")),
+        ] {
+            let shape = shape_id(&watchers);
+            watchers.paused(&reason);
+            assert_eq!(pointers(&wire, &mut far), [(0, false, false)], "{reason}");
+            starts_watching(&mut watchers);
+            assert!(pointers(&wire, &mut far).is_empty(), "{reason}");
+            assert_eq!(shape_id(&watchers), shape, "{reason}");
+            // Told again in another kind, as a lock after the monitor left is.
+            watchers.paused(&PauseReason::SecureDesktop);
+            assert!(pointers(&wire, &mut far).is_empty(), "{reason}");
+            watchers.resumed();
+            assert_ne!(shape_id(&watchers), shape, "{reason}");
+            assert_eq!(pointers(&wire, &mut far), [(0, false, false)], "{reason}");
+            watchers.cursor(at(9, None), true);
+            assert_eq!(pointers(&wire, &mut far), [(9, true, true)], "{reason}");
+        }
+
+        // Nobody started watching: nobody needs the shape again.
+        let shape = shape_id(&watchers);
+        watchers.paused(&PauseReason::SecureDesktop);
+        assert_eq!(pointers(&wire, &mut far), [(0, false, false)]);
+        watchers.resumed();
+        assert_eq!(shape_id(&watchers), shape);
+        assert!(pointers(&wire, &mut far).is_empty());
+        watchers.cursor(at(9, None), true);
+        assert_eq!(pointers(&wire, &mut far), [(9, true, true)]);
+
+        watchers.paused(&PauseReason::Minimized);
+        assert!(pointers(&wire, &mut far).is_empty(), "minimized");
+        starts_watching(&mut watchers);
+        assert_ne!(shape_id(&watchers), shape, "minimized");
+        assert_eq!(pointers(&wire, &mut far), [(9, true, false)], "minimized");
+        watchers.resumed();
+        assert!(pointers(&wire, &mut far).is_empty(), "minimized");
     }
 
     // The source can answer with a pointer update, or with nothing new,
