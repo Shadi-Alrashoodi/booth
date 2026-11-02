@@ -89,6 +89,20 @@ struct Picker {
     picked: Option<Picked>,
 }
 
+impl Picker {
+    // A rectangle let go of stays as it was until the next press. Whether
+    // the window needs drawing again.
+    fn mouse_moved(&mut self, hwnd: HWND, to: POINT) -> bool {
+        match &mut self.drag {
+            Some((on, _, now)) if *on == hwnd && self.small.is_none() => {
+                *now = to;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 thread_local! {
     static PICKER: RefCell<Option<Picker>> = const { RefCell::new(None) };
 }
@@ -331,13 +345,7 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             0
         }
         WM_MOUSEMOVE => {
-            let moved = with_picker(|picker| match &mut picker.drag {
-                Some((on, _, now)) if *on == hwnd => {
-                    *now = point(lparam);
-                    true
-                }
-                _ => false,
-            });
+            let moved = with_picker(|picker| picker.mouse_moved(hwnd, point(lparam)));
             if moved == Some(true) {
                 redraw(hwnd);
             }
@@ -668,6 +676,28 @@ mod tests {
         } else {
             println!("clicks not checked: another window is in front of the picker");
         }
+    }
+
+    // No window opens here: the picker alone, as WM_MOUSEMOVE reaches it.
+    #[test]
+    fn a_rectangle_let_go_of_stays_as_it_was() {
+        let hwnd = ptr::without_provenance_mut(1);
+        let from = POINT { x: 100, y: 50 };
+        let end = POINT { x: 200, y: 400 };
+        let far = POINT { x: 900, y: 800 };
+        let mut picker = Picker {
+            windows: Vec::new(),
+            monitors: Vec::new(),
+            drag: Some((hwnd, from, end)),
+            small: None,
+            picked: None,
+        };
+        let now = |picker: &Picker| picker.drag.map(|(_, _, now)| (now.x, now.y));
+        assert!(picker.mouse_moved(hwnd, end));
+        assert_eq!(now(&picker), Some((200, 400)));
+        picker.small = Some(hwnd);
+        assert!(!picker.mouse_moved(hwnd, far));
+        assert_eq!(now(&picker), Some((200, 400)));
     }
 
     #[test]
