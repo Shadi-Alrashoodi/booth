@@ -402,12 +402,23 @@ impl Room {
 
     /// As share, with only `region` of the monitor going out, in its
     /// upright pixels: at least share::SMALLEST_REGION each way, and only
-    /// while the monitor keeps the resolution and rotation it has now. A
-    /// share that runs already keeps what it shows.
-    pub fn share_region(&self, fps: u8, monitor: MonitorId, region: share::Region) {
+    /// while the monitor keeps the resolution and rotation it was drawn on,
+    /// `drawn_on` being its upright size then. A share that runs already
+    /// keeps what it shows.
+    pub fn share_region(
+        &self,
+        fps: u8,
+        monitor: MonitorId,
+        region: share::Region,
+        drawn_on: (u32, u32),
+    ) {
         self.threads.share(
             fps.clamp(1, control::MAX_FPS),
-            Shown::Region { monitor, region },
+            Shown::Region {
+                monitor,
+                region,
+                drawn_on,
+            },
         );
     }
 

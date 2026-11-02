@@ -596,9 +596,23 @@ fn choose(source: &VideoSource, shown: &Shown, log: &Log, number: u32) -> Result
     match source {
         VideoSource::Screen => match shown {
             Shown::Monitor(Some(id)) => attached(id).map(Choice::Screen),
-            Shown::Region { monitor, region } => attached(monitor).map(|monitor| Choice::Region {
+            Shown::Region {
                 monitor,
-                region: *region,
+                region,
+                drawn_on,
+            } => attached(monitor).and_then(|monitor| {
+                // The capture takes this monitor's size as the one the region
+                // was drawn on, so a turn up to now has to stop here.
+                if (monitor.width, monitor.height) != *drawn_on {
+                    return Err(format!(
+                        "{} changed resolution or rotation, so the region drawn on it no longer matches. Share the region again",
+                        monitor.name
+                    ));
+                }
+                Ok(Choice::Region {
+                    monitor,
+                    region: *region,
+                })
             }),
             Shown::Monitor(None) => primary()
                 .cloned()
@@ -1541,6 +1555,7 @@ mod tests {
         let shown = Shown::Region {
             monitor: nowhere,
             region: small,
+            drawn_on: (1920, 1080),
         };
         let Err(why) = choose(&VideoSource::Screen, &shown, &log, 6) else {
             panic!("a region too small was shared");
@@ -1548,6 +1563,49 @@ mod tests {
         assert_eq!(
             crate::screen::share_failed(&why, false),
             "Could not start sharing: the region is 255x1080, smaller than 256 by 256 pixels. Draw a bigger one."
+        );
+    }
+
+    // A monitor turned or set to another resolution since a region was drawn
+    // on it is refused, even where the region would still fit. choose only
+    // lists the monitors; nothing is captured.
+    #[test]
+    fn a_region_holds_on_the_size_it_was_drawn_on() {
+        let (log, _) = Log::capture(8);
+        let monitors = share::monitors().unwrap();
+        let Some(monitor) = monitors.first() else {
+            println!("skipped: no monitor is attached to the desktop");
+            return;
+        };
+        let region = Region {
+            left: 0,
+            top: 0,
+            width: 256,
+            height: 256,
+        };
+        let shown = |drawn_on| Shown::Region {
+            monitor: monitor.id.clone(),
+            region,
+            drawn_on,
+        };
+        let same = shown((monitor.width, monitor.height));
+        let Ok(Choice::Region {
+            monitor: chosen, ..
+        }) = choose(&VideoSource::Screen, &same, &log, 8)
+        else {
+            panic!("a region on the size it was drawn on was refused");
+        };
+        assert_eq!(chosen.id, monitor.id);
+        let other = shown((monitor.height, monitor.width + 1));
+        let Err(why) = choose(&VideoSource::Screen, &other, &log, 9) else {
+            panic!("a region drawn on another size was shared");
+        };
+        assert_eq!(
+            crate::screen::share_failed(&why, false),
+            format!(
+                "Could not start sharing: {} changed resolution or rotation, so the region drawn on it no longer matches. Share the region again.",
+                monitor.name
+            )
         );
     }
 

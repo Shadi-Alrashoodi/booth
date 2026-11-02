@@ -266,7 +266,8 @@ impl InRoom {
         match answer {
             Ok(Ok(Some(picked))) => {
                 let fps = monitors::fps(picked.refresh_hz);
-                self.room.share_region(fps, picked.monitor, picked.region);
+                self.room
+                    .share_region(fps, picked.monitor, picked.region, picked.drawn_on);
                 Some(Step::ListNext)
             }
             Ok(Err(why)) => Some(self.pick_failed(why)),

@@ -2512,6 +2512,7 @@ mod tests {
                 width: 256,
                 height: 256,
             },
+            drawn_on: (1920, 1080),
         };
         answer.send(Ok(Some(picked))).unwrap();
         let _ = ctx.run_logic(&with_window(true), |ctx| {

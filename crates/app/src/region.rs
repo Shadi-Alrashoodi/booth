@@ -55,11 +55,13 @@ const EDGE: i32 = 2;
 const TEXT_PX: i32 = 14;
 const PAD: i32 = 8;
 
-// The monitor and the region of it, in its own upright pixels.
+// The monitor and the region of it, in its own upright pixels, with the upright
+// size the monitor had when the picker opened: the only one the region holds on.
 pub struct Picked {
     pub monitor: MonitorId,
     pub refresh_hz: f64,
     pub region: Region,
+    pub drawn_on: (u32, u32),
 }
 
 // Opens the picker on its own thread at once. The answer comes once, None
@@ -374,6 +376,7 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
                     monitor: monitor.id.clone(),
                     refresh_hz: monitor.refresh_hz,
                     region,
+                    drawn_on: (monitor.width, monitor.height),
                 });
                 Some(())
             });
@@ -652,7 +655,9 @@ mod tests {
                 height: 350,
             }
         );
-        assert!(monitors.iter().any(|monitor| monitor.id == picked.monitor));
+        assert!(monitors.iter().any(|monitor| {
+            monitor.id == picked.monitor && (monitor.width, monitor.height) == picked.drawn_on
+        }));
         let answer = pick(monitors, || {}).unwrap();
         let hwnd = window();
         let mut inside = POINT { x: 150, y: 200 };

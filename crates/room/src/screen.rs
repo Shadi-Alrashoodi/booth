@@ -278,10 +278,12 @@ pub enum Answer {
 pub(crate) enum Shown {
     // A whole monitor; None is the primary one.
     Monitor(Option<MonitorId>),
-    // Only this part of the monitor, in its upright pixels.
+    // Only this part of the monitor, in its upright pixels, with the upright
+    // size the monitor had when it was drawn.
     Region {
         monitor: MonitorId,
         region: share::Region,
+        drawn_on: (u32, u32),
     },
     Window(share::WindowId),
 }

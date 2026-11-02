@@ -354,7 +354,7 @@ fn pattern_window(drawing: &Drawing) -> Result<(WindowId, RECT), String> {
         thread::sleep(LOOK);
     };
     let monitor = primary();
-    let (_, region) = middle(Some(WINDOW_AT));
+    let (_, region, _) = middle(Some(WINDOW_AT));
     let left = monitor.left + region.left as i32;
     let top = monitor.top + region.top as i32;
     let to = RECT {
@@ -391,7 +391,9 @@ fn pattern_window(drawing: &Drawing) -> Result<(WindowId, RECT), String> {
 }
 
 // What DWM draws of the window as a region of the monitor it is on.
-fn window_region(window: WindowId) -> Result<(share::MonitorId, share::Region), String> {
+fn window_region(
+    window: WindowId,
+) -> Result<(share::MonitorId, share::Region, (u32, u32)), String> {
     let monitor = share::window_monitor(window).ok_or("the pattern window is on no monitor")?;
     let bounds = bounds(window.hwnd).ok_or("could not read the pattern window's bounds")?;
     let (left, top) = (bounds.left - monitor.left, bounds.top - monitor.top);
@@ -414,7 +416,7 @@ fn window_region(window: WindowId) -> Result<(share::MonitorId, share::Region), 
         width: width as u32,
         height: height as u32,
     };
-    Ok((monitor.id, region))
+    Ok((monitor.id, region, (monitor.width, monitor.height)))
 }
 
 // Changes the window's size while a resized case is measured, its top left
@@ -469,7 +471,7 @@ fn resizing(source: Source, window: WindowId, stop: Arc<AtomicBool>) -> JoinHand
 }
 
 // The primary monitor, and the region of it in its middle, or all of it.
-fn middle(size: Option<(u32, u32)>) -> (share::MonitorId, share::Region) {
+fn middle(size: Option<(u32, u32)>) -> (share::MonitorId, share::Region, (u32, u32)) {
     let monitor = primary();
     let (width, height) = size.unwrap_or((monitor.width, monitor.height));
     let region = share::Region {
@@ -478,7 +480,7 @@ fn middle(size: Option<(u32, u32)>) -> (share::MonitorId, share::Region) {
         width,
         height,
     };
-    (monitor.id.clone(), region)
+    (monitor.id.clone(), region, (monitor.width, monitor.height))
 }
 
 struct Pair {
@@ -522,12 +524,13 @@ fn open(source: Source, fps: u8, window: Option<WindowId>) -> Pair {
     });
     match (source, window) {
         (Source::Region(size), _) => {
-            let (monitor, region) = middle(size);
-            host.room().share_region(fps, monitor, region);
+            let (monitor, region, drawn_on) = middle(size);
+            host.room().share_region(fps, monitor, region, drawn_on);
         }
         (Source::WindowAsRegion, Some(window)) => {
-            let (monitor, region) = window_region(window).expect("the pattern window's region");
-            host.room().share_region(fps, monitor, region);
+            let (monitor, region, drawn_on) =
+                window_region(window).expect("the pattern window's region");
+            host.room().share_region(fps, monitor, region, drawn_on);
         }
         (Source::Window | Source::WindowDragged | Source::WindowStepped, Some(window)) => {
             host.room().share_window(fps, window);
