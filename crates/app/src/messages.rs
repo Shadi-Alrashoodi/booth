@@ -152,9 +152,9 @@ fn host_version_step(host: Option<(Version, u16)>) -> String {
     let host_newer = host.is_some_and(|host| host > (invite::VERSION, invite::PROTOCOL));
     match (host_newer, cfg!(feature = "store")) {
         (true, false) => format!("Get the same version as the host from {RELEASES_PAGE}."),
-        (true, true) => String::from(
-            "The Microsoft Store keeps Booth up to date. Check for updates there.",
-        ),
+        (true, true) => {
+            String::from("The Microsoft Store keeps Booth up to date. Check for updates there.")
+        }
         (false, false) => format!(
             "Ask the host to get Booth {} from {RELEASES_PAGE}.",
             invite::VERSION
@@ -512,12 +512,17 @@ pub fn stun_refused(line: usize) -> String {
 
 pub const REGION_PICK: &str = "Drag over what to share. Esc cancels.";
 
+pub const REGION_FAILED: &str = "Could not open the region picker. Press Share to try again.";
+
+pub const LIST_FAILED: &str = "Could not open the share list. Press Share to try again.";
+
 pub fn region_too_small(width: u32, height: u32) -> String {
     let least = share::SMALLEST_REGION;
     format!("{width}x{height}: smaller than {least} by {least}. Drag a bigger one.")
 }
 
-pub const SHARE_PAUSED: &str = "Sharing is paused. Nothing of your screen is sent until you resume.";
+pub const SHARE_PAUSED: &str =
+    "Sharing is paused. Nothing of your screen is sent until you resume.";
 pub const SHARE_PAUSED_WITH_SOUND: &str =
     "Sharing is paused. Nothing of your screen or PC sound is sent until you resume.";
 
@@ -1020,8 +1025,7 @@ mod tests {
             major: this.major + 1,
             ..this
         };
-        let store =
-            "The Microsoft Store keeps Booth up to date. Check for updates there.";
+        let store = "The Microsoft Store keeps Booth up to date. Check for updates there.";
         assert_eq!(
             code_error(&CodeError::OtherVersion {
                 protocol: invite::PROTOCOL + 1,
@@ -1387,6 +1391,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_list_or_picker_that_cannot_open_says_what_to_do() {
+        for line in [LIST_FAILED, REGION_FAILED] {
+            assert_sentences(line);
+            assert!(line.ends_with("Press Share to try again."), "{line}");
+        }
+    }
+
     // A failed join, one test for each of its four cases: each line names the
     // case and its fix on the side that can know it.
 
@@ -1397,7 +1409,10 @@ mod tests {
     fn case_code_not_pasted() {
         assert_sentences(CODE_NOT_PASTED);
         assert!(CODE_NOT_PASTED.contains("under their invite"));
-        assert!(!CODE_NOT_PASTED.contains("get in"), "it shows in the room too");
+        assert!(
+            !CODE_NOT_PASTED.contains("get in"),
+            "it shows in the room too"
+        );
         let quiet = reply(
             ReplyState::Expired {
                 second_router: false,

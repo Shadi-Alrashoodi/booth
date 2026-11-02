@@ -72,6 +72,9 @@ pub struct InRoom {
     list_room: ListRoom,
     // The region picker's answer, while it is open.
     region_pick: Option<Receiver<Result<Option<Picked>, String>>>,
+    // Why Region brought no picker or the share key no list, until the list
+    // opens again or Share goes away. The reason itself goes to the log.
+    pick_error: Option<&'static str>,
     panic: PanicKey,
     allow_wait: AllowWait,
     block_wait: BlockWait,
@@ -196,6 +199,7 @@ impl InRoom {
             control_offered: false,
             monitors: None,
             region_pick: None,
+            pick_error: None,
             windows: Vec::new(),
             list_room: ListRoom::default(),
             panic,
@@ -265,7 +269,7 @@ impl InRoom {
                 self.room.share_region(fps, picked.monitor, picked.region);
                 Some(Step::ListNext)
             }
-            Ok(Err(why)) => Some(Step::Log(why)),
+            Ok(Err(why)) => Some(self.pick_failed(why)),
             Ok(Ok(None)) | Err(_) => None,
         }
     }
@@ -283,6 +287,11 @@ impl InRoom {
         self.monitors = Some(monitors::picks(&list));
         self.windows = window_picks();
         Ok(())
+    }
+
+    // The panel stays where it is, so this waits for the person to look.
+    pub fn list_failed(&mut self) {
+        self.pick_error = Some(messages::LIST_FAILED);
     }
 
     pub fn show(
@@ -336,6 +345,15 @@ impl InRoom {
         let top = ui.cursor().top();
         // Whether a block in panel tone ends right above the body.
         let mut block = false;
+        if self.monitors.is_some() || share != Some(ShareVerb::Share) {
+            self.pick_error = None;
+        }
+        if let Some(error) = self.pick_error {
+            block = true;
+            controls::region(ui, |ui| {
+                controls::text(ui, error, theme::caption(), BAD);
+            });
+        }
         if let Some(picks) = &self.monitors {
             block = true;
             let picked = share_list(ui, picks, &self.windows);
@@ -427,7 +445,7 @@ impl InRoom {
             }
             RowPick::Region => {
                 self.monitors = None;
-                self.pick_region(ctx)
+                self.pick_region(monitors::list(), ctx)
             }
             RowPick::Window(i) => {
                 let id = self.windows[i].id;
@@ -1163,10 +1181,14 @@ fn window_row(ui: &mut Ui, window: &WindowPick) -> bool {
 impl InRoom {
     // The picker over every monitor; follow_region_pick takes its answer when
     // it comes.
-    fn pick_region(&mut self, ctx: &Context) -> Option<Step> {
-        let list = match monitors::list() {
+    fn pick_region(&mut self, list: Result<Vec<Monitor>, String>, ctx: &Context) -> Option<Step> {
+        let list = match list {
+            Ok(list) if list.is_empty() => {
+                let why = "could not open the region picker: no monitor is attached";
+                return Some(self.pick_failed(String::from(why)));
+            }
             Ok(list) => list,
-            Err(why) => return Some(Step::Log(why)),
+            Err(why) => return Some(self.pick_failed(why)),
         };
         let ctx = ctx.clone();
         match region::pick(list, move || ctx.request_repaint()) {
@@ -1174,10 +1196,14 @@ impl InRoom {
                 self.region_pick = Some(answer);
                 None
             }
-            Err(err) => Some(Step::Log(format!(
-                "could not open the region picker: {err}"
-            ))),
+            Err(err) => Some(self.pick_failed(format!("could not open the region picker: {err}"))),
         }
+    }
+
+    // The list has closed by now and nothing else would come of the press.
+    fn pick_failed(&mut self, why: String) -> Step {
+        self.pick_error = Some(messages::REGION_FAILED);
+        Step::Log(why)
     }
 }
 
@@ -3091,6 +3117,23 @@ pub(crate) mod tests {
         in_room.monitors.is_some()
     }
 
+    fn line_shown(in_room: &mut InRoom, ctx: &Context, view: &View, line: &str) -> bool {
+        let (_, output) = crate::controls::tests::frame(ctx, Vec::new(), |ui| {
+            in_room.show(ui, view, false, hotkeys::State::default(), false)
+        });
+        let update = output.accesskit_update.expect("accesskit is on");
+        update
+            .nodes
+            .iter()
+            .any(|(_, node)| [node.label(), node.value()].contains(&Some(line)))
+    }
+
+    // Whether a frame of the panel has this line on it.
+    pub(crate) fn shows_line(in_room: &mut InRoom, line: &str) -> bool {
+        let view = in_room.room.view();
+        line_shown(in_room, &accessible_panel(), &view, line)
+    }
+
     // A picker closed with nothing picked leaves nothing behind: no share, no
     // line, and the share key goes on as it was.
     #[test]
@@ -3113,6 +3156,7 @@ pub(crate) mod tests {
         drop(picker_open(&mut in_room));
         assert!(in_room.follow_region_pick().is_none());
         assert!(!in_room.picking());
+        assert_eq!(in_room.pick_error, None);
         assert!(!own_share_on(&room.view().share.own));
 
         drop(in_room);
@@ -3180,6 +3224,80 @@ pub(crate) mod tests {
         shares(true);
         room.stop_sharing();
         shares(false);
+
+        drop(in_room);
+        target.leave();
+        hotkeys::leave(room);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // Region can fail before any picker opens, and the picker can fail once
+    // open. Each says so where the person is looking, and the log has why,
+    // until the list opens again or Share goes away.
+    #[test]
+    fn a_picker_that_cannot_open_says_so() {
+        let data_dir = std::env::temp_dir().join(format!("booth-app-pick-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let room = Arc::new(test_room(&data_dir));
+        let target = Target::default();
+        target.enter(Arc::clone(&room));
+        let mut in_room = test_in_room(&room, &target);
+        let ctx = accessible_panel();
+        let logged = |step: Option<Step>| match step {
+            Some(Step::Log(line)) => line,
+            _ => panic!("no line for the log"),
+        };
+        let shown_in = |in_room: &mut InRoom, ctx: &Context, view: &View| {
+            line_shown(in_room, ctx, view, messages::REGION_FAILED)
+        };
+        let shown = |in_room: &mut InRoom, ctx: &Context| shown_in(in_room, ctx, &room.view());
+        assert!(!shown(&mut in_room, &ctx));
+
+        let step = in_room.pick_region(Err(String::from("no list")), &ctx);
+        assert_eq!(logged(step), "no list");
+        assert!(!in_room.picking());
+        assert!(shown(&mut in_room, &ctx));
+
+        in_room.pick_error = None;
+        let step = in_room.pick_region(Ok(Vec::new()), &ctx);
+        assert!(logged(step).contains("no monitor"));
+        assert!(shown(&mut in_room, &ctx));
+
+        in_room.pick_error = None;
+        picker_open(&mut in_room)
+            .send(Err(String::from("no window")))
+            .unwrap();
+        assert_eq!(logged(in_room.follow_region_pick()), "no window");
+        assert!(!in_room.picking());
+        assert!(shown(&mut in_room, &ctx));
+
+        // The list open again takes the line away.
+        in_room.monitors = Some(Vec::new());
+        assert!(!shown(&mut in_room, &ctx));
+        assert_eq!(in_room.pick_error, None);
+
+        // So does Share going away, since the line tells the person to press
+        // it: a friend's share, this PC's own, a room that has ended.
+        let share_goes = |in_room: &mut InRoom, view: &View| {
+            in_room.pick_error = Some(messages::REGION_FAILED);
+            assert!(!shown_in(in_room, &ctx, view));
+            assert_eq!(in_room.pick_error, None);
+        };
+        let mut friend_shares = room.view();
+        friend_shares.share.current = Some(mara_shares(false));
+        share_goes(&mut in_room, &friend_shares);
+        let mut ended = room.view();
+        ended.notice = Some(Notice::RoomClosed);
+        share_goes(&mut in_room, &ended);
+
+        room.share(30, None);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !own_share_on(&room.view().share.own) {
+            assert!(Instant::now() < deadline, "the share never started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        share_goes(&mut in_room, &room.view());
 
         drop(in_room);
         target.leave();

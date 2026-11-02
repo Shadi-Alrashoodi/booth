@@ -791,7 +791,10 @@ impl App {
         }
         match in_room.open_share_list(list) {
             Ok(()) => self.show_panel(ctx),
-            Err(err) => self.backlog.add(format!("share key: {err}")),
+            Err(err) => {
+                in_room.list_failed();
+                self.backlog.add(format!("share key: {err}"));
+            }
         }
     }
 
@@ -1934,15 +1937,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&friend_dir);
     }
 
-    // No list to show: the log says why, and the panel stays where it is.
+    // No list to show: the panel stays where it is, a line on it says so for
+    // when the person looks, and the log says why.
     #[test]
     fn the_share_key_brings_the_panel_only_for_a_list() {
         let dir = fresh_dir("list-none");
         let ctx = Context::default();
         let mut app = app_in_room(&dir);
+        let shown = |app: &mut App| room_tests::shows_line(in_room(app), messages::LIST_FAILED);
+        assert!(!shown(&mut app));
 
         app.open_list_by_key(Err(String::from("no list")), &ctx);
         assert!(app.backlog.texts().contains(&"share key: no list"));
+        assert!(shown(&mut app));
         app.open_list_by_key(Ok(Vec::new()), &ctx);
         assert!(
             app.backlog
@@ -1956,6 +1963,12 @@ mod tests {
         app.open_list_by_key(Ok(vec![monitor]), &ctx);
         assert!(app.raise);
         assert!(room_tests::list_open(in_room(&mut app)));
+        assert!(!shown(&mut app));
+
+        // An empty list says so the same way.
+        in_room(&mut app).close_monitors();
+        app.open_list_by_key(Ok(Vec::new()), &ctx);
+        assert!(shown(&mut app));
 
         close_room(app);
         let _ = std::fs::remove_dir_all(&dir);
