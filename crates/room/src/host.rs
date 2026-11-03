@@ -6931,7 +6931,8 @@ mod tests {
     // A share's state goes from its sharer to each watcher whose Hello says
     // SHARE_STATE_SINCE or later, never to an older one, and to a new
     // watcher in the answer to its Watch; a room standing for an older copy
-    // passes none on, and one from someone who does not share is bad.
+    // passes none on and counts each bad, as such a copy does, and one from
+    // someone who does not share is bad.
     #[test]
     fn share_state_goes_only_to_watchers_that_read_it() {
         use crate::view::ShareState::{Live, Paused};
@@ -6986,9 +6987,11 @@ mod tests {
                 let told = states(guest, share, later);
                 assert_eq!(told, if passes { vec![Live] } else { vec![] }, "{host}");
             }
-            assert_eq!(rig.host.drops.bad, 0, "{host}");
+            // Ana said three.
+            let bad = if passes { 0 } else { 3 };
+            assert_eq!(rig.host.drops.bad, bad, "{host}");
             cy.say(&mut rig, &paused, later);
-            assert_eq!(rig.host.drops.bad, 1, "{host}");
+            assert_eq!(rig.host.drops.bad, bad + 1, "{host}");
             assert!(states(&mut dan, share, later).is_empty(), "{host}");
         }
     }
@@ -7061,8 +7064,8 @@ mod tests {
     // who does not watch, or back to the sharer. A new watcher hears at once
     // whether the sound is on, and the sound goes on whatever ShareSound
     // says. A room standing for an older copy passes none of it on and
-    // counts each sound packet bad, as such a copy does, and the room's own
-    // view says so.
+    // counts each sound packet and ShareSound bad, as such a copy does, and
+    // the room's own view says so.
     #[test]
     fn pc_sound_goes_only_to_watchers_that_read_it() {
         use crate::view::ShareState::Live;
@@ -7150,7 +7153,8 @@ mod tests {
                 assert_eq!((sounds.len(), told), heard, "{host}");
             }
             assert!(sound_to(&mut ana, later).0.is_empty(), "{host}");
-            assert_eq!(rig.host.drops.bad, if passes { 0 } else { 2 }, "{host}");
+            // Two packets and three ShareSounds.
+            assert_eq!(rig.host.drops.bad, if passes { 0 } else { 5 }, "{host}");
         }
     }
 

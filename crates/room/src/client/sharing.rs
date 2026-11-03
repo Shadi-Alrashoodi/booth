@@ -625,6 +625,16 @@ impl Client {
             } if self.screen.watched == Some(share) => {
                 self.sharer_unread = Some(share);
             }
+            // A room standing for an older copy counts these bad, as such a
+            // copy does.
+            Message::ShareState { .. } if self.version < crate::peer::SHARE_STATE_SINCE => {
+                self.drops.bad(now);
+            }
+            Message::ShareSound { .. } | Message::WatchAnswer { .. }
+                if self.version < crate::peer::PC_SOUND_SINCE =>
+            {
+                self.drops.bad(now);
+            }
             // One for a share no longer watched was on its way, and so was one
             // before the host's answer to this PC's last Watch: it was sent to
             // a watch this PC stopped.

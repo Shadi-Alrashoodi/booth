@@ -1177,8 +1177,9 @@ fn a_new_session_keeps_the_watch_of_the_same_sharer() {
     assert!(heard > 0.15, "{heard}");
 }
 
-// A client standing for a copy older than PC_SOUND_SINCE counts channel 8
-// bad, as such a copy does, and plays none of it.
+// A client standing for a copy older than PC_SOUND_SINCE counts channel 8,
+// the host's answer to its Watch and the sharer's words bad, as such a copy
+// does, and plays and shows none of them.
 #[test]
 fn a_client_standing_for_1_2_0_counts_pc_sound_bad() {
     let start = Instant::now();
@@ -1200,4 +1201,10 @@ fn a_client_standing_for_1_2_0_counts_pc_sound_bad() {
     }
     assert_eq!(rig.client.drops.bad, bad + 5);
     assert!(rig.client.view(start, 0).numbers.sound.is_none());
+    let shown = words(&rig);
+    answer(&mut rig, &mut session, ShareState::Paused, true, start);
+    bo_says(&mut rig, &mut session, true, start);
+    bo_stands(&mut rig, &mut session, ShareState::Away, start);
+    assert_eq!(rig.client.drops.bad, bad + 8);
+    assert_eq!(words(&rig), shown);
 }

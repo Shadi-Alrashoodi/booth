@@ -921,6 +921,16 @@ impl Host {
                 }
                 false
             }
+            // A room standing for an older copy counts these bad, as such a
+            // copy does.
+            Message::ShareState { .. } if self.version < crate::peer::SHARE_STATE_SINCE => {
+                self.drops.bad(now);
+                false
+            }
+            Message::ShareSound { .. } if self.version < crate::peer::PC_SOUND_SINCE => {
+                self.drops.bad(now);
+                false
+            }
             // From the live share's sharer only; one from a share of theirs
             // that ended was on its way.
             Message::ShareState { share, state } => {
