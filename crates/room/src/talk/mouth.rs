@@ -97,10 +97,12 @@ impl Mouth {
 
     // The microphone opened again after a gap. The part of a frame from
     // before it does not go out with what comes after, and a spell that was
-    // going ended with the gap, as when the stream closes (see Drop).
+    // going ended with the gap, as when the stream closes (see Drop). The
+    // open mic floor is learnt again, from whichever microphone this is.
     pub(crate) fn restart(&mut self) {
         self.filled = 0;
         self.first = None;
+        self.detector = Detector::new().quietest(self.shared.sensitivity_db);
         if self.sending {
             self.sending = false;
             self.shared.sending.store(false, Ordering::Relaxed);
@@ -384,6 +386,56 @@ mod tests {
         shared.set_muted(true);
         drop(mouth);
         assert!(!shared.sending());
+    }
+
+    // A microphone opened again, perhaps another one, learns its own open mic
+    // floor: the steady room of a louder microphone after a quiet one does
+    // not send.
+    #[test]
+    fn reopened_microphone_learns_its_floor() {
+        let (mut mouth, shared) = mouth(TalkMode::OpenMic, true, false);
+        let mut at = Instant::now();
+        // About -70 dBFS, then -45.
+        assert!(run(&mut mouth, &mut at, 750, 0.0003).is_empty());
+        mouth.restart();
+        assert!(run(&mut mouth, &mut at, 750, 0.0056).is_empty());
+        assert!(!shared.sending());
+    }
+
+    // A spell the gap cut off is over: the microphone opened again sends no
+    // tail of it, whatever it hears.
+    #[test]
+    fn reopened_microphone_sends_no_tail() {
+        let (mut mouth, shared) = mouth(TalkMode::OpenMic, true, false);
+        let mut at = Instant::now();
+        // About -70 dBFS, then a voice at -20.
+        assert!(run(&mut mouth, &mut at, 750, 0.0003).is_empty());
+        assert!(!run(&mut mouth, &mut at, 10, 0.1).is_empty());
+        assert!(shared.sending());
+        mouth.restart();
+        assert!(run(&mut mouth, &mut at, 750, 0.0003).is_empty());
+        assert!(!shared.sending());
+    }
+
+    // A microphone opened again keeps the open mic sensitivity from
+    // Settings: a voice at -40 dBFS that -30 turns away is still turned away,
+    // and one at -20 still goes.
+    #[test]
+    fn reopened_microphone_keeps_the_sensitivity() {
+        let config = VoiceConfig {
+            talk: TalkMode::OpenMic,
+            sensitivity_db: -30,
+            ..VoiceConfig::default()
+        };
+        let shared = Shared::new(&config, None, false);
+        let mut mouth = Mouth::new(Arc::clone(&shared), Clock::new(Instant::now())).unwrap();
+        let mut at = Instant::now();
+        // About -70 dBFS on both sides of the gap.
+        assert!(run(&mut mouth, &mut at, 750, 0.0003).is_empty());
+        mouth.restart();
+        assert!(run(&mut mouth, &mut at, 750, 0.0003).is_empty());
+        assert!(run(&mut mouth, &mut at, 50, 0.01).is_empty());
+        assert!(!run(&mut mouth, &mut at, 10, 0.1).is_empty());
     }
 
     #[test]
