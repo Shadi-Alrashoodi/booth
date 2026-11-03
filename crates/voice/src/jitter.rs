@@ -337,6 +337,9 @@ impl JitterBuffer {
                     let since_last_pull = self.pulls;
                     self.arrivals.retain(|arrival| arrival.at < since_last_pull);
                     self.measure_depth();
+                    // What the play point has passed played or had its turn,
+                    // so it does not count as dropped when it goes.
+                    self.discard_before(self.play, false);
                     self.phase = Phase::Starting;
                     self.timed_out = false;
                 }
@@ -1115,9 +1118,9 @@ impl JitterBuffer {
         }
     }
 
-    // Frames that arrived but will never be played. `counted` says whether they
-    // are dropped for delay; when not, they were later than the cap and the
-    // loss count has them.
+    // Frames let go. `counted` says they arrived, never played and went to cut
+    // delay. Otherwise they played, had their turn, are in the loss count, or
+    // the mixer had paused.
     fn discard_before(&mut self, oldest_kept: i64, counted: bool) {
         for slot in &mut self.slots {
             if slot.held != Held::Empty && slot.ext < oldest_kept {

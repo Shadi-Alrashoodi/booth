@@ -753,7 +753,7 @@ fn after_pulls_stop_it_restarts_at_its_depth() {
     }
     let stats = listener.stats();
     assert_eq!((stats.depth_frames, stats.late, stats.lost), (1, 0, 0));
-    assert!(stats.dropped >= 190, "{stats:?}");
+    assert_eq!(stats.dropped, 200);
     listener.assert_no_clicks();
 }
 
@@ -1322,4 +1322,26 @@ fn late_frame_decoded_only_while_in_reach() {
     );
     listener.assert_in_order();
     listener.assert_no_clicks();
+}
+
+// Pulls stop and the numbers jump past the cap. What played is not dropped
+// for it, only what arrived and never will.
+#[test]
+fn only_what_never_played_counts_as_dropped() {
+    let sent = low_delay(&tone(0.1), 0);
+    let mut buffer = JitterBuffer::new().unwrap();
+    let mut frame = [0f32; MAX_FRAME];
+    buffer.push(sent[0].packet()).unwrap();
+    assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Packet(0));
+    buffer.push(sent[13].packet()).unwrap();
+    assert_eq!(buffer.stats().dropped, 0);
+
+    let mut buffer = JitterBuffer::new().unwrap();
+    buffer.push(sent[0].packet()).unwrap();
+    buffer.pull(&mut frame).unwrap();
+    buffer.push(sent[1].packet()).unwrap();
+    buffer.push(sent[2].packet()).unwrap();
+    buffer.push(sent[13].packet()).unwrap();
+    assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Packet(13));
+    assert_eq!(buffer.stats().dropped, 2);
 }
