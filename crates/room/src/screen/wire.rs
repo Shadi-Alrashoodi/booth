@@ -534,6 +534,9 @@ impl Assembler {
     // The whole shape, with its share and id, once its last chunk is in.
     pub(crate) fn push(&mut self, chunk: ShapeChunk) -> Option<(u32, u32, Shape)> {
         let (mut first, next) = if chunk.index == 0 {
+            // The shape under way is dropped here: a shape of one chunk is
+            // never kept below, so it would not replace it.
+            self.under_way = None;
             (chunk, 1)
         } else {
             let (mut first, next) = self.under_way.take()?;
@@ -949,6 +952,22 @@ mod tests {
         assembler.push(all[0].clone());
         assert_eq!(assembler.push(other[1].clone()), None);
         assert_eq!(assembler.push(all[1].clone()), None);
+    }
+
+    // A first chunk ends the shape under way, also when it is a whole shape
+    // of one chunk: the rest of the old one makes nothing after it.
+    #[test]
+    fn a_one_chunk_shape_drops_the_shape_under_way() {
+        let big = color(32, 32);
+        let small = color(1, 1);
+        let all: Vec<ShapeChunk> = chunks(1, 5, &big).collect();
+        let whole = chunks(1, 6, &small).next().unwrap();
+        let mut assembler = Assembler::default();
+        assert_eq!(assembler.push(all[0].clone()), None);
+        assert_eq!(assembler.push(whole), Some((1, 6, small)));
+        for chunk in &all[1..] {
+            assert_eq!(assembler.push(chunk.clone()), None);
+        }
     }
 
     #[test]
