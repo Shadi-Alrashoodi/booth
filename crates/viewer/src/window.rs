@@ -38,17 +38,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsIconic, IsWindowVisible, IsZoomed, LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MF_BYCOMMAND,
     MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MINMAXINFO, MSG, PostMessageW,
     PostQuitMessage, RegisterClassExW, SC_KEYMENU, SIZE_MINIMIZED, SM_CXICON, SM_CXSMICON,
-    SPI_GETCLIENTAREAANIMATION, SW_HIDE, SW_RESTORE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetCursor, SetWindowDisplayAffinity,
-    SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, ShowWindow, SystemParametersInfoW,
-    TranslateMessage, WA_INACTIVE, WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WINDOWPLACEMENT, WM_ACTIVATE, WM_ACTIVATEAPP, WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND,
-    WM_WINDOWPOSCHANGED, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE,
-    WS_OVERLAPPEDWINDOW, WS_POPUP,
+    SPI_GETCLIENTAREAANIMATION, SW_HIDE, SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE,
+    SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+    SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetCursor,
+    SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, ShowWindow,
+    SystemParametersInfoW, TranslateMessage, WA_INACTIVE, WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WINDOWPLACEMENT, WM_ACTIVATE, WM_ACTIVATEAPP, WM_APP, WM_CLOSE, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE,
+    WM_SYSCOMMAND, WM_WINDOWPOSCHANGED, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW,
+    WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 use windows::core::{BOOL, HSTRING, PCWSTR, w};
 
@@ -1053,13 +1053,17 @@ fn leave_fullscreen(hwnd: HWND, shared: &Shared) {
 }
 
 // SetWindowPlacement shows the window with the saved command, which would
-// show a hidden one and activate one that is not active.
+// show a hidden one and activate one that is not active. A window that was
+// maximized is activated on its way back: no show command maximizes one
+// that is not minimized without activating it.
 fn quietly(hwnd: HWND, placement: &mut WINDOWPLACEMENT) {
     // SAFETY: a live window.
     if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
         placement.showCmd = SW_HIDE.0 as u32;
     } else if placement.showCmd == SW_SHOWNORMAL.0 as u32 {
         placement.showCmd = SW_SHOWNOACTIVATE.0 as u32;
+    } else if placement.showCmd == SW_SHOWMINIMIZED.0 as u32 {
+        placement.showCmd = SW_SHOWMINNOACTIVE.0 as u32;
     }
 }
 
@@ -1140,11 +1144,19 @@ fn enter_small(hwnd: HWND, shared: &Shared) {
     let outer_h = outer_h.min(work.bottom - work.top - 2 * margin);
     let x = (work.right - outer_w - margin).max(work.left);
     let y = (work.bottom - outer_h - margin).max(work.top);
-    // SAFETY: a live window. Only SW_RESTORE brings a maximized or minimized
-    // one back to a plain window that SetWindowPos can size.
+    // SAFETY: a live window. SW_SHOWNOACTIVATE brings a maximized or
+    // minimized one back to a plain window that SetWindowPos can size,
+    // without activating it. One minimized from maximized comes back
+    // maximized first, as with SW_RESTORE. Not a hidden one, as a closed
+    // viewer is, which it would show.
     unsafe {
-        if IsZoomed(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
+        if IsWindowVisible(hwnd).as_bool() {
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            }
+            if IsZoomed(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            }
         }
         let _ = SetWindowPos(
             hwnd,
@@ -1508,7 +1520,8 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 mod tests {
     use windows::Win32::Graphics::Gdi::EnumDisplayMonitors;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetSystemMetrics, SM_CMONITORS, SW_SHOWMINNOACTIVE,
+        GUITHREADINFO, GetGUIThreadInfo, GetSystemMetrics, GetWindowThreadProcessId, SM_CMONITORS,
+        WPF_RESTORETOMAXIMIZED, WS_MAXIMIZE, WS_MINIMIZE,
     };
 
     use super::*;
@@ -1558,6 +1571,44 @@ mod tests {
         .ok()
         .unwrap();
         all
+    }
+
+    // Active among its own thread's windows, which needs no foreground.
+    fn active(hwnd: HWND) -> bool {
+        let mut info = GUITHREADINFO {
+            cbSize: size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: a live window's thread and a GUITHREADINFO with its size
+        // set.
+        unsafe { GetGUIThreadInfo(GetWindowThreadProcessId(hwnd, None), &mut info) }.unwrap();
+        info.hwndActive == hwnd
+    }
+
+    // As Show::Activate makes it, which can be activated, but still hidden.
+    fn activatable(hwnd: HWND) {
+        // SAFETY: a getter and a setter on a test's live window.
+        unsafe {
+            let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style & !(WS_EX_NOACTIVATE.0 as isize));
+        }
+    }
+
+    // Minimized as from maximized, so that it comes back maximized, and not
+    // activated.
+    fn minimize_from_maximized(hwnd: HWND) {
+        let mut placement = WINDOWPLACEMENT {
+            length: size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: a test's live window and a WINDOWPLACEMENT with its length
+        // set.
+        unsafe {
+            GetWindowPlacement(hwnd, &mut placement).unwrap();
+            placement.flags |= WPF_RESTORETOMAXIMIZED;
+            placement.showCmd = SW_SHOWMINNOACTIVE.0 as u32;
+            SetWindowPlacement(hwnd, &placement).unwrap();
+        }
     }
 
     #[test]
@@ -1909,6 +1960,87 @@ mod tests {
         assert!(
             small.top >= work.top && small.bottom <= work.bottom,
             "{small:?} in the work area {work:?}"
+        );
+    }
+
+    // A closed viewer that was maximized or minimized stays hidden through
+    // small on top. Never shown, unless small on top shows it.
+    #[test]
+    fn small_on_top_leaves_a_closed_viewer_hidden() {
+        let _screen = crate::tests::one_at_a_time();
+        for (what, state) in [("maximized", WS_MAXIMIZE), ("minimized", WS_MINIMIZE)] {
+            let window = open(Show::Hidden);
+            let hwnd = window.hwnd();
+            // As far as IsZoomed and IsIconic go.
+            // SAFETY: a getter and a setter on this test's live window.
+            unsafe {
+                let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+                SetWindowLongPtrW(hwnd, GWL_STYLE, style | state.0 as isize);
+            }
+            send(hwnd, WM_CLOSE, 0, 0);
+            send(hwnd, WM_SMALL, 1, 0);
+            assert!(window.shared().small());
+            // SAFETY: a getter on a live window.
+            let shown = unsafe { IsWindowVisible(hwnd) }.as_bool();
+            assert!(!shown, "small on top showed a closed {what} viewer");
+        }
+    }
+
+    // A minimized viewer that can be activated, as Show::Activate opens it:
+    // small on top and back again leave it inactive. On screen for a
+    // moment, as a button on the taskbar and a small window in a corner.
+    //
+    //   cargo test -p viewer --lib -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn small_on_top_does_not_activate_a_minimized_window() {
+        let _screen = crate::tests::one_at_a_time();
+        let window = open(Show::Hidden);
+        let hwnd = window.hwnd();
+        activatable(hwnd);
+        // SAFETY: this test's live window.
+        let _ = unsafe { ShowWindow(hwnd, SW_SHOWMINNOACTIVE) };
+        // SAFETY: a getter on a live window.
+        let minimized = || unsafe { IsIconic(hwnd) }.as_bool();
+        assert!(minimized() && !active(hwnd));
+        send(hwnd, WM_SMALL, 1, 0);
+        assert!(window.shared().small() && !minimized());
+        assert!(!active(hwnd), "small on top activated the window");
+        send(hwnd, WM_SMALL, 0, 0);
+        assert!(minimized(), "the window did not go back to minimized");
+        assert!(
+            !active(hwnd),
+            "going back to minimized activated the window"
+        );
+    }
+
+    // A viewer minimized from maximized, which SW_SHOWNOACTIVATE brings back
+    // maximized: small on top makes it a plain window in the corner, and
+    // back again it is minimized, inactive all along. On screen for a
+    // moment, as a button on the taskbar, over the work area and in a
+    // corner.
+    #[test]
+    #[ignore]
+    fn small_on_top_is_never_maximized() {
+        let _screen = crate::tests::one_at_a_time();
+        let window = open(Show::Hidden);
+        let hwnd = window.hwnd();
+        activatable(hwnd);
+        minimize_from_maximized(hwnd);
+        // SAFETY: a getter on a live window.
+        let minimized = || unsafe { IsIconic(hwnd) }.as_bool();
+        // SAFETY: a getter on a live window.
+        let maximized = || unsafe { IsZoomed(hwnd) }.as_bool();
+        assert!(minimized() && !active(hwnd));
+        send(hwnd, WM_SMALL, 1, 0);
+        assert!(window.shared().small() && !minimized());
+        assert!(!maximized(), "small on top is a maximized window");
+        assert!(!active(hwnd), "small on top activated the window");
+        send(hwnd, WM_SMALL, 0, 0);
+        assert!(minimized(), "the window did not go back to minimized");
+        assert!(
+            !active(hwnd),
+            "going back to minimized activated the window"
         );
     }
 }
