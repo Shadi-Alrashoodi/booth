@@ -956,25 +956,28 @@ fn a_jump_ahead_counts_the_frames_skipped_as_lost_and_no_more() {
     );
 }
 
-// A frame of a spell that has ended, after its end, is a straggler. Numbering
-// that goes back further than any frame is delayed is the sharer starting
-// over, even with its first frame's mark lost: a new spell from a reset
-// decoder.
+// A frame of a spell that has ended, after its end, is a straggler however
+// far behind the newest it is, the spell's first frame too: the sharer's
+// numbering never goes back. The next spell, numbered on, starts from a
+// reset decoder.
 #[test]
 fn stragglers_and_numbering_going_back() {
-    let mut first = spell(&music(1.0), 30_000, 0);
+    let mut first = spell(&music(3.0), 30_000, 0);
     first.last_mut().unwrap().last = true;
-    let mut straggler = first[90].clone();
-    straggler.sent_at = first.last().unwrap().sent_at + 30 * TICK;
-    let mut second = spell(&music(1.0), 5, 2 * SECOND);
-    second[0].first = false;
+    let end_at = first.last().unwrap().sent_at;
     let mut sent = first.clone();
-    sent.push(straggler.clone());
+    // 9, 249 and 299 frames behind the newest.
+    for (n, i) in [290, 50, 0].into_iter().enumerate() {
+        let mut straggler = first[i].clone();
+        straggler.sent_at = end_at + 10 * (n as u64 + 1) * TICK;
+        sent.push(straggler);
+    }
+    let second = spell(&music(1.0), 30_300, 4 * SECOND);
     sent.extend(second.iter().cloned());
     let mut listener = Listener::new();
-    listener.run(&sent, &on_time(&sent), 3 * SECOND + TICK, always);
+    listener.run(&sent, &on_time(&sent), 5 * SECOND + TICK, always);
 
-    let end = listener.pull_at(first.last().unwrap().sent_at) + 1;
+    let end = listener.pull_at(end_at) + 1;
     let start = listener.pull_at(second[0].sent_at);
     let between = listener.sources(end..start);
     assert_eq!(between[0], Some(Source::End));
@@ -991,37 +994,107 @@ fn stragglers_and_numbering_going_back() {
     listener.assert_no_clicks();
 }
 
-// A frame marked first starts a spell even when the numbering went back only
-// a little, and a frame from before it that comes after it never plays.
+// A pull from each, the same from both, or a pause of both while deafened.
+fn same_turn(never: &mut Buffer, held_up: &mut Buffer, deafened: bool, n: usize) {
+    if deafened {
+        never.pause();
+        held_up.pause();
+        return;
+    }
+    let (mut a, mut b) = ([0f32; SAMPLES], [0f32; SAMPLES]);
+    assert_eq!(held_up.pull(&mut b), never.pull(&mut a), "frame {n}");
+    assert_eq!(a, b, "frame {n}");
+}
+
+// While sound plays, or is held while deafened, a frame held up on the way
+// for over 2 s is not the sharer's numbering starting over: it is dropped,
+// and the buffer plays and counts just as one that never got it.
+#[test]
+fn a_frame_held_up_over_2_s_is_dropped_in_a_spell() {
+    let sent = spell(&music(4.0), 0, 0);
+    for deaf in [0..0, 250..320] {
+        let mut never = Buffer::new().unwrap();
+        let mut held_up = Buffer::new().unwrap();
+        for (n, packet) in sent.iter().enumerate() {
+            if n == 301 {
+                // 201 frames behind the newest.
+                held_up.push(sent[99].packet()).unwrap();
+                same_turn(&mut never, &mut held_up, deaf.contains(&n), n);
+            }
+            if n != 99 {
+                never.push(packet.packet()).unwrap();
+                held_up.push(packet.packet()).unwrap();
+            }
+            same_turn(&mut never, &mut held_up, deaf.contains(&n), n);
+        }
+        assert_eq!(held_up.stats(), never.stats());
+    }
+}
+
+// A frame marked first starts a spell from a reset decoder, after a time-out
+// too, which keeps the decoder, and a frame from before it never plays, even
+// one that comes in time for its turn.
 #[test]
 fn frames_from_before_a_first_are_dropped() {
-    let mut first = spell(&music(1.0), 2000, 0);
-    first.last_mut().unwrap().last = true;
-    let second = spell(&music(1.0), 2050, 2 * SECOND);
+    let first = spell(&music(1.0), 2000, 0);
+    // Frames 2100 to 2108 are lost on the way, and 2109 comes after the
+    // first frame of the next spell.
+    let second = spell(&music(1.0), 2110, 2 * SECOND);
     let mut old = first[60].clone();
     old.seq = second[0].seq.wrapping_sub(1);
-    old.sent_at = second[3].sent_at;
+    old.sent_at = second[0].sent_at + 1;
     let mut sent = first.clone();
     sent.extend(second.iter().cloned());
     sent.push(old.clone());
     let mut listener = Listener::new();
-    listener.run(&sent, &on_time(&sent), 3 * SECOND + TICK, always);
+    // Three deep, playing starts two frames before the first frame in, so
+    // `old` comes after the first pull and before its turn.
+    listener.buffer.set_period(1056);
+    listener.run(&sent, &on_time(&sent), 3 * SECOND + 3 * TICK, always);
     for packet in &second {
         assert_eq!(
-            listener.played_from(packet.seq, 2 * SECOND),
-            Some(packet.sent_at)
+            listener.played_at(packet.seq),
+            Some(packet.sent_at + 2 * TICK)
         );
     }
-    assert_eq!(listener.played_from(old.seq, 2 * SECOND), None);
-    let start = listener.pull_at(second[0].sent_at);
+    assert_eq!(listener.played_at(old.seq), None);
+    let start = listener.pull_at(second[0].sent_at + 2 * TICK);
     let mut fresh = Decoder::new().unwrap();
     let mut out = [0f32; SAMPLES];
     fresh.decode(&second[0].frame, &mut out).unwrap();
     assert_eq!(listener.heard[start].audio, faded_in(&out));
     let stats = listener.stats();
-    assert_eq!((stats.late, stats.lost, stats.concealed), (0, 0, 0));
+    assert_eq!((stats.late, stats.lost, stats.concealed), (0, 0, 3));
     listener.assert_in_order();
     listener.assert_no_clicks();
+}
+
+// A spell's first frame held up on the way until its spell has ended is a
+// straggler like any other, and so is a copy of it after the end: neither
+// starts a spell of its own.
+#[test]
+fn a_first_frame_after_the_end_of_its_spell_never_plays() {
+    let mut sent = spell(&music(0.2), 7, 0);
+    sent.last_mut().unwrap().last = true;
+    let end_at = sent.last().unwrap().sent_at + TICK;
+    let late = end_at + 2 * TICK;
+    let mut held_up = on_time(&sent);
+    held_up[0] = Some(late);
+    let mut copied = sent.clone();
+    copied.push(sent[0].clone());
+    let mut copy_after = on_time(&sent);
+    copy_after.push(Some(late));
+    for (sent, arrive) in [(&sent, held_up), (&copied, copy_after)] {
+        let mut listener = Listener::new();
+        listener.run(sent, &arrive, late + 10 * TICK, always);
+        let end = listener.pull_at(end_at);
+        assert_eq!(listener.sources(end..end + 1), [Some(Source::End)]);
+        let after = listener.sources(end + 1..listener.heard.len());
+        assert!(after.iter().all(Option::is_none), "{after:?}");
+        let stats = listener.stats();
+        assert_eq!((stats.concealed, stats.lost), (0, 0), "{stats:?}");
+        assert!(!stats.playing);
+    }
 }
 
 // Three deep, a spell starts two frames behind the first frame in, and a

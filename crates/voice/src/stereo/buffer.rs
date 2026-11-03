@@ -58,9 +58,6 @@ const SEEN: usize = (LATE_WINDOW + CAP) as usize;
 // 5 s of arrivals is 500; the rest is room for frames that come while
 // nobody pulls.
 const MAX_ARRIVALS: usize = 1024;
-// A frame this far behind the newest is not late: the sharer's numbering
-// started over.
-const RESTART_BACK: i64 = LATE_WINDOW;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SoundPacket<'a> {
@@ -286,14 +283,13 @@ impl Buffer {
         })?;
         let ext = self.extend(packet.seq);
         let newer = self.newest.is_none_or(|newest| ext > newest);
-        let back_far = self
-            .newest
-            .is_some_and(|newest| newest - ext > RESTART_BACK);
-        if back_far || (packet.first && (newer || self.phase == Phase::Idle)) {
+        let fresh = packet.first && newer;
+        if fresh {
             self.begin(ext, packet.last, true);
         } else if self.phase == Phase::Idle {
             if !newer {
-                // A straggler from a spell that has ended.
+                // A straggler from a spell that has ended, however far back:
+                // the sharer's numbering never goes back within a watch.
                 return Ok(());
             }
             self.begin(ext, packet.last, false);
@@ -441,16 +437,10 @@ impl Buffer {
         per_period.min(CAP)
     }
 
-    // A spell starts at `ext`. `fresh` when the sharer's encoder started
-    // over (a frame marked first, numbering that went back far), so the
+    // A spell starts at `ext`, newer than any frame before it. `fresh` when
+    // the sharer's encoder started over, at a frame marked first, so the
     // decoder does too and nothing older belongs to this spell.
     fn begin(&mut self, ext: i64, last: bool, fresh: bool) {
-        if self.newest.is_some_and(|newest| ext <= newest) {
-            // The numbering went back. The numbers it uses now may have
-            // been seen before.
-            self.seen = [i64::MIN; SEEN];
-            self.judged = Some(ext - 1);
-        }
         if fresh {
             self.spell_first = Some(ext);
             self.reset_due = true;
@@ -937,8 +927,9 @@ impl Buffer {
 
     // Settles, for every frame number up to `upto`, whether it counts as
     // lost, and keeps the last 2 s of that for the loss percentage. A big
-    // jump in numbering is judged over its last 2 s only, so a sharer
-    // restarting their count does not read as thousands of losses.
+    // jump in numbering is judged over its last 2 s only, so one frame far
+    // ahead, which a broken or hostile sharer can send, costs at most 2 s of
+    // judging.
     fn judge_through(&mut self, upto: i64, arrived_counts_as_lost: bool) {
         let from = match self.judged {
             Some(judged) if judged >= upto => return,
