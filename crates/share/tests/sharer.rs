@@ -953,6 +953,48 @@ fn the_codec_follows_the_viewers() {
     println!("said {lines:?}");
 }
 
+// A new encoder for a new rate or after a pause by hand, within a SWITCH_GAP
+// of the change to H.264, keeps H.264 though the viewer who needed it left:
+// someone else who needs it gets it at once, with no new encoder for them.
+#[test]
+fn a_new_encoder_inside_the_gap_keeps_h264() {
+    let Some((_turn, adapter)) = gpu() else {
+        return;
+    };
+    let packets: Packets = Arc::default();
+    let (mut sharer, _) = share_on(adapter, &packets, (2560, 1440), 120, None, None)
+        .unwrap_or_else(|err| panic!("{err}"));
+    if sharer.codec() != Some(Codec::Hevc) {
+        println!("skipped: no encoder here takes HEVC at 2560x1440 and 120 fps");
+        return;
+    }
+    let mut watching = Watching {
+        takes_hevc: false,
+        ..Watching::default()
+    };
+    assert_eq!(next_frame(&mut sharer, &mut watching).1, Codec::H264);
+    watching.takes_hevc = true;
+    assert_eq!(next_frame(&mut sharer, &mut watching).1, Codec::H264);
+    let new_rate = sharer
+        .set_fps(60, &mut |_| {})
+        .unwrap_or_else(|err| panic!("{err}"));
+    assert!(new_rate);
+    assert_eq!(sharer.codec(), Some(Codec::H264));
+    sharer.pause();
+    sharer
+        .resume(&mut |_| {})
+        .unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(sharer.codec(), Some(Codec::H264));
+    let changes = sharer.numbers().codec_changes;
+    assert_eq!(changes, 1);
+    // HEVC comes back when the gap ends, as without a new encoder.
+    let until = Instant::now() + SWITCH_GAP * 2;
+    while next_frame(&mut sharer, &mut watching).1 != Codec::Hevc {
+        assert!(Instant::now() < until, "{:?}", watching.lines);
+    }
+    assert_eq!(sharer.numbers().codec_changes, changes + 1);
+}
+
 // The pacer's failure is a whole sentence already, which the room shows
 // after "Sharing stopped: ".
 #[test]

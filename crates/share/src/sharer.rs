@@ -35,9 +35,10 @@ const RESTED_AFTER: Duration = Duration::from_millis(250);
 // often. Each change opens a new encoder, which holds up the frame it opens
 // for (5 to 8 ms for NVENC at 1440p, tests/sharer.rs), and starts with an
 // IDR of about six frames' worth. A viewer who needs H.264 gets it at once
-// unless a change came within the gap, and HEVC comes back only once no
-// viewer has needed H.264 for a whole gap, so someone who closes the
-// viewer and opens it again within it costs no change at all.
+// unless a change came within the gap, when only a new encoder opened for
+// another reason brings it sooner, and HEVC comes back only once no viewer
+// has needed H.264 for a whole gap, so someone who closes the viewer and
+// opens it again within it costs no change at all.
 pub const SWITCH_GAP: Duration = Duration::from_secs(3);
 
 // A shared window's new size gets a new encoder only this long after the
@@ -123,7 +124,7 @@ pub struct Setup {
     // Whether every viewer decodes HEVC, for a share left to pick: what the
     // first encoder opens for, before Audience::takes_hevc is asked, then
     // its newest answer, which an encoder opened for a new size or rate
-    // follows too.
+    // follows too, back to HEVC only once SWITCH_GAP allows it.
     pub takes_hevc: bool,
     // Video bytes in a packet: PAYLOAD_INTERNET, or PAYLOAD_LAN when every
     // viewer is on the LAN.
@@ -267,6 +268,9 @@ pub struct Sharer {
     fallback: Option<Fallback>,
     // Paused by hand (pause), until resume.
     held: bool,
+    // The codec it was in when paused by hand: resume's new encoder keeps to
+    // SWITCH_GAP as any other does.
+    held_in: Option<Codec>,
     // When the last new encoder opened, and for a window share, when a new
     // size may try again after a new encoder did not open and how many did
     // not in a row (RESIZE_SPACING, RESIZE_TRIES).
@@ -422,6 +426,7 @@ impl Sharer {
             reopens: 0,
             fallback: None,
             held: false,
+            held_in: None,
             last_encoder: Some(Instant::now()),
             resize_retry: None,
             resizes_failed: 0,
@@ -523,6 +528,7 @@ impl Sharer {
     // next() is not called while it holds.
     pub fn pause(&mut self) {
         self.forget_pictures();
+        self.held_in = self.codec().or(self.held_in);
         self.opened = None;
         self.held = true;
     }
@@ -723,7 +729,9 @@ impl Sharer {
             self.take_options(options);
             return Ok(false);
         }
-        let current = self.codec();
+        let now = Instant::now();
+        let current = self.codec().or(self.held_in.take());
+        let pick = self.pick_in(current, now);
         // Windows allows one duplication of a monitor per process, so the
         // old one goes before the new one opens, and the last picture with
         // it, since it is on the old one's texture.
@@ -733,13 +741,14 @@ impl Sharer {
         let mut opened = source::open(
             &self.setup.choice,
             self.encoder_kind(),
-            self.pick(),
+            pick,
             &self.setup.settings,
             options,
             self.hevc_offer.clone(),
             say,
         )?;
         if current.is_some_and(|was| was != opened.encoder.codec()) {
+            self.switches.changed(now);
             self.numbers.codec_changes += 1;
         }
         if let Some(offer) = opened.hevc.take() {
@@ -811,6 +820,17 @@ impl Sharer {
                 takes_hevc: self.setup.takes_hevc,
             },
         }
+    }
+
+    // The same for a new encoder that takes over from one in `current`: back
+    // to HEVC only once SWITCH_GAP allows it. A viewer who needs H.264 gets
+    // it with this encoder, gap or no gap.
+    fn pick_in(&self, current: Option<Codec>, now: Instant) -> Pick {
+        let mut pick = self.pick();
+        if current == Some(Codec::H264) && !self.switches.hevc_may(now) {
+            pick.takes_hevc = false;
+        }
+        pick
     }
 
     // Waits for the source's next picture, at most 100 ms on a still screen,
@@ -1033,12 +1053,7 @@ impl Sharer {
         let now = Instant::now();
         let window = matches!(self.setup.choice, Choice::Window { .. });
         let current = self.codec();
-        let mut pick = self.pick();
-        // A window changes size often, so its new encoder changes codec only
-        // as pick_codec would: back to HEVC only once SWITCH_GAP allows it.
-        if window && current == Some(Codec::H264) && !self.switches.hevc_may(now) {
-            pick.takes_hevc = false;
-        }
+        let pick = self.pick_in(current, now);
         let kind = self.encoder_kind();
         let Some(opened) = &mut self.opened else {
             return Ok(false);
@@ -1204,7 +1219,6 @@ impl Sharer {
                 None => return,
             },
         };
-        self.switches.changed(now);
         let was = self.encoder_name().to_string();
         let changed = if self.keeps(options) {
             self.switch(codec, kind)
@@ -1213,6 +1227,9 @@ impl Sharer {
             self.reopen(options, &mut |line| audience.line(line))
                 .map(|_| ())
         };
+        // After it: a reopen asks whether HEVC may come back, and due has
+        // just said it may.
+        self.switches.changed(now);
         match changed {
             Ok(()) => audience.line(Line::Log(format!(
                 "{was} to {} in {:.1} ms: {}",
@@ -1810,6 +1827,37 @@ mod tests {
         Sharer::open(setup, |_: &[u8]| {}, &mut |_| {}).unwrap_or_else(|err| panic!("{err}"))
     }
 
+    // What a monitor's capture does at a new mode, which a test cannot bring
+    // about: the source goes on under the same limits, its next picture at
+    // the new size, and a source opened again sees the new size too. The
+    // pattern takes no new box while it runs, so called again, this is the
+    // capture bringing its next picture within the box it was just given.
+    fn new_mode(sharer: &mut Sharer, width: u32, height: u32) {
+        let Choice::Pattern { adapter, busy, .. } = sharer.setup.choice.clone() else {
+            panic!("not a pattern");
+        };
+        let choice = Choice::Pattern {
+            adapter,
+            width,
+            height,
+            busy,
+        };
+        sharer.setup.choice = choice;
+        let opened = sharer.opened.as_mut().expect("a source");
+        let Source::Pattern(pattern) = &opened.source else {
+            panic!("not a pattern");
+        };
+        let pattern = capture::Pattern::with_source(
+            pattern.device(),
+            width,
+            height,
+            capture::Rotation::Identity,
+            sharer.options,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        opened.source = Source::Pattern(Box::new(pattern));
+    }
+
     // While capture is paused, a change of codec that would open the source
     // again waits, since a monitor's source does not open while the desktop
     // is away, and it comes with the first picture back. One that keeps the
@@ -1892,6 +1940,61 @@ mod tests {
             .unwrap_or_else(|err| panic!("{err}"));
         assert_eq!(sharer.reopens, 0);
         assert_eq!(sharer.codec(), Some(Codec::H264));
+    }
+
+    // A change of codec that came with a new encoder for a new rate is a
+    // change like any other: it counts, and starts a SWITCH_GAP.
+    #[test]
+    fn a_reopen_that_changes_codec_starts_the_gap() {
+        let Some((_turn, adapter)) = gpu() else {
+            return;
+        };
+        let mut sharer = pattern_share(adapter, (2560, 1440), None);
+        if sharer.codec() != Some(Codec::Hevc) {
+            println!("skipped: no encoder here takes HEVC at 2560x1440 and 60 fps");
+            return;
+        }
+        sharer.setup.takes_hevc = false;
+        let opened = sharer
+            .set_fps(30, &mut |_| {})
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert!(opened);
+        assert_eq!(sharer.codec(), Some(Codec::H264));
+        assert_eq!(sharer.numbers().codec_changes, 1);
+        assert!(!sharer.switches.hevc_may(Instant::now()));
+    }
+
+    // A monitor's new mode inside a SWITCH_GAP of the change to H.264 keeps
+    // H.264, as a window's new size does.
+    #[test]
+    fn a_new_mode_inside_the_gap_keeps_h264() {
+        let Some((_turn, adapter)) = gpu() else {
+            return;
+        };
+        let mut sharer = pattern_share(adapter, (1920, 1080), None);
+        if sharer.codec() != Some(Codec::Hevc) {
+            println!("skipped: no encoder here takes HEVC at 1920x1080 and 60 fps");
+            return;
+        }
+        let mut watching = Watching::default();
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(sharer.codec(), Some(Codec::H264));
+        watching.takes_hevc = true;
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        new_mode(&mut sharer, 2560, 1440);
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(
+            (sharer.size(), sharer.codec()),
+            ((2560, 1440), Some(Codec::H264)),
+            "{:?}",
+            watching.lines
+        );
     }
 
     // The watchers' limit sets the box when nothing smaller does, and each
