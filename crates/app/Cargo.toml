@@ -41,7 +41,9 @@ zeroize.workspace = true
 # Win32_UI_HiDpi for the window icons at the sizes the window's DPI asks for.
 # Win32_Graphics_Gdi for the region picker's drawing, and the tray window's class
 # struct has a background brush in it.
-# Win32_UI_Input_KeyboardAndMouse for the region picker's mouse capture and Esc.
+# Win32_UI_Input_KeyboardAndMouse for the region picker's mouse capture and Esc,
+# the modifiers the panel's key hook reads, and Hold to talk's check that a
+# mouse button is still down.
 # Win32_Networking_WinHttp, Win32_Security_Cryptography and
 # Win32_Storage_FileSystem for the update check: the fetch, the SHA-256 and
 # the move into Downloads.
