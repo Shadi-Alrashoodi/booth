@@ -64,27 +64,37 @@ pub(crate) fn apply(session: &GraphicsCaptureSession) -> Border {
         return Border::NoSwitch;
     }
     match answer() {
-        Some(AppCapabilityAccessStatus::Allowed) => match session.SetIsBorderRequired(false) {
-            Ok(()) => Border::Off,
-            Err(_) => Border::Kept("Windows allowed leaving it off, then refused the switch"),
-        },
-        Some(AppCapabilityAccessStatus::DeniedByUser) => Border::Kept(
-            "it is turned on in Windows' privacy settings, under screenshot borders (DeniedByUser)",
-        ),
-        Some(AppCapabilityAccessStatus::DeniedBySystem) => {
-            Border::Kept("Windows does not let programs leave it off here (DeniedBySystem)")
+        Answer::Known(AppCapabilityAccessStatus::Allowed) => {
+            match session.SetIsBorderRequired(false) {
+                Ok(()) => Border::Off,
+                Err(_) => Border::Kept("Windows allowed leaving it off, then refused the switch"),
+            }
         }
-        Some(AppCapabilityAccessStatus::NotDeclaredByApp) => Border::Kept(
-            "the package does not declare graphicsCaptureWithoutBorder (NotDeclaredByApp)",
-        ),
-        Some(_) => Border::Kept("Windows answered with something else than yes or no"),
-        None => Border::Kept(
-            "Windows has not answered whether it may go; a share after the answer uses it",
-        ),
+        answer => kept(answer),
     }
 }
 
-fn answer() -> Option<AppCapabilityAccessStatus> {
+// Why the border stays, for any answer but yes.
+fn kept(answer: Answer) -> Border {
+    match answer {
+        Answer::Known(AppCapabilityAccessStatus::DeniedByUser) => Border::Kept(
+            "it is turned on in Windows' privacy settings, under screenshot borders (DeniedByUser)",
+        ),
+        Answer::Known(AppCapabilityAccessStatus::DeniedBySystem) => {
+            Border::Kept("Windows does not let programs leave it off here (DeniedBySystem)")
+        }
+        Answer::Known(AppCapabilityAccessStatus::NotDeclaredByApp) => Border::Kept(
+            "the package does not declare graphicsCaptureWithoutBorder (NotDeclaredByApp)",
+        ),
+        Answer::Known(_) => Border::Kept("Windows answered with something else than yes or no"),
+        Answer::Unasked | Answer::Asking(_) => Border::Kept(
+            "Windows has not answered whether it may go; a share after the answer uses it",
+        ),
+        Answer::Failed => Border::Kept("Windows could not be asked whether it may go"),
+    }
+}
+
+fn answer() -> Answer {
     let unasked = {
         let mut state = lock(&ANSWER);
         let unasked = *state == Answer::Unasked;
@@ -106,10 +116,7 @@ fn answer() -> Option<AppCapabilityAccessStatus> {
             .unwrap_or_else(PoisonError::into_inner)
             .0;
     }
-    match *state {
-        Answer::Known(status) => Some(status),
-        _ => None,
-    }
+    *state
 }
 
 fn ask() {
@@ -136,4 +143,23 @@ fn ask() {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Only a question still open has an answer to come; one that could not
+    // be put is never put again.
+    #[test]
+    fn only_an_open_question_waits_for_its_answer() {
+        let waits =
+            |answer| matches!(kept(answer), Border::Kept(why) if why.contains("after the answer"));
+        assert!(waits(Answer::Unasked));
+        assert!(waits(Answer::Asking(Instant::now())));
+        assert!(!waits(Answer::Failed));
+        assert!(!waits(Answer::Known(
+            AppCapabilityAccessStatus::DeniedByUser
+        )));
+    }
 }
