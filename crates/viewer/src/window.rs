@@ -92,12 +92,13 @@ const WINDOW: COLORREF = palette::WINDOW.colorref();
 // and never bigger than the video at one to one.
 const OPEN_SHARE: f64 = 0.8;
 // Small enough to tuck into a corner, big enough that some picture shows
-// above the strip and the strip's longest words that never drop out end
-// before the gap and the trace's 148 points: while controlling with the
-// sharer paused, "reconnecting", the path word's slot as wide as "relayed",
-// "controlling", "Control is paused." and "composed", 56 characters of Plex
+// above the strip and the strip's longest words that stay end before the
+// gap and the trace's 148 points: while controlling with control paused,
+// "reconnecting", the path word's slot as wide as "relayed", "controlling",
+// "Control is paused." and "composed", 56 characters of Plex
 // Mono at 7.2 points and four gaps, 452 points, after the 16 point side. At
-// 100 percent scaling.
+// 100 percent scaling. With the share paused as well, its "paused" and a
+// fifth gap leave no room for the path word, which goes (strip.rs).
 const MIN_CLIENT: (i32, i32) = (620, 180);
 
 // With the setting on, the strip hides in fullscreen until the mouse moves,

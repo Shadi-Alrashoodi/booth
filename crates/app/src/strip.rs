@@ -83,12 +83,32 @@ pub fn show(
         controls::ring_within(&painter, rect, rect);
     }
 
-    let words = words(strip, cap_set, watched);
-    let widths: Vec<(Part, f32)> = words
-        .iter()
-        .map(|word| (word.part, slot_width(&painter, word)))
-        .collect();
-    let kept = fit(&widths, slot.left() - GAP - (rect.left() + SIDE));
+    let mut words = words(strip, cap_set, watched);
+    let measured = |words: &[Word]| -> Vec<(Part, f32)> {
+        words
+            .iter()
+            .map(|word| (word.part, slot_width(&painter, word)))
+            .collect()
+    };
+    let room = slot.left() - GAP - (rect.left() + SIDE);
+    let mut widths = measured(&words);
+    let mut kept = fit(&widths, room);
+    if used(&widths, &kept) > room && words.iter().any(|word| word.short.is_some()) {
+        for word in &mut words {
+            if let Some(short) = word.short.take() {
+                word.text = short;
+            }
+        }
+        widths = measured(&words);
+        kept = fit(&widths, room);
+    }
+    if used(&widths, &kept) > room {
+        kept.retain(|part| *part != Part::Path);
+    }
+    // Zoomed in with Ctrl+=, the panel can be too narrow even for the words
+    // that stay, and what does not fit is cut short of the trace rather than
+    // drawn under it.
+    let before_trace = painter.with_clip_rect(rect.with_max_x(slot.left() - GAP));
     let mut x = rect.left() + SIDE;
     for (word, (_, width)) in words.into_iter().zip(widths) {
         if !kept.contains(&word.part) {
@@ -99,7 +119,7 @@ pub fn show(
         // fixed place and the first sits on the gutter; a short value leaves
         // the rest of its slot empty after it.
         let y = (rect.center().y - galley.size().y / 2.0).round();
-        painter.galley(pos2(x, y), galley, word.color);
+        before_trace.galley(pos2(x, y), galley, word.color);
         x += width + GAP;
     }
 
@@ -170,9 +190,14 @@ impl Part {
 }
 
 // What goes first when the strip is too narrow for everything. The state
-// word, the path word and the share's state always stay: the strip is the
-// one place state shows, "relayed" is the reason a link is slow, and a
-// paused share and a still screen look alike without the word.
+// word, the path word and the share's state stay: the strip is the one
+// place state shows, "relayed" is the reason a link is slow, and a paused
+// share and a still screen look alike without the word. When they still do
+// not fit, the share's state reads "paused" whoever paused it, and then the
+// path word goes. At 100 percent zoom only reconnecting with the share
+// paused comes to that, in a panel narrower than 370 points, and a link that
+// is down is not slow. Zoomed in, the panel has fewer points and other cases
+// come to it too.
 const DROP_ORDER: [Part; 4] = [Part::Cap, Part::Jitter, Part::Loss, Part::RoundTrip];
 
 struct Word {
@@ -185,6 +210,8 @@ struct Word {
     // a packet comes back, only loss moves, and at the narrowest window that
     // room is what keeps a number on screen at all.
     slot: bool,
+    // What it says when even the words that stay do not fit.
+    short: Option<String>,
 }
 
 fn slot_width(painter: &Painter, word: &Word) -> f32 {
@@ -204,21 +231,22 @@ fn slot_width(painter: &Painter, word: &Word) -> f32 {
 
 fn fit(widths: &[(Part, f32)], room: f32) -> Vec<Part> {
     let mut kept: Vec<Part> = widths.iter().map(|(part, _)| *part).collect();
-    let used = |kept: &[Part]| {
-        let shown: Vec<f32> = widths
-            .iter()
-            .filter(|(part, _)| kept.contains(part))
-            .map(|(_, width)| *width)
-            .collect();
-        shown.iter().sum::<f32>() + GAP * shown.len().saturating_sub(1) as f32
-    };
     for part in DROP_ORDER {
-        if used(&kept) <= room {
+        if used(widths, &kept) <= room {
             break;
         }
         kept.retain(|kept| *kept != part);
     }
     kept
+}
+
+fn used(widths: &[(Part, f32)], kept: &[Part]) -> f32 {
+    let shown: Vec<f32> = widths
+        .iter()
+        .filter(|(part, _)| kept.contains(part))
+        .map(|(_, width)| *width)
+        .collect();
+    shown.iter().sum::<f32>() + GAP * shown.len().saturating_sub(1) as f32
 }
 
 fn words(strip: &Strip, cap_set: bool, watched: ShareState) -> Vec<Word> {
@@ -229,6 +257,8 @@ fn words(strip: &Strip, cap_set: bool, watched: ShareState) -> Vec<Word> {
             text,
             color,
             slot,
+            // The share's state, "paused" whoever paused it.
+            short: (part == Part::Share).then(|| String::from("paused")),
         })
     };
     let stale = match strip.state {
@@ -448,6 +478,8 @@ impl Pixels {
 
 #[cfg(test)]
 mod tests {
+    use eframe::egui::{Context, RawInput, Shape};
+
     use super::*;
 
     fn rtts(values: &[f32]) -> Vec<TracePoint> {
@@ -628,6 +660,107 @@ mod tests {
             (Part::Cap, 50.0),
         ];
         assert_eq!(fit(&widths, 100.0), [Part::Path, Part::Share]);
+    }
+
+    // The words one frame of a strip `width` wide draws, each with where it
+    // ends and where it is cut short.
+    fn drawn(
+        ctx: &Context,
+        width: f32,
+        strip: &Strip,
+        watched: ShareState,
+    ) -> Vec<(String, f32, f32)> {
+        let input = RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, HEIGHT))),
+            ..RawInput::default()
+        };
+        let output = ctx.run_ui(input, |ui| {
+            show(ui, Some(strip), false, watched, &Sweep::default(), true);
+        });
+        let words = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                Shape::Text(text) => Some((
+                    text.galley.text().to_owned(),
+                    text.pos.x + text.galley.size().x,
+                    clipped.clip_rect.right(),
+                )),
+                _ => None,
+            })
+            .collect();
+        output.drop_without_applying_deltas();
+        words
+    }
+
+    // At the panel's least width and its default, in the strip's own face,
+    // every word kept ends a gap before the trace whatever the link and the
+    // share say, and the state word and the share's state are kept. In what
+    // Ctrl+= zoom to 120 percent leaves of the least width, what does not
+    // fit is cut short there instead.
+    #[test]
+    fn the_words_end_before_the_trace() {
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        let mut seen = Vec::new();
+        for width in [320.0 / 1.2, 320.0, 360.0] {
+            let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(width, HEIGHT));
+            let end = trace_slot(rect).left() - GAP;
+            for state in [LinkState::Live, LinkState::Reconnecting] {
+                for watched in [ShareState::Live, ShareState::Paused, ShareState::Away] {
+                    let strip = Strip {
+                        state,
+                        rtt_ms: Some(100.0),
+                        jitter_ms: Some(99.0),
+                        loss_pct: Some(10.0),
+                        path: Some(PathWord::Direct),
+                        ..Strip::default()
+                    };
+                    let words = drawn(&ctx, width, &strip, watched);
+                    let texts: Vec<&str> = words.iter().map(|(text, ..)| text.as_str()).collect();
+                    for (text, right, cut) in &words {
+                        assert!(
+                            *cut <= end + 0.01,
+                            "{width} {state:?} {watched:?}: {text:?} cut at {cut}, past {end}: {texts:?}"
+                        );
+                        assert!(
+                            width < 320.0 || *right <= end + 0.01,
+                            "{width} {state:?} {watched:?}: {text:?} ends at {right}, past {end}: {texts:?}"
+                        );
+                    }
+                    let state_word = state == LinkState::Reconnecting;
+                    assert_eq!(texts.contains(&"reconnecting"), state_word, "{texts:?}");
+                    let share_word = texts
+                        .iter()
+                        .any(|text| *text == "paused" || *text == "paused by Windows");
+                    assert_eq!(share_word, watched != ShareState::Live, "{texts:?}");
+                    seen.push(((width, state, watched), texts.join(" ")));
+                }
+            }
+        }
+        let shown = |width: f32, state, watched| {
+            seen.iter()
+                .find(|(case, _)| *case == (width, state, watched))
+                .map(|(_, texts)| texts.as_str())
+        };
+        // "paused by Windows" in full wherever it fits; the path word goes
+        // only where even "paused" does not fit beside it.
+        assert_eq!(
+            shown(320.0, LinkState::Live, ShareState::Away),
+            Some("direct paused")
+        );
+        assert_eq!(
+            shown(360.0, LinkState::Live, ShareState::Away),
+            Some("direct paused by Windows")
+        );
+        assert_eq!(
+            shown(360.0, LinkState::Reconnecting, ShareState::Away),
+            Some("reconnecting paused")
+        );
+        assert_eq!(
+            shown(320.0, LinkState::Reconnecting, ShareState::Live),
+            Some("reconnecting direct")
+        );
     }
 
     #[test]

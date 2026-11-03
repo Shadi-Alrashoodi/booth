@@ -22,7 +22,7 @@ use crate::device::{self, Gpu};
 use crate::palette::{AMBER, Colour, SAGE, WARN, WINDOW};
 use crate::picture::VIEW_IDLE;
 use crate::scene::{Scene, Target};
-use crate::strip::{Band, LinkState, Look, PathWord, PresentPath, Strip, band_height};
+use crate::strip::{Band, LinkState, Look, PathWord, PresentPath, ShareState, Strip, band_height};
 use crate::window::min_client;
 
 const WIDTH: u32 = 640;
@@ -752,9 +752,11 @@ fn control_words_in_their_colours() {
     assert_eq!(coloured(&spans[path + 2], AMBER), 0);
 }
 
-// The words that never drop out (state, path, control and present path)
-// have to fit before the trace in the smallest window at every scaling,
-// measured with the real face, or the trace paints over the last of them.
+// The words that stay (state, path, the share's state, control and present
+// path) have to fit before the trace in the smallest window at every
+// scaling, measured with the real face, or the trace paints over the last
+// of them. Where they do not, the short forms come in, and then the path
+// word goes.
 #[test]
 fn kept_words_fit_the_smallest_window() {
     let Some(mut screen) = Offscreen::new() else {
@@ -774,7 +776,17 @@ fn kept_words_fit_the_smallest_window() {
         control_paused: true,
         ..controlling.clone()
     };
-    let cases: [(&Strip, &[&str]); 3] = [
+    // Windows has the sharer's screen, a UAC prompt or the lock screen, and
+    // then with control paused too.
+    let away = Strip {
+        share_state: ShareState::Away,
+        ..longest.clone()
+    };
+    let all_paused = Strip {
+        share_state: ShareState::Away,
+        ..paused.clone()
+    };
+    let cases: [(&Strip, &[&str]); 5] = [
         (&longest, &["reconnecting", "direct", "composed"]),
         (
             &controlling,
@@ -785,6 +797,20 @@ fn kept_words_fit_the_smallest_window() {
             &[
                 "reconnecting",
                 "direct",
+                "controlling",
+                "Control is paused.",
+                "composed",
+            ],
+        ),
+        (
+            &away,
+            &["reconnecting", "direct", "paused by Windows", "composed"],
+        ),
+        (
+            &all_paused,
+            &[
+                "reconnecting",
+                "paused",
                 "controlling",
                 "Control is paused.",
                 "composed",

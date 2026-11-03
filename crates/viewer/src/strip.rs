@@ -264,13 +264,17 @@ impl Part {
 
 // What goes first when the strip is too narrow for everything. The state
 // word, the path word, the share's state, the control words and the present
-// path always stay: the strip is the one place state shows, a paused share
+// path stay: the strip is the one place state shows, a paused share
 // and a still screen look alike without the word, "relayed" is the reason a link is
 // slow, the control words say this PC's keys go to another, and "composed"
 // is the reason a windowed viewer is a frame behind. When they still do not
-// fit, the control words take their short forms. "cap set" and "sound
-// muted" are reminders of this PC's own choices and go first; then snd, the
-// one reading about the sound rather than the link or the picture.
+// fit, the control words take their short forms, then the share's state reads
+// "paused" whoever paused it, and then the path word goes. Only reconnecting
+// while controlling, with control and the share both paused, comes to that,
+// in a window narrower than about 675 points, and a link that is down is not
+// slow. "cap set" and "sound muted" are reminders of this PC's own choices
+// and go first; then snd, the one reading about the sound rather than the
+// link or the picture.
 const DROP_ORDER: [Part; 9] = [
     Part::Cap,
     Part::Muted,
@@ -292,7 +296,7 @@ struct Word {
     // does, and the path word always does. The last numbers shown while
     // reconnecting do not.
     slot: bool,
-    // What it says when even the words that always stay do not fit.
+    // What it says when even the words that stay do not fit.
     short: Option<String>,
 }
 
@@ -304,7 +308,8 @@ fn words(strip: &Strip, present: Option<PresentPath>) -> Vec<Word> {
             text,
             colour,
             slot,
-            short: None,
+            // The share's state, "paused" whoever paused it.
+            short: (part == Part::Share).then(|| String::from("paused")),
         })
     };
     // With no numbers the control words still show: this PC's keys go to
@@ -516,14 +521,26 @@ fn place(
     let mut words = words;
     let mut widths = measured(&words, measure)?;
     let mut kept = fit(&widths, room);
-    if used(&widths, &kept) > room && words.iter().any(|word| word.short.is_some()) {
-        for word in &mut words {
+    // The control words take their short forms before the share's state, so
+    // "paused by Windows" stays whole wherever it fits beside them.
+    for parts in [&[Part::Control, Part::Paused][..], &[Part::Share]] {
+        if used(&widths, &kept) <= room {
+            break;
+        }
+        let mut shortened = false;
+        for word in words.iter_mut().filter(|word| parts.contains(&word.part)) {
             if let Some(short) = word.short.take() {
                 word.text = short;
+                shortened = true;
             }
         }
-        widths = measured(&words, measure)?;
-        kept = fit(&widths, room);
+        if shortened {
+            widths = measured(&words, measure)?;
+            kept = fit(&widths, room);
+        }
+    }
+    if used(&widths, &kept) > room {
+        kept.retain(|part| *part != Part::Path);
     }
     let mut x = SIDE;
     let mut placed = Vec::with_capacity(kept.len());
@@ -1142,6 +1159,93 @@ mod tests {
     // Every character 7 points wide, as a stand-in for the font.
     fn measure(text: &str) -> Result<f32, ViewerError> {
         Ok(text.chars().count() as f32 * 7.0)
+    }
+
+    // Reconnecting in the smallest window while Windows has the sharer's
+    // screen: the share's state is whole and the path word stays, and with
+    // control paused too, the share's state reads "paused" and the path
+    // word goes, so the words still end a gap before the trace.
+    #[test]
+    fn the_share_state_fits_the_smallest_window() {
+        let width = crate::window::min_client(96).0 as f32;
+        let away = Strip {
+            state: LinkState::Reconnecting,
+            path: Some(PathWord::Direct),
+            share_state: ShareState::Away,
+            ..Strip::default()
+        };
+        let all_paused = Strip {
+            controlling: Some(String::from("Ctrl+Shift+Alt+Page Down")),
+            control_paused: true,
+            ..away.clone()
+        };
+        for (strip, stay) in [
+            (
+                &away,
+                &["reconnecting", "direct", "paused by Windows", "composed"][..],
+            ),
+            (
+                &all_paused,
+                &[
+                    "reconnecting",
+                    "paused",
+                    "controlling",
+                    "Control is paused.",
+                    "composed",
+                ],
+            ),
+        ] {
+            let placed = place(
+                words(strip, Some(PresentPath::Composed)),
+                width,
+                &mut measure,
+            )
+            .unwrap();
+            let texts: Vec<&str> = placed.iter().map(|p| p.word.text.as_str()).collect();
+            assert_eq!(texts, stay);
+            let end = placed.iter().map(|p| p.x + p.width).fold(0.0, f32::max);
+            let trace = width - SIDE - TRACE_SAMPLES as f32;
+            assert!(
+                end + GAP <= trace,
+                "{texts:?} end at {end}, the trace at {trace}"
+            );
+        }
+    }
+
+    // While controlling, and with control paused too, the control words'
+    // short forms make the room, and "paused by Windows" stays whole beside
+    // them.
+    #[test]
+    fn the_control_words_shorten_before_the_share_state() {
+        let smallest = crate::window::min_client(96).0 as f32;
+        let paused = Strip {
+            control_paused: true,
+            ..controlling("Ctrl+Shift+End")
+        };
+        for (strip, width, control) in [
+            (controlling("Ctrl+Shift+End"), smallest, "controlling"),
+            (paused, 700.0, "Control is paused."),
+        ] {
+            let strip = Strip {
+                path: Some(PathWord::Direct),
+                share_state: ShareState::Away,
+                ..strip
+            };
+            let texts: Vec<String> = place(
+                words(&strip, Some(PresentPath::Composed)),
+                width,
+                &mut measure,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|placed| placed.word.text)
+            .collect();
+            assert!(
+                texts.contains(&String::from("paused by Windows")),
+                "{width}: {texts:?}"
+            );
+            assert!(texts.contains(&String::from(control)), "{width}: {texts:?}");
+        }
     }
 
     #[test]
