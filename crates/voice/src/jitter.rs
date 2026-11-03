@@ -1065,17 +1065,18 @@ impl JitterBuffer {
     // read from what is buffered; the minimum-depth rule then adds a frame if
     // the 10 ms mode needs one. Back from the 10 ms mode, what is buffered
     // includes that mode's extra frame, which 5 ms frames do not need, so it
-    // comes off as excess.
+    // comes off as excess. After a stall more than the new mode's cap can be
+    // buffered, and then playing starts again from the newest packets, as it
+    // does when packets overflow.
     fn switch_frame(&mut self, samples: usize) {
         self.carry_target_to(samples);
-        let beyond_cap = self.play + self.cap();
-        for slot in &mut self.slots {
-            if slot.held != Held::Empty && slot.ext >= beyond_cap {
-                slot.held = Held::Empty;
-                self.stats.dropped += 1;
-            }
-        }
         let held = self.newest.map_or(1, |newest| newest - self.play + 1);
+        if held > self.cap() {
+            self.discard_before(self.play, false);
+            self.timed_out = false;
+            self.restart();
+            return;
+        }
         self.depth = held.clamp(1, self.cap());
         self.min_lag = self.play_lag - self.depth + 1;
         self.fastest = self.min_lag;

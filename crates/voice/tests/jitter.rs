@@ -1324,6 +1324,34 @@ fn late_frame_decoded_only_while_in_reach() {
     listener.assert_no_clicks();
 }
 
+// The render side stalls while the talker moves to 10 ms frames, for more
+// than that mode's cap: playing starts again from the newest frames, as it
+// does when packets overflow, not from the oldest with the newest thrown away.
+#[test]
+fn a_stall_over_the_switch_to_10_ms_frames_keeps_the_newest() {
+    let short = low_delay(&tone(0.01), 0);
+    let mut long = talk(&[(Mode::Repair, &tone(0.08))], 1, 0, false);
+    long.last_mut().unwrap().last = true;
+    assert_eq!(long.len(), 8);
+    let mut buffer = JitterBuffer::new().unwrap();
+    let mut frame = [0f32; MAX_FRAME];
+    buffer.push(short[0].packet()).unwrap();
+    assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Packet(0));
+    for packet in &long {
+        buffer.push(packet.packet()).unwrap();
+    }
+    let mut sources = Vec::new();
+    while let Some(pulled) = buffer.pull(&mut frame) {
+        sources.push(pulled.source);
+    }
+    assert_eq!(
+        sources,
+        [Source::Packet(7), Source::Packet(8), Source::Silence]
+    );
+    let stats = buffer.stats();
+    assert_eq!((stats.frame_ms, stats.dropped, stats.lost), (10, 6, 0));
+}
+
 // A word in 10 ms frames, then one in 5 ms frames after a pause: the depth the
 // rules asked for carries over, without the 10 ms mode's extra frame, which
 // nothing else would take off for 5 s. The other way round the minimum of the
@@ -1399,4 +1427,25 @@ fn only_what_never_played_counts_as_dropped() {
     buffer.push(sent[13].packet()).unwrap();
     assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Packet(13));
     assert_eq!(buffer.stats().dropped, 2);
+}
+
+// The same stall with a time out earlier on, which says nothing about this
+// transmission: what played is no loss, and what never will play is dropped.
+#[test]
+fn a_stall_over_the_switch_after_a_time_out_counts_the_same() {
+    let short = low_delay(&tone(0.01), 0);
+    let long = talk(&[(Mode::Repair, &tone(0.08))], 2, 0, false);
+    let mut buffer = JitterBuffer::new().unwrap();
+    let mut frame = [0f32; MAX_FRAME];
+    buffer.push(short[0].packet()).unwrap();
+    while buffer.pull(&mut frame).is_some() {}
+    assert!(!buffer.stats().playing);
+    buffer.push(short[1].packet()).unwrap();
+    assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Packet(1));
+    for packet in &long {
+        buffer.push(packet.packet()).unwrap();
+    }
+    assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Packet(8));
+    let stats = buffer.stats();
+    assert_eq!((stats.frame_ms, stats.dropped, stats.lost), (10, 6, 0));
 }
