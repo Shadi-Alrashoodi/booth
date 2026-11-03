@@ -1073,9 +1073,9 @@ pub fn mapping_entry(service: &Service, external_port: u16) -> Result<Entry, Upn
         .get("NewInternalClient")
         .and_then(|text| text.parse::<Ipv4Addr>().ok())
         .ok_or(UpnpError::BadAnswer(action, "internal client"))?;
-    let enabled = values
-        .get("NewEnabled")
-        .is_none_or(|text| !(text == "0" || text.eq_ignore_ascii_case("false")));
+    let enabled = values.get("NewEnabled").is_none_or(|text| {
+        !(text == "0" || text.eq_ignore_ascii_case("false") || text.eq_ignore_ascii_case("no"))
+    });
     let lease = match values.get("NewLeaseDuration") {
         None | Some("") => 0,
         Some(text) => text

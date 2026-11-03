@@ -1383,6 +1383,46 @@ fn disabled_forward_is_not_taken() {
     assert!(mapped.delete_on_close);
 }
 
+// The spec has routers send 0 or 1 but anyone reading take the old spellings
+// too.
+#[test]
+fn forward_switched_off_as_no_is_not_taken() {
+    for enabled in ["no", "NO"] {
+        let (addr, _rx) = fake_router(3, move |request| match soap_action(request) {
+            "AddPortMapping" => http("200 OK", &soap_ok("AddPortMapping", "")),
+            _ if arg(request, "NewExternalPort") == Some("41062") => {
+                entry_answer("192.168.100.38", 41062, enabled, "0")
+            }
+            _ => no_entry(),
+        });
+        let mapped = add_mapping(&ip_service(addr), OUR_LAN_ADDR, 41062, &mut |_| {}).unwrap();
+        assert_ne!(mapped.external_port, 41062, "{enabled}");
+        assert!(mapped.delete_on_close, "{enabled}");
+    }
+}
+
+#[test]
+fn enabled_in_every_spelling() {
+    let spellings = [
+        ("0", false),
+        ("false", false),
+        ("FALSE", false),
+        ("no", false),
+        ("No", false),
+        ("1", true),
+        ("true", true),
+        ("yes", true),
+        ("YES", true),
+    ];
+    for (enabled, want) in spellings {
+        let (addr, _rx) = fake_router(1, move |_| {
+            entry_answer("192.168.100.38", 41062, enabled, "0")
+        });
+        let entry = mapping_entry(&ip_service(addr), 41062).unwrap();
+        assert_eq!(entry.enabled, want, "{enabled}");
+    }
+}
+
 #[test]
 fn conflict_everywhere_gives_up_after_three_random_ports() {
     let (addr, rx) = fake_router(9, |request| match soap_action(request) {
