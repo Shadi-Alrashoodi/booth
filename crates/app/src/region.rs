@@ -475,6 +475,7 @@ fn paint(hwnd: HWND) {
                 memory,
                 &words,
                 (rect.left - edge, at.max(0)),
+                client.right,
                 tone,
                 scaled(PAD),
             );
@@ -485,6 +486,7 @@ fn paint(hwnd: HWND) {
             memory,
             words,
             ((client.right - width) / 2, scaled(3 * PAD)),
+            client.right,
             CHALK,
             scaled(PAD),
         );
@@ -540,8 +542,9 @@ fn text_width(dc: HDC, text: &str) -> i32 {
     rect.right - rect.left
 }
 
-// Words on a panel-tone box whose top left corner is `at`.
-fn label(dc: HDC, text: &str, at: (i32, i32), tone: Color32, pad: i32) {
+// Words on a panel-tone box whose top left corner is `at`, or left of it as
+// far as the box needs to end by `right`, the client area's edge.
+fn label(dc: HDC, text: &str, at: (i32, i32), right: i32, tone: Color32, pad: i32) {
     let mut wide_text = wide(text);
     let mut measured = RECT::default();
     // SAFETY: as in text_width.
@@ -556,23 +559,13 @@ fn label(dc: HDC, text: &str, at: (i32, i32), tone: Color32, pad: i32) {
     };
     let width = measured.right - measured.left;
     let height = measured.bottom - measured.top;
-    let left = at.0.max(0);
-    let top = at.1;
-    fill(
-        dc,
-        RECT {
-            left,
-            top,
-            right: left + width + 2 * pad,
-            bottom: top + height + 2 * pad,
-        },
-        colour(PANEL),
-    );
+    let panel = label_box(at, (width, height), pad, right);
+    fill(dc, panel, colour(PANEL));
     let mut rect = RECT {
-        left: left + pad,
-        top: top + pad,
-        right: left + pad + width,
-        bottom: top + pad + height,
+        left: panel.left + pad,
+        top: panel.top + pad,
+        right: panel.right - pad,
+        bottom: panel.bottom - pad,
     };
     // SAFETY: a live device context and a buffer of the length passed.
     unsafe {
@@ -584,6 +577,20 @@ fn label(dc: HDC, text: &str, at: (i32, i32), tone: Color32, pad: i32) {
             &mut rect,
             DT_SINGLELINE | DT_NOPREFIX,
         );
+    }
+}
+
+// The box for words `size` big with `pad` round them: its top left corner is
+// `at`, or left of it as far as the box needs to end by `right`, and never left
+// of 0, so one wider than that starts at 0.
+fn label_box(at: (i32, i32), size: (i32, i32), pad: i32, right: i32) -> RECT {
+    let (width, height) = (size.0 + 2 * pad, size.1 + 2 * pad);
+    let left = at.0.min(right - width).max(0);
+    RECT {
+        left,
+        top: at.1,
+        right: left + width,
+        bottom: at.1 + height,
     }
 }
 
@@ -709,6 +716,22 @@ mod tests {
         picker.small = Some(hwnd);
         assert!(!picker.mouse_moved(hwnd, far));
         assert_eq!(now(&picker), Some((200, 400)));
+    }
+
+    // A 350 px line with 10 px of pad, for a too-small rectangle near the right
+    // edge of a 1920 wide monitor, moves in so it is read to its end.
+    #[test]
+    fn a_label_stays_on_the_monitor() {
+        let place = |left, width| {
+            let placed = label_box((left, 500), (width, 20), 10, 1920);
+            (placed.left, placed.top, placed.right, placed.bottom)
+        };
+        assert_eq!(place(1700, 350), (1550, 500, 1920, 540));
+        assert_eq!(place(1550, 350), (1550, 500, 1920, 540));
+        assert_eq!(place(100, 350), (100, 500, 470, 540));
+        assert_eq!(place(-6, 350), (0, 500, 370, 540));
+        // Wider than the monitor: its start shows.
+        assert_eq!(place(100, 1990), (0, 500, 2010, 540));
     }
 
     // The handle is new with each call that adds the font.
