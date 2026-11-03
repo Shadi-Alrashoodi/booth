@@ -1530,6 +1530,78 @@ fn a_later_spell_starts_at_the_depth_learned_and_takes_a_due_shrink() {
     listener.assert_no_clicks();
 }
 
+// Spells of 3 s every 4 s, numbered on from one to the next, each ending
+// with its last frame marked.
+fn short_spells(count: usize) -> Vec<Vec<Sent>> {
+    (0..count)
+        .map(|n| {
+            let mut sent = spell(&music(3.0), (300 * n) as u16, 4 * n as u64 * SECOND);
+            sent.last_mut().unwrap().last = true;
+            sent
+        })
+        .collect()
+}
+
+// Spells too short for the 5 s a shrink waits for add up to it: two frames
+// deep from a lone late frame in the first, the third starts one frame deep.
+#[test]
+fn short_spells_add_up_to_the_5_s_a_shrink_waits_for() {
+    let spells = short_spells(3);
+    let sent = spells.concat();
+    let mut arrive = on_time(&sent);
+    arrive[50] = Some(sent[50].sent_at + 1);
+    let mut listener = Listener::new();
+    listener.run(&sent, &arrive, 11 * SECOND + TICK, always);
+    for packet in &spells[1] {
+        assert_eq!(listener.played_at(packet.seq), Some(packet.sent_at + TICK));
+    }
+    for packet in &spells[2] {
+        assert_eq!(listener.played_at(packet.seq), Some(packet.sent_at));
+    }
+    let stats = listener.stats();
+    assert_eq!(
+        (stats.depth_frames, stats.inserted, stats.dropped),
+        (1, 1, 1),
+        "{stats:?}"
+    );
+    assert_eq!((stats.late, stats.lost), (1, 0));
+    listener.assert_in_order();
+    listener.assert_no_clicks();
+}
+
+// The same with a frame near the end of the second spell a pull later than
+// the rest, just in time two frames deep and late one frame deep. It holds
+// the shrink off for 5 s of play though the history it was in has gone: the
+// fourth spell starts two frames deep still, the fifth one frame deep.
+#[test]
+fn a_frame_just_in_time_holds_a_shrink_off_across_spells() {
+    let spells = short_spells(5);
+    let sent = spells.concat();
+    let mut arrive = on_time(&sent);
+    arrive[50] = Some(sent[50].sent_at + 1);
+    arrive[590] = Some(sent[590].sent_at + 1);
+    let mut listener = Listener::new();
+    listener.run(&sent, &arrive, 19 * SECOND + TICK, always);
+    for packet in spells[1..4].iter().flatten() {
+        assert_eq!(
+            listener.played_at(packet.seq),
+            Some(packet.sent_at + TICK),
+            "seq {}",
+            packet.seq
+        );
+    }
+    for packet in &spells[4] {
+        assert_eq!(listener.played_at(packet.seq), Some(packet.sent_at));
+    }
+    let stats = listener.stats();
+    assert_eq!(
+        (stats.depth_frames, stats.inserted, stats.dropped),
+        (1, 1, 1),
+        "{stats:?}"
+    );
+    assert_eq!((stats.late, stats.lost), (1, 0));
+}
+
 // 500 Hz on the left and 700 Hz on the right, through a lost frame and a
 // frame added for a late one.
 #[test]

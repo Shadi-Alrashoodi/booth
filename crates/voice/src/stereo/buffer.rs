@@ -210,6 +210,11 @@ pub struct Buffer {
     pulls: i64,
     last_change: Option<i64>,
     last_late: Option<i64>,
+    // The pull at which playing last started, where the history begins.
+    started: i64,
+    // Of the histories before it, the latest pull at which a frame came that
+    // would have been late at one frame less.
+    last_close: Option<i64>,
     // Measured: how far behind the fastest frame lately the play point is.
     depth: i64,
     // What the rules asked for: the minimum at first, a frame more for each
@@ -265,6 +270,8 @@ impl Buffer {
             pulls: 0,
             last_change: None,
             last_late: None,
+            started: 0,
+            last_close: None,
             depth: 0,
             target: 0,
             min_lag: 0,
@@ -492,8 +499,15 @@ impl Buffer {
         let min = self.min_depth();
         let kept = self.target.clamp(min, CAP);
         // The gap before a spell is the best place for a shrink that is due,
-        // and sound that never goes quiet still shrinks this way.
-        let shrink = !first_contact && kept > min && self.clean() && self.settled();
+        // and sound that never goes quiet still shrinks this way. Spells too
+        // short for the 5 s a shrink waits for add up to it.
+        let shrink = !first_contact
+            && kept > min
+            && self.clean()
+            && self
+                .last_close
+                .is_none_or(|at| self.pulls - at > CLEAN_WINDOW)
+            && self.settled();
         let depth = kept - i64::from(shrink);
         let start = newest - (depth - 1);
         let counted = !self.timed_out && !self.paused;
@@ -511,16 +525,26 @@ impl Buffer {
             self.judged = Some(self.judged.map_or(before_first, |j| j.max(before_first)));
         }
         self.judge_through(start - 1, self.timed_out);
+        let close = self
+            .arrivals
+            .iter()
+            .filter(|arrival| arrival.lag >= self.play_lag)
+            .map(|arrival| arrival.at)
+            .max();
         self.play = start;
         self.play_lag = self.pulls - start;
         self.depth = depth;
         self.target = depth;
         self.min_lag = self.play_lag - (depth - 1);
         // The timing before a gap or a pause says nothing about the timing
-        // after it, so the history starts over, and with it the 5 s a
-        // shrink waits for.
+        // after it, so the history starts over. What in it would have been
+        // late at one frame less still holds a shrink off for 5 s.
         self.arrivals.clear();
-        self.last_change = Some(self.pulls);
+        self.last_close = close.or(self.last_close);
+        self.started = self.pulls;
+        if first_contact || shrink {
+            self.last_change = Some(self.pulls);
+        }
         if shrink {
             self.stats.dropped += 1;
         }
@@ -705,9 +729,11 @@ impl Buffer {
         if self.pending.is_some() || self.depth <= min || !clean {
             return;
         }
+        // A shrink needs 5 s of history, which goes back only to where
+        // playing last started; a shorter spell leaves it to the next start.
         if self.excess() > 0 {
             self.pending = Some(Adjust::Trim);
-        } else if self.settled() && self.target > min {
+        } else if self.settled() && self.pulls - self.started >= CLEAN_WINDOW && self.target > min {
             self.pending = Some(Adjust::Drop);
         } else {
             return;
@@ -722,7 +748,7 @@ impl Buffer {
             .all(|arrival| arrival.lag < self.play_lag)
     }
 
-    // 5 s of play since the depth last changed or playing last started.
+    // 5 s of play since the depth last changed.
     fn settled(&self) -> bool {
         self.last_change
             .is_some_and(|change| self.pulls - change >= CLEAN_WINDOW)
