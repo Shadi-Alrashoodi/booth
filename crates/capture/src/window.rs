@@ -457,6 +457,19 @@ impl WindowCapture {
         Ok(Some(self.frame_out(slot, (now, now, now), cursor)))
     }
 
+    // After a picture from again() that did not go out: the newest picture
+    // under the frame set now once more, and the pointer's update for it.
+    // What again() placed never reached the watchers, so the pointer starts
+    // over and goes whole, as for a capture opened again.
+    pub fn again_dropped(&mut self) -> Result<Option<CursorUpdate>, CaptureError> {
+        let Some((width, height)) = self.content else {
+            return Ok(None);
+        };
+        self.rebuild(self.plan_for(width, height))?;
+        self.pointer = Pointer::new(self.window.hwnd);
+        Ok(self.poll_pointer(true))
+    }
+
     // As Capture::next. A minimized window is a pause, told once, until a
     // picture comes again; a closed one is an error that ends the share.
     #[allow(clippy::should_implement_trait)]

@@ -3,10 +3,11 @@
 // while the window is dragged to new sizes the pictures keep going out in
 // the frame the encoder has, new encoders keep RESIZE_SPACING apart, and the
 // window's own size goes out once it stands still. A pointer update that
-// rides a picture says so, after a resume too. Sizes and times only, never
-// the pixels.
+// rides a picture says so, after a resume and at a new size too. Sizes and
+// times only, never the pixels.
 
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,13 +17,20 @@ use share::{
     Audience, Back, Choice, Clock, Kind, Line, PAYLOAD_LAN, RESIZE_SPACING, SWITCH_GAP, Sent,
     Setup, Sharer, WindowId,
 };
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DispatchMessageW, IsWindow, MSG, PM_REMOVE, PeekMessageW, PostMessageW,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetWindowPos, TranslateMessage, WINDOW_STYLE,
-    WM_CLOSE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    CreateWindowExW, DispatchMessageW, GetCursorPos, HWND_TOPMOST, IsWindow, MSG, PM_REMOVE,
+    PeekMessageW, PostMessageW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetCursorPos,
+    SetWindowPos, SetWindowTextW, TranslateMessage, WINDOW_STYLE, WM_CLOSE, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE, WindowFromPoint,
 };
-use windows::core::w;
+use windows::core::{HSTRING, w};
+
+// The tests that put the pointer over their window run alone, the rest side
+// by side: every window here opens at the same place, so the others' windows
+// would be under the pointer too, and one of them keeps the GPU encoders from
+// opening for every share in this process.
+static ALONE: RwLock<()> = RwLock::new(());
 
 // A window on its own thread, which pumps its messages until it is closed.
 struct Window(isize);
@@ -101,11 +109,14 @@ struct Watching {
     sent: Vec<(Instant, Sent)>,
     lines: Vec<(Instant, String)>,
     cursors: Vec<(CursorUpdate, bool)>,
+    // When each pointer update came.
+    cursors_at: Vec<Instant>,
 }
 
 impl Audience for Watching {
     fn cursor(&mut self, update: CursorUpdate, with_picture: bool) {
         self.cursors.push((update, with_picture));
+        self.cursors_at.push(Instant::now());
     }
 
     fn back(&mut self, _: &mut Vec<Back>) {}
@@ -185,6 +196,7 @@ fn run(sharer: &mut Sharer, watching: &mut Watching, for_: Duration) {
 // could.
 #[test]
 fn a_window_share_opens_at_the_size_of_its_pictures() {
+    let _turn = ALONE.read().unwrap_or_else(|p| p.into_inner());
     let Some(adapter) = adapter() else { return };
     let window = Window::with_style(WS_OVERLAPPEDWINDOW, 640, 360);
     let mut sharer = open(&window, adapter);
@@ -223,6 +235,7 @@ fn a_window_share_opens_at_the_size_of_its_pictures() {
 // pointer update goes as before, on the first picture, marked as its own.
 #[test]
 fn a_resumed_share_marks_its_first_pointer() {
+    let _turn = ALONE.read().unwrap_or_else(|p| p.into_inner());
     let Some(adapter) = adapter() else { return };
     let window = Window::with_style(WS_POPUP, 640, 360);
     let mut sharer = open(&window, adapter);
@@ -243,10 +256,184 @@ fn a_resumed_share_marks_its_first_pointer() {
     assert!(*with_picture, "{first:?} went alone");
 }
 
+// Puts the pointer back where it was when dropped.
+struct PointerBack(POINT);
+
+impl Drop for PointerBack {
+    fn drop(&mut self) {
+        // SAFETY: a plain call.
+        let _ = unsafe { SetCursorPos(self.0.x, self.0.y) };
+    }
+}
+
+// The pointer over `window`, until what this gives drops; None when another
+// window is in front of it there. A window made without being activated can
+// open under the active one, so it is put on top, and the windows of the
+// tests that ran before close on their own threads, so they are given a
+// moment.
+fn pointer_over(window: &Window) -> Option<PointerBack> {
+    let mut was = POINT::default();
+    // SAFETY: a live POINT.
+    let _ = unsafe { GetCursorPos(&mut was) };
+    let back = PointerBack(was);
+    // SAFETY: a window of this process; the change is sent to its thread.
+    let _ = unsafe {
+        SetWindowPos(
+            HWND(window.0 as *mut _),
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+    };
+    // The helper puts its windows at 120,120 on the desktop.
+    let over = POINT { x: 440, y: 300 };
+    let start = Instant::now();
+    // SAFETY: plain calls.
+    while unsafe {
+        let _ = SetCursorPos(over.x, over.y);
+        WindowFromPoint(over) != HWND(window.0 as *mut _)
+    } {
+        if start.elapsed() > Duration::from_secs(1) {
+            println!("skipped: another window is over the test's own");
+            return None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Some(back)
+}
+
+// A window that grew past the share's frame goes out fitted into it, and
+// once it may, at its own size through a new encoder, whether it stands
+// still by then or keeps changing: the pointer resting over it goes at its
+// place on that picture, with it, not alone a moment later.
+#[test]
+fn a_resized_windows_pointer_goes_with_its_own_size() {
+    let _turn = ALONE.write().unwrap_or_else(|p| p.into_inner());
+    let Some(adapter) = adapter() else { return };
+    // One window for both: a second one made later can open under others.
+    let window = Window::with_style(WS_POPUP, 640, 360);
+    let Some(_back) = pointer_over(&window) else {
+        return;
+    };
+    for changing in [false, true] {
+        resize(window.0, 640, 360);
+        thread::sleep(Duration::from_millis(100));
+        let stop = Arc::new(AtomicBool::new(false));
+        let changer = changing.then(|| {
+            let (stop, hwnd) = (Arc::clone(&stop), window.0);
+            thread::spawn(move || {
+                let mut count = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    let text = HSTRING::from(count.to_string());
+                    // SAFETY: sent to the window's own thread, which paints it.
+                    let _ = unsafe { SetWindowTextW(HWND(hwnd as *mut _), &text) };
+                    count += 1;
+                    thread::sleep(Duration::from_millis(5));
+                }
+            })
+        });
+        let mut sharer = open(&window, adapter.clone());
+        let mut watching = Watching::default();
+        run(&mut sharer, &mut watching, Duration::from_millis(300));
+        resize(window.0, 1280, 720);
+        run(
+            &mut sharer,
+            &mut watching,
+            RESIZE_SPACING + Duration::from_millis(500),
+        );
+        stop.store(true, Ordering::Relaxed);
+        if let Some(changer) = changer {
+            changer.join().unwrap();
+        }
+        assert_eq!(sharer.size(), (1280, 720), "{:?}", watching.lines);
+        // The newest update when the new encoder's first picture goes out
+        // came after that encoder opened.
+        let opened = watching.new_sizes()[0];
+        let out = watching
+            .sent
+            .iter()
+            .map(|(at, _)| *at)
+            .find(|&at| at > opened)
+            .expect("nothing went out through the new encoder");
+        let before = watching.cursors_at.iter().filter(|&&at| at <= out).count();
+        let (update, with_picture) = &watching.cursors[before.max(1) - 1];
+        assert!(
+            watching.cursors_at[before.max(1) - 1] > opened
+                && *with_picture
+                && update.visible
+                && (update.scale - 1.0).abs() < 0.01,
+            "changing {changing}: {update:?} with the picture {with_picture}"
+        );
+    }
+}
+
+// Takes back the encoders' faults however the test ends.
+struct Faults;
+
+impl Drop for Faults {
+    fn drop(&mut self) {
+        encode::fault::clear();
+    }
+}
+
+// A window grown while no new encoder opens for its size goes on fitted into
+// the share's frame, and so does the pointer over it, with a picture or
+// alone: the update made for the picture at the window's own size, which
+// never goes out, does not go with the fitted one, and the ones after it are
+// placed on the fitted picture.
+#[test]
+fn a_pointer_goes_only_with_its_own_picture() {
+    let _turn = ALONE.write().unwrap_or_else(|p| p.into_inner());
+    let Some(adapter) = adapter() else { return };
+    let window = Window::with_style(WS_POPUP, 640, 360);
+    let Some(_back) = pointer_over(&window) else {
+        return;
+    };
+    let mut sharer = open(&window, adapter);
+    if sharer.kind() == Some(Kind::MfSoftware) {
+        println!("skipped: the share is on the software encoder");
+        return;
+    }
+    let mut watching = Watching::default();
+    run(&mut sharer, &mut watching, Duration::from_millis(300));
+    let _faults = Faults;
+    encode::fault::refuse_gpu(400);
+    resize(window.0, 1280, 720);
+    run(
+        &mut sharer,
+        &mut watching,
+        RESIZE_SPACING + Duration::from_millis(500),
+    );
+    assert_eq!(sharer.size(), (640, 360), "{:?}", watching.lines);
+    assert!(
+        watching
+            .lines
+            .iter()
+            .any(|(_, text)| text.starts_with("no new encoder")),
+        "{:?}",
+        watching.lines
+    );
+    // Scaled by half into the frame from the first fitted picture on.
+    let fitted = watching
+        .cursors
+        .iter()
+        .position(|(update, with_picture)| *with_picture && update.scale < 0.9)
+        .expect("no pointer update with a fitted picture");
+    let after: Vec<(f32, bool)> = watching.cursors[fitted..]
+        .iter()
+        .map(|(update, with_picture)| (update.scale, *with_picture))
+        .collect();
+    assert!(after.iter().all(|&(scale, _)| scale < 0.9), "{after:?}");
+}
+
 // On Windows' software encoder a window that grows past 1080p goes on within
 // 1920x1080, through a new encoder, never one the software encoder refuses.
 #[test]
 fn a_window_on_the_software_encoder_keeps_to_1080p() {
+    let _turn = ALONE.read().unwrap_or_else(|p| p.into_inner());
     let Some(adapter) = adapter() else { return };
     let window = Window::with_style(WS_POPUP, 800, 600);
     let mut sharer = open_with(&window, adapter, Some(Kind::MfSoftware), 60);
@@ -278,6 +465,7 @@ fn a_window_on_the_software_encoder_keeps_to_1080p() {
 // goes out once it stands still.
 #[test]
 fn a_dragged_window_keeps_its_encoders_apart() {
+    let _turn = ALONE.read().unwrap_or_else(|p| p.into_inner());
     let Some(adapter) = adapter() else { return };
     let window = Window::with_style(WS_POPUP, 640, 360);
     let mut sharer = open(&window, adapter);

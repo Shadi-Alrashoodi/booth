@@ -884,7 +884,7 @@ impl Sharer {
                     audience.resumed();
                 }
                 self.count_source(&frame);
-                if let Some(cursor) = frame.cursor.clone() {
+                if let Some(cursor) = frame.cursor.take() {
                     audience.cursor(cursor, true);
                 }
                 // A test's picture that never goes out after its pointer, as
@@ -899,6 +899,9 @@ impl Sharer {
                     own.present = frame.present;
                     if self.go(own, audience)? {
                         return Ok(());
+                    }
+                    if let Some(cursor) = self.again_dropped()? {
+                        audience.cursor(cursor, true);
                     }
                 }
                 self.go(frame, audience)?;
@@ -933,7 +936,7 @@ impl Sharer {
     // first when its size is new. False when that encoder did not open for
     // a window, which keeps the one it has, or when a monitor's new mode
     // needs the software encoder's fit: nothing went out.
-    fn go(&mut self, frame: Frame, audience: &mut dyn Audience) -> Result<bool, String> {
+    fn go(&mut self, mut frame: Frame, audience: &mut dyn Audience) -> Result<bool, String> {
         if (frame.width, frame.height) != self.size && !self.new_size(&frame, audience)? {
             return Ok(false);
         }
@@ -943,6 +946,11 @@ impl Sharer {
         // frame is the old one's, and the next is the new one's.
         if self.reopens != reopens {
             return Ok(true);
+        }
+        // Only a window's picture made again at its own size (window_resize)
+        // still has its pointer here, which goes only with that picture.
+        if let Some(cursor) = frame.cursor.take() {
+            audience.cursor(cursor, true);
         }
         self.send(&frame, None, audience)?;
         if self.reopens == reopens {
@@ -954,10 +962,13 @@ impl Sharer {
     // No new picture: a window that stood still at a size it went out
     // fitted at goes out at its own size once it may, else as still().
     fn quiet(&mut self, audience: &mut dyn Audience) -> Result<(), String> {
-        if let Some(own) = self.window_resize(Instant::now())?
-            && self.go(own, audience)?
-        {
-            return Ok(());
+        if let Some(own) = self.window_resize(Instant::now())? {
+            if self.go(own, audience)? {
+                return Ok(());
+            }
+            if let Some(cursor) = self.again_dropped()? {
+                audience.cursor(cursor, false);
+            }
         }
         self.still(audience)
     }
@@ -991,6 +1002,16 @@ impl Sharer {
             opened.source.set_frame(Some(size));
         }
         Ok(own)
+    }
+
+    // The picture from window_resize did not go out: capture goes back to
+    // the share's frame, with the pointer's update for it, as the one made
+    // for that picture was dropped with it (WindowCapture::again_dropped).
+    fn again_dropped(&mut self) -> Result<Option<CursorUpdate>, String> {
+        match &mut self.opened {
+            Some(opened) => opened.source.again_dropped(),
+            None => Ok(None),
+        }
     }
 
     // A new encoder for a window's new size did not open: the window goes on

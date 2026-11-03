@@ -6,7 +6,8 @@
 use std::time::{Duration, Instant};
 
 use capture::{
-    Adapter, Capture, CaptureError, Frame, Monitor, Next, Pattern, Rotation, WindowCapture,
+    Adapter, Capture, CaptureError, CursorUpdate, Frame, Monitor, Next, Pattern, Rotation,
+    WindowCapture,
 };
 use encode::{Codec, EncodeError, Encoder, Fit, Kind, Settings};
 use net::Timer;
@@ -261,6 +262,15 @@ impl Source {
     pub(crate) fn again(&mut self) -> Result<Option<Frame>, String> {
         match self {
             Source::Window(capture) => capture.again().map_err(|err| err.to_string()),
+            _ => Ok(None),
+        }
+    }
+
+    // After a window's picture from again() did not go out
+    // (WindowCapture::again_dropped).
+    pub(crate) fn again_dropped(&mut self) -> Result<Option<CursorUpdate>, String> {
+        match self {
+            Source::Window(capture) => capture.again_dropped().map_err(|err| err.to_string()),
             _ => Ok(None),
         }
     }

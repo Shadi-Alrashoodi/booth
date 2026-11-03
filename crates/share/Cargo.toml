@@ -27,8 +27,8 @@ windows-sys = { workspace = true, features = ["Win32_Media"] }
 fault = []
 
 [dev-dependencies]
-# tests/sharer.rs and the tests in src/sharer.rs make the encoders stall, fail
-# and not open.
+# tests/sharer.rs, tests/window.rs and the tests in src/sharer.rs make the
+# encoders stall, fail and not open.
 encode = { workspace = true, features = ["fault"] }
 # tests/window.rs makes the window it shares.
 windows = { workspace = true, features = [
