@@ -536,9 +536,7 @@ impl PcSound {
     {
         let work = Work::Stereo {
             audio: Box::new(audio),
-            meter: Meter::default(),
             stereo: Vec::new(),
-            mid: Vec::new(),
             first: true,
             end: None,
         };
@@ -556,11 +554,6 @@ impl PcSound {
 
     pub fn info(&self) -> Option<StreamInfo> {
         self.0.shared.info()
-    }
-
-    // Of both channels together.
-    pub fn level(&self) -> Reading {
-        self.0.shared.level.read()
     }
 
     pub fn glitches(&self) -> u64 {
@@ -632,10 +625,7 @@ enum Work {
     },
     Stereo {
         audio: StereoIn,
-        meter: Meter,
         stereo: Vec<f32>,
-        // Both channels' average, for the meter.
-        mid: Vec<f32>,
         first: bool,
         // Where the last packet ended, on its own clock.
         end: Option<Instant>,
@@ -675,10 +665,7 @@ impl Work {
         match self {
             Work::Capture { mono, .. } => stats::gauge!("voice.capture.mono", *mono),
             Work::Render { samples, .. } => stats::gauge!("voice.render.mono", *samples),
-            Work::Stereo { stereo, mid, .. } => {
-                stats::gauge!("voice.pc_sound.stereo", *stereo);
-                stats::gauge!("voice.pc_sound.mid", *mid);
-            }
+            Work::Stereo { stereo, .. } => stats::gauge!("voice.pc_sound.stereo", *stereo),
         }
     }
 
@@ -738,9 +725,7 @@ impl Work {
             }
             Work::Stereo {
                 audio,
-                meter,
                 stereo,
-                mid,
                 first,
                 end,
             } => stream.read(&mut |packet| {
@@ -753,10 +738,6 @@ impl Work {
                 } else {
                     interleaved(packet.data, &format, stereo);
                 }
-                mid.clear();
-                let (pairs, _) = stereo.as_chunks::<2>();
-                mid.extend(pairs.iter().map(|[left, right]| (left + right) * 0.5));
-                meter.push(mid, &shared.level);
                 let length = frames_to_time(packet.frames);
                 let time = packet_time(packet.time, *end, Instant::now(), length);
                 let gap = *first || packet.glitch || after_gap(time, *end);
