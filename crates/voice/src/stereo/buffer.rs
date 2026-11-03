@@ -51,9 +51,10 @@ const LOUD_BLEND: usize = 240;
 // Room for the cap's six frames ahead of the play point and a late one just
 // behind it, with no two sharing a slot.
 const SLOTS: usize = 16;
-// Frames remembered as received, which must reach from a cap behind the play
-// point to a cap ahead of it.
-const SEEN: usize = 64;
+// Frames remembered as received. A frame that jumps far ahead is remembered
+// before the 2 s up to a cap behind it are judged, so it must not take the
+// place of any of them.
+const SEEN: usize = (LATE_WINDOW + CAP) as usize;
 // 5 s of arrivals is 500; the rest is room for frames that come while
 // nobody pulls.
 const MAX_ARRIVALS: usize = 1024;

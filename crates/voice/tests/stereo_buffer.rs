@@ -935,6 +935,27 @@ fn duplicates_are_played_once() {
     );
 }
 
+// With nobody pulling, 63 frames in a row are lost, and the frame after them
+// comes far ahead of the play point: playing starts again from it, and only
+// the 63 count as lost.
+#[test]
+fn a_jump_ahead_counts_the_frames_skipped_as_lost_and_no_more() {
+    let sent = spell(&music(1.3), 0, 0);
+    let mut buffer = Buffer::new().unwrap();
+    let mut frame = [0f32; SAMPLES];
+    for packet in sent[..64].iter().chain([&sent[127]]) {
+        buffer.push(packet.packet()).unwrap();
+        let pulled = buffer.pull(&mut frame).unwrap();
+        assert_eq!(pulled.source, Source::Packet(packet.seq));
+    }
+    let stats = buffer.stats();
+    assert_eq!(
+        (stats.lost, stats.late, stats.dropped),
+        (63, 0, 0),
+        "{stats:?}"
+    );
+}
+
 // A frame of a spell that has ended, after its end, is a straggler. Numbering
 // that goes back further than any frame is delayed is the sharer starting
 // over, even with its first frame's mark lost: a new spell from a reset
