@@ -502,6 +502,8 @@ struct FakeIgd {
     table: Arc<Table>,
     // What a read says about the lease of any entry.
     lease: Arc<AtomicU32>,
+    // False for a router that shows every entry with no name.
+    keeps_names: Arc<AtomicBool>,
 }
 
 impl FakeIgd {
@@ -511,15 +513,18 @@ impl FakeIgd {
         let actions = Arc::new(Mutex::new(Vec::new()));
         let table = Arc::new(Mutex::new(Vec::new()));
         let lease = Arc::new(AtomicU32::new(3600));
+        let keeps_names = Arc::new(AtomicBool::new(true));
         thread::spawn({
             let (actions, table, lease) =
                 (Arc::clone(&actions), Arc::clone(&table), Arc::clone(&lease));
+            let keeps_names = Arc::clone(&keeps_names);
             move || {
                 for stream in listener.incoming() {
                     let Ok(mut stream) = stream else { return };
                     let request = read_request(&mut stream);
                     let lease = lease.load(Ordering::Relaxed);
-                    let reply = igd_answer(&request, &actions, &table, lease);
+                    let keeps_names = keeps_names.load(Ordering::Relaxed);
+                    let reply = igd_answer(&request, &actions, &table, lease, keeps_names);
                     let _ = stream.write_all(reply.as_bytes());
                 }
             }
@@ -541,6 +546,7 @@ impl FakeIgd {
             actions,
             table,
             lease,
+            keeps_names,
         }
     }
 
@@ -586,7 +592,13 @@ fn arg(request: &str, name: &str) -> String {
     request[start..end].to_owned()
 }
 
-fn igd_answer(request: &str, actions: &Mutex<Vec<String>>, table: &Table, lease: u32) -> String {
+fn igd_answer(
+    request: &str,
+    actions: &Mutex<Vec<String>>,
+    table: &Table,
+    lease: u32,
+    keeps_names: bool,
+) -> String {
     const URN: &str = "urn:schemas-upnp-org:service:WANIPConnection:1";
     let (status, body) = if request.starts_with("GET ") {
         (
@@ -620,7 +632,11 @@ fn igd_answer(request: &str, actions: &Mutex<Vec<String>>, table: &Table, lease:
                     port,
                     arg(request, "NewInternalClient"),
                     arg(request, "NewInternalPort").parse().unwrap_or(0),
-                    arg(request, "NewPortMappingDescription"),
+                    if keeps_names {
+                        arg(request, "NewPortMappingDescription")
+                    } else {
+                        String::new()
+                    },
                 );
                 match found {
                     Some(at) => table[at] = entry,
@@ -731,11 +747,12 @@ fn foreign_port_left_at_close() {
     ));
 }
 
-// Some routers keep no names, so a renewal reads the room's own entry as a
+// Some routers keep no names, so at close the room's own entry reads as a
 // forward someone else made. It is still the room's to delete.
 #[test]
 fn nameless_entry_still_deleted() {
     let igd = FakeIgd::start();
+    igd.keeps_names.store(false, Ordering::Relaxed);
     let (log, captured) = Log::capture(1024);
     let (mut mapper, reports) = start(target(closed_port(), igd.ssdp), log);
     let wait = Duration::from_secs(5);
@@ -743,7 +760,6 @@ fn nameless_entry_still_deleted() {
         reports.recv_timeout(wait),
         Ok(mapped(Protocol::Upnp, upnp::LEASE))
     );
-    lock(&igd.table)[0].3.clear();
     mapper.renewer().send(()).unwrap();
     assert!(matches!(
         reports.recv_timeout(wait),
@@ -765,6 +781,29 @@ fn nameless_entry_still_deleted() {
 
 fn count(actions: &[String], action: &str) -> usize {
     actions.iter().filter(|name| *name == action).count()
+}
+
+// Used as it is, the entry would count down to nothing while the room still
+// offers the address: only asking again starts its lease again.
+#[test]
+fn nameless_entry_renewed_by_asking() {
+    let igd = FakeIgd::start();
+    igd.keeps_names.store(false, Ordering::Relaxed);
+    let (mut mapper, reports) = start(target(closed_port(), igd.ssdp), Log::off());
+    let wait = Duration::from_secs(5);
+    assert_eq!(
+        reports.recv_timeout(wait),
+        Ok(mapped(Protocol::Upnp, upnp::LEASE))
+    );
+    mapper.renewer().send(()).unwrap();
+    assert_eq!(
+        reports.recv_timeout(wait),
+        Ok(mapped(Protocol::Upnp, upnp::LEASE))
+    );
+    assert_eq!(count(&igd.actions(), "AddPortMapping"), 2);
+    mapper.close();
+    assert!(mapper.wait(Instant::now() + wait));
+    assert!(lock(&igd.table).is_empty());
 }
 
 // The room's own entry on a router that keeps only permanent mappings. Read

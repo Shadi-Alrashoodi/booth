@@ -1301,6 +1301,62 @@ fn renewal_asks_again_for_its_permanent_entry() {
     assert_eq!(requests(&rx).len(), 3);
 }
 
+// A router that keeps no names shows the room's entry with none, and only
+// asking again starts its lease again. Before the room holds it, an entry like
+// that could be anyone's.
+#[test]
+fn nameless_entry_is_asked_for_only_by_a_renewal() {
+    let (addr, rx) = fake_router(1, |_| entry_named("192.168.100.38", 41062, "1", "3600", ""));
+    let mapped = add_mapping(&ip_service(addr), OUR_LAN_ADDR, 41062, &mut |_| {}).unwrap();
+    assert_eq!(
+        mapped,
+        Mapped {
+            external_port: 41062,
+            lease: 3600,
+            delete_on_close: false
+        }
+    );
+    assert_eq!(requests(&rx).len(), 1);
+
+    let (addr, rx) = fake_router(2, |request| match soap_action(request) {
+        "AddPortMapping" => http("200 OK", &soap_ok("AddPortMapping", "")),
+        _ => entry_named("192.168.100.38", 41062, "1", "3600", ""),
+    });
+    let mapped = renew_mapping(&ip_service(addr), OUR_LAN_ADDR, 41062, &mut |_| {}).unwrap();
+    assert_eq!(
+        mapped,
+        Mapped {
+            external_port: 41062,
+            lease: LEASE,
+            delete_on_close: true
+        }
+    );
+    assert_eq!(soap_action(&requests(&rx)[1]), "AddPortMapping");
+}
+
+#[test]
+fn nameless_entry_the_router_will_not_renew() {
+    let mut adds = 0;
+    let (addr, rx) = fake_router(5, move |request| match soap_action(request) {
+        "AddPortMapping" => {
+            adds += 1;
+            if adds == 1 {
+                conflict()
+            } else {
+                http("200 OK", &soap_ok("AddPortMapping", ""))
+            }
+        }
+        "DeletePortMapping" => http("200 OK", &soap_ok("DeletePortMapping", "")),
+        _ => entry_named("192.168.100.38", 41062, "1", "3", ""),
+    });
+    let mapped = renew_mapping(&ip_service(addr), OUR_LAN_ADDR, 41062, &mut |_| {}).unwrap();
+    assert_eq!(
+        (mapped.external_port, mapped.lease, mapped.delete_on_close),
+        (41062, LEASE, true)
+    );
+    assert_eq!(requests(&rx).len(), 5);
+}
+
 // A forward under a name is someone's, even on a port the room held.
 #[test]
 fn renewal_uses_a_forward_made_since() {

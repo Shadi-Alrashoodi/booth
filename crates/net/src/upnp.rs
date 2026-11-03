@@ -851,6 +851,8 @@ fn owner_to_ask(entry: &Entry, internal: SocketAddrV4, held: bool) -> Owner {
                 Owner::Other
             }
         }
+        // A router that keeps no names shows the room's own entry with none.
+        Owner::ThisPc if held && entry.description.is_empty() => Owner::Booth,
         owner => owner,
     }
 }
