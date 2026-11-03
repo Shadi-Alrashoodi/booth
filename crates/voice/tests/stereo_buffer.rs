@@ -1162,6 +1162,241 @@ fn a_first_frame_while_sound_plays_starts_the_decoder_over() {
     listener.assert_no_clicks();
 }
 
+// What the pull that plays the new spell's first frame gives, and the four
+// after it: the sound before carried on by concealment from `old`, blended
+// into the first frame from a reset decoder, then that decoder going on.
+fn starts_over(listener: &Listener, at: usize, mut old: Decoder, second: &[Sent]) {
+    let mut carried_on = [0f32; SAMPLES];
+    old.conceal(&mut carried_on).unwrap();
+    let mut fresh = Decoder::new().unwrap();
+    let mut started = [0f32; SAMPLES];
+    fresh.decode(&second[0].frame, &mut started).unwrap();
+    assert_eq!(
+        listener.heard[at].audio,
+        blended(&carried_on, &started, 120)
+    );
+    for (n, packet) in second.iter().enumerate().take(5).skip(1) {
+        fresh.decode(&packet.frame, &mut started).unwrap();
+        assert_eq!(listener.heard[at + n].audio, started, "frame {n}");
+    }
+}
+
+fn decoded(packets: &[Sent]) -> Decoder {
+    let mut decoder = Decoder::new().unwrap();
+    let mut out = [0f32; SAMPLES];
+    for packet in packets {
+        decoder.decode(&packet.frame, &mut out).unwrap();
+    }
+    decoder
+}
+
+// Three deep, the next spell's first frame while sound plays is overtaken on
+// the way by the frame after it, and both come in time for its turn. The
+// decoder still starts over for it.
+#[test]
+fn a_first_frame_overtaken_by_the_next_still_starts_the_decoder_over() {
+    let first = spell(&music(1.0), 0, 0);
+    let second = spell(&music(1.0), 100, SECOND);
+    let mut sent = first.clone();
+    sent.extend(second.iter().cloned());
+    let mut arrive = on_time(&sent);
+    arrive[100] = Some(second[1].sent_at + 1);
+    let mut listener = Listener::new();
+    listener.buffer.set_period(1056);
+    listener.run(&sent, &arrive, 2 * SECOND + 2 * TICK, always);
+    for packet in &sent[..sent.len() - 1] {
+        assert_eq!(
+            listener.played_at(packet.seq),
+            Some(packet.sent_at + 2 * TICK)
+        );
+    }
+    let at = listener.pull_at(second[0].sent_at + 2 * TICK);
+    starts_over(&listener, at, decoded(&first), &second);
+    let stats = listener.stats();
+    assert_eq!(
+        (stats.late, stats.lost, stats.concealed, stats.depth_frames),
+        (0, 0, 0, 3)
+    );
+    listener.assert_no_clicks();
+}
+
+// One frame deep, with the new spell's first frame coming after the frame
+// after it, and after its own turn. As a lone late frame it plays next, from
+// a reset decoder.
+#[test]
+fn a_late_first_frame_that_still_plays_starts_the_decoder_over() {
+    let first = spell(&music(1.0), 0, 0);
+    let second = spell(&music(1.0), 100, SECOND);
+    let mut sent = first.clone();
+    sent.extend(second.iter().cloned());
+    // Every frame half a pull after it was sent.
+    let mut arrive: Vec<Option<u64>> = sent
+        .iter()
+        .map(|packet| Some(packet.sent_at + TICK / 2))
+        .collect();
+    arrive[100] = Some(second[1].sent_at + TICK / 2 + 1);
+    let mut listener = Listener::new();
+    listener.run(&sent, &arrive, 2 * SECOND, always);
+    let at = listener.pull_at(second[0].sent_at + 2 * TICK);
+    assert_eq!(
+        listener.sources(at - 1..at + 2),
+        [
+            Some(Source::Concealed),
+            Some(Source::Packet(100)),
+            Some(Source::Packet(101))
+        ]
+    );
+    // The decoder also made up the frame in the first frame's turn.
+    let mut old = decoded(&first);
+    old.conceal(&mut [0f32; SAMPLES]).unwrap();
+    starts_over(&listener, at, old, &second);
+    let stats = listener.stats();
+    assert_eq!(
+        (stats.late, stats.inserted, stats.concealed, stats.lost),
+        (1, 1, 1, 0),
+        "{stats:?}"
+    );
+    listener.assert_no_clicks();
+}
+
+// A shrink due on the frame just before such a first frame does not decode
+// across it: the frame before plays, and the first frame after it from a
+// reset decoder.
+#[test]
+fn a_shrink_does_not_decode_across_a_first_frame_that_came_after_the_next() {
+    // In silence every frame is quiet, so the excess from a stalled render
+    // thread comes off a frame a pull from the first check after it. The
+    // first frame dropped then is the one the new spell will follow.
+    let stall = SECOND / 2..SECOND / 2 + 5 * TICK;
+    let ear = |now: u64| {
+        if stall.contains(&now) {
+            Ear::Stalled
+        } else {
+            Ear::Pulling
+        }
+    };
+    let quiet = spell(&silence(2.0), 0, 0);
+    let mut listener = Listener::new();
+    listener.run(&quiet, &on_time(&quiet), 2 * SECOND, ear);
+    let k = listener.skipped(&quiet)[0] + 1;
+    assert!(quiet[k - 1].sent_at > stall.start, "frame {k}");
+
+    let first = &quiet[..k];
+    let second = spell(&music(1.0), k as u16, quiet[k].sent_at - TICK);
+    let mut sent = first.to_vec();
+    sent.extend(second.iter().cloned());
+    let mut arrive = on_time(&sent);
+    arrive[k] = Some(sent[k + 1].sent_at + 1);
+    let mut listener = Listener::new();
+    listener.run(&sent, &arrive, 2 * SECOND, ear);
+    let at = listener.pull_at(listener.played_at(sent[k].seq).unwrap());
+    assert_eq!(
+        listener.sources(at - 1..at + 1),
+        [
+            Some(Source::Packet(sent[k - 1].seq)),
+            Some(Source::Packet(sent[k].seq))
+        ]
+    );
+    starts_over(&listener, at, decoded(first), &second);
+}
+
+// One frame deep, with a frame late in the 5 s before, the new spell's first
+// frame comes after the frame after it and after its own turn, and does not
+// play. A pull late, nothing of its spell has been decoded, so the decoder
+// starts over at the frame after it. Two pulls late, the frame after it has
+// played from the old decoder, which carries on.
+#[test]
+fn a_late_first_frame_that_does_not_play_starts_the_decoder_over_unless_the_next_has_played() {
+    let first = spell(&music(1.0), 0, 0);
+    let second = spell(&music(1.0), 100, SECOND);
+    let mut sent = first.clone();
+    sent.extend(second.iter().cloned());
+    for late in [1, 2] {
+        // Every frame half a pull after it was sent, and frame 50 two pulls
+        // after that, too late to play.
+        let mut arrive: Vec<Option<u64>> = sent
+            .iter()
+            .map(|packet| Some(packet.sent_at + TICK / 2))
+            .collect();
+        arrive[50] = Some(sent[50].sent_at + 2 * TICK + TICK / 2);
+        arrive[100] = Some(second[late].sent_at + TICK / 2 + 1);
+        let mut listener = Listener::new();
+        listener.run(&sent, &arrive, 2 * SECOND, always);
+        let at = listener.pull_at(second[1].sent_at + TICK);
+        assert_eq!(
+            listener.sources(at - 1..at + 1),
+            [Some(Source::Concealed), Some(Source::Packet(101))],
+            "{late} late"
+        );
+        assert_eq!(listener.played_at(100), None);
+        // The old decoder made up frame 50 and the first frame's turn.
+        let mut old = Decoder::new().unwrap();
+        let mut out = [0f32; SAMPLES];
+        for packet in &first {
+            if packet.seq == 50 {
+                old.conceal(&mut out).unwrap();
+            } else {
+                old.decode(&packet.frame, &mut out).unwrap();
+            }
+        }
+        old.conceal(&mut out).unwrap();
+        if late == 1 {
+            starts_over(&listener, at, old, &second[1..]);
+        } else {
+            for (n, packet) in second.iter().enumerate().take(6).skip(1) {
+                old.decode(&packet.frame, &mut out).unwrap();
+                assert_eq!(listener.heard[at + n - 1].audio, out, "frame {n}");
+            }
+        }
+        let stats = listener.stats();
+        assert_eq!(
+            (stats.late, stats.inserted, stats.concealed, stats.lost),
+            (2, 0, 2, 0),
+            "{late} late: {stats:?}"
+        );
+    }
+}
+
+// After a time-out, which keeps the decoder, the next spell's first frame
+// comes after the frame after it, both before the first pull. One frame
+// deep, playing starts at the newest, so the first frame never plays, and
+// the decoder starts over at the frame after it.
+#[test]
+fn a_first_frame_overtaken_after_a_time_out_starts_the_decoder_over_at_the_next() {
+    let first = spell(&music(1.0), 0, 0);
+    let second = spell(&music(1.0), 100, 2 * SECOND);
+    let mut sent = first.clone();
+    sent.extend(second.iter().cloned());
+    // Every frame half a pull after it was sent.
+    let mut arrive: Vec<Option<u64>> = sent
+        .iter()
+        .map(|packet| Some(packet.sent_at + TICK / 2))
+        .collect();
+    arrive[100] = Some(second[1].sent_at + TICK / 2 + 1);
+    let mut listener = Listener::new();
+    listener.run(&sent, &arrive, 3 * SECOND, always);
+    let at = listener.pull_at(second[1].sent_at + TICK);
+    assert_eq!(
+        listener.sources(at - 1..at + 1),
+        [None, Some(Source::Packet(101))]
+    );
+    assert_eq!(listener.played_at(100), None);
+    let mut fresh = Decoder::new().unwrap();
+    let mut out = [0f32; SAMPLES];
+    fresh.decode(&second[1].frame, &mut out).unwrap();
+    assert_eq!(listener.heard[at].audio, faded_in(&out));
+    for (n, packet) in second.iter().enumerate().take(6).skip(2) {
+        fresh.decode(&packet.frame, &mut out).unwrap();
+        assert_eq!(listener.heard[at + n - 1].audio, out, "frame {n}");
+    }
+    let mut kept = decoded(&first);
+    for _ in 0..3 {
+        kept.conceal(&mut out).unwrap();
+    }
+    kept.decode(&second[1].frame, &mut out).unwrap();
+    assert_ne!(listener.heard[at].audio, faded_in(&out));
+}
+
 // A spell starts at the depth the buffer learned. A shrink that came due
 // and found no quiet frame before its spell ended happens at the next
 // spell's start instead, in the gap between them.

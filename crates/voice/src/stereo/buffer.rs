@@ -184,11 +184,16 @@ pub struct Buffer {
     period: usize,
     newest: Option<i64>,
     ends_after: Option<i64>,
-    // Where the sharer's encoder last started over: anything older came from
-    // before that and never plays.
+    // Where the last spell that began at a frame marked first started:
+    // anything older came from before that and never plays. A first frame
+    // that came after a later one is held in reset_at instead.
     spell_first: Option<i64>,
     // The decoder starts over before the next frame it decodes.
     reset_due: bool,
+    // A frame marked first that did not start its spell, since a later
+    // frame came before it: the decoder starts over before it, or before the
+    // first frame after it that it decodes.
+    reset_at: Option<i64>,
     // Idle because the frames stopped, not because the sharer said so. What
     // comes next and is older than where playing restarts was later than the
     // cap, so it counts as lost rather than dropped.
@@ -248,6 +253,7 @@ impl Buffer {
             ends_after: None,
             spell_first: None,
             reset_due: false,
+            reset_at: None,
             timed_out: false,
             paused: false,
             play: 0,
@@ -328,6 +334,10 @@ impl Buffer {
         }
         if self.is_seen(ext) {
             return Ok(());
+        }
+        if packet.first && !fresh {
+            // It came after a later frame of its spell.
+            self.reset_at = Some(ext);
         }
         self.store(ext, packet.frame);
         self.see(ext);
@@ -444,6 +454,7 @@ impl Buffer {
         if fresh {
             self.spell_first = Some(ext);
             self.reset_due = true;
+            self.reset_at = None;
             self.judged = Some(self.judged.map_or(ext - 1, |judged| judged.max(ext - 1)));
         }
         self.slots = [EMPTY_SLOT; SLOTS];
@@ -529,6 +540,7 @@ impl Buffer {
             // does this decoder.
             let _ = self.decoder.reset();
             self.reset_due = false;
+            self.reset_at = None;
         }
         self.audible = false;
         self.fade_in = true;
@@ -556,6 +568,12 @@ impl Buffer {
         if self.newest.is_none_or(|newest| ext > newest) {
             self.newest = Some(ext);
             self.ends_after = packet.last.then_some(ext);
+        }
+        if packet.first && ext == self.play - 1 {
+            // Only its stand-in has played, so nothing of its spell has been
+            // decoded yet. Further behind, some of it may have been, from the
+            // old decoder, as when a first frame is lost.
+            self.reset_at = Some(ext);
         }
         let lone = self
             .last_late
@@ -802,6 +820,10 @@ impl Buffer {
     // over while sound plays starts from nothing, so the sound before it is
     // carried on by concealment and blended out instead.
     fn decode(&mut self, slot: &Slot, out: &mut [f32]) -> bool {
+        if self.reset_at.is_some_and(|at| slot.ext >= at) {
+            self.reset_at = None;
+            self.reset_due = true;
+        }
         let blend = self.reset_due && self.audible;
         if blend && self.decoder.conceal(&mut self.scratch).is_err() {
             self.scratch.fill(0.0);
@@ -842,6 +864,10 @@ impl Buffer {
             return None;
         }
         let ext = self.play + 1;
+        if self.reset_at.is_some_and(|at| ext >= at) {
+            // The decoder starts over there, which only decode does.
+            return None;
+        }
         let next = *self.slot(ext)?;
         let decoded = self
             .decoder
