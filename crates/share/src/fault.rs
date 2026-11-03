@@ -215,13 +215,13 @@ fn pointer(number: u64) -> CursorUpdate {
     }
 }
 
-// False, once, for a picture the pattern made never to go out.
 // While the pattern carries a pointer, a viewer holds as on the flip path:
 // the tests' viewers are windows, which DWM composes.
 pub(crate) fn holds_as_flip() -> bool {
     ON.load(Ordering::Acquire)
 }
 
+// False, once, for a picture the pattern made never to go out.
 pub(crate) fn picture_goes() -> bool {
     !ON.load(Ordering::Acquire) || !std::mem::take(&mut lock(&POINTER).withheld)
 }
