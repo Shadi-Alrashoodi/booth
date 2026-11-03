@@ -1,6 +1,6 @@
 // The capture and render threads against the fake device, on the real clock.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -241,6 +241,55 @@ fn the_meter_forgets_what_is_older_than_50_ms() {
     assert_eq!(loud.peak, 1.0, "{loud:?}");
     // 4800 frames of signal, 2400 of silence, and one packet to spare.
     wait_for(&frames, 4_800 + 2_400 + 128);
+    let quiet = capture.level();
+    assert_eq!((quiet.peak, quiet.rms), (0.0, 0.0), "{quiet:?}");
+    capture.stop();
+}
+
+// Full scale until the microphone goes away, silence once it is back: the
+// first block of the new stream reads silence, with nothing of the old one
+// left in the 50 ms.
+#[test]
+fn the_meter_starts_empty_when_the_device_comes_back() {
+    static LOUD: AtomicBool = AtomicBool::new(true);
+    let fake = one_mic(Setup {
+        signal: |_, _| {
+            if LOUD.load(Ordering::Relaxed) {
+                1.0
+            } else {
+                0.0
+            }
+        },
+        ..Setup::default()
+    });
+    let frames = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&frames);
+    let (on_event, rx) = events();
+    let capture = Capture::start_with(
+        fake.device(),
+        Choice::Device(String::from("mic")),
+        move |samples: &[f32], _| {
+            counted.fetch_add(samples.len() as u64, Ordering::Relaxed);
+        },
+        on_event,
+    )
+    .unwrap();
+    opened(&rx);
+    wait_for(&frames, 2_560);
+    let loud = capture.level();
+    assert_eq!(loud.peak, 1.0, "{loud:?}");
+    fake.unplug("mic");
+    match next(&rx) {
+        (_, Event::Gone(err)) => assert!(err.is_lost(), "{err}"),
+        (_, other) => panic!("expected Gone, got {other:?}"),
+    }
+    LOUD.store(false, Ordering::Relaxed);
+    fake.plug("mic", "Fake microphone");
+    opened(&rx);
+    // Past the new stream's first 5 ms block, some 45 ms before the old
+    // sound would have left the window by itself.
+    let now = frames.load(Ordering::Relaxed);
+    wait_for(&frames, now + 256);
     let quiet = capture.level();
     assert_eq!((quiet.peak, quiet.rms), (0.0, 0.0), "{quiet:?}");
     capture.stop();

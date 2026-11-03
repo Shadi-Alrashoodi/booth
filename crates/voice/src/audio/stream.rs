@@ -651,7 +651,12 @@ impl Work {
 
     fn start(&mut self, stream: &mut dyn DeviceStream) -> Result<(), AudioError> {
         match self {
-            Work::Capture { first, .. } => *first = true,
+            Work::Capture { first, meter, .. } => {
+                *first = true;
+                // The meter starts empty, so the last 50 ms it reads hold
+                // nothing from the stream before.
+                *meter = Meter::default();
+            }
             Work::Stereo { first, end, .. } => {
                 *first = true;
                 *end = None;
