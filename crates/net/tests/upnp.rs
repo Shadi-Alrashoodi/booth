@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use net::upnp::{
     Action, Fault, Ignored, Kind, LEASE, MAX_ANSWER, Mapped, Owner, Search, Service, UpnpError,
     Url, add_mapping, delete_mapping, describe, external_ip, find, http_response, mapping_entry,
-    services, soap_answer, ssdp_answer,
+    renew_mapping, services, soap_answer, ssdp_answer,
 };
 use proptest::prelude::*;
 use proptest::test_runner::FileFailurePersistence;
@@ -1122,9 +1122,12 @@ fn own_entry_the_router_will_not_renew() {
 
 #[test]
 fn another_pcs_port_moves_to_a_random_one() {
-    let (addr, rx) = fake_router(2, |request| match soap_action(request) {
+    let (addr, rx) = fake_router(3, |request| match soap_action(request) {
         "AddPortMapping" => http("200 OK", &soap_ok("AddPortMapping", "")),
-        _ => entry_answer("192.168.100.20", 41062, "1", "0"),
+        _ if arg(request, "NewExternalPort") == Some("41062") => {
+            entry_answer("192.168.100.20", 41062, "1", "0")
+        }
+        _ => no_entry(),
     });
     let mapped = add_mapping(&ip_service(addr), OUR_LAN_ADDR, 41062, &mut |_| {}).unwrap();
     assert!(
@@ -1133,20 +1136,85 @@ fn another_pcs_port_moves_to_a_random_one() {
     );
     assert_eq!((mapped.lease, mapped.delete_on_close), (LEASE, true));
     let sent = requests(&rx);
-    assert_eq!(sent.len(), 2, "no AddPortMapping over another pc's port");
-    assert_eq!(soap_action(&sent[1]), "AddPortMapping");
+    assert_eq!(sent.len(), 3, "no AddPortMapping over another pc's port");
+    assert_eq!(soap_action(&sent[1]), "GetSpecificPortMappingEntry");
+    assert_eq!(soap_action(&sent[2]), "AddPortMapping");
     assert_eq!(
-        arg(&sent[1], "NewExternalPort"),
+        arg(&sent[2], "NewExternalPort"),
         Some(mapped.external_port.to_string().as_str())
     );
-    assert_eq!(arg(&sent[1], "NewInternalPort"), Some("41062"));
+    assert_eq!(arg(&sent[2], "NewInternalPort"), Some("41062"));
+}
+
+// A random port can hold a forward as well, and asking over one to this PC
+// would replace it.
+#[test]
+fn random_port_with_an_entry_is_left_alone() {
+    let (addr, rx) = fake_router(4, |request| {
+        if arg(request, "NewExternalPort") == Some("41062") {
+            entry_answer("192.168.100.20", 41062, "1", "0")
+        } else {
+            entry_answer("192.168.100.38", 41062, "1", "0")
+        }
+    });
+    let got = add_mapping(&ip_service(addr), OUR_LAN_ADDR, 41062, &mut |_| {});
+    assert!(matches!(got, Err(UpnpError::NoFreePort(41062))), "{got:?}");
+    let sent = requests(&rx);
+    assert_eq!(sent.len(), 4);
+    assert!(
+        sent.iter()
+            .all(|r| soap_action(r) == "GetSpecificPortMappingEntry"),
+        "{sent:?}"
+    );
+}
+
+// The lease is not a number, so nothing says whose this is, and asking would
+// replace a forward to this PC.
+#[test]
+fn unreadable_entry_is_not_asked_over() {
+    let (addr, rx) = fake_router(3, |request| match soap_action(request) {
+        "AddPortMapping" => http("200 OK", &soap_ok("AddPortMapping", "")),
+        _ if arg(request, "NewExternalPort") == Some("41062") => {
+            entry_answer("192.168.100.38", 41062, "1", "soon")
+        }
+        _ => no_entry(),
+    });
+    let mapped = add_mapping(&ip_service(addr), OUR_LAN_ADDR, 41062, &mut |_| {}).unwrap();
+    assert_ne!(mapped.external_port, 41062);
+    let sent = requests(&rx);
+    assert_eq!(sent.len(), 3);
+    assert_eq!(soap_action(&sent[2]), "AddPortMapping");
+    assert_ne!(arg(&sent[2], "NewExternalPort"), Some("41062"));
+}
+
+// Moving the port on each unreadable answer would make every renewal a new
+// address for friends.
+#[test]
+fn renewal_asks_for_its_port_when_the_read_fails() {
+    let (addr, rx) = fake_router(2, |request| match soap_action(request) {
+        "AddPortMapping" => http("200 OK", &soap_ok("AddPortMapping", "")),
+        _ => entry_answer("192.168.100.38", 41062, "1", "soon"),
+    });
+    let mapped = renew_mapping(&ip_service(addr), OUR_LAN_ADDR, 41062, &mut |_| {}).unwrap();
+    assert_eq!(
+        mapped,
+        Mapped {
+            external_port: 41062,
+            lease: LEASE,
+            delete_on_close: true
+        }
+    );
+    assert_eq!(requests(&rx).len(), 2);
 }
 
 #[test]
 fn disabled_forward_is_not_taken() {
-    let (addr, _rx) = fake_router(2, |request| match soap_action(request) {
+    let (addr, _rx) = fake_router(3, |request| match soap_action(request) {
         "AddPortMapping" => http("200 OK", &soap_ok("AddPortMapping", "")),
-        _ => entry_answer("192.168.100.38", 41062, "0", "0"),
+        _ if arg(request, "NewExternalPort") == Some("41062") => {
+            entry_answer("192.168.100.38", 41062, "0", "0")
+        }
+        _ => no_entry(),
     });
     let mapped = add_mapping(&ip_service(addr), OUR_LAN_ADDR, 41062, &mut |_| {}).unwrap();
     assert_ne!(mapped.external_port, 41062);
@@ -1155,14 +1223,14 @@ fn disabled_forward_is_not_taken() {
 
 #[test]
 fn conflict_everywhere_gives_up_after_three_random_ports() {
-    let (addr, rx) = fake_router(6, |request| match soap_action(request) {
+    let (addr, rx) = fake_router(9, |request| match soap_action(request) {
         "AddPortMapping" => conflict(),
         _ => no_entry(),
     });
     let got = add_mapping(&ip_service(addr), OUR_LAN_ADDR, 41062, &mut |_| {});
     assert!(matches!(got, Err(UpnpError::NoFreePort(41062))), "{got:?}");
     let sent = requests(&rx);
-    assert_eq!(sent.len(), 6);
+    assert_eq!(sent.len(), 9);
     let mut ports: Vec<&str> = sent
         .iter()
         .filter(|r| soap_action(r) == "AddPortMapping")
@@ -1202,10 +1270,11 @@ fn only_permanent_leases_retries_with_zero() {
     assert_eq!(arg(&sent[2], "NewLeaseDuration"), Some("0"));
 }
 
-// A router that cannot read one entry back still gets asked for the port.
+// A router that cannot read one entry back still gets asked for a port, a
+// random one, since the room's own may hold a forward nobody could read.
 #[test]
 fn other_faults_stop_the_mapping() {
-    let (addr, rx) = fake_router(2, |_| {
+    let (addr, rx) = fake_router(3, |_| {
         http(
             "500 Internal Server Error",
             &soap_fault("606", "Action not authorized"),
@@ -1219,7 +1288,10 @@ fn other_faults_stop_the_mapping() {
         ),
         "{got:?}"
     );
-    assert_eq!(requests(&rx).len(), 2);
+    let sent = requests(&rx);
+    assert_eq!(sent.len(), 3);
+    assert_eq!(soap_action(&sent[2]), "AddPortMapping");
+    assert_ne!(arg(&sent[2], "NewExternalPort"), Some("41062"));
 }
 
 #[test]

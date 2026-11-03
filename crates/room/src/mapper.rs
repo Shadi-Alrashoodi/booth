@@ -1033,7 +1033,12 @@ fn renew_upnp(
     note: &mut dyn FnMut(fmt::Arguments<'_>),
 ) -> Result<Renewed, String> {
     let ip = upnp::external_ip(&held.service).map_err(|err| err.to_string())?;
-    let mapped = upnp::add_mapping(&held.service, held.internal, held.external_port, note)
+    let ask = if held.delete_on_close {
+        upnp::renew_mapping
+    } else {
+        upnp::add_mapping
+    };
+    let mapped = ask(&held.service, held.internal, held.external_port, note)
         .map_err(|err| err.to_string())?;
     let retired = if mapped.external_port == held.external_port {
         held.delete_on_close |= mapped.delete_on_close;

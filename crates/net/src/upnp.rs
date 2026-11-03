@@ -408,7 +408,7 @@ impl fmt::Display for UpnpError {
             }
             UpnpError::NoFreePort(port) => write!(
                 f,
-                "port {port} and {RANDOM_PORTS} random ports are all taken on the router"
+                "could not get a port on the router: tried {port} and {RANDOM_PORTS} random ports"
             ),
         }
     }
@@ -807,14 +807,46 @@ pub fn external_ip(service: &Service) -> Result<Ipv4Addr, UpnpError> {
 // the port is read first: the IGD spec has AddPortMapping over a forward to
 // the same PC succeed and replace it, so the room would take over the user's
 // own forward and delete it when it closes. A forward to us that Booth did
-// not make is used as it is; a port that is someone else's, or one that
-// turns out to be taken all the same, moves to one of three random ports.
+// not make is used as it is; a port that is someone else's, one whose entry
+// cannot be read, or one that turns out to be taken all the same, moves to
+// one of three random ports.
 pub fn add_mapping(
     service: &Service,
     internal: SocketAddrV4,
     external_port: u16,
     note: &mut dyn FnMut(fmt::Arguments<'_>),
 ) -> Result<Mapped, UpnpError> {
+    map_port(service, internal, external_port, Asking::First, note)
+}
+
+// The same for a port the room made its own mapping on. Only asking again
+// starts a lease again, so that entry is not used as it is, and an entry that
+// cannot be read is still asked for, or each renewal would move the port.
+pub fn renew_mapping(
+    service: &Service,
+    internal: SocketAddrV4,
+    external_port: u16,
+    note: &mut dyn FnMut(fmt::Arguments<'_>),
+) -> Result<Mapped, UpnpError> {
+    map_port(service, internal, external_port, Asking::Made, note)
+}
+
+// What the port is to the room when it asks for it.
+#[derive(Clone, Copy)]
+enum Asking {
+    First,
+    // The room made its own mapping on it.
+    Made,
+}
+
+fn map_port(
+    service: &Service,
+    internal: SocketAddrV4,
+    external_port: u16,
+    asking: Asking,
+    note: &mut dyn FnMut(fmt::Arguments<'_>),
+) -> Result<Mapped, UpnpError> {
+    let held = matches!(asking, Asking::Made);
     let mut lease = LEASE;
     let free = match mapping_entry(service, external_port) {
         Ok(entry) => match entry.owner(internal) {
@@ -832,12 +864,20 @@ pub fn add_mapping(
             }
         },
         Err(UpnpError::Fault(_, Fault::NO_SUCH_ENTRY)) => true,
-        Err(err) => {
-            note(format_args!(
-                "could not read the entry for port {external_port}: {err}; asking for it all the same"
-            ));
-            true
-        }
+        Err(err) => match asking {
+            Asking::Made => {
+                note(format_args!(
+                    "could not read the entry for port {external_port}: {err}; asking for it all the same"
+                ));
+                true
+            }
+            Asking::First => {
+                note(format_args!(
+                    "could not read the entry for port {external_port}: {err}; not asking over it"
+                ));
+                false
+            }
+        },
     };
 
     if free {
@@ -888,6 +928,18 @@ pub fn add_mapping(
         let port = random_port(&tried);
         tried.push(port);
         note(format_args!("trying port {port} instead"));
+        match mapping_entry(service, port) {
+            Ok(entry) => {
+                note_taken(port, &entry, note);
+                continue;
+            }
+            Err(UpnpError::Fault(_, Fault::NO_SUCH_ENTRY)) => {}
+            // A router that cannot read its table still gets a mapping, and
+            // a random port is very unlikely to hold a forward.
+            Err(err) => note(format_args!(
+                "could not read the entry for port {port}: {err}; asking for it all the same"
+            )),
+        }
         match add_or_permanent(service, internal, port, &mut lease, note) {
             Ok(()) => {
                 return Ok(Mapped {
