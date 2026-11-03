@@ -1290,7 +1290,7 @@ fn add_row_backgrounds(point_scale: PointScale, job: &LayoutJob, row: &Row, mesh
     };
 
     let mut run_start = None;
-    let mut last_rect = Rect::NAN;
+    let mut last_right_x = f32::NAN;
 
     for i in visual_order(row) {
         let glyph = &row.glyphs[i];
@@ -1299,7 +1299,7 @@ fn add_row_backgrounds(point_scale: PointScale, job: &LayoutJob, row: &Row, mesh
         let rect = glyph.logical_rect();
 
         if color == Color32::TRANSPARENT {
-            end_run(run_start.take(), last_rect.right());
+            end_run(run_start.take(), last_right_x);
         } else if let Some((existing_color, start, expand)) = run_start {
             if existing_color == color
                 && start.top() == rect.top()
@@ -1308,17 +1308,19 @@ fn add_row_backgrounds(point_scale: PointScale, job: &LayoutJob, row: &Row, mesh
             {
                 // continue the same background rectangle
             } else {
-                end_run(run_start.take(), last_rect.right());
+                end_run(run_start.take(), last_right_x);
                 run_start = Some((color, rect, format.expand_bg));
             }
         } else {
             run_start = Some((color, rect, format.expand_bg));
         }
 
-        last_rect = rect;
+        // A mark comes after its letter here and has no width, so the last
+        // glyph's right edge can fall short of the letter's.
+        last_right_x = last_right_x.max(rect.right());
     }
 
-    end_run(run_start.take(), last_rect.right());
+    end_run(run_start.take(), last_right_x);
 }
 
 fn tessellate_glyphs(point_scale: PointScale, job: &LayoutJob, row: &mut Row, mesh: &mut Mesh) {
@@ -1414,7 +1416,8 @@ fn add_row_hline(
             line_start = Some((stroke, pos2(glyph.pos.x, y)));
         }
 
-        last_right_x = glyph.max_x();
+        // As in add_row_backgrounds, for a mark after its letter.
+        last_right_x = last_right_x.max(glyph.max_x());
     }
 
     end_line(line_start.take(), last_right_x);
@@ -2674,6 +2677,84 @@ mod tests {
                     "{text:?} at {x} came back as {back:?}"
                 );
                 x += 0.25;
+            }
+        }
+    }
+
+    // A mark sorts after its letter and has no width. A background or a line
+    // ending on the mark's right edge stops short of the letter's.
+    #[test]
+    fn a_background_and_a_line_reach_the_end_of_a_marked_letter() {
+        let mut fonts = plex_fonts();
+        let format = TextFormat {
+            font_id: FontId::proportional(13.0),
+            background: Color32::RED,
+            underline: Stroke::new(1.0, Color32::BLUE),
+            ..TextFormat::default()
+        };
+        // At the end of the row, where the format stops inside it, and where
+        // it changes to another.
+        for job in [
+            LayoutJob::single_section("بِسْمِ".to_owned(), format.clone()),
+            {
+                let mut job = LayoutJob::default();
+                job.append(
+                    "hi ",
+                    0.0,
+                    TextFormat::simple(format.font_id.clone(), Color32::WHITE),
+                );
+                job.append("بِسْمِ", 0.0, format.clone());
+                job.append(
+                    " hi",
+                    0.0,
+                    TextFormat::simple(format.font_id.clone(), Color32::WHITE),
+                );
+                job
+            },
+            {
+                let mut job = LayoutJob::default();
+                job.append(
+                    "hi ",
+                    0.0,
+                    TextFormat::simple(format.font_id.clone(), Color32::WHITE),
+                );
+                job.append("بِسْمِ", 0.0, format.clone());
+                job.append(
+                    " hi",
+                    0.0,
+                    TextFormat {
+                        background: Color32::GREEN,
+                        underline: Stroke::new(1.0, Color32::GREEN),
+                        ..format.clone()
+                    },
+                );
+                job
+            },
+        ] {
+            let galley = layout(&mut fonts, 1.0, job.into());
+            let row = &galley.rows[0].row;
+            let right = row
+                .glyphs
+                .iter()
+                .filter(|g| g.is_rtl())
+                .map(|g| g.max_x())
+                .fold(f32::MIN, f32::max);
+            let vertices = &row.visuals.mesh.vertices;
+            let range = &row.visuals.glyph_vertex_range;
+            for (what, color, drawn) in [
+                ("background", Color32::RED, &vertices[..range.start]),
+                ("underline", Color32::BLUE, &vertices[range.end..]),
+            ] {
+                // The next section's band and line reach further.
+                let reach = drawn
+                    .iter()
+                    .filter(|v| v.color == color)
+                    .map(|v| v.pos.x)
+                    .fold(f32::MIN, f32::max);
+                assert!(
+                    right - 1.0 <= reach && reach <= right + 2.0,
+                    "{what} reaches {reach}, the letters {right}"
+                );
             }
         }
     }

@@ -65,6 +65,9 @@ Changed from the pull request
   letter typed there took the marks, and Backspace left them alone. The
   keyboard still goes there.
 - A row with no right-to-left glyph keeps 0.36.2's char_at and x_offset.
+- Backgrounds, underline and strikethrough end at the largest right edge of
+  their glyphs, not the last one's: walked by x a mark comes after its
+  letter, has no width, and ended the run short of the letter.
 - Shaping asks for no dotted circle under a mark that has no letter before
   it: the circle would be a glyph without a char.
 - UAX #9 rule L1 before rows are put in visual order: whitespace at the end
@@ -110,14 +113,15 @@ Changed from the pull request
   ends when the char before it is a right-to-left mark. It went where the
   mark is, over the letter, and mirroring the row then put letters over
   each other, as when the room panel cuts a long name short.
-- Thirteen more tests: the caret at the end of a line ending in digits,
+- Fifteen more tests: the caret at the end of a line ending in digits,
   the caret staying with the run it was typed into, marks on their letters
-  and joins, caret places round-tripping through x, the order unicode-bidi
-  gives, Arabic words in one run, the space where a line wraps, a
-  section's leading space, zero-width chars taking no room, a right-to-left
-  row as wide as its first letter with a mark on it, one a little past its
-  line starting where the galley does, English then Arabic with marks as
-  wide as its letters, and an ellipsis after a mark.
+  and joins, caret places round-tripping through x, a click staying out of
+  a letter and its marks, the order unicode-bidi gives, Arabic words in one
+  run, the space where a line wraps, a section's leading space, zero-width
+  chars taking no room, a right-to-left row as wide as its first letter with
+  a mark on it, one a little past its line starting where the galley does,
+  English then Arabic with marks as wide as its letters, an ellipsis after
+  a mark, and a background and a line reaching the end of a marked letter.
 
 Still as in 0.36.2
 The arrow keys move by char index, in logical order, so Left moves right
