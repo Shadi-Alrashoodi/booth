@@ -822,7 +822,7 @@ impl Sharer {
         self.left = Some(Instant::now());
         result?;
         if let Some(why) = self.pacer.failure() {
-            return Err(format!("the video send thread stopped: {why}"));
+            return Err(why);
         }
         Ok(())
     }

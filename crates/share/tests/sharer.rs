@@ -952,6 +952,46 @@ fn the_codec_follows_the_viewers() {
     println!("said {lines:?}");
 }
 
+// The pacer's failure is a whole sentence already, which the room shows
+// after "Sharing stopped: ".
+#[test]
+fn a_send_thread_that_stops_ends_the_share_saying_so_once() {
+    let Some((_turn, adapter)) = gpu() else {
+        return;
+    };
+    let setup = Setup {
+        choice: Choice::Pattern {
+            adapter,
+            width: 1280,
+            height: 720,
+            busy: false,
+        },
+        fps: 60,
+        settings: Settings::default(),
+        encoder: None,
+        codec: None,
+        takes_hevc: true,
+        payload: PAYLOAD_LAN,
+        spread: false,
+        clock: Clock::starting(Instant::now()),
+        keep_times: false,
+    };
+    let send = |_: &[u8]| panic!("no way out");
+    let mut sharer = Sharer::open(setup, send, &mut |_| {}).unwrap_or_else(|err| panic!("{err}"));
+    let mut watching = Watching::default();
+    let until = Instant::now() + Duration::from_secs(5);
+    let why = loop {
+        if let Err(why) = sharer.next(&mut watching) {
+            break why;
+        }
+        assert!(Instant::now() < until, "the share went on");
+    };
+    assert_eq!(
+        why,
+        "the video send thread stopped: it panicked: no way out"
+    );
+}
+
 // A share of the pattern at `size` and `fps` that sends into `packets`,
 // with what it said while it opened. Every viewer takes HEVC.
 fn share_on(
