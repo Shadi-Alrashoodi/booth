@@ -48,7 +48,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE,
     WM_SYSCOMMAND, WM_WINDOWPOSCHANGED, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW,
-    WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WS_EX_NOACTIVATE, WS_MAXIMIZE, WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 use windows::core::{BOOL, HSTRING, PCWSTR, w};
 
@@ -955,6 +955,16 @@ fn note_monitor(hwnd: HWND, shared: &Shared) -> bool {
 // Borderless over the whole monitor the window is on, which is what lets
 // DWM hand the swap chain to the display directly.
 fn enter_fullscreen(hwnd: HWND, shared: &Shared) {
+    // SAFETY: a live window. A minimized one comes back first as it was,
+    // maximized or not, and goes on from there: SetWindowPos would only move
+    // the minimized window, which Windows would later bring back maximized
+    // if it was before. Not activated, as below, and not a hidden one, as a
+    // closed viewer is, which it would show.
+    unsafe {
+        if IsWindowVisible(hwnd).as_bool() && IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+    }
     // SAFETY: a plain lookup on a live window.
     let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
     let Some((whole, _)) = monitor_rects(monitor) else {
@@ -972,7 +982,10 @@ fn enter_fullscreen(hwnd: HWND, shared: &Shared) {
     let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
     SAVED.with(|saved| saved.set(Some(Saved { placement, style })));
     shared.fullscreen.store(true, Ordering::Release);
-    let borderless = (style & !(WS_OVERLAPPEDWINDOW.0 as isize)) | WS_POPUP.0 as isize;
+    // Not maximized either: Restore in the system menu would put a maximized
+    // one back at its old size while it is still borderless and fullscreen.
+    let borderless =
+        (style & !((WS_OVERLAPPEDWINDOW.0 | WS_MAXIMIZE.0) as isize)) | WS_POPUP.0 as isize;
     // SAFETY: a live window; the new style is the old one without its frame.
     // SWP_NOACTIVATE: F11 is pressed in an active window already, and a call
     // from the API must not take the focus from a game.
@@ -1520,8 +1533,8 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 mod tests {
     use windows::Win32::Graphics::Gdi::EnumDisplayMonitors;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GUITHREADINFO, GetGUIThreadInfo, GetSystemMetrics, GetWindowThreadProcessId, SM_CMONITORS,
-        WPF_RESTORETOMAXIMIZED, WS_MAXIMIZE, WS_MINIMIZE,
+        GUITHREADINFO, GetGUIThreadInfo, GetSystemMetrics, GetWindowThreadProcessId, SC_RESTORE,
+        SM_CMONITORS, SW_MAXIMIZE, WPF_RESTORETOMAXIMIZED, WS_MINIMIZE,
     };
 
     use super::*;
@@ -2042,5 +2055,59 @@ mod tests {
             !active(hwnd),
             "going back to minimized activated the window"
         );
+    }
+
+    // A maximized viewer goes fullscreen over the whole monitor, stays there
+    // when Restore is picked in its system menu, as from its taskbar button,
+    // and comes back maximized. Covers the monitor for a moment, and is
+    // activated to be maximized.
+    #[test]
+    #[ignore]
+    fn a_maximized_window_stays_fullscreen_through_restore() {
+        let _screen = crate::tests::one_at_a_time();
+        let window = open(Show::NoActivate);
+        let hwnd = window.hwnd();
+        // SAFETY: a getter on a live window.
+        let maximized = || unsafe { IsZoomed(hwnd) }.as_bool();
+        // SAFETY: this test's live window.
+        let _ = unsafe { ShowWindow(hwnd, SW_MAXIMIZE) };
+        assert!(maximized());
+        let before = window_rect(hwnd);
+        let (whole, _) = monitor_of(hwnd);
+        send(hwnd, WM_FULLSCREEN, 1, 0);
+        assert_eq!(window_rect(hwnd), Some(whole));
+        send(hwnd, WM_SYSCOMMAND, SC_RESTORE as usize, 0);
+        assert_eq!(window_rect(hwnd), Some(whole), "Restore shrank it");
+        send(hwnd, WM_FULLSCREEN, 0, 0);
+        assert_eq!(window_rect(hwnd), before, "not back where it was");
+        assert!(maximized(), "not maximized again");
+    }
+
+    // A viewer minimized from maximized goes fullscreen as a maximized one
+    // does: back from minimized without being activated, and still over the
+    // whole monitor when Restore is picked in its system menu. On screen for
+    // a moment, as a button on the taskbar and over the whole monitor, and
+    // activated to be maximized again.
+    #[test]
+    #[ignore]
+    fn a_minimized_window_stays_fullscreen_through_restore() {
+        let _screen = crate::tests::one_at_a_time();
+        let window = open(Show::Hidden);
+        let hwnd = window.hwnd();
+        activatable(hwnd);
+        minimize_from_maximized(hwnd);
+        // SAFETY: a getter on a live window.
+        let minimized = || unsafe { IsIconic(hwnd) }.as_bool();
+        // SAFETY: a getter on a live window.
+        let maximized = || unsafe { IsZoomed(hwnd) }.as_bool();
+        let (whole, _) = monitor_of(hwnd);
+        send(hwnd, WM_FULLSCREEN, 1, 0);
+        assert!(!minimized(), "fullscreen left it minimized");
+        assert!(!active(hwnd), "fullscreen activated the window");
+        assert_eq!(window_rect(hwnd), Some(whole));
+        send(hwnd, WM_SYSCOMMAND, SC_RESTORE as usize, 0);
+        assert_eq!(window_rect(hwnd), Some(whole), "Restore shrank it");
+        send(hwnd, WM_FULLSCREEN, 0, 0);
+        assert!(maximized(), "not maximized again");
     }
 }
