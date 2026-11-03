@@ -459,8 +459,10 @@ fn control_words(strip: &Strip, words: &mut Vec<Word>) {
     }
 }
 
+// Never "0 ms": formatting rounds exactly 0.5 to the even 0, so it reads
+// "<1 ms" with everything under it.
 fn milliseconds(ms: f32) -> String {
-    if ms < 0.5 {
+    if ms <= 0.5 {
         String::from("<1 ms")
     } else {
         format!("{ms:.0} ms")
@@ -1287,6 +1289,15 @@ mod tests {
         assert!(!parts.contains(&Part::Jitter));
         assert!(parts.contains(&Part::Path));
         assert!(parts.contains(&Part::Present));
+    }
+
+    // A round trip of exactly 500 us is half a millisecond, under one.
+    #[test]
+    fn half_a_millisecond_reads_under_one() {
+        assert_eq!(milliseconds(0.49), "<1 ms");
+        assert_eq!(milliseconds(0.5), "<1 ms");
+        assert_eq!(milliseconds(0.51), "1 ms");
+        assert_eq!(milliseconds(1.5), "2 ms");
     }
 
     #[test]

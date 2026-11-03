@@ -300,8 +300,10 @@ fn words(strip: &Strip, cap_set: bool, watched: ShareState) -> Vec<Word> {
     words
 }
 
+// Never "0 ms": formatting rounds exactly 0.5 to the even 0, so it reads
+// "<1 ms" with everything under it.
 pub fn round_trip(ms: f32) -> String {
-    if ms < 0.5 {
+    if ms <= 0.5 {
         String::from("<1 ms")
     } else {
         format!("{ms:.0} ms")
@@ -477,6 +479,15 @@ mod tests {
         ];
         assert_eq!(fit(&widths, 200.0).len(), 3);
         assert_eq!(fit(&widths, 120.0), [Part::RoundTrip, Part::Path]);
+    }
+
+    // A round trip of exactly 500 us is half a millisecond, under one.
+    #[test]
+    fn half_a_millisecond_reads_under_one() {
+        assert_eq!(round_trip(0.49), "<1 ms");
+        assert_eq!(round_trip(0.5), "<1 ms");
+        assert_eq!(round_trip(0.51), "1 ms");
+        assert_eq!(round_trip(1.5), "2 ms");
     }
 
     #[test]
