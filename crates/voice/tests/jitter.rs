@@ -1429,6 +1429,75 @@ fn only_what_never_played_counts_as_dropped() {
     assert_eq!(buffer.stats().dropped, 2);
 }
 
+// Back from the 10 ms mode at three to six frames of depth, the last 10 ms
+// frame 2 ms before a pull and 7 ms before one. The 5 ms frames pile up behind
+// the ones still to play, more of them in numbers than the 10 ms mode's cap,
+// and that is no overflow: every frame plays, and at the switch only the mode's
+// extra frame comes off. At six frames, 7 ms before a pull, what is queued at
+// the switch is 65 ms, truly over the cap: the 10 ms frames still all play, and
+// playing starts again from the newest 5 ms ones.
+#[test]
+fn back_from_the_10_ms_mode_deep_in_the_buffer_no_frame_goes() {
+    let before = tone(1.5);
+    let after = speech(2.0, -70.0);
+    let switch = 150;
+    for depth in 3..=6u64 {
+        for held_back in [0, 336] {
+            let case = format!("depth {depth}, first packet held back {held_back}");
+            let sent = talk(
+                &[(Mode::Repair, &before), (Mode::LowDelay, &after)],
+                0,
+                144,
+                false,
+            );
+            let mut arrive = on_time(&sent);
+            arrive[0] = Some(sent[0].sent_at + held_back);
+            for i in [50, 55, 60] {
+                arrive[i] = Some(sent[i].sent_at + (depth - 1) * 2 * TICK);
+            }
+            let mut listener = Listener::new();
+            listener.run(&sent, &arrive, sent[switch - 10].sent_at, always);
+            let stats = listener.stats();
+            assert_eq!(
+                (stats.frame_ms, u64::from(stats.depth_frames)),
+                (10, depth),
+                "{case}"
+            );
+
+            let end = sent.last().unwrap().sent_at + 12 * TICK;
+            listener.run(&sent, &arrive, end, always);
+            let over_the_cap = depth == 6 && held_back > 0;
+            let through = if over_the_cap { switch } else { switch + 20 };
+            let around = &sent[switch - depth as usize..through];
+            for packet in around {
+                assert!(
+                    listener.played_at(packet.seq).is_some(),
+                    "{case}: seq {} never played",
+                    packet.seq
+                );
+            }
+            let first = listener.played_at(around[0].seq).unwrap();
+            let last = listener.played_at(around.last().unwrap().seq).unwrap();
+            for heard in &listener.heard {
+                if (first..=last).contains(&heard.at) {
+                    let source = heard.pulled.unwrap().source;
+                    assert!(matches!(source, Source::Packet(_)), "{case}: {source:?}");
+                }
+            }
+            let stats = listener.stats();
+            assert_eq!(stats.frame_ms, 5, "{case}");
+            assert_eq!(
+                u64::from(stats.depth_frames),
+                1 + 2 * (depth - 2),
+                "{case}: {stats:?}"
+            );
+            assert_eq!(stats.lost, 0, "{case}");
+            listener.assert_in_order();
+            listener.assert_no_clicks();
+        }
+    }
+}
+
 // The same stall with a time out earlier on, which says nothing about this
 // transmission: what played is no loss, and what never will play is dropped.
 #[test]
@@ -1448,4 +1517,32 @@ fn a_stall_over_the_switch_after_a_time_out_counts_the_same() {
     assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Packet(8));
     let stats = buffer.stats();
     assert_eq!((stats.frame_ms, stats.dropped, stats.lost), (10, 6, 0));
+}
+
+// The render side stalls in the 10 ms mode while the talker moves to 5 ms
+// frames, past what the shorter frames' own cap allows: playing starts again
+// from the newest instead of running over slots still to play.
+#[test]
+fn a_stall_past_the_cap_of_the_shorter_frames_keeps_the_newest() {
+    let sent = talk(
+        &[(Mode::Repair, &tone(0.1)), (Mode::LowDelay, &tone(0.1))],
+        0,
+        0,
+        false,
+    );
+    let mut buffer = JitterBuffer::new().unwrap();
+    let mut frame = [0f32; MAX_FRAME];
+    for packet in &sent[..10] {
+        buffer.push(packet.packet()).unwrap();
+        buffer.pull(&mut frame).unwrap();
+    }
+    assert_eq!(buffer.stats().frame_ms, 10);
+    for packet in &sent[10..23] {
+        buffer.push(packet.packet()).unwrap();
+    }
+    assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Packet(22));
+    buffer.push(sent[23].packet()).unwrap();
+    assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Packet(23));
+    let stats = buffer.stats();
+    assert_eq!((stats.frame_ms, stats.dropped, stats.lost), (5, 13, 0));
 }

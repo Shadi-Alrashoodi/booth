@@ -328,12 +328,18 @@ impl JitterBuffer {
                     }
                     let redundancy = packet.redundancy || packet.previous.is_some();
                     self.back_to_switch(ext, info.samples, redundancy);
-                } else if lead >= self.cap() {
+                } else if lead >= self.cap()
+                    && (info.samples >= self.frame || lead > 2 * self.cap())
+                {
                     // The play point fell too far behind the packets: pulls
                     // stopped (deafen, a stalled audio thread) or the talker
                     // jumped ahead. Start again from the newest packets, at
                     // the depth from before: what arrived since the last pull
-                    // only looks early because nobody was pulling.
+                    // only looks early because nobody was pulling. Shorter
+                    // frames ahead of a mode switch go by their own cap, twice
+                    // as many numbers: the longer frames before them are still
+                    // due to play, and the same delay takes twice the numbers
+                    // at the new size.
                     let since_last_pull = self.pulls;
                     self.arrivals.retain(|arrival| arrival.at < since_last_pull);
                     self.measure_depth();
