@@ -117,7 +117,8 @@ pub struct Setup {
     // --port, which wins over the setting for this run: it is how two
     // copies share one PC for testing.
     port_given: Option<u16>,
-    // Keys that went back to their defaults as settings.txt was read.
+    // Keys that went back to their defaults as settings.txt was read, and a
+    // new action moved off its default.
     gave_way: Vec<GaveWay>,
 }
 
@@ -1468,8 +1469,8 @@ pub enum NotStarted {
 }
 
 // What the start screen says for this run. A key that gave way is said until
-// Settings has moved it or the other key, each of which reading the file left
-// on its default: after that the line's "back on" or its clash is not true.
+// Settings has moved it or the other key from where reading the file left them:
+// after that the line's "back on" or "is on", or its clash, is not true.
 fn start_lines(
     hint: Option<&'static str>,
     setup: &Result<Setup, String>,
@@ -1487,8 +1488,8 @@ fn start_lines(
                 .gave_way
                 .iter()
                 .filter(|gave| {
-                    hotkeys.chord(gave.action) == gave.action.default_chord()
-                        && hotkeys.chord(gave.with) == gave.with.default_chord()
+                    hotkeys.chord(gave.action) == gave.now
+                        && hotkeys.chord(gave.with) == gave.with_now
                 })
                 .map(messages::key_gave_way),
         );
@@ -2216,7 +2217,7 @@ mod tests {
         assert_eq!(
             start_lines(None, &build(&dir), &[], &[]),
             [
-                "Push to talk was on F9, which clashed with Ctrl+Shift+F9 for pausing a share. It is back on Right Ctrl. Change either in Settings."
+                "Pausing a share is on Ctrl+Shift+F10 rather than Ctrl+Shift+F9, which clashed with F9 for push to talk. Change either in Settings."
             ]
         );
 
@@ -2229,8 +2230,9 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // Saved before pause sharing had Ctrl+Shift+F9. The line stays for the run
-    // while both keys are on their defaults, and goes once either has been
+    // Saved before pause sharing had Ctrl+Shift+F9: push to talk keeps F9, and
+    // pausing moves to Ctrl+Shift+F10. The line stays for the run while both
+    // keys are where reading the file left them, and goes once either has been
     // moved, as it offers.
     #[test]
     fn the_start_screen_says_which_key_gave_way() {
@@ -2239,8 +2241,9 @@ mod tests {
         fs::write(dir.join("settings.txt"), "hotkey_push_to_talk = F9\r\n").unwrap();
         let mut setup = setup_in(&dir);
         (setup.settings, _, setup.gave_way) = Settings::load(&dir);
+        let read = setup.settings.hotkeys();
         let mut setup = Ok(setup);
-        let line = "Push to talk was on F9, which clashed with Ctrl+Shift+F9 for pausing a share. It is back on Right Ctrl. Change either in Settings.";
+        let line = "Pausing a share is on Ctrl+Shift+F10 rather than Ctrl+Shift+F9, which clashed with F9 for push to talk. Change either in Settings.";
         assert_eq!(start_lines(None, &setup, &[], &[]), [line]);
         assert_eq!(
             start_lines(
@@ -2255,16 +2258,16 @@ mod tests {
         let Ok(moved) = &mut setup else {
             panic!("the setup is there");
         };
-        let mut hotkeys = moved.settings.hotkeys();
+        let mut hotkeys = read;
         hotkeys.set(input::Action::PushToTalk, "F8".parse().unwrap());
         moved.settings.set_hotkeys(hotkeys);
         assert!(start_lines(None, &setup, &[], &[]).is_empty());
 
-        // Moving the other one ends the clash as well.
+        // Moving the other one ends the line as well.
         let Ok(moved) = &mut setup else {
             panic!("the setup is there");
         };
-        let mut hotkeys = input::Bindings::default();
+        let mut hotkeys = read;
         hotkeys.set(input::Action::PauseShare, "F8".parse().unwrap());
         moved.settings.set_hotkeys(hotkeys);
         assert!(start_lines(None, &setup, &[], &[]).is_empty());

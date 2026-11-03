@@ -131,8 +131,20 @@ impl Bindings {
     // hold it, and so can a key saved before a newer version made it a new
     // action's default, or one moved in a run that could not read the file.
     pub fn first_conflict(&self) -> Option<(Action, Action)> {
-        Action::ALL.into_iter().find_map(|action| {
-            self.conflict(action, self.chord(action))
+        self.first_conflict_without(&[])
+    }
+
+    // The same, as if the actions in `left_out` set off nothing.
+    pub fn first_conflict_without(&self, left_out: &[Action]) -> Option<(Action, Action)> {
+        let counted = || {
+            Action::ALL
+                .into_iter()
+                .filter(|action| !left_out.contains(action))
+        };
+        counted().find_map(|action| {
+            counted()
+                .filter(|other| *other != action)
+                .find(|other| clash((action, self.chord(action)), (*other, self.chord(*other))))
                 .map(|other| (action, other))
         })
     }

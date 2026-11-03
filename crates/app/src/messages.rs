@@ -570,9 +570,10 @@ pub fn key_used(other: Action) -> String {
 }
 
 // One start screen line for each key that went back to its default as
-// settings.txt was read. The other key is named, since Settings has no row on
-// F9 when the clash was with Ctrl+Shift+F9. Not through sentence, which breaks
-// a line at a semicolon, and a chord can end in one.
+// settings.txt was read, and for a new action moved off its default. The other
+// key is named, since once a key has moved, Settings may have no row on the key
+// the clash was on. Not through sentence, which breaks a line at a semicolon,
+// and a chord can end in one.
 pub fn key_gave_way(gave: &GaveWay) -> String {
     let with = in_a_sentence(gave.with);
     let why = if gave.with_was == gave.was {
@@ -581,6 +582,14 @@ pub fn key_gave_way(gave: &GaveWay) -> String {
         format!("which clashed with {} for {with}", gave.with_was)
     };
     let (first, rest) = in_a_sentence(gave.action).split_at(1);
+    if gave.now != gave.action.default_chord() {
+        return format!(
+            "{}{rest} is on {} rather than {}, {why}. Change either in Settings.",
+            first.to_uppercase(),
+            gave.now,
+            gave.was
+        );
+    }
     format!(
         "{}{rest} was on {}, {why}. It is back on {}. Change either in Settings.",
         first.to_uppercase(),
@@ -1212,29 +1221,35 @@ mod tests {
         let pause_key = "Ctrl+Shift+F9".parse().unwrap();
         let push_to_talk = GaveWay {
             action: Action::PushToTalk,
-            was: "F9".parse().unwrap(),
+            was: "F8".parse().unwrap(),
             with: Action::PauseShare,
-            with_was: pause_key,
+            with_was: "Ctrl+F8".parse().unwrap(),
+            now: Action::PushToTalk.default_chord(),
+            with_now: pause_key,
         };
         assert_eq!(
             key_gave_way(&push_to_talk),
-            "Push to talk was on F9, which clashed with Ctrl+Shift+F9 for pausing a share. It is back on Right Ctrl. Change either in Settings."
+            "Push to talk was on F8, which clashed with Ctrl+F8 for pausing a share. It is back on Right Ctrl. Change either in Settings."
         );
         let panic = GaveWay {
             action: Action::Panic,
-            was: "F9".parse().unwrap(),
+            was: "F8".parse().unwrap(),
             with: Action::PauseShare,
-            with_was: pause_key,
+            with_was: "Ctrl+F8".parse().unwrap(),
+            now: Action::Panic.default_chord(),
+            with_now: pause_key,
         };
         assert_eq!(
             key_gave_way(&panic),
-            "The panic key was on F9, which clashed with Ctrl+Shift+F9 for pausing a share. It is back on Ctrl+Shift+End. Change either in Settings."
+            "The panic key was on F8, which clashed with Ctrl+F8 for pausing a share. It is back on Ctrl+Shift+End. Change either in Settings."
         );
         let mute = GaveWay {
             action: Action::Mute,
             was: "F8".parse().unwrap(),
             with: Action::Deafen,
             with_was: "F8".parse().unwrap(),
+            now: Action::Mute.default_chord(),
+            with_now: Action::Deafen.default_chord(),
         };
         assert_eq!(
             key_gave_way(&mute),
@@ -1245,6 +1260,8 @@ mod tests {
             was: "F8".parse().unwrap(),
             with: Action::ShowPanel,
             with_was: "F8".parse().unwrap(),
+            now: Action::Share.default_chord(),
+            with_now: Action::ShowPanel.default_chord(),
         };
         assert_eq!(
             key_gave_way(&share),
@@ -1256,10 +1273,37 @@ mod tests {
             was: "Ctrl+;".parse().unwrap(),
             with: Action::PushToTalk,
             with_was: ";".parse().unwrap(),
+            now: Action::Mute.default_chord(),
+            with_now: Action::PushToTalk.default_chord(),
         };
         assert_eq!(
             key_gave_way(&on_semicolon),
             "Mute was on Ctrl+;, which clashed with ; for push to talk. It is back on Ctrl+Shift+M. Change either in Settings."
+        );
+        // A new action moved off its default, which a key in the file clashed
+        // with.
+        let f9 = "F9".parse().unwrap();
+        let pause = GaveWay {
+            action: Action::PauseShare,
+            was: pause_key,
+            with: Action::PushToTalk,
+            with_was: f9,
+            now: "Ctrl+Shift+F10".parse().unwrap(),
+            with_now: f9,
+        };
+        assert_eq!(
+            key_gave_way(&pause),
+            "Pausing a share is on Ctrl+Shift+F10 rather than Ctrl+Shift+F9, which clashed with F9 for push to talk. Change either in Settings."
+        );
+        let mute_on_it = GaveWay {
+            with: Action::Mute,
+            with_was: pause_key,
+            with_now: pause_key,
+            ..pause
+        };
+        assert_eq!(
+            key_gave_way(&mute_on_it),
+            "Pausing a share is on Ctrl+Shift+F10 rather than Ctrl+Shift+F9, the same key as mute. Change either in Settings."
         );
     }
 

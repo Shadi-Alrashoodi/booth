@@ -146,13 +146,17 @@ pub struct Settings {
 
 // A hotkey in the file that went back to its default, because a press of it
 // would also have set off `with`, on `with_was` at that point: as the file had
-// it, or its default if it had gone back already.
+// it, or its default if it had gone back already. Or a new action that moved to
+// a free key instead, since a press of where it was would also have set off
+// `with`. `now` and `with_now` are where reading the file left the two.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GaveWay {
     pub action: Action,
     pub was: Chord,
     pub with: Action,
     pub with_was: Chord,
+    pub now: Chord,
+    pub with_now: Chord,
 }
 
 impl Settings {
@@ -663,6 +667,27 @@ fn hotkey_action(key: &str) -> Option<Action> {
     })
 }
 
+// Actions some settings files are older than: pause sharing came in 1.3.0. Such
+// a file has no line for one, so a press of its default can set off a key
+// chosen there for another action. A copy older than such an action does not
+// know where it is either, so it can put another key on the spare it went to.
+const NEW_ACTIONS: [Action; 1] = [Action::PauseShare];
+// Where such an action goes then, if its default is not free: the first of
+// these that is. There are as many as other actions, and one more with the
+// default, and since no default is on their keys, each other action keeps it
+// off one at most: by its key or, if it went back over a clash with this one,
+// by the key it left. Not F11, which the viewer goes in and out of fullscreen
+// on whatever else is held.
+const SPARE_CHORDS: [&str; 7] = [
+    "Ctrl+Shift+F10",
+    "Ctrl+Shift+F12",
+    "Ctrl+Shift+F8",
+    "Ctrl+Shift+F7",
+    "Ctrl+Shift+F6",
+    "Ctrl+Shift+F5",
+    "Ctrl+Shift+F3",
+];
+
 // Windows' endpoint ids look like {0.0.1.00000000}.{1ebb6084-...}, about 55
 // characters. Anything much longer, or with control characters in it, was
 // not written by Booth. Empty is Windows default.
@@ -895,10 +920,25 @@ fn parse(bytes: &[u8]) -> (Settings, Vec<String>) {
 // default, a key chosen earlier for another, or from a key moved in a run that
 // could not read the file. Only an action moved off its default gives way, so
 // the rest of what was chosen stays; of two moved ones, which was meant is
-// anyone's guess, so both do.
+// anyone's guess, so both do. A new action on its default or a spare, as the
+// file had it or once it went back, was most likely put there by Booth and not
+// chosen, so it is the one that moves, and last, once the other keys are where
+// they stay. It does not take the key one that went back over a clash with it
+// has left, or that one alone would have given way.
 fn settle_hotkeys(settings: &mut Settings, problems: &mut Vec<String>) -> Vec<GaveWay> {
-    let mut gave_way = Vec::new();
-    while let Some((one, other)) = settings.hotkeys.first_conflict() {
+    let mut gave_way: Vec<GaveWay> = Vec::new();
+    let spares: Vec<Chord> = SPARE_CHORDS
+        .into_iter()
+        .filter_map(|chord| chord.parse().ok())
+        .collect();
+    let mut new: Vec<Action> = NEW_ACTIONS
+        .into_iter()
+        .filter(|action| {
+            let chord = settings.hotkeys.chord(*action);
+            chord == action.default_chord() || spares.contains(&chord)
+        })
+        .collect();
+    while let Some((one, other)) = settings.hotkeys.first_conflict_without(&new) {
         let chord = settings.hotkeys.chord(one);
         let other_chord = settings.hotkeys.chord(other);
         let moved: Vec<Action> = [one, other]
@@ -928,8 +968,13 @@ fn settle_hotkeys(settings: &mut Settings, problems: &mut Vec<String>) -> Vec<Ga
                 was: settings.hotkeys.chord(action),
                 with,
                 with_was,
+                now: action.default_chord(),
+                with_now: with.default_chord(),
             });
             settings.hotkeys.set(action, action.default_chord());
+            if NEW_ACTIONS.contains(&action) {
+                new.push(action);
+            }
             back.push(format!(
                 "{} goes back to {}",
                 action.name(),
@@ -941,6 +986,53 @@ fn settle_hotkeys(settings: &mut Settings, problems: &mut Vec<String>) -> Vec<Ga
             one.name(),
             other.name(),
             back.join(" and ")
+        ));
+    }
+    for action in new {
+        let was = settings.hotkeys.chord(action);
+        let Some(with) = settings.hotkeys.conflict(action, was) else {
+            continue;
+        };
+        let with_was = settings.hotkeys.chord(with);
+        let free = std::iter::once(action.default_chord())
+            .chain(spares.iter().copied())
+            .find(|chord| {
+                settings.hotkeys.conflict(action, *chord).is_none()
+                    && !gave_way
+                        .iter()
+                        .any(|gave| gave.with == action && gave.was == *chord)
+            });
+        // Never, by the count above; the keys must not clash even so.
+        let Some(now) = free else {
+            problems.push(format!(
+                "settings: no free key for {}; using the default hotkeys",
+                action.name()
+            ));
+            settings.hotkeys = Bindings::default();
+            break;
+        };
+        settings.hotkeys.set(action, now);
+        // If it went back to its default above, it is not there now, and a key
+        // that gave way to it is told where it is.
+        gave_way.retain(|gave| gave.action != action);
+        for gave in &mut gave_way {
+            if gave.with == action {
+                gave.with_now = now;
+            }
+        }
+        gave_way.push(GaveWay {
+            action,
+            was,
+            with,
+            with_was,
+            now,
+            with_now: with_was,
+        });
+        problems.push(format!(
+            "settings: {} and {} are on one key, {with_was}; {} goes to {now}",
+            with.name(),
+            action.name(),
+            action.name()
         ));
     }
     gave_way
@@ -1289,8 +1381,9 @@ mod tests {
 
     // Saved by an older version, before pause sharing had Ctrl+Shift+F9. Push
     // to talk also runs with more modifiers down, so that press would set off
-    // both, and it goes back. The log says so, and so does what is handed on
-    // for the start screen.
+    // both. Push to talk's key was chosen and pausing's never was, so pausing
+    // goes to a free key. The log says so, and so does what is handed on for
+    // the start screen.
     #[test]
     fn a_key_that_gave_way_is_handed_back() {
         let folder = Folder::new("gave-way");
@@ -1301,26 +1394,32 @@ mod tests {
         .unwrap();
         let (settings, problems, gave_way) = Settings::load(&folder.0);
         assert_eq!(
-            settings.hotkeys().chord(Action::PushToTalk),
-            Action::PushToTalk.default_chord()
+            settings.hotkeys().chord(Action::PushToTalk).to_string(),
+            "F9"
         );
         assert_eq!(
             settings.hotkeys().chord(Action::StatsPanel).to_string(),
             "F10"
         );
         assert_eq!(
+            settings.hotkeys().chord(Action::PauseShare).to_string(),
+            "Ctrl+Shift+F10"
+        );
+        assert_eq!(
             problems,
             [
-                "settings: push to talk and pause sharing, resume (press twice) are on one key, F9; push to talk goes back to Right Ctrl"
+                "settings: push to talk and pause sharing, resume (press twice) are on one key, F9; pause sharing, resume (press twice) goes to Ctrl+Shift+F10"
             ]
         );
         assert_eq!(
             gave_way,
             [GaveWay {
-                action: Action::PushToTalk,
-                was: "F9".parse().unwrap(),
-                with: Action::PauseShare,
-                with_was: "Ctrl+Shift+F9".parse().unwrap(),
+                action: Action::PauseShare,
+                was: "Ctrl+Shift+F9".parse().unwrap(),
+                with: Action::PushToTalk,
+                with_was: "F9".parse().unwrap(),
+                now: "Ctrl+Shift+F10".parse().unwrap(),
+                with_now: "F9".parse().unwrap(),
             }]
         );
 
@@ -1336,12 +1435,16 @@ mod tests {
                     was: f8,
                     with: Action::Deafen,
                     with_was: f8,
+                    now: Action::Mute.default_chord(),
+                    with_now: Action::Deafen.default_chord(),
                 },
                 GaveWay {
                     action: Action::Deafen,
                     was: f8,
                     with: Action::Mute,
                     with_was: f8,
+                    now: Action::Deafen.default_chord(),
+                    with_now: Action::Mute.default_chord(),
                 },
             ]
         );
@@ -1356,6 +1459,8 @@ mod tests {
                 was: "Ctrl+Shift+M".parse().unwrap(),
                 with: Action::Mute,
                 with_was: "Ctrl+Shift+M".parse().unwrap(),
+                now: Action::Deafen.default_chord(),
+                with_now: Action::Mute.default_chord(),
             }]
         );
 
@@ -1374,12 +1479,16 @@ mod tests {
                     was: "F5".parse().unwrap(),
                     with: Action::Mute,
                     with_was: "Ctrl+F5".parse().unwrap(),
+                    now: Action::PushToTalk.default_chord(),
+                    with_now: Action::Mute.default_chord(),
                 },
                 GaveWay {
                     action: Action::Mute,
                     was: "Ctrl+F5".parse().unwrap(),
                     with: Action::PushToTalk,
                     with_was: "F5".parse().unwrap(),
+                    now: Action::Mute.default_chord(),
+                    with_now: Action::PushToTalk.default_chord(),
                 },
             ]
         );
@@ -1400,12 +1509,16 @@ mod tests {
                     was: "Ctrl+Shift+S".parse().unwrap(),
                     with: Action::Share,
                     with_was: "Ctrl+Shift+S".parse().unwrap(),
+                    now: Action::Mute.default_chord(),
+                    with_now: Action::Share.default_chord(),
                 },
                 GaveWay {
                     action: Action::Deafen,
                     was: "Ctrl+Shift+M".parse().unwrap(),
                     with: Action::Mute,
                     with_was: "Ctrl+Shift+M".parse().unwrap(),
+                    now: Action::Deafen.default_chord(),
+                    with_now: Action::Mute.default_chord(),
                 },
             ]
         );
@@ -1415,6 +1528,280 @@ mod tests {
         let (settings, problems, gave_way) = Settings::load(&folder.0);
         assert_eq!(settings.hotkeys().chord(Action::Mute).to_string(), "F9");
         assert!(problems.is_empty() && gave_way.is_empty(), "{problems:?}");
+    }
+
+    // As 1.2.0 saves it, before pause sharing had Ctrl+Shift+F9: push to talk
+    // or the panic key on F9, alone or with Shift, Ctrl or both, or another key
+    // on exactly Ctrl+Shift+F9. Every key stays where the person put it, and
+    // pausing takes the first free one. A save keeps that, so the next start
+    // has nothing to settle.
+    #[test]
+    fn an_upgrade_from_1_2_0_keeps_every_key() {
+        let folder = Folder::new("from-1.2.0");
+        let pause_now: Chord = "Ctrl+Shift+F12".parse().unwrap();
+        for (key, chord) in [
+            (HOTKEY_PUSH_TO_TALK, "F9"),
+            (HOTKEY_PUSH_TO_TALK, "Shift+F9"),
+            (HOTKEY_PUSH_TO_TALK, "Ctrl+F9"),
+            (HOTKEY_PUSH_TO_TALK, "Ctrl+Shift+F9"),
+            (HOTKEY_PANIC, "F9"),
+            (HOTKEY_PANIC, "Shift+F9"),
+            (HOTKEY_PANIC, "Ctrl+F9"),
+            (HOTKEY_PANIC, "Ctrl+Shift+F9"),
+            (HOTKEY_MUTE, "Ctrl+Shift+F9"),
+        ] {
+            let before = format!(
+                "name = Mara\r\n{key} = {chord}\r\nhotkey_stats_panel = Ctrl+Shift+F10\r\ntalk_mode = open_mic\r\nshare_monitor = \\\\.\\DISPLAY2\r\n"
+            );
+            fs::write(folder.file(), &before).unwrap();
+            let action = hotkey_action(key).unwrap();
+            let chord: Chord = chord.parse().unwrap();
+            let mut expected = Bindings::default();
+            expected.set(action, chord);
+            expected.set(Action::StatsPanel, "Ctrl+Shift+F10".parse().unwrap());
+            expected.set(Action::PauseShare, pause_now);
+
+            let (mut settings, problems, gave_way) = Settings::load(&folder.0);
+            assert_eq!(settings.hotkeys(), expected, "{key} = {chord}");
+            assert_eq!(
+                problems,
+                [format!(
+                    "settings: {} and pause sharing, resume (press twice) are on one key, {chord}; pause sharing, resume (press twice) goes to Ctrl+Shift+F12",
+                    action.name()
+                )]
+            );
+            assert_eq!(
+                gave_way,
+                [GaveWay {
+                    action: Action::PauseShare,
+                    was: Action::PauseShare.default_chord(),
+                    with: action,
+                    with_was: chord,
+                    now: pause_now,
+                    with_now: chord,
+                }]
+            );
+
+            settings.save(&folder.0).unwrap();
+            assert_eq!(
+                fs::read_to_string(folder.file()).unwrap(),
+                format!("{before}hotkey_pause_share = Ctrl+Shift+F12\r\n")
+            );
+            let (again, problems, gave_way) = Settings::load(&folder.0);
+            assert!(problems.is_empty() && gave_way.is_empty(), "{problems:?}");
+            assert_eq!(again.hotkeys(), expected);
+        }
+    }
+
+    // Two keys of the file on F9 go back first, as 1.2.0 had them go, and then
+    // pausing's default is free and stays.
+    #[test]
+    fn keys_of_the_file_are_settled_before_a_new_action_moves() {
+        let (settings, problems) = settled(b"hotkey_panic = F9\nhotkey_stats_panel = F9\n");
+        assert_eq!(settings.hotkeys(), Bindings::default());
+        assert_eq!(
+            problems,
+            [
+                "settings: panic key and stats panel are on one key, F9; panic key goes back to Ctrl+Shift+End and stats panel goes back to Ctrl+Shift+I"
+            ]
+        );
+    }
+
+    // Pausing and mute on one key in the file, each moved there: both go back,
+    // and a press of pausing's default then sets off push to talk or the panic
+    // key on F9 as well. That default was never chosen either, so pausing moves
+    // on and F9 stays, and what is handed on for the start screen says where
+    // the keys are now.
+    #[test]
+    fn a_new_action_that_went_back_moves_on() {
+        let f9: Chord = "F9".parse().unwrap();
+        let both_were: Chord = "F8".parse().unwrap();
+        let spare: Chord = "Ctrl+Shift+F10".parse().unwrap();
+        for key in [HOTKEY_PUSH_TO_TALK, HOTKEY_PANIC] {
+            let (mut settings, mut problems) = parse(
+                format!("{key} = F9\nhotkey_pause_share = F8\nhotkey_mute = F8\n").as_bytes(),
+            );
+            let gave_way = settle_hotkeys(&mut settings, &mut problems);
+            let action = hotkey_action(key).unwrap();
+            let mut expected = Bindings::default();
+            expected.set(action, f9);
+            expected.set(Action::PauseShare, spare);
+            assert_eq!(settings.hotkeys(), expected, "{key}");
+            assert_eq!(settings.hotkeys().first_conflict(), None);
+            assert_eq!(
+                problems,
+                [
+                    "settings: mute and pause sharing, resume (press twice) are on one key, F8; mute goes back to Ctrl+Shift+M and pause sharing, resume (press twice) goes back to Ctrl+Shift+F9".to_string(),
+                    format!(
+                        "settings: {} and pause sharing, resume (press twice) are on one key, F9; pause sharing, resume (press twice) goes to Ctrl+Shift+F10",
+                        action.name()
+                    ),
+                ]
+            );
+            assert_eq!(
+                gave_way,
+                [
+                    GaveWay {
+                        action: Action::Mute,
+                        was: both_were,
+                        with: Action::PauseShare,
+                        with_was: both_were,
+                        now: Action::Mute.default_chord(),
+                        with_now: spare,
+                    },
+                    GaveWay {
+                        action: Action::PauseShare,
+                        was: Action::PauseShare.default_chord(),
+                        with: action,
+                        with_was: f9,
+                        now: spare,
+                        with_now: f9,
+                    },
+                ]
+            );
+        }
+    }
+
+    // A save after pausing moved writes the spare it is on, and a copy older
+    // than pausing lets any key go there. That key was chosen and the spare was
+    // not, so pausing alone moves: back to its default if that is free, or else
+    // on to the next spare.
+    #[test]
+    fn a_key_put_on_a_new_actions_spare_stays() {
+        let spare: Chord = "Ctrl+Shift+F10".parse().unwrap();
+        for key in [HOTKEY_PUSH_TO_TALK, HOTKEY_PANIC] {
+            let (mut settings, mut problems) = parse(
+                format!("{key} = Ctrl+Shift+F10\nhotkey_pause_share = Ctrl+Shift+F10\n").as_bytes(),
+            );
+            let gave_way = settle_hotkeys(&mut settings, &mut problems);
+            let action = hotkey_action(key).unwrap();
+            let mut expected = Bindings::default();
+            expected.set(action, spare);
+            assert_eq!(settings.hotkeys(), expected, "{key}");
+            assert_eq!(settings.hotkeys().first_conflict(), None);
+            assert_eq!(
+                problems,
+                [format!(
+                    "settings: {} and pause sharing, resume (press twice) are on one key, Ctrl+Shift+F10; pause sharing, resume (press twice) goes to Ctrl+Shift+F9",
+                    action.name()
+                )]
+            );
+            assert_eq!(
+                gave_way,
+                [GaveWay {
+                    action: Action::PauseShare,
+                    was: spare,
+                    with: action,
+                    with_was: spare,
+                    now: Action::PauseShare.default_chord(),
+                    with_now: spare,
+                }]
+            );
+        }
+
+        let (mut settings, mut problems) = parse(
+            b"hotkey_push_to_talk = F9\nhotkey_mute = Ctrl+Shift+F10\nhotkey_pause_share = Ctrl+Shift+F10\n",
+        );
+        let gave_way = settle_hotkeys(&mut settings, &mut problems);
+        let next: Chord = "Ctrl+Shift+F12".parse().unwrap();
+        let mut expected = Bindings::default();
+        expected.set(Action::PushToTalk, "F9".parse().unwrap());
+        expected.set(Action::Mute, spare);
+        expected.set(Action::PauseShare, next);
+        assert_eq!(settings.hotkeys(), expected);
+        assert_eq!(settings.hotkeys().first_conflict(), None);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(
+            gave_way,
+            [GaveWay {
+                action: Action::PauseShare,
+                was: spare,
+                with: Action::Mute,
+                with_was: spare,
+                now: next,
+                with_now: spare,
+            }]
+        );
+    }
+
+    // Push to talk or the panic key, and pausing on a chord of its key with
+    // more modifiers, both go back, and the other of the two on F9 keeps
+    // pausing off its default. Pausing then does not move on to the key the
+    // first just left, or only that one would have given way.
+    #[test]
+    fn a_new_action_takes_no_key_given_up_over_it() {
+        for (key, on_f9) in [
+            (HOTKEY_PUSH_TO_TALK, HOTKEY_PANIC),
+            (HOTKEY_PANIC, HOTKEY_PUSH_TO_TALK),
+        ] {
+            let (mut settings, mut problems) = parse(
+                format!(
+                    "{on_f9} = F9\n{key} = Ctrl+Shift+F10\nhotkey_pause_share = Ctrl+Shift+Alt+F10\n"
+                )
+                .as_bytes(),
+            );
+            let gave_way = settle_hotkeys(&mut settings, &mut problems);
+            let (action, other) = (hotkey_action(key).unwrap(), hotkey_action(on_f9).unwrap());
+            let (f9, next): (Chord, Chord) =
+                ("F9".parse().unwrap(), "Ctrl+Shift+F12".parse().unwrap());
+            let mut expected = Bindings::default();
+            expected.set(other, f9);
+            expected.set(Action::PauseShare, next);
+            assert_eq!(settings.hotkeys(), expected, "{key}");
+            assert_eq!(settings.hotkeys().first_conflict(), None);
+            assert_eq!(problems.len(), 2, "{problems:?}");
+            assert_eq!(
+                gave_way,
+                [
+                    GaveWay {
+                        action,
+                        was: "Ctrl+Shift+F10".parse().unwrap(),
+                        with: Action::PauseShare,
+                        with_was: "Ctrl+Shift+Alt+F10".parse().unwrap(),
+                        now: action.default_chord(),
+                        with_now: next,
+                    },
+                    GaveWay {
+                        action: Action::PauseShare,
+                        was: Action::PauseShare.default_chord(),
+                        with: other,
+                        with_was: f9,
+                        now: next,
+                        with_now: f9,
+                    },
+                ]
+            );
+        }
+    }
+
+    // Each spare is on a key of its own and not any default's, one for each
+    // other action, so with all of them on F keys the last is still free. None
+    // is on F11, which the viewer acts on whatever else is held.
+    #[test]
+    fn a_new_action_always_finds_a_free_key() {
+        let spares: Vec<Chord> = SPARE_CHORDS
+            .into_iter()
+            .map(|text| text.parse().unwrap())
+            .collect();
+        let mut keys: Vec<_> = spares.iter().map(|spare| spare.key).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), spares.len());
+        for action in Action::ALL {
+            assert!(!keys.contains(&action.default_chord().key));
+        }
+        assert!(!keys.contains(&input::Key::F11));
+        assert!(spares.len() >= Action::ALL.len() - 1);
+
+        let (settings, problems) = settled(
+            b"hotkey_push_to_talk = F9\nhotkey_mute = Ctrl+Shift+F10\nhotkey_deafen = Ctrl+Shift+F12\nhotkey_share = Ctrl+Shift+F8\nhotkey_panic = Ctrl+Shift+F7\nhotkey_show_panel = Ctrl+Shift+F6\nhotkey_stats_panel = Ctrl+Shift+F5\n",
+        );
+        assert_eq!(
+            settings.hotkeys().chord(Action::PauseShare).to_string(),
+            "Ctrl+Shift+F3"
+        );
+        assert_eq!(settings.hotkeys().first_conflict(), None);
+        assert_eq!(problems.len(), 1, "{problems:?}");
     }
 
     #[test]

@@ -163,6 +163,28 @@ fn the_panic_key_takes_its_key_under_more_modifiers() {
     assert_eq!(Action::Panic.name(), "panic key");
 }
 
+// An action left out clashes with nothing, and what it hid is found.
+#[test]
+fn a_conflict_found_without_some_actions() {
+    let mut bindings = Bindings::default();
+    bindings.set(Action::PushToTalk, chord("F9"));
+    assert_eq!(
+        bindings.first_conflict(),
+        Some((Action::PushToTalk, Action::PauseShare))
+    );
+    assert_eq!(bindings.first_conflict_without(&[Action::PauseShare]), None);
+    bindings.set(Action::StatsPanel, chord("Alt+F9"));
+    assert_eq!(
+        bindings.first_conflict_without(&[Action::PauseShare]),
+        Some((Action::PushToTalk, Action::StatsPanel))
+    );
+    assert_eq!(bindings.first_conflict_without(&[Action::PushToTalk]), None);
+    assert_eq!(
+        bindings.first_conflict_without(&[]),
+        bindings.first_conflict()
+    );
+}
+
 // Raw Input hears these like any other keys, but Windows acts on them first,
 // mostly by moving to another window, so settings does not take them.
 #[test]
