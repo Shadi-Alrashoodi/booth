@@ -21,8 +21,8 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteObject, FillRect, GetMonitorInfoW, HBRUSH, HDC, HMONITOR,
-    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
-    MonitorFromWindow, ScreenToClient,
+    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
+    MonitorFromPoint, MonitorFromRect, MonitorFromWindow, ScreenToClient,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -533,6 +533,9 @@ thread_local! {
 struct Saved {
     placement: WINDOWPLACEMENT,
     style: isize,
+    // Where the window was on the screen, which the placement does not hold
+    // for a window snapped to a side of its monitor.
+    rect: RECT,
 }
 
 fn run(
@@ -978,9 +981,18 @@ fn enter_fullscreen(hwnd: HWND, shared: &Shared) {
     if unsafe { GetWindowPlacement(hwnd, &mut placement) }.is_err() {
         return;
     }
+    let Some(rect) = window_rect(hwnd) else {
+        return;
+    };
     // SAFETY: a live window.
     let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
-    SAVED.with(|saved| saved.set(Some(Saved { placement, style })));
+    SAVED.with(|saved| {
+        saved.set(Some(Saved {
+            placement,
+            style,
+            rect,
+        }))
+    });
     shared.fullscreen.store(true, Ordering::Release);
     // Not maximized either: Restore in the system menu would put a maximized
     // one back at its old size while it is still borderless and fullscreen.
@@ -1043,6 +1055,7 @@ fn leave_fullscreen(hwnd: HWND, shared: &Shared) {
         return;
     };
     shared.fullscreen.store(false, Ordering::Release);
+    let normal = saved.placement.showCmd == SW_SHOWNORMAL.0 as u32;
     quietly(hwnd, &mut saved.placement);
     // SAFETY: a live window, its own earlier style and placement.
     unsafe {
@@ -1063,6 +1076,9 @@ fn leave_fullscreen(hwnd: HWND, shared: &Shared) {
                 | SWP_NOACTIVATE,
         );
     }
+    if normal {
+        back_to(hwnd, saved.rect);
+    }
 }
 
 // SetWindowPlacement shows the window with the saved command, which would
@@ -1078,6 +1094,30 @@ fn quietly(hwnd: HWND, placement: &mut WINDOWPLACEMENT) {
     } else if placement.showCmd == SW_SHOWMINIMIZED.0 as u32 {
         placement.showCmd = SW_SHOWMINNOACTIVE.0 as u32;
     }
+}
+
+// Puts a window that was neither maximized nor minimized back where it was
+// on the screen, after SetWindowPlacement. A window snapped to a side of its
+// monitor counts as neither, and its placement holds where it was before the
+// snap. Not when no monitor shows `rect` now: SetWindowPlacement has brought
+// the window onto one.
+fn back_to(hwnd: HWND, rect: RECT) {
+    // SAFETY: a plain lookup.
+    if unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONULL) }.is_invalid() {
+        return;
+    }
+    // SAFETY: a live window.
+    let _ = unsafe {
+        SetWindowPos(
+            hwnd,
+            None,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE,
+        )
+    };
 }
 
 fn set_small(hwnd: HWND, shared: &Shared, on: bool) {
@@ -1120,6 +1160,9 @@ fn enter_small(hwnd: HWND, shared: &Shared) {
     if unsafe { GetWindowPlacement(hwnd, &mut placement) }.is_err() {
         return;
     }
+    let Some(rect) = window_rect(hwnd) else {
+        return;
+    };
     // SAFETY: getters on a live window.
     let (style, ex_style, dpi) = unsafe {
         (
@@ -1128,7 +1171,13 @@ fn enter_small(hwnd: HWND, shared: &Shared) {
             GetDpiForWindow(hwnd).max(96),
         )
     };
-    SMALL.with(|small| small.set(Some(Saved { placement, style })));
+    SMALL.with(|small| {
+        small.set(Some(Saved {
+            placement,
+            style,
+            rect,
+        }))
+    });
     shared.small.store(true, Ordering::Release);
     // Before the first present the picture's size is not known yet.
     let source = shared.placed().map_or((16, 9), |placed| placed.source);
@@ -1188,6 +1237,7 @@ fn leave_small(hwnd: HWND, shared: &Shared) {
         return;
     };
     shared.small.store(false, Ordering::Release);
+    let normal = saved.placement.showCmd == SW_SHOWNORMAL.0 as u32;
     quietly(hwnd, &mut saved.placement);
     // SAFETY: a live window and its own earlier placement.
     unsafe {
@@ -1201,6 +1251,9 @@ fn leave_small(hwnd: HWND, shared: &Shared) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER | SWP_NOACTIVATE,
         );
         let _ = SetWindowPlacement(hwnd, &saved.placement);
+    }
+    if normal {
+        back_to(hwnd, saved.rect);
     }
 }
 
@@ -1533,8 +1586,9 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 mod tests {
     use windows::Win32::Graphics::Gdi::EnumDisplayMonitors;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GUITHREADINFO, GetGUIThreadInfo, GetSystemMetrics, GetWindowThreadProcessId, SC_RESTORE,
-        SM_CMONITORS, SW_MAXIMIZE, WPF_RESTORETOMAXIMIZED, WS_MINIMIZE,
+        GUITHREADINFO, GetGUIThreadInfo, GetSystemMetrics, GetWindowThreadProcessId, HTTOP,
+        SC_RESTORE, SM_CMONITORS, SW_MAXIMIZE, WM_NCLBUTTONDBLCLK, WPF_RESTORETOMAXIMIZED,
+        WS_MINIMIZE,
     };
 
     use super::*;
@@ -1952,6 +2006,36 @@ mod tests {
         assert_eq!(window_rect(hwnd), Some(whole), "once back");
     }
 
+    // A window that was where no monitor is now, as on a monitor unplugged
+    // while it was fullscreen, comes back where SetWindowPlacement puts it,
+    // on a monitor. Never shown.
+    #[test]
+    fn leaving_fullscreen_never_goes_back_off_every_monitor() {
+        let _screen = crate::tests::one_at_a_time();
+        let window = open(Show::Hidden);
+        let hwnd = window.hwnd();
+        // SAFETY: this test's live window. SetWindowPos returns once the
+        // window's thread has handled the move.
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                None,
+                -30000,
+                -30000,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        }
+        .unwrap();
+        send(hwnd, WM_FULLSCREEN, 1, 0);
+        send(hwnd, WM_FULLSCREEN, 0, 0);
+        let rect = window_rect(hwnd).unwrap();
+        // SAFETY: a plain lookup.
+        let monitor = unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONULL) };
+        assert!(!monitor.is_invalid(), "{rect:?} is on no monitor");
+    }
+
     // A picture far taller than any monitor: small on top stays inside the
     // work area, the strip at its bottom included. Never shown.
     #[test]
@@ -2109,5 +2193,27 @@ mod tests {
         assert_eq!(window_rect(hwnd), Some(whole), "Restore shrank it");
         send(hwnd, WM_FULLSCREEN, 0, 0);
         assert!(maximized(), "not maximized again");
+    }
+
+    // A viewer snapped to its monitor's full height, as a double click on
+    // its top edge does, comes back from fullscreen and from small on top
+    // where it was snapped, not where it was before. On screen for a
+    // moment, over the whole monitor too.
+    #[test]
+    #[ignore]
+    fn a_snapped_window_comes_back_where_it_was() {
+        let _screen = crate::tests::one_at_a_time();
+        for (what, msg) in [("fullscreen", WM_FULLSCREEN), ("small on top", WM_SMALL)] {
+            let window = open(Show::NoActivate);
+            let hwnd = window.hwnd();
+            let before = window_rect(hwnd).unwrap();
+            let edge = (before.top + 2) << 16 | (((before.left + before.right) / 2) & 0xffff);
+            send(hwnd, WM_NCLBUTTONDBLCLK, HTTOP as usize, edge as isize);
+            let snapped = window_rect(hwnd);
+            assert_ne!(snapped, Some(before), "the double click did not snap it");
+            send(hwnd, msg, 1, 0);
+            send(hwnd, msg, 0, 0);
+            assert_eq!(window_rect(hwnd), snapped, "after {what}");
+        }
     }
 }
