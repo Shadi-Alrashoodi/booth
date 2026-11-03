@@ -1262,12 +1262,17 @@ impl Sharer {
         let past_default = size.0 > default.max_width || size.1 > default.max_height;
         if window && past_default && chosen.codec == Codec::H264 {
             self.keep_to_h264_box();
+            audience.line(Line::Log(format!(
+                "the window at {}x{} goes on fitted into {}x{} until a new encoder opens for its picture, which capture keeps within {}x{} as H.264 needs",
+                size.0,
+                size.1,
+                self.size.0,
+                self.size.1,
+                self.options.max_width,
+                self.options.max_height
+            )));
             return Ok(false);
         }
-        audience.line(Line::Say(format!(
-            "the picture went from {}x{} to {}x{}: starting a new encoder",
-            self.size.0, self.size.1, size.0, size.1
-        )));
         let settings = &self.setup.settings;
         let fps = self.fps;
         let encoder = opened
@@ -1276,18 +1281,27 @@ impl Sharer {
         let encoder = match encoder {
             Ok(encoder) => Ok(encoder),
             Err(err) if chosen.codec == Codec::Hevc && self.setup.codec.is_none() => {
-                audience.line(Line::Log(format!(
-                    "HEVC did not open at {}x{}: {err}; going on in H.264",
-                    size.0, size.1
-                )));
                 if let Some(offer) = &mut self.hevc_offer {
                     offer.kind = None;
                     offer.why_not = err.to_string();
                 }
                 if window && past_default {
                     self.keep_to_h264_box();
+                    audience.line(Line::Log(format!(
+                        "HEVC did not open at {}x{}: {err}; the window goes on fitted into {}x{} until a new encoder opens for its picture, which capture keeps within {}x{} as H.264 needs",
+                        size.0,
+                        size.1,
+                        self.size.0,
+                        self.size.1,
+                        self.options.max_width,
+                        self.options.max_height
+                    )));
                     return Ok(false);
                 }
+                audience.line(Line::Log(format!(
+                    "HEVC did not open at {}x{}: {err}; trying H.264",
+                    size.0, size.1
+                )));
                 opened
                     .source
                     .encoder(self.setup.encoder, Codec::H264, size, fps, settings)
@@ -1324,8 +1338,22 @@ impl Sharer {
                 }
                 return Ok(false);
             }
-            Err(why) => return Err(why.to_string()),
+            Err(why) => {
+                audience.line(Line::Log(format!(
+                    "the picture went from {}x{} to {}x{} and no encoder opened for it",
+                    self.size.0, self.size.1, size.0, size.1
+                )));
+                return Err(why.to_string());
+            }
         }
+        audience.line(Line::Say(format!(
+            "the picture went from {}x{} to {}x{}: a new encoder opened in {}",
+            self.size.0,
+            self.size.1,
+            size.0,
+            size.1,
+            opened.encoder.codec()
+        )));
         let codec_changed = current.is_some_and(|was| was != opened.encoder.codec());
         if codec_changed {
             self.switches.changed(now);
@@ -2161,8 +2189,9 @@ mod tests {
     // No GPU encoder takes a monitor's new mode, as when another program holds
     // all of NVENC's sessions, and the software encoder only takes it smaller.
     // At the rate it has, the share takes the fit with no source opened, and
-    // the encoder it has goes on. Faster than the software encoder takes, the
-    // source opens again for the rate and lands on the software encoder.
+    // the encoder it has goes on, which the log does not call a new one.
+    // Faster than the software encoder takes, the source opens again for the
+    // rate and lands on the software encoder.
     #[test]
     fn a_monitor_mode_no_gpu_encoder_takes_goes_on_at_the_fit() {
         let Some((_turn, adapter)) = gpu() else {
@@ -2188,6 +2217,14 @@ mod tests {
         assert_eq!(
             (sharer.options.max_width, sharer.options.max_height),
             (1920, 1080)
+        );
+        assert!(
+            !watching.lines.iter().any(|line| {
+                let (Line::Say(text) | Line::Log(text)) = line;
+                text.starts_with("the picture went from")
+            }),
+            "{:?}",
+            watching.lines
         );
         new_mode(&mut sharer, 2560, 1440);
         sharer
@@ -2227,6 +2264,38 @@ mod tests {
         assert_eq!(watching.sent.len(), 2);
         assert!(watching.sent[1].idr);
         assert_eq!(watching.sent[1].number, 1);
+    }
+
+    // The one GPU encoder a share was set up for does not take a monitor's
+    // new mode, and nothing else may: the share ends, and the log has the
+    // sizes, which the encoder's error does not name.
+    #[test]
+    fn a_monitor_mode_no_encoder_takes_ends_the_share_with_its_sizes() {
+        let Some((_turn, adapter)) = gpu() else {
+            return;
+        };
+        let kind = pattern_share(adapter.clone(), (1920, 1080), None).kind();
+        if kind == Some(Kind::MfSoftware) {
+            println!("skipped: no GPU encoder here to refuse");
+            return;
+        }
+        let mut sharer = pattern_share(adapter, (1920, 1080), kind);
+        let mut watching = Watching::default();
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        encode::fault::refuse_gpu(0);
+        new_mode(&mut sharer, 2560, 1440);
+        let refused = sharer.next(&mut watching);
+        encode::fault::clear();
+        assert!(refused.is_err(), "{:?}", watching.lines);
+        assert!(
+            watching.lines.contains(&Line::Log(String::from(
+                "the picture went from 1920x1080 to 2560x1440 and no encoder opened for it"
+            ))),
+            "{:?}",
+            watching.lines
+        );
     }
 
     // While capture is paused, a change of codec that would open the source

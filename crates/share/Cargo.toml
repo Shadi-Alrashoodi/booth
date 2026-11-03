@@ -28,7 +28,7 @@ fault = []
 
 [dev-dependencies]
 # tests/sharer.rs, tests/window.rs and the tests in src/sharer.rs make the
-# encoders stall, fail and not open.
+# encoders stall, fail, not open and not offer HEVC.
 encode = { workspace = true, features = ["fault"] }
 # The tests in src/sharer.rs say what a look at the desktop finds.
 capture = { workspace = true, features = ["fault"] }

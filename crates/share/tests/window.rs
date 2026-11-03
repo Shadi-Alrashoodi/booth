@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use capture::CursorUpdate;
 use encode::Settings;
 use share::{
-    Audience, Back, Choice, Clock, Kind, Line, PAYLOAD_LAN, RESIZE_SPACING, SWITCH_GAP, Sent,
-    Setup, Sharer, WindowId,
+    Audience, Back, Choice, Clock, Codec, Kind, Line, PAYLOAD_LAN, RESIZE_SPACING, SWITCH_GAP,
+    Sent, Setup, Sharer, WindowId,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -26,10 +26,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, w};
 
-// The tests that put the pointer over their window run alone, the rest side
-// by side: every window here opens at the same place, so the others' windows
-// would be under the pointer too, and one of them keeps the GPU encoders from
-// opening for every share in this process.
+// The tests that put the pointer over their window or keep the GPU encoders
+// from opening run alone, the rest side by side: every window here opens at
+// the same place, so the others' windows would be under the pointer too, and
+// the encoders are kept from opening for every share in this process.
 static ALONE: RwLock<()> = RwLock::new(());
 
 // A window on its own thread, which pumps its messages until it is closed.
@@ -152,7 +152,7 @@ impl Watching {
     fn new_sizes(&self) -> Vec<Instant> {
         self.lines
             .iter()
-            .filter(|(_, text)| text.contains("starting a new encoder"))
+            .filter(|(_, text)| text.contains("a new encoder opened"))
             .map(|(at, _)| *at)
             .collect()
     }
@@ -415,6 +415,7 @@ fn a_pointer_goes_only_with_its_own_picture() {
     }
     let mut watching = Watching::default();
     run(&mut sharer, &mut watching, Duration::from_millis(300));
+    let hevc = sharer.codec() == Some(Codec::Hevc);
     let _faults = Faults;
     encode::fault::refuse_gpu(400);
     resize(window.0, 1280, 720);
@@ -432,6 +433,24 @@ fn a_pointer_goes_only_with_its_own_picture() {
         "{:?}",
         watching.lines
     );
+    // No line says one opened, or that the share went on in H.264.
+    assert!(
+        !watching.lines.iter().any(|(_, text)| {
+            text.starts_with("the picture went from") || text.contains("going on in H.264")
+        }),
+        "{:?}",
+        watching.lines
+    );
+    // In HEVC, that HEVC did not open and H.264 is tried.
+    assert!(
+        !hevc
+            || watching.lines.iter().any(|(_, text)| {
+                text.starts_with("HEVC did not open at 1280x720: ")
+                    && text.ends_with("; trying H.264")
+            }),
+        "{:?}",
+        watching.lines
+    );
     // Scaled by half into the frame from the first fitted picture on.
     let fitted = watching
         .cursors
@@ -443,6 +462,80 @@ fn a_pointer_goes_only_with_its_own_picture() {
         .map(|(update, with_picture)| (update.scale, *with_picture))
         .collect();
     assert!(after.iter().all(|&(scale, _)| scale < 0.9), "{after:?}");
+}
+
+// A window in HEVC under a 4K limit grown past H.264's box, at a size where
+// HEVC does not open, or is not offered: capture keeps the window within the
+// box, it goes on fitted into the share's frame, and its picture within the
+// box goes out through a new encoder in HEVC. The log says HEVC did not open
+// there, or was not offered, that the window goes on fitted, and that the new
+// encoder opened in HEVC; it never says "going on in H.264".
+#[test]
+fn a_window_past_h264s_box_without_hevc_goes_on_fitted() {
+    let _turn = ALONE.write().unwrap_or_else(|p| p.into_inner());
+    let Some(adapter) = adapter() else { return };
+    for offered in [true, false] {
+        let window = Window::with_style(WS_POPUP, 640, 360);
+        let mut sharer = open(&window, adapter.clone());
+        if sharer.kind() != Some(Kind::Nvenc) || sharer.codec() != Some(Codec::Hevc) {
+            println!("skipped: no NVENC here to share in HEVC with");
+            return;
+        }
+        let four_k = capture::Options {
+            max_width: 4096,
+            max_height: 2160,
+            max_fps: 120,
+        };
+        sharer
+            .set_limit(four_k, &mut |_| {})
+            .unwrap_or_else(|err| panic!("{err}"));
+        let mut watching = Watching::default();
+        run(&mut sharer, &mut watching, Duration::from_millis(300));
+        let _faults = Faults;
+        if offered {
+            encode::fault::refuse_gpu(1440);
+        } else {
+            encode::fault::refuse_hevc_offer(1440);
+        }
+        resize(window.0, 2560, 1600);
+        run(
+            &mut sharer,
+            &mut watching,
+            RESIZE_SPACING + Duration::from_millis(800),
+        );
+        let said = |text: &str| watching.lines.iter().any(|(_, line)| line.contains(text));
+        let refused = if offered {
+            "HEVC did not open at 2560x1600"
+        } else {
+            "no HEVC at 2560x1600"
+        };
+        assert!(said(refused), "{:?}", watching.lines);
+        assert!(
+            said("goes on fitted into 640x360 until a new encoder opens"),
+            "{:?}",
+            watching.lines
+        );
+        assert!(!said("going on in H.264"), "{:?}", watching.lines);
+        assert!(
+            !said("the picture went from 640x360 to 2560x1600"),
+            "{:?}",
+            watching.lines
+        );
+        let (width, height) = sharer.size();
+        assert_eq!(
+            (height, sharer.codec()),
+            (1440, Some(Codec::Hevc)),
+            "{:?}",
+            watching.lines
+        );
+        assert!(
+            said(&format!(
+                "the picture went from 640x360 to {width}x{height}: a new encoder opened in HEVC"
+            )),
+            "{:?}",
+            watching.lines
+        );
+    }
 }
 
 // On Windows' software encoder a window that grows past 1080p goes on within

@@ -16,6 +16,7 @@ struct Faults {
     software_fails: Option<u64>,
     software_refused: bool,
     gpu_refuses_past: Option<u32>,
+    hevc_offered_to: Option<u32>,
 }
 
 static FAULTS: Mutex<Faults> = Mutex::new(Faults {
@@ -24,6 +25,7 @@ static FAULTS: Mutex<Faults> = Mutex::new(Faults {
     software_fails: None,
     software_refused: false,
     gpu_refuses_past: None,
+    hevc_offered_to: None,
 });
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static LIVE_AT_LAST_OPEN: AtomicUsize = AtomicUsize::new(0);
@@ -75,6 +77,13 @@ pub fn refuse_gpu(height: u32) {
     faults().gpu_refuses_past = Some(height);
 }
 
+/// [`crate::offer`] gives no encoder for HEVC at a picture taller than
+/// `height` from now on, until clear(), as NVENC does past the top level its
+/// driver reports.
+pub fn refuse_hevc_offer(height: u32) {
+    faults().hevc_offered_to = Some(height);
+}
+
 /// Takes back faults set and not used yet, for a test that ended early.
 pub fn clear() {
     *faults() = Faults::default();
@@ -102,6 +111,10 @@ pub(crate) fn take_software_refusal() -> bool {
 
 pub(crate) fn gpu_refuses(height: u32) -> bool {
     faults().gpu_refuses_past.is_some_and(|most| height > most)
+}
+
+pub(crate) fn hevc_offer_refused(height: u32) -> bool {
+    faults().hevc_offered_to.is_some_and(|most| height > most)
 }
 
 /// Media Foundation hardware encoders started and not yet shut down with

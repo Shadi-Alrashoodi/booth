@@ -26,7 +26,8 @@ windows = { workspace = true, features = [
 # Tests only (share's and room's tests turn it on): the faults in
 # src/fault.rs, which let a test make a real Media Foundation hardware
 # encoder stop asking for frames, a real NVENC or software encoder fail a
-# frame, and the GPU's encoders not open. A release build never has it.
+# frame, the GPU's encoders not open, and HEVC not be offered. A release
+# build never has it.
 fault = []
 
 [build-dependencies]

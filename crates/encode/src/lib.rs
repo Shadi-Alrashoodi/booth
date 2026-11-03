@@ -474,6 +474,13 @@ pub fn offer(
         ));
         return Ok(offer);
     }
+    #[cfg(feature = "fault")]
+    if codec == Codec::Hevc && fault::hevc_offer_refused(height) {
+        offer
+            .refused
+            .push(String::from("this test keeps HEVC from being offered"));
+        return Ok(offer);
+    }
     for kind in Kind::ALL {
         let answer = match kind {
             Kind::Nvenc if adapter.vendor != gpu::NVIDIA => {
