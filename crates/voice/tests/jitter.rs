@@ -1352,6 +1352,93 @@ fn assert_starts_from_a_reset_decoder(listener: &Listener, spell: &[Sent], blend
     }
 }
 
+// A word that ends and the next one that starts within the buffer's depth:
+// the second is in before the first has played out, and its packets take over
+// the newest number, but the end mark still resets the decoder there.
+#[test]
+fn a_transmission_queued_behind_an_end_mark_starts_clean() {
+    let mut first = talk(&[(Mode::LowDelay, &tone(0.5))], 0, 0, true);
+    first.last_mut().unwrap().last = true;
+    let end = first.last().unwrap().sent_at;
+    let second = talk(
+        &[(Mode::LowDelay, &tone(0.5))],
+        first.len() as u16,
+        end,
+        true,
+    );
+    let mut sent = first.clone();
+    sent.extend(second.iter().cloned());
+    let mut listener = Listener::new();
+    listener.run(&sent, &on_time(&sent), end + SECOND / 2 + 2 * TICK, always);
+    for packet in &sent {
+        assert_eq!(listener.played_at(packet.seq), Some(packet.sent_at + TICK));
+    }
+    let stats = listener.stats();
+    assert_eq!((stats.lost, stats.late, stats.concealed), (0, 0, 0));
+    assert_starts_from_a_reset_decoder(&listener, &second, 1);
+    listener.assert_in_order();
+    listener.assert_no_clicks();
+}
+
+// The same with the end mark read from a late packet, whose frame is decoded
+// for the decoder's sake before the reset, not after it.
+#[test]
+fn an_end_mark_read_late_still_starts_the_next_transmission_clean() {
+    let mut first = low_delay(&tone(0.5), 0);
+    first.last_mut().unwrap().last = true;
+    let end = first.last().unwrap().sent_at;
+    let second = talk(
+        &[(Mode::LowDelay, &tone(0.5))],
+        first.len() as u16,
+        end,
+        false,
+    );
+    let mut sent = first.clone();
+    sent.extend(second.iter().cloned());
+    let mut arrive = on_time(&sent);
+    arrive[first.len() - 1] = Some(end + 1);
+    let mut listener = Listener::new();
+    listener.run(&sent, &arrive, end + SECOND / 2 + TICK, always);
+    for packet in &second {
+        assert_eq!(listener.played_at(packet.seq), Some(packet.sent_at));
+    }
+    let stats = listener.stats();
+    assert_eq!((stats.late, stats.late_decoded, stats.lost), (1, 1, 0));
+    assert_starts_from_a_reset_decoder(&listener, &second, 1);
+    listener.assert_in_order();
+    listener.assert_no_clicks();
+}
+
+// The first frame after the end mark is the late one. The decoder resets before
+// it, so the frames after it decode from the history the talker's encoder had.
+#[test]
+fn a_late_first_frame_behind_an_end_mark_is_decoded_after_the_reset() {
+    let mut first = low_delay(&tone(1.0), 0);
+    first.last_mut().unwrap().last = true;
+    let end = first.last().unwrap().sent_at;
+    let second = talk(
+        &[(Mode::LowDelay, &tone(0.5))],
+        first.len() as u16,
+        end,
+        false,
+    );
+    let mut sent = first.clone();
+    sent.extend(second.iter().cloned());
+    let mut arrive = on_time(&sent);
+    for i in [100, 110, 120, 130, 140] {
+        arrive[i] = Some(sent[i].sent_at + TICK);
+    }
+    arrive[first.len()] = Some(second[0].sent_at + TICK + 1);
+    let mut listener = Listener::new();
+    listener.run(&sent, &arrive, end + SECOND / 2 + 2 * TICK, always);
+    let stats = listener.stats();
+    assert_eq!((stats.late, stats.late_decoded, stats.lost), (6, 6, 0));
+    assert_eq!(stats.depth_frames, 2);
+    assert_starts_from_a_reset_decoder(&listener, &second, 2);
+    listener.assert_in_order();
+    listener.assert_no_clicks();
+}
+
 // The talker's last packet comes after its frame was made up. The word still
 // ends on its own frame instead of timing out, the next one starts from a
 // reset decoder, and a frame that arrived is not a loss.
@@ -1712,6 +1799,145 @@ fn a_stall_over_the_switch_after_a_time_out_counts_the_same() {
     assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Packet(8));
     let stats = buffer.stats();
     assert_eq!((stats.frame_ms, stats.dropped, stats.lost), (10, 6, 0));
+}
+
+// The first frame behind an end mark is lost and rebuilt from the repair data
+// of the second. The rebuild starts from the reset, and the frames after it
+// follow it, as they did in the talker's encoder.
+#[test]
+fn a_first_frame_rebuilt_behind_an_end_mark_starts_from_the_reset() {
+    let mut first = talk(&[(Mode::Repair, &tone(0.5))], 0, 0, false);
+    first.last_mut().unwrap().last = true;
+    let end = first.last().unwrap().sent_at;
+    let second = talk(
+        &[(Mode::Repair, &tone(0.5))],
+        first.len() as u16,
+        end,
+        false,
+    );
+    let mut sent = first.clone();
+    sent.extend(second.iter().cloned());
+    let mut arrive = on_time(&sent);
+    arrive[first.len()] = None;
+    let mut listener = Listener::new();
+    listener.run(&sent, &arrive, end + SECOND / 2 + 4 * TICK, always);
+    assert!(
+        listener
+            .sources()
+            .contains(&Source::Repaired(second[0].seq))
+    );
+
+    let mut decoder = Decoder::new().unwrap();
+    let mut fresh = [0f32; MAX_FRAME];
+    decoder.recover(&second[1].frame, 480, &mut fresh).unwrap();
+    for packet in &second[1..] {
+        let len = decoder.decode(&packet.frame, &mut fresh).unwrap();
+        let heard = listener
+            .heard
+            .iter()
+            .find(|heard| heard.pulled.map(|p| p.source) == Some(Source::Packet(packet.seq)))
+            .unwrap();
+        assert_eq!(heard.audio, fresh[..len], "seq {}", packet.seq);
+    }
+    let stats = listener.stats();
+    assert_eq!((stats.repaired, stats.concealed, stats.lost), (1, 0, 1));
+    listener.assert_no_clicks();
+}
+
+// A spell of two frames between two others, all of it queued: the decoder
+// resets at each boundary, not only at the newest.
+#[test]
+fn every_end_mark_queued_gets_its_reset() {
+    let mut first = low_delay(&tone(0.02), 0);
+    first.last_mut().unwrap().last = true;
+    let mut second = low_delay(&tone(0.01), first.len() as u16);
+    second.last_mut().unwrap().last = true;
+    let third = low_delay(&tone(0.02), (first.len() + second.len()) as u16);
+    let mut sent = first.clone();
+    sent.extend(second.iter().cloned());
+    sent.extend(third.iter().cloned());
+
+    let mut buffer = JitterBuffer::new().unwrap();
+    let mut frame = [0f32; MAX_FRAME];
+    buffer.push(sent[0].packet()).unwrap();
+    assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Packet(0));
+    for packet in &sent[1..] {
+        buffer.push(packet.packet()).unwrap();
+    }
+    let mut heard = vec![Vec::new()];
+    for packet in &sent[1..] {
+        let pulled = buffer.pull(&mut frame).unwrap();
+        assert_eq!(pulled.source, Source::Packet(packet.seq));
+        heard.push(frame[..pulled.samples].to_vec());
+    }
+    let after_first = &heard[first.len()..];
+    assert_eq!(after_first[1], decoded_fresh(&second)[1]);
+    assert_eq!(after_first[second.len() + 1], decoded_fresh(&third)[1]);
+    assert_eq!(buffer.stats().lost, 0);
+}
+
+// The talker's last packet and the next word's first are both late, and the
+// last comes when both stand-ins have played. Nothing has been decoded since
+// it, so the decoder still resets before the word goes on.
+#[test]
+fn a_late_end_mark_behind_two_stand_ins_still_resets() {
+    let mut first = low_delay(&tone(0.5), 0);
+    first.last_mut().unwrap().last = true;
+    let end = first.last().unwrap().sent_at;
+    let second = talk(
+        &[(Mode::LowDelay, &tone(0.5))],
+        first.len() as u16,
+        end,
+        false,
+    );
+    let mut sent = first.clone();
+    sent.extend(second.iter().cloned());
+    let mut arrive = on_time(&sent);
+    arrive[first.len() - 1] = Some(end + TICK + 1);
+    arrive[first.len()] = None;
+    let mut listener = Listener::new();
+    listener.run(&sent, &arrive, end + SECOND / 2 + TICK, always);
+    assert_starts_from_a_reset_decoder(&listener, &second[1..], 1);
+    listener.assert_in_order();
+    listener.assert_no_clicks();
+}
+
+// The last packet comes after the next word's first frame has been decoded.
+// That word is under way, so it hears the same as if the packet never came.
+#[test]
+fn a_late_end_mark_past_a_decoded_frame_resets_nothing() {
+    let mut first = low_delay(&tone(0.5), 0);
+    first.last_mut().unwrap().last = true;
+    let end = first.last().unwrap().sent_at;
+    let second = talk(
+        &[(Mode::LowDelay, &tone(0.5))],
+        first.len() as u16,
+        end,
+        false,
+    );
+    let mut sent = first.clone();
+    sent.extend(second.iter().cloned());
+    let listen = |last_arrives: Option<u64>| {
+        let mut arrive = on_time(&sent);
+        arrive[first.len() - 1] = last_arrives;
+        let mut listener = Listener::new();
+        listener.run(&sent, &arrive, end + SECOND / 2 + TICK, always);
+        listener
+    };
+    let came = listen(Some(end + TICK + 1));
+    let never = listen(None);
+    assert_eq!(came.stats().late, 1);
+    for packet in &second {
+        let audio = |listener: &Listener| {
+            let source = Some(Source::Packet(packet.seq));
+            let heard = listener
+                .heard
+                .iter()
+                .find(|heard| heard.pulled.map(|p| p.source) == source);
+            heard.unwrap().audio.clone()
+        };
+        assert_eq!(audio(&came), audio(&never), "seq {}", packet.seq);
+    }
 }
 
 // Three frames deep with a frame to spare, so the check has lowered the target

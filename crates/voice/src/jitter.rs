@@ -192,6 +192,11 @@ pub struct JitterBuffer {
     period: usize,
     newest: Option<i64>,
     ends_after: Option<i64>,
+    // The end marks with their next frame not decoded yet, placed like the
+    // slots. The next transmission's packets can arrive before playing reaches
+    // one, and they replace `ends_after`, but its first frame still has to
+    // start from a reset decoder.
+    ended_at: [Option<i64>; SLOTS],
     // The newest frame accepted after its stand-in had played. It stays out of
     // `newest`, so that a delay step still times out and starts again soon.
     late_newest: Option<i64>,
@@ -269,6 +274,7 @@ impl JitterBuffer {
             period: 0,
             newest: None,
             ends_after: None,
+            ended_at: [None; SLOTS],
             late_newest: None,
             redundancy: false,
             timed_out: false,
@@ -366,6 +372,9 @@ impl JitterBuffer {
         }
         self.store(ext, Held::Primary, packet.frame, info);
         self.see(ext);
+        if packet.last {
+            self.mark_end(ext);
+        }
         if self.newest.is_none_or(|newest| ext > newest) {
             self.newest = Some(ext);
             self.redundancy = packet.redundancy || packet.previous.is_some();
@@ -647,8 +656,9 @@ impl JitterBuffer {
         if !timed_out {
             // The talker said it stopped, so its next transmission starts
             // from a reset encoder; a decoder still holding this one's tail
-            // would put a seam into that transmission's first frames. After
-            // an outage the talker's encoder carried on, and so does this.
+            // would put a seam into that transmission's first frames. With no
+            // end mark the talker's encoder is taken to have carried on
+            // through an outage, and so does this.
             let _ = self.decoder.reset();
         }
     }
@@ -658,6 +668,7 @@ impl JitterBuffer {
         self.late = EMPTY_SLOT;
         self.made_up = false;
         self.phase = Phase::Idle;
+        self.ended_at = [None; SLOTS];
         self.late_newest = None;
         self.audible = false;
         self.fade_in = true;
@@ -675,9 +686,16 @@ impl JitterBuffer {
         self.see(ext);
         self.stats.late += 1;
         self.late_newest = self.late_newest.max(Some(ext));
-        if last && self.newest.is_none_or(|newest| ext > newest) {
-            self.newest = Some(ext);
-            self.ends_after = Some(ext);
+        if last {
+            if self.newest.is_none_or(|newest| ext > newest) {
+                self.newest = Some(ext);
+                self.ends_after = Some(ext);
+            }
+            // Stand-ins may have played since it. Any later and a frame past it
+            // has been decoded already.
+            if ext >= self.play - 1 - i64::from(self.missing_run) {
+                self.mark_end(ext);
+            }
         }
         self.record(ext, info.samples);
         // Its stand-in has played, so it never plays itself. Decoded before
@@ -708,6 +726,7 @@ impl JitterBuffer {
         if !self.late_in_reach(late.ext, late.samples) {
             return false;
         }
+        self.cross_end_mark(late.ext);
         let mut unplayed = [0f32; MAX_FRAME];
         let decoded = self
             .decoder
@@ -942,7 +961,14 @@ impl JitterBuffer {
 
         // The blend carries on from what played, so it is made before a late
         // frame moves the decoder on to the talker's own audio.
-        let blending = std::mem::take(&mut self.blend);
+        // So is the one from the talker's last frame into their next
+        // transmission, which the reset decoder starts from nothing. With no
+        // frame to decode or rebuild yet, the tail is still concealed from the
+        // old history.
+        let crossing = self.audible
+            && (self.slot(self.play).is_some() || self.can_rebuild(self.play))
+            && self.end_mark_before(self.play);
+        let blending = std::mem::take(&mut self.blend) || crossing;
         if blending && self.decoder.conceal(self.frame, &mut self.scratch).is_err() {
             self.scratch.fill(0.0);
         }
@@ -1102,6 +1128,7 @@ impl JitterBuffer {
         let seq = ext as u16;
         if let Some(slot) = self.slot(ext) {
             let slot = *slot;
+            self.cross_end_mark(ext);
             self.decoder
                 .decode(&slot.bytes[..slot.len], out)
                 .ok()
@@ -1113,15 +1140,40 @@ impl JitterBuffer {
                 Source::Packet(seq)
             });
         }
-        let next = *self.slot(ext + 1)?;
-        if next.held != Held::Primary || !next.repair || next.samples != self.frame {
+        if !self.can_rebuild(ext) {
             return None;
         }
+        let next = *self.slot(ext + 1)?;
+        self.cross_end_mark(ext);
         self.decoder
             .recover(&next.bytes[..next.len], self.frame, out)
             .ok()?;
         self.stats.repaired += 1;
         Some(Source::Repaired(seq))
+    }
+
+    fn can_rebuild(&self, ext: i64) -> bool {
+        self.slot(ext + 1).is_some_and(|next| {
+            next.held == Held::Primary && next.repair && next.samples == self.frame
+        })
+    }
+
+    fn mark_end(&mut self, ext: i64) {
+        let mark = &mut self.ended_at[ext.rem_euclid(SLOTS as i64) as usize];
+        *mark = (*mark).max(Some(ext));
+    }
+
+    fn end_mark_before(&self, ext: i64) -> bool {
+        self.ended_at.iter().flatten().any(|&ended| ended < ext)
+    }
+
+    // The first frame past the talker's end mark starts from a reset decoder,
+    // as their encoder did.
+    fn cross_end_mark(&mut self, ext: i64) {
+        if self.end_mark_before(ext) {
+            self.ended_at = self.ended_at.map(|mark| mark.filter(|&ended| ended >= ext));
+            let _ = self.decoder.reset();
+        }
     }
 
     // The talker changed mode in the middle of a transmission. The depth is
