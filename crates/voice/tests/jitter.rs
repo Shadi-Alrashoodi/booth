@@ -1707,6 +1707,42 @@ fn a_cancelled_trim_keeps_the_depth_for_the_next_transmission() {
     assert_eq!((stats.frame_ms, stats.depth_frames), (10, 3));
 }
 
+// Nothing before the first packet was ever sent to us, whether the talker is
+// first heard while deafened or two packets come before the first pull.
+#[test]
+fn numbers_before_the_first_packet_are_not_lost() {
+    let sent = low_delay(&tone(0.2), 100);
+    let mut frame = [0f32; MAX_FRAME];
+
+    let mut buffer = JitterBuffer::new().unwrap();
+    buffer.pause();
+    for packet in &sent[..20] {
+        buffer.push(packet.packet()).unwrap();
+        buffer.pause();
+    }
+    let stats = buffer.stats();
+    assert_eq!((stats.lost, stats.loss_percent), (0, 0.0));
+    buffer.push(sent[20].packet()).unwrap();
+    assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Packet(120));
+    let stats = buffer.stats();
+    assert_eq!((stats.lost, stats.dropped, stats.loss_percent), (0, 0, 0.0));
+
+    let mut buffer = JitterBuffer::new().unwrap();
+    buffer.push(sent[0].packet()).unwrap();
+    buffer.push(sent[1].packet()).unwrap();
+    assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Packet(101));
+    for packet in &sent[2..20] {
+        buffer.push(packet.packet()).unwrap();
+        assert_eq!(
+            buffer.pull(&mut frame).unwrap().source,
+            Source::Packet(packet.seq)
+        );
+    }
+    let stats = buffer.stats();
+    assert_eq!((stats.lost, stats.dropped), (0, 1));
+    assert_eq!((stats.loss_percent, stats.scattered_percent), (0.0, 0.0));
+}
+
 // The render side stalls in the 10 ms mode while the talker moves to 5 ms
 // frames, past what the shorter frames' own cap allows: playing starts again
 // from the newest instead of running over slots still to play.

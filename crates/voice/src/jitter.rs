@@ -382,8 +382,12 @@ impl JitterBuffer {
             // Anything a cap behind the newest packet cannot survive the
             // restart, so it is judged now, while it is still remembered, and
             // let go, so a buffer nobody pulls never holds more than the cap.
+            // Before the first pull there is nothing to judge: the numbers
+            // before the first packet were never sent to us.
             let oldest_kept = newest - self.cap() + 1;
-            self.judge_through(oldest_kept - 1, self.timed_out);
+            if self.last_change.is_some() {
+                self.judge_through(oldest_kept - 1, self.timed_out);
+            }
             self.discard_before(oldest_kept, !self.timed_out && !self.paused);
         }
         Ok(())
@@ -393,9 +397,10 @@ impl JitterBuffer {
     // it pulls again. What is held would come out then as old speech, so it
     // goes, uncounted, and so does what the decoder remembers: the next pull
     // starts at the depth kept, from silence, with the last period's packets
-    // at most. Their numbers are still judged as packets arrive. A buffer that
-    // timed out before this would otherwise count everything the talker says
-    // next as lost, since nothing tells it the time is passing.
+    // at most. Their numbers are still judged as packets arrive, once it has
+    // played. A buffer that timed out before this would otherwise count
+    // everything the talker says next as lost, since nothing tells it the time
+    // is passing.
     pub fn pause(&mut self) {
         if self.phase != Phase::Idle {
             self.let_go();
