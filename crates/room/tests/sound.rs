@@ -1219,6 +1219,14 @@ fn a_capture_that_cannot_start_turns_share_sound_off() {
     watches(&ana, share);
     watched_by(&host, 1);
     host.room().share_sound(true);
+    // From the press: a share's first word goes at once, so an on told
+    // before the capture failed would show here, and the off taking it back
+    // only after the 250 ms the host leaves between two words.
+    ana.member.holds_for(
+        Duration::from_millis(500),
+        "Ana told the sound is on",
+        |v| v.share.watched_sound != Some(true),
+    );
     let view = host.member.wait_for(WAIT, "Share sound off and why", |v| {
         !v.share.own_sound.on && v.share.problem.is_some()
     });
@@ -1233,11 +1241,6 @@ fn a_capture_that_cannot_start_turns_share_sound_off() {
     ana.member.wait_for(WAIT, "Ana told off at her Watch", |v| {
         v.share.watched_sound == Some(false)
     });
-    ana.member.holds_for(
-        Duration::from_millis(300),
-        "Ana told the sound is on",
-        |v| v.share.watched_sound != Some(true),
-    );
     assert_eq!(ana.view().numbers.dropped_bad, 0);
 }
 
