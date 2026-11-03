@@ -1135,6 +1135,9 @@ fn enter_small(hwnd: HWND, shared: &Shared) {
     };
     let (outer_w, outer_h) = (frame.right - frame.left, frame.bottom - frame.top);
     let margin = SMALL_MARGIN * dpi as i32 / 96;
+    // Never taller than the work area less the margins: a tall picture
+    // gets bars at its sides instead.
+    let outer_h = outer_h.min(work.bottom - work.top - 2 * margin);
     let x = (work.right - outer_w - margin).max(work.left);
     let y = (work.bottom - outer_h - margin).max(work.top);
     // SAFETY: a live window. Only SW_RESTORE brings a maximized or minimized
@@ -1883,5 +1886,29 @@ mod tests {
         }
         assert!(!minimized());
         assert_eq!(window_rect(hwnd), Some(whole), "once back");
+    }
+
+    // A picture far taller than any monitor: small on top stays inside the
+    // work area, the strip at its bottom included. Never shown.
+    #[test]
+    fn small_on_top_stays_inside_the_work_area() {
+        let _screen = crate::tests::one_at_a_time();
+        let window = open(Show::Hidden);
+        let hwnd = window.hwnd();
+        window.shared().set_placed(Some(Placement {
+            left: 0,
+            top: 0,
+            width: 620,
+            height: 180,
+            source: (200, 4000),
+        }));
+        send(hwnd, WM_SMALL, 1, 0);
+        assert!(window.shared().small());
+        let (_, work) = monitor_of(hwnd);
+        let small = window_rect(hwnd).unwrap();
+        assert!(
+            small.top >= work.top && small.bottom <= work.bottom,
+            "{small:?} in the work area {work:?}"
+        );
     }
 }
