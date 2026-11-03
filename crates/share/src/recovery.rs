@@ -52,8 +52,9 @@ const IDR_AFTER_FAILURES: u32 = 3;
 // running out, which a game can cause for a moment.
 const REFUSALS_TO_STOP: u32 = 3;
 
-// Frames in one recover request are checked one by one. A request this
-// long only comes after an outage, and its first frames are enough.
+// Frames in one recover request are checked one by one, from the first no
+// earlier answer covers. A request this long only comes after an outage,
+// and the first frames from there are enough.
 const MOST_RECOVERED: u32 = 64;
 
 // Recent invalidations remembered on the sharer's side. A request about the
@@ -464,10 +465,21 @@ impl Answers {
             .filter(|&&index| (first_index..=last_index).contains(&index))
             .count() as u64;
         numbers.recoveries += 1;
-        let count = (last - first).min(MOST_RECOVERED - 1) + 1;
+        // Every frame before the last IDR is covered, and so is every frame
+        // a cut holds, so the frames looked at start from the first that
+        // neither covers.
+        let mut start = self
+            .last_idr
+            .map_or(first_index, |idr| first_index.max(idr));
+        while let Some(&(_, cut_last)) = self
+            .cuts
+            .iter()
+            .find(|&&(cut_first, cut_last)| (cut_first..=cut_last).contains(&start))
+        {
+            start = cut_last + 1;
+        }
         let (mut waits, mut idr, mut invalidated) = (false, false, false);
-        for offset in 0..count {
-            let index = u64::from(first + offset);
+        for index in (start..=last_index).take(MOST_RECOVERED as usize) {
             if self.covered(index) {
                 continue;
             }
@@ -882,6 +894,35 @@ mod tests {
         assert_eq!(encoder.recovered, [3, 11]);
         assert_eq!((numbers.idr_answers, numbers.covered), (2, 2));
         assert_eq!(numbers.idr_asks, 0);
+    }
+
+    // Bo's link is down from frame 1 to 200, and Cy starts watching at frame
+    // 100, which makes an IDR. Bo's report names all 200: the frames before
+    // IDR 100 are covered, and IDR 100 itself is news. A report whose first
+    // frames earlier cuts hold is answered past them the same way.
+    #[test]
+    fn a_long_report_is_answered_past_what_is_covered() {
+        let mut answers = Answers::new(BITRATE);
+        let mut encoder = Fake::new(Recovery::Idr);
+        let mut numbers = SharerNumbers::default();
+        encoded(&mut answers, 0..=99);
+        answers.encoded(100, true);
+        encoded(&mut answers, 101..=200);
+        answers.recover(&mut encoder, 1, 200, Instant::now(), &mut numbers);
+        assert_eq!(encoder.recovered, [100]);
+        assert_eq!((numbers.idr_answers, numbers.covered), (1, 0));
+
+        let mut answers = Answers::new(BITRATE);
+        let mut encoder = Fake::new(Recovery::Invalidated);
+        let mut numbers = SharerNumbers::default();
+        encoded(&mut answers, 0..=100);
+        answers.recover(&mut encoder, 1, 1, Instant::now(), &mut numbers);
+        encoded(&mut answers, 101..=200);
+        answers.recover(&mut encoder, 1, 200, Instant::now(), &mut numbers);
+        encoded(&mut answers, 201..=300);
+        answers.recover(&mut encoder, 1, 300, Instant::now(), &mut numbers);
+        assert_eq!(encoder.recovered, [1, 101, 201]);
+        assert_eq!((numbers.invalidated, numbers.covered), (3, 0));
     }
 
     #[test]

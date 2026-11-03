@@ -18,7 +18,7 @@ use crate::remote::ControlEnd;
 use crate::screen::wire::{self, RELAYED, SENT, ShapeChunk};
 use crate::screen::{
     self, Answer, Back, FACTS_EVERY, IDR_ASK_EVERY, OwnShare, Refusal, ShareNews, ShareOutlet,
-    WatchEvent, WatchNews, is_after, percent, permille, recover_span,
+    WatchEvent, WatchNews, is_after, percent, permille, recover_fits,
 };
 use crate::socket::Socket;
 use crate::sound;
@@ -459,8 +459,11 @@ impl Host {
             };
             match back {
                 Back::Recover { share, first, last } if share == number => {
-                    let (first, last) = recover_span(first, last);
-                    self.recover_from(first, last, now, socket);
+                    if recover_fits(first, last) {
+                        self.recover_from(first, last, now, socket);
+                    } else {
+                        self.idr_for(By::Host, Some(last), now, socket);
+                    }
                 }
                 Back::Idr { share, seen } if share == number => {
                     self.idr_for(By::Host, Some(seen), now, socket);

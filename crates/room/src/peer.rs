@@ -14,6 +14,7 @@ use zeroize::Zeroizing;
 use crate::config::Timers;
 use crate::control::Message;
 use crate::minute::Minute;
+use crate::screen::{either_idr, recover_fits};
 use crate::socket::Socket;
 
 // Media flows on a link while this PC sent or heard voice on it this
@@ -416,7 +417,9 @@ pub(crate) struct Link {
 
 // Feedback held for the stream (FEEDBACK_WAITING): a recover span from the
 // oldest first frame to the newest last, for one share, and the newest IDR
-// ask and loss report.
+// ask and loss report. A span too long for one request
+// (screen::recover_fits) becomes an IDR ask after its last frame, joined
+// with one held for the share.
 #[derive(Default)]
 struct Held {
     recover: Option<(u32, u32, u32)>,
@@ -433,10 +436,21 @@ impl Held {
     fn add(&mut self, message: &Message) -> bool {
         match *message {
             Message::Recover { share, first, last } => {
-                self.recover = Some(match self.recover {
-                    Some((held, from, _)) if held == share => (share, from, last),
-                    _ => (share, first, last),
-                });
+                let from = match self.recover {
+                    Some((held, from, _)) if held == share => from,
+                    _ => first,
+                };
+                if recover_fits(from, last) {
+                    self.recover = Some((share, from, last));
+                } else {
+                    self.recover = None;
+                    self.idr = Some(match self.idr {
+                        Some((held, seen)) if held == share => {
+                            (share, either_idr(seen, Some(last)))
+                        }
+                        _ => (share, Some(last)),
+                    });
+                }
             }
             Message::Idr { share, seen } => self.idr = Some((share, seen)),
             Message::VideoLoss { share, loss } => self.loss = Some((share, loss)),
@@ -971,6 +985,43 @@ mod tests {
         // Nothing held, and room on the stream: straight on.
         link.queue_feedback(&recover(20, 20));
         assert_eq!(link.feedback_waiting(), 1);
+    }
+
+    // Merged, frames 0 to 1030 are more than one request carries, so an IDR
+    // ask after the last goes instead, joined with one held: a new watcher's
+    // still wants one whatever came before.
+    #[test]
+    fn a_held_span_too_long_to_carry_goes_as_an_idr_ask() {
+        let now = Instant::now();
+        let mut link = Link::new(now);
+        link.feedback_read = true;
+        let mut other = Reliable::new();
+        let recover = |first, last| Message::Recover {
+            share: 3,
+            first,
+            last,
+        };
+        for (held, want) in [
+            (None, Some(1030)),
+            (Some(None), None),
+            (Some(Some(9)), Some(1030)),
+        ] {
+            for frame in 0..FEEDBACK_WAITING as u32 {
+                link.queue_feedback(&recover(frame, frame));
+            }
+            if let Some(seen) = held {
+                link.queue_feedback(&Message::Idr { share: 3, seen });
+            }
+            link.queue_feedback(&recover(0, 10));
+            link.queue_feedback(&recover(1000, 1030));
+            carry_feedback(&mut link, &mut other, now);
+            link.release_held();
+            let read = carry_feedback(&mut link, &mut other, now);
+            assert!(
+                matches!(read.as_slice(), [Message::Idr { share: 3, seen }] if *seen == want),
+                "{held:?}"
+            );
+        }
     }
 
     // Pings go every few ms during a call, so a pong after a gap with three

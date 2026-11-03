@@ -699,6 +699,44 @@ fn watcher_asks_reach_the_sharer() {
     assert_eq!(dropped, 4, "the IDR asks held back");
 }
 
+// After an outage longer than the reassembler follows, a viewer can gather a
+// range longer than a recover request carries. An IDR ask after its last
+// frame goes in its place, from a friend's viewer and the host's own alike.
+#[test]
+fn a_range_too_long_to_carry_asks_for_an_idr() {
+    // Reports once in 10 s, so only what goes at once can arrive in the
+    // test's time.
+    let timers = Timers {
+        voice_report_every: Duration::from_secs(10),
+        ..timers()
+    };
+    let (host, friends, _) = room_of(&["Mara", "Ana", "Bo"], timers);
+    let (ana, bo) = (&friends[0], &friends[1]);
+    let share = shares(ana, 120);
+    let sharing = ana.room().sharing();
+    for member in [bo, &host] {
+        watches(member, share);
+        assert_eq!(
+            answers_within(&sharing, WAIT, |a| !a.is_empty()),
+            [Answer::Idr { seen: None }]
+        );
+    }
+    // A watcher's IDR ask goes at most every half second, its Watch
+    // included. Frames 0 to 1024 are one more than a request carries.
+    thread::sleep(Duration::from_millis(600));
+    for member in [bo, &host] {
+        member.room().watching().back(Back::Recover {
+            share,
+            first: 0,
+            last: 1024,
+        });
+        assert_eq!(
+            answers_within(&sharing, WAIT, |a| !a.is_empty()),
+            [Answer::Idr { seen: Some(1024) }]
+        );
+    }
+}
+
 // The rule from the host's side, faked on one PC: every link is on
 // loopback, which counts as the LAN, so the internet half is in the unit
 // tests where a path can be set.

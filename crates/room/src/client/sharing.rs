@@ -14,7 +14,7 @@ use crate::remote::ControlEnd;
 use crate::screen::wire::{self, PREFIX, RELAYED};
 use crate::screen::{
     self, Answer, Back, OwnShare, Refusal, ShareNews, ShareOutlet, WatchEvent, WatchNews, percent,
-    permille, recover_span,
+    permille, recover_fits,
 };
 use crate::socket::Socket;
 use crate::sound;
@@ -305,9 +305,15 @@ impl Client {
             };
             match back {
                 Back::Recover { share, first, last } if share == number => {
-                    let (first, last) = recover_span(first, last);
-                    self.link
-                        .queue_feedback(&Message::Recover { share, first, last });
+                    let message = if recover_fits(first, last) {
+                        Message::Recover { share, first, last }
+                    } else {
+                        Message::Idr {
+                            share,
+                            seen: Some(last),
+                        }
+                    };
+                    self.link.queue_feedback(&message);
                 }
                 Back::Idr { share, seen } if share == number => {
                     self.link.queue_feedback(&Message::Idr {

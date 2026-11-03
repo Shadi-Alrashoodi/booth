@@ -2100,7 +2100,7 @@ pub(crate) fn is_after(a: u32, b: u32) -> bool {
 // One IDR answers two asks. A new watcher's, with no frame, needs one
 // whatever came before; otherwise the ask about the newer frame is the one
 // an IDR must come after.
-fn either_idr(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+pub(crate) fn either_idr(a: Option<u32>, b: Option<u32>) -> Option<u32> {
     let (a, b) = (a?, b?);
     Some(if is_after(b, a) { b } else { a })
 }
@@ -2133,16 +2133,17 @@ fn add_answer(answers: &mut Vec<Answer>, answer: Answer) {
     answers.push(answer);
 }
 
-// A viewer's recover request as the control channel carries it: at most
-// MAX_RECOVER_SPAN frames, from the first. The reassembler can gather a
-// longer one after an outage, and the sharer looks at no more than the
-// first 64 of a range anyway.
-pub(crate) fn recover_span(first: u32, last: u32) -> (u32, u32) {
-    if last.wrapping_sub(first) >= MAX_RECOVER_SPAN {
-        (first, first.wrapping_add(MAX_RECOVER_SPAN - 1))
-    } else {
-        (first, last)
-    }
+// Whether a viewer's recover request fits the control channel's message:
+// MAX_RECOVER_SPAN frames at most. The reassembler can gather a longer one
+// after an outage, and an IDR ask after its last frame goes in its place.
+// Cut to its first frames, the request would leave out an IDR made late in
+// the outage, which covers every frame kept, so the sharer would answer
+// nothing. Cut to its last, it would leave out one made early, and Windows'
+// software encoder answers a loss after its last IDR with a frame predicted
+// from that IDR, which the viewer never got. NVENC and the hardware Media
+// Foundation encoders answer frames lost that long ago with an IDR anyway.
+pub(crate) fn recover_fits(first: u32, last: u32) -> bool {
+    last.wrapping_sub(first) < MAX_RECOVER_SPAN
 }
 
 // Loss in percent as the control messages carry it, in tenths of a percent,
@@ -2535,27 +2536,28 @@ mod tests {
     }
 
     #[test]
-    fn recover_span_fits_message() {
+    fn recover_fits_message() {
         let most = MAX_RECOVER_SPAN - 1;
         let wrapped = u32::MAX - 5;
-        for ((first, last), want) in [
-            ((10, 12), (10, 12)),
-            ((10, 10 + most), (10, 10 + most)),
-            ((10, 10 + most + 1), (10, 10 + most)),
-            ((10, 9), (10, 10 + most)),
-            ((wrapped, 3000), (wrapped, wrapped.wrapping_add(most))),
+        for ((first, last), fits) in [
+            ((10, 12), true),
+            ((10, 10 + most), true),
+            ((wrapped, wrapped.wrapping_add(most)), true),
+            ((10, 10 + most + 1), false),
+            ((10, 9), false),
+            ((wrapped, 3000), false),
         ] {
-            let (first, last) = recover_span(first, last);
-            assert_eq!((first, last), want);
+            assert_eq!(recover_fits(first, last), fits, "{first} to {last}");
             let message = Message::Recover {
                 share: 1,
                 first,
                 last,
             };
-            assert!(matches!(
+            let carried = matches!(
                 Message::decode(&message.encode()),
                 Some(Message::Recover { share: 1, first: f, last: l }) if (f, l) == (first, last)
-            ));
+            );
+            assert_eq!(carried, fits, "{first} to {last}");
         }
     }
 
