@@ -201,6 +201,9 @@ pub struct Buffer {
     // The mixer stopped pulling (deafened). Until the next pull, what falls
     // out of the buffer was neither late nor thrown away to cut delay.
     paused: bool,
+    // How long the mixer has paused since the newest frame came, counted as
+    // its period is: nothing pulls meanwhile to find that the frames stopped.
+    paused_for: usize,
 
     play: i64,
     play_lag: i64,
@@ -256,6 +259,7 @@ impl Buffer {
             reset_at: None,
             timed_out: false,
             paused: false,
+            paused_for: 0,
             play: 0,
             play_lag: 0,
             pulls: 0,
@@ -289,6 +293,9 @@ impl Buffer {
         })?;
         let ext = self.extend(packet.seq);
         let newer = self.newest.is_none_or(|newest| ext > newest);
+        if newer {
+            self.paused_for = 0;
+        }
         let fresh = packet.first && newer;
         if fresh {
             self.begin(ext, packet.last, true);
@@ -364,6 +371,18 @@ impl Buffer {
     // The mixer stopped pulling: deafened. It calls this every period until
     // it pulls again, which starts at the depth kept, from silence.
     pub fn pause(&mut self) {
+        // Before the mixer says its period, a pause counts as a pull.
+        let period = if self.period == 0 { FRAME } else { self.period };
+        self.paused_for = self.paused_for.saturating_add(period);
+        if self.phase != Phase::Idle && self.paused_for > CAP as usize * FRAME {
+            // Nothing newer for longer than the cap: the sharer's sound has
+            // stopped, with its last frame or without. What is held of it
+            // would otherwise play at the next pull, however long from now.
+            let ended = self
+                .newest
+                .is_some_and(|newest| self.ends_after == Some(newest));
+            self.go_idle(!ended);
+        }
         self.paused = true;
         self.timed_out = false;
         self.audible = false;

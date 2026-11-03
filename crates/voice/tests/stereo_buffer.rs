@@ -905,6 +905,102 @@ fn a_pause_loses_and_drops_nothing() {
     listener.assert_no_clicks();
 }
 
+// The sharer's sound ends while the listener is deafened: with its last
+// frame marked, with that frame overtaking the one before it, or with no
+// mark at all. What was held of it is let go, so none of it plays when they
+// come back, however long after, and nothing that came counts as lost. The
+// decoder starts over after a marked end and carries on after an unmarked
+// one, as the sharer's encoder does.
+#[test]
+fn a_spell_that_ends_while_deafened_is_not_heard_after() {
+    let mut marked = spell(&music(1.0), 0, 0);
+    marked.last_mut().unwrap().last = true;
+    // The next spell comes after they are back, without its first mark, so
+    // only the end of the one before starts the decoder over.
+    let mut next = spell(&music(1.0), 100, 4 * SECOND);
+    next[0].first = false;
+    marked.extend(next);
+    // With no mark the frames stop as in an outage, and the sharer's
+    // encoder carries on until they come again after the listener is back.
+    let mut unmarked = spell(&music(5.0), 0, 0);
+    unmarked.drain(100..400);
+    let mut overtaken = on_time(&marked);
+    overtaken[98] = Some(marked[99].sent_at + TICK);
+    let deaf = SECOND / 2..3 * SECOND;
+    let ear = |now: u64| {
+        if deaf.contains(&now) {
+            Ear::Deafened
+        } else {
+            Ear::Pulling
+        }
+    };
+    for (sent, arrive) in [
+        (&marked, on_time(&marked)),
+        (&marked, overtaken),
+        (&unmarked, on_time(&unmarked)),
+    ] {
+        let mut listener = Listener::new();
+        listener.run(sent, &arrive, 4 * SECOND, ear);
+        let back = listener.pull_at(deaf.end);
+        let after = listener.sources(back..listener.heard.len());
+        assert!(after.iter().all(Option::is_none), "{after:?}");
+        let stats = listener.stats();
+        assert_eq!(
+            (
+                stats.held_frames,
+                stats.lost,
+                stats.dropped,
+                stats.concealed
+            ),
+            (0, 0, 0, 0),
+            "{stats:?}"
+        );
+        assert!(!stats.playing);
+
+        // After a marked end the next frame decodes from a reset decoder,
+        // and after an unmarked one from the decoder as the frames before
+        // the deafen left it.
+        listener.run(sent, &arrive, 4 * SECOND + 2 * TICK, ear);
+        let after_end = &sent[100];
+        let at = listener.pull_at(after_end.sent_at);
+        assert_eq!(
+            listener.sources(at..at + 1),
+            [Some(Source::Packet(after_end.seq))]
+        );
+        let played: Vec<Sent> = sent[..100]
+            .iter()
+            .filter(|packet| listener.played_at(packet.seq).is_some())
+            .cloned()
+            .collect();
+        let mut kept = decoded(&played);
+        let mut fresh = Decoder::new().unwrap();
+        let (mut carried_on, mut started) = ([0f32; SAMPLES], [0f32; SAMPLES]);
+        kept.decode(&after_end.frame, &mut carried_on).unwrap();
+        fresh.decode(&after_end.frame, &mut started).unwrap();
+        let (right, wrong) = if sent[99].last {
+            (started, carried_on)
+        } else {
+            (carried_on, started)
+        };
+        assert_eq!(listener.heard[at].audio, faded_in(&right));
+        assert_ne!(listener.heard[at].audio, faded_in(&wrong));
+    }
+
+    // Each pause stands for the mixer's period: at 1056 frames the cap has
+    // passed with nothing newer at the third pause, not the seventh.
+    let mut buffer = Buffer::new().unwrap();
+    buffer.set_period(1056);
+    let mut frame = [0f32; SAMPLES];
+    for packet in &marked[..10] {
+        buffer.push(packet.packet()).unwrap();
+        buffer.pull(&mut frame).unwrap();
+    }
+    for pauses in 1..=3 {
+        buffer.pause();
+        assert_eq!(buffer.stats().playing, pauses < 3, "{pauses} pauses");
+    }
+}
+
 #[test]
 fn duplicates_are_played_once() {
     let sent = spell(&music(1.0), 500, 0);
