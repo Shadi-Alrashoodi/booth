@@ -99,6 +99,21 @@ fn restart_forgets_the_gain() {
     assert_eq!(processor.gain_db(), 0.0);
 }
 
+// Nor does the meter keep what it heard of the one before: the first 5 ms
+// block after a restart reads only itself, with nothing of the 50 ms before
+// in it.
+#[test]
+fn restart_empties_the_meter() {
+    let mut processor = Processor::new(Arc::new(Switches::new(false, false)));
+    let level = processor.level();
+    through(&mut processor, &[1.0; 2_400]);
+    assert_eq!(level.read().peak, 1.0);
+    processor.restart();
+    through(&mut processor, &[0.0; 240]);
+    let quiet = level.read();
+    assert_eq!((quiet.peak, quiet.rms), (0.0, 0.0), "{quiet:?}");
+}
+
 // Speech in 400 ms words with 200 ms of the room between them, at `db` dBFS
 // RMS over a room 35 dB quieter, after a second of the room alone.
 fn speech(seconds: usize, db: f32) -> Vec<f32> {

@@ -6,10 +6,11 @@
 // as a muted microphone's is. Nothing here opens a device at any other time.
 
 use std::mem;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
+use std::time::Instant;
 
 use eframe::egui::Context;
 use voice::audio::{
@@ -47,12 +48,8 @@ impl SettingsAudio {
         // while it is off.
         let playback = Playback::default();
         let feed = playback.clone();
-        let open: Open = Arc::new(move |choice, echo, mut processor: Processor, events| {
-            let feed = feed.clone();
-            let audio = move |samples: &[f32], at| {
-                let (out, _) = processor.run(samples, at);
-                feed.push(out);
-            };
+        let open: Open = Arc::new(move |choice, echo, processor: Processor, events| {
+            let (audio, events) = meter_audio(processor, feed.clone(), events);
             match echo {
                 Some(reference) => Capture::start_cancelling_echo(choice, reference, audio, events),
                 None => Capture::start(choice, audio, events),
@@ -207,6 +204,42 @@ type Open = Arc<
         + Send
         + Sync,
 >;
+
+// The meter's microphone: each packet through the processing and on to Hear
+// yourself, each event on to the meter. When the stream opens its device
+// again after a gap it starts afresh, as a room's does: every event clears
+// the level the meter draws, and the first packet after Opened restarts the
+// processing. Both run on the stream's thread, which says a device went away
+// before it shows one open again, so no reading holds sound from before the
+// gap. Only Windows default moving to another device goes unsaid, and there
+// the old level can show for the instant before Opened.
+fn meter_audio(
+    mut processor: Processor,
+    feed: Playback,
+    mut events: Events,
+) -> (
+    impl FnMut(&[f32], Instant) + Send + 'static,
+    impl FnMut(Event) + Send + 'static,
+) {
+    let level = processor.level();
+    let fresh = Arc::new(AtomicBool::new(false));
+    let opened = Arc::clone(&fresh);
+    let audio = move |samples: &[f32], at: Instant| {
+        if fresh.swap(false, Ordering::Relaxed) {
+            processor.restart();
+        }
+        let (out, _) = processor.run(samples, at);
+        feed.push(out);
+    };
+    let events = move |event: Event| {
+        level.clear();
+        if let Event::Opened(_) = &event {
+            opened.store(true, Ordering::Relaxed);
+        }
+        events(event);
+    };
+    (audio, events)
+}
 
 enum Stream {
     Off,
@@ -593,10 +626,8 @@ pub(crate) mod tests {
 
     fn fake_open(fake: &Fake) -> Open {
         let fake = fake.clone();
-        Arc::new(move |choice, _echo, mut processor: Processor, events| {
-            let audio = move |samples: &[f32], at| {
-                processor.run(samples, at);
-            };
+        Arc::new(move |choice, _echo, processor: Processor, events| {
+            let (audio, events) = meter_audio(processor, Playback::default(), events);
             Capture::start_with(fake.device(), choice, audio, events)
         })
     }
@@ -829,6 +860,79 @@ pub(crate) mod tests {
         let record = fake.record();
         assert_eq!(record.opens.len(), 1);
         assert_eq!(record.most_at_once, 1);
+    }
+
+    // Full scale until the microphone goes away, silence once it is back in
+    // the same stream: the meter shows nothing from before, neither while
+    // the stream shows it open before saying so, nor on the frame that hears
+    // it opened, nor once the first packet is in. Packets of 25 ms leave the
+    // panel time to look in between.
+    #[test]
+    fn the_meter_starts_empty_when_the_microphone_comes_back() {
+        static LOUD: AtomicBool = AtomicBool::new(true);
+        let fake = Fake::new(
+            Setup {
+                period_frames: 1_200,
+                buffer_frames: 2_400,
+                signal: |_, _| {
+                    if LOUD.load(Ordering::Relaxed) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                },
+                ..Setup::default()
+            },
+            &[("mic", "Headset")],
+            Some("mic"),
+        );
+        // What the meter would draw as each Opened leaves the stream, before
+        // the meter hears it.
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        let open: Open = {
+            let fake = fake.clone();
+            let shown = Arc::clone(&shown);
+            Arc::new(move |choice, _echo, processor: Processor, events| {
+                let level = processor.level();
+                let shown = Arc::clone(&shown);
+                let (audio, mut events) = meter_audio(processor, Playback::default(), events);
+                let events = move |event: Event| {
+                    if let Event::Opened(_) = &event {
+                        lock(&shown).push(level.read());
+                    }
+                    events(event);
+                };
+                Capture::start_with(fake.device(), choice, audio, events)
+            })
+        };
+        let choice = Choice::Device(String::from("mic"));
+        let mut mic = Mic::new(
+            &Context::default(),
+            open,
+            Arc::new(Switches::new(false, false)),
+            &choice,
+        );
+        frames_until(&mut mic, &choice, |mic| {
+            mic.level().is_some_and(|level| level.peak == 1.0)
+        });
+        fake.unplug("mic");
+        frames_until(&mut mic, &choice, |mic| mic.problem.is_some());
+        LOUD.store(false, Ordering::Relaxed);
+        let packets = fake.record().packets.len();
+        fake.plug("mic", "Headset");
+        let until = Instant::now() + Duration::from_secs(3);
+        while !mic.follow(&choice, true) {
+            assert!(Instant::now() < until, "not open again within 3 s");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let opened = mic.level();
+        wait_until("the first packet", || fake.record().packets.len() > packets);
+        let first = mic.level();
+        let again = lock(&shown).get(1).copied();
+        for reading in [again, opened, first] {
+            let reading = reading.unwrap();
+            assert_eq!((reading.peak, reading.rms), (0.0, 0.0), "{reading:?}");
+        }
     }
 
     // A slow answer about a device that was passed over never shows under the

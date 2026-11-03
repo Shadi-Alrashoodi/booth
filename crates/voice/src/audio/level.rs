@@ -44,7 +44,7 @@ impl Level {
             .store(reading.loudest.to_bits(), Ordering::Relaxed);
     }
 
-    pub(crate) fn clear(&self) {
+    pub fn clear(&self) {
         self.publish(Reading::default());
     }
 }
