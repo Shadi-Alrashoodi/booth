@@ -89,3 +89,34 @@ pub(crate) fn drop_takes(window: isize) -> Option<Duration> {
         .take_if(|(set_for, _)| *set_for == window)
         .map(|(_, takes)| takes)
 }
+
+static DRAG_MOST: Mutex<Vec<(isize, (i32, i32))>> = Mutex::new(Vec::new());
+
+/// The next time a capture of `window` starts over for a window grown past
+/// its frames, it takes `most` for the largest a window can be dragged to,
+/// as a desktop of that size gives, once. Only that window's.
+pub fn set_drag_most(window: isize, most: (i32, i32)) {
+    let mut all = DRAG_MOST.lock().unwrap_or_else(|p| p.into_inner());
+    all.retain(|&(set_for, _)| set_for != window);
+    all.push((window, most));
+}
+
+pub(crate) fn drag_most(window: isize) -> Option<(i32, i32)> {
+    let mut all = DRAG_MOST.lock().unwrap_or_else(|p| p.into_inner());
+    let at = all.iter().position(|&(set_for, _)| set_for == window)?;
+    Some(all.swap_remove(at).1)
+}
+
+static STARTS_OVER: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
+/// How many times a capture of `window` started over for a window grown
+/// past its frames.
+pub fn starts_over(window: isize) -> usize {
+    let all = STARTS_OVER.lock().unwrap_or_else(|p| p.into_inner());
+    all.iter().filter(|&&each| each == window).count()
+}
+
+pub(crate) fn count_start_over(window: isize) {
+    let mut all = STARTS_OVER.lock().unwrap_or_else(|p| p.into_inner());
+    all.push(window);
+}

@@ -21,8 +21,9 @@ use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED, HANDLE, HWND, RECT};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device,
-    ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11DeviceContext,
+    ID3D11ShaderResourceView, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
@@ -40,7 +41,8 @@ use windows::Win32::System::WinRT::Direct3D11::{
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowPlacement, GetWindowThreadProcessId, IsIconic, WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED,
+    GetSystemMetrics, GetWindowPlacement, GetWindowThreadProcessId, IsIconic, SM_CXMAXTRACK,
+    SM_CYMAXTRACK, WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED,
 };
 use windows::core::{Interface, factory};
 
@@ -121,9 +123,9 @@ pub struct WindowCapture {
     layout: Layout,
     targets: [Target; 2],
     last_out: usize,
-    // Kept for its Closed event; the session and the pool close when this
-    // is dropped (Drop below).
-    _item: GraphicsCaptureItem,
+    // Kept for its Closed event and for a capture started over; the session
+    // and the pool close when this is dropped (Drop below).
+    item: GraphicsCaptureItem,
     pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
     pool_size: SizeInt32,
@@ -343,9 +345,9 @@ impl WindowCapture {
             converter.target(plan.width, plan.height)?,
         ];
         // Frames as big as the largest monitor, so the window maximized or
-        // made bigger on any of them still fits: after a new pool Windows
-        // sends nothing until the window changes again, and a window that
-        // grew and then stood still would stay cut to its old size.
+        // made bigger on any of them still fits: past them the capture
+        // starts over (take), since after a new pool Windows can send
+        // nothing more of a window that stands still.
         let pool_size = crate::monitors()
             .unwrap_or_default()
             .iter()
@@ -353,26 +355,8 @@ impl WindowCapture {
                 Width: most.Width.max(monitor.width as i32),
                 Height: most.Height.max(monitor.height as i32),
             });
-        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&graphics, FORMAT, 2, pool_size)
-            .map_err(fail("make the frames of"))?;
-        let session = pool
-            .CreateCaptureSession(&item)
-            .map_err(fail("start a capture of"))?;
-        // Booth runs on Windows 10 2004 and later, which all have it; left
-        // in, the pointer would show twice.
-        session
-            .SetIsCursorCaptureEnabled(false)
-            .map_err(fail("leave the pointer out of the pictures of"))?;
-        let paced = !unpace(&session);
-        let border = border::apply(&session);
         let arrived = Arc::new(Arrived::new()?);
         let closed = Arc::new(AtomicBool::new(false));
-        let wake = Arc::clone(&arrived);
-        pool.FrameArrived(&TypedEventHandler::new(move |_, _| {
-            wake.set();
-            Ok(())
-        }))
-        .map_err(fail("hear the frames of"))?;
         let (gone, wake) = (Arc::clone(&closed), Arc::clone(&arrived));
         item.Closed(&TypedEventHandler::new(move |_, _| {
             gone.store(true, Ordering::Release);
@@ -380,7 +364,12 @@ impl WindowCapture {
             Ok(())
         }))
         .map_err(fail("hear about"))?;
-        session.StartCapture().map_err(fail("start capturing"))?;
+        let Started {
+            pool,
+            session,
+            paced,
+            border,
+        } = start(&item, &graphics, pool_size, &arrived)?;
         let mut qpc_frequency = 0;
         // SAFETY: fills one live i64; it cannot fail on Windows XP and later.
         let _ = unsafe { QueryPerformanceFrequency(&mut qpc_frequency) };
@@ -394,7 +383,7 @@ impl WindowCapture {
             layout,
             targets,
             last_out: 1,
-            _item: item,
+            item,
             pool,
             session,
             pool_size,
@@ -678,6 +667,18 @@ impl WindowCapture {
             }
             self.restoring_until = None;
         }
+        // Only a window bigger than the frames gets here, its picture cut to
+        // them. With the pool made again, the one more frame Windows sends
+        // once the drain makes room still came cut 11 times in 31 on this PC,
+        // and a window that then stood still sent nothing more; a capture
+        // started over sends its first frame unasked. So the capture starts
+        // over and this frame does not go out: the next is the whole window.
+        if content.Width > self.pool_size.Width || content.Height > self.pool_size.Height {
+            let _ = frame.Close();
+            self.skipped += 1;
+            self.start_over(content)?;
+            return Ok(None);
+        }
         let time = frame
             .SystemRelativeTime()
             .map_err(fail("read the time of"))?;
@@ -728,20 +729,6 @@ impl WindowCapture {
         drop(view);
         drop(texture);
         let _ = frame.Close();
-        // Only a window bigger than every monitor gets here. This frame was
-        // cut to the old frames' size, and the next one at the new size
-        // comes when the window next changes. Recreate drops every frame of
-        // the pool, so it comes once this one is converted and closed.
-        if content.Width > self.pool_size.Width || content.Height > self.pool_size.Height {
-            let size = SizeInt32 {
-                Width: content.Width.max(self.pool_size.Width),
-                Height: content.Height.max(self.pool_size.Height),
-            };
-            self.pool
-                .Recreate(&self.graphics, FORMAT, 2, size)
-                .map_err(fail("follow the new size of"))?;
-            self.pool_size = size;
-        }
         // SAFETY: a call on the live immediate context.
         unsafe { self.context.Flush() };
         let converted = Instant::now();
@@ -768,6 +755,59 @@ impl WindowCapture {
                 cursor.map(Next::Cursor)
             }
         })
+    }
+
+    // A new pool and session on the same item, with frames that hold
+    // `content` and the most a window with a sizing border can be dragged
+    // to, which takes in every monitor (SM_CXMAXTRACK, SM_CYMAXTRACK): a
+    // drag past them starts the capture over once, and a program that makes
+    // its window bigger still, at each step past that. Direct3D 11 makes no
+    // frame past 16384 a side, and frames that big that cannot be made give
+    // way to the window's own size.
+    fn start_over(&mut self, content: SizeInt32) -> Result<(), CaptureError> {
+        let whole = SizeInt32 {
+            Width: content.Width.max(self.pool_size.Width),
+            Height: content.Height.max(self.pool_size.Height),
+        };
+        // SAFETY: plain queries.
+        let drag = unsafe {
+            (
+                GetSystemMetrics(SM_CXMAXTRACK),
+                GetSystemMetrics(SM_CYMAXTRACK),
+            )
+        };
+        #[cfg(feature = "fault")]
+        let drag = crate::fault::drag_most(self.window.hwnd).unwrap_or(drag);
+        let most = D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION as i32;
+        let size = SizeInt32 {
+            Width: drag.0.min(most).max(whole.Width),
+            Height: drag.1.min(most).max(whole.Height),
+        };
+        let _ = self.session.Close();
+        let _ = self.pool.Close();
+        #[cfg(feature = "fault")]
+        crate::fault::count_start_over(self.window.hwnd);
+        let started = match start(&self.item, &self.graphics, size, &self.arrived) {
+            Err(_) if size != whole => start(&self.item, &self.graphics, whole, &self.arrived)
+                .map(|started| (started, whole)),
+            started => started.map(|started| (started, size)),
+        };
+        // A window that closed meanwhile is said as next() says it.
+        let (started, size) = started.map_err(|err| {
+            if self.closed.load(Ordering::Acquire) || !self.window.exists() {
+                CaptureError::other(WINDOW_CLOSED)
+            } else {
+                err
+            }
+        })?;
+        Started {
+            pool: self.pool,
+            session: self.session,
+            paced: self.paced,
+            border: self.border,
+        } = started;
+        self.pool_size = size;
+        Ok(())
     }
 
     // A new size: new constants, and new targets if the output size changed.
@@ -1035,6 +1075,50 @@ fn unpace(session: &GraphicsCaptureSession) -> bool {
             Duration: TICKS / 1000,
         })
         .is_ok()
+}
+
+// A capture of the window into a pool of frames of its own.
+struct Started {
+    pool: Direct3D11CaptureFramePool,
+    session: GraphicsCaptureSession,
+    // Windows keeps the capture to its own pace.
+    paced: bool,
+    border: Border,
+}
+
+// A new pool of frames of `size` and a capture of the item into it,
+// started, each frame setting `arrived`.
+fn start(
+    item: &GraphicsCaptureItem,
+    graphics: &IDirect3DDevice,
+    size: SizeInt32,
+    arrived: &Arc<Arrived>,
+) -> Result<Started, CaptureError> {
+    let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(graphics, FORMAT, 2, size)
+        .map_err(fail("make the frames of"))?;
+    let session = pool
+        .CreateCaptureSession(item)
+        .map_err(fail("start a capture of"))?;
+    // Booth runs on Windows 10 2004 and later, which all have it; left in,
+    // the pointer would show twice.
+    session
+        .SetIsCursorCaptureEnabled(false)
+        .map_err(fail("leave the pointer out of the pictures of"))?;
+    let paced = !unpace(&session);
+    let border = border::apply(&session);
+    let wake = Arc::clone(arrived);
+    pool.FrameArrived(&TypedEventHandler::new(move |_, _| {
+        wake.set();
+        Ok(())
+    }))
+    .map_err(fail("hear the frames of"))?;
+    session.StartCapture().map_err(fail("start capturing"))?;
+    Ok(Started {
+        pool,
+        session,
+        paced,
+        border,
+    })
 }
 
 // `step` reads before "the shared window", as in "read the size of".

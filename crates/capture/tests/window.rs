@@ -291,6 +291,80 @@ fn a_resized_window_comes_out_at_its_new_size() {
     assert_eq!(sizes.last(), Some(&(1000, 560)), "{sizes:?}");
 }
 
+// Made wider than every monitor in one step, so wider than the frames the
+// capture started with, and then still: the window comes out whole, and
+// only whole. With the pool made again at the new size and the frames taken
+// 600 ms after the resize, the one Windows sent once the drain made room
+// came cut 5 times in 5, and nothing after it.
+#[test]
+fn a_window_grown_past_every_monitor_comes_out_whole() {
+    let _turn = ALONE.read().unwrap_or_else(|p| p.into_inner());
+    let Some(adapter) = adapter() else { return };
+    let widest = capture::monitors()
+        .unwrap()
+        .iter()
+        .map(|monitor| monitor.width)
+        .max()
+        .unwrap_or(0);
+    let width = (widest + 400) & !1;
+    let options = Options {
+        max_width: 0,
+        max_height: 0,
+        max_fps: 0,
+    };
+    for _ in 0..3 {
+        let window = Window::open(640, 360);
+        let mut capture = WindowCapture::open(window.id(), &adapter, options).unwrap();
+        assert_eq!(
+            frame_size(&mut capture, Duration::from_secs(2)),
+            Ok((640, 360))
+        );
+        window.resize(width as i32, 360);
+        thread::sleep(Duration::from_millis(600));
+        let sizes = sizes_for(&mut capture, Duration::from_secs(1));
+        println!("grown to {width}x360: {sizes:?}");
+        assert!(!sizes.is_empty(), "no frame after the resize");
+        assert!(sizes.iter().all(|&size| size == (width, 360)), "{sizes:?}");
+    }
+}
+
+// Grown past every monitor and then a little more, on a desktop as wide as
+// five 3840x2160 monitors side by side, past what Direct3D 11 makes a frame
+// of: the capture starts over once, with frames as big as it can make, and
+// the window comes out whole both times.
+#[cfg(feature = "fault")]
+#[test]
+fn a_window_grown_twice_past_every_monitor_starts_over_once() {
+    let _turn = ALONE.read().unwrap_or_else(|p| p.into_inner());
+    let Some(adapter) = adapter() else { return };
+    let widest = capture::monitors()
+        .unwrap()
+        .iter()
+        .map(|monitor| monitor.width)
+        .max()
+        .unwrap_or(0);
+    let options = Options {
+        max_width: 0,
+        max_height: 0,
+        max_fps: 0,
+    };
+    let window = Window::open(640, 360);
+    capture::fault::set_drag_most(window.0, (5 * 3840, 2160));
+    let before = capture::fault::starts_over(window.0);
+    let mut capture = WindowCapture::open(window.id(), &adapter, options).unwrap();
+    assert_eq!(
+        frame_size(&mut capture, Duration::from_secs(2)),
+        Ok((640, 360))
+    );
+    for width in [(widest + 200) & !1, (widest + 400) & !1] {
+        window.resize(width as i32, 360);
+        let sizes = sizes_for(&mut capture, Duration::from_secs(1));
+        println!("grown to {width}x360: {sizes:?}");
+        assert_eq!(sizes.last(), Some(&(width, 360)), "{sizes:?}");
+    }
+    assert_eq!(capture::fault::starts_over(window.0) - before, 1);
+}
+
 // Kept in a frame, the window comes out at the frame's size whatever its
 // own, while natural() says its own; once it stands still, again() makes
 // its newest picture at its own size.
