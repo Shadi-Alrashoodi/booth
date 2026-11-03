@@ -1182,6 +1182,17 @@ impl Sharer {
         if codec == Codec::Hevc && (self.answers.within_floor(now) || !spaced) {
             return;
         }
+        // A watchers' limit past capture's default counts only in HEVC, so
+        // under one the change of codec can also be a change of size: the
+        // source then opens again for it, and takes the codec from
+        // takes_hevc.
+        let options = self.source_options_in(Some(codec), self.setup.fps);
+        // Not while capture is paused: a monitor's source does not open
+        // while the desktop is away, and that would end the share. Such a
+        // change waits for the first picture back.
+        if self.paused && !self.keeps(options) {
+            return;
+        }
         let kind = match codec {
             Codec::H264 => self.setup.encoder,
             Codec::Hevc => match self.offered_hevc(audience) {
@@ -1191,11 +1202,6 @@ impl Sharer {
         };
         self.switches.changed(now);
         let was = self.encoder_name().to_string();
-        // A watchers' limit past capture's default counts only in HEVC, so
-        // under one the change of codec can also be a change of size: the
-        // source then opens again for it, and takes the codec from
-        // takes_hevc.
-        let options = self.source_options_in(Some(codec), self.setup.fps);
         let changed = if self.keeps(options) {
             self.switch(codec, kind)
                 .map(|()| self.take_options(options))
@@ -1729,7 +1735,160 @@ fn within_default(limit: capture::Options) -> capture::Options {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
     use super::*;
+    use crate::PAYLOAD_LAN;
+
+    const NVIDIA: u32 = 0x10de;
+
+    #[derive(Default)]
+    struct Watching {
+        takes_hevc: bool,
+        sent: Vec<Sent>,
+        lines: Vec<Line>,
+    }
+
+    impl Audience for Watching {
+        fn cursor(&mut self, _: CursorUpdate, _: bool) {}
+
+        fn back(&mut self, _: &mut Vec<Back>) {}
+
+        fn takes_hevc(&mut self) -> bool {
+            self.takes_hevc
+        }
+
+        fn sent(&mut self, frame: &Sent) {
+            self.sent.push(*frame);
+        }
+
+        fn line(&mut self, line: Line) {
+            self.lines.push(line);
+        }
+    }
+
+    // One share at a time on the GPU.
+    static TURN: Mutex<()> = Mutex::new(());
+
+    fn gpu() -> Option<(MutexGuard<'static, ()>, capture::Adapter)> {
+        let turn = TURN.lock().unwrap_or_else(PoisonError::into_inner);
+        let adapters = capture::adapters().unwrap_or_else(|err| panic!("{err}"));
+        let Some(adapter) = adapters
+            .iter()
+            .find(|adapter| adapter.vendor_id == NVIDIA)
+            .or(adapters.first())
+        else {
+            println!("skipped: this PC has no graphics card to make the pattern on");
+            return None;
+        };
+        Some((turn, adapter.clone()))
+    }
+
+    // A share of the pattern, left to pick its codec, whose viewers take HEVC.
+    fn pattern_share(adapter: capture::Adapter, size: (u32, u32), encoder: Option<Kind>) -> Sharer {
+        let setup = Setup {
+            choice: Choice::Pattern {
+                adapter,
+                width: size.0,
+                height: size.1,
+                busy: false,
+            },
+            fps: 60,
+            settings: Settings::default(),
+            encoder,
+            codec: None,
+            takes_hevc: true,
+            payload: PAYLOAD_LAN,
+            spread: false,
+            clock: Clock::starting(Instant::now()),
+            keep_times: false,
+        };
+        Sharer::open(setup, |_: &[u8]| {}, &mut |_| {}).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    // While capture is paused, a change of codec that would open the source
+    // again waits, since a monitor's source does not open while the desktop
+    // is away, and it comes with the first picture back. One that keeps the
+    // source goes at once.
+    #[test]
+    fn a_codec_change_that_opens_the_source_waits_out_a_pause() {
+        let Some((_turn, adapter)) = gpu() else {
+            return;
+        };
+        if adapter.vendor_id != NVIDIA {
+            println!("skipped: no NVIDIA GPU, so no NVENC to share 4K in HEVC with");
+            return;
+        }
+        let mut sharer = pattern_share(adapter.clone(), (3840, 2160), None);
+        let four_k = capture::Options {
+            max_width: 4096,
+            max_height: 2160,
+            max_fps: 60,
+        };
+        sharer
+            .set_limit(four_k, &mut |_| {})
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(
+            (sharer.size(), sharer.codec()),
+            ((3840, 2160), Some(Codec::Hevc))
+        );
+        let reopens = sharer.reopens;
+        sharer.paused = true;
+        // Someone who does not take HEVC starts watching, and capture says
+        // nothing is new.
+        let mut watching = Watching::default();
+        sharer
+            .quiet(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(sharer.reopens, reopens, "{:?}", watching.lines);
+        assert_eq!(
+            (sharer.size(), sharer.codec()),
+            ((3840, 2160), Some(Codec::Hevc))
+        );
+        sharer.paused = false;
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(sharer.reopens, reopens + 1);
+        assert_eq!(
+            (sharer.size(), sharer.codec()),
+            ((2560, 1440), Some(Codec::H264))
+        );
+
+        // Now in H.264 under the limit, with HEVC due, which takes the box
+        // back to 4K.
+        watching.takes_hevc = true;
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        std::thread::sleep(SWITCH_GAP);
+        let reopens = sharer.reopens;
+        sharer.paused = true;
+        sharer
+            .quiet(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(sharer.reopens, reopens, "{:?}", watching.lines);
+        assert_eq!(sharer.codec(), Some(Codec::H264));
+        sharer.paused = false;
+        let until = Instant::now() + SWITCH_GAP * 2;
+        while sharer.codec() != Some(Codec::Hevc) {
+            assert!(Instant::now() < until, "{:?}", watching.lines);
+            sharer
+                .next(&mut watching)
+                .unwrap_or_else(|err| panic!("{err}"));
+        }
+        assert_eq!(sharer.size(), (3840, 2160));
+
+        let mut sharer = pattern_share(adapter, (2560, 1440), None);
+        assert_eq!(sharer.codec(), Some(Codec::Hevc));
+        watching.takes_hevc = false;
+        sharer.paused = true;
+        sharer
+            .quiet(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(sharer.reopens, 0);
+        assert_eq!(sharer.codec(), Some(Codec::H264));
+    }
 
     // The watchers' limit sets the box when nothing smaller does, and each
     // side and the rate are the smaller of the two.
