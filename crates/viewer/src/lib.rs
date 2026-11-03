@@ -207,10 +207,16 @@ pub struct Viewer {
     // showed a new picture did.
     presented_at: Instant,
     pictured_at: Instant,
-    // The strip has something the last present did not draw. A present
-    // while minimized or with the strip hidden clears it as well: the
-    // restore and the strip coming back redraw everything.
+    // The strip has something the last present did not draw: something new
+    // from the caller, or a present path word that present learned or lost
+    // after drawing. A present while minimized or with the strip hidden clears
+    // what came from the caller as well: the restore and the strip coming
+    // back redraw everything.
     strip_new: bool,
+    // For tests: how the statistics say each present reached the screen,
+    // in place of the swap chain's own.
+    #[cfg(test)]
+    told: Option<windows::Win32::Graphics::Dxgi::DXGI_FRAME_PRESENTATION_MODE>,
     // Where the last present put the strip.
     band: Band,
     // The controller's mouse on the picture as the last present found it,
@@ -257,6 +263,8 @@ impl Viewer {
             presented_at: Instant::now(),
             pictured_at: Instant::now(),
             strip_new: false,
+            #[cfg(test)]
+            told: None,
             band: Band::Below,
             local: None,
             rested: false,
@@ -468,7 +476,10 @@ impl Viewer {
         if frame.video.is_some() {
             self.pictured_at = self.presented_at;
         }
-        self.strip_new = false;
+        // The word is read after drawing, so a change to it waits for the
+        // next present, which on a still screen with nothing else to draw
+        // comes through strip_due.
+        self.strip_new = self.path.word() != look.present;
         Ok(Presented {
             took,
             path: self.path.word(),
@@ -517,6 +528,18 @@ impl Viewer {
     // The statistics describe the newest frame Windows has put on screen,
     // which is a few presents behind the one just made.
     fn read_path(&mut self) {
+        #[cfg(test)]
+        if let Some(mode) = self.told {
+            let last = self.swap.last_present();
+            self.path.read(
+                Some(Stats {
+                    present: last,
+                    mode,
+                }),
+                last,
+            );
+            return;
+        }
         let Some(media) = &self.swap.media else {
             return;
         };
@@ -673,7 +696,9 @@ mod tests {
     use std::sync::{Mutex, MutexGuard};
 
     use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::Graphics::Dxgi::DXGI_FRAME_PRESENTATION_MODE_OVERLAY;
+    use windows::Win32::Graphics::Dxgi::{
+        DXGI_FRAME_PRESENTATION_MODE_NONE, DXGI_FRAME_PRESENTATION_MODE_OVERLAY,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowDisplayAffinity, SendMessageW, WDA_EXCLUDEFROMCAPTURE, WM_DISPLAYCHANGE,
     };
@@ -870,5 +895,46 @@ mod tests {
         viewer.pictured_at = now - STILL;
         viewer.presented_at = now - QUIET;
         assert!(!viewer.strip_due(now), "drawn");
+    }
+
+    // The present path word comes from statistics read after the present
+    // is drawn, so a still screen that learns or loses it then wants a
+    // present of its own to show that, and only that one.
+    #[test]
+    fn a_word_learned_after_drawing_wants_a_present() {
+        let _screen = one_at_a_time();
+        let Some(mut viewer) = hidden("Booth viewer word test") else {
+            return;
+        };
+        let strip = Strip::default();
+        let still = Frame {
+            video: None,
+            cursor: None,
+            strip: &strip,
+        };
+        viewer.told = Some(DXGI_FRAME_PRESENTATION_MODE_OVERLAY);
+        let presented = viewer.present(&still).unwrap();
+        assert_eq!(presented.path, Some(PresentPath::Flip));
+        let now = Instant::now();
+        viewer.pictured_at = now - STILL;
+        viewer.presented_at = now - QUIET;
+        assert!(viewer.strip_due(now), "flip learned and not drawn");
+        viewer.present(&still).unwrap();
+        let now = Instant::now();
+        viewer.pictured_at = now - STILL;
+        viewer.presented_at = now - QUIET;
+        assert!(!viewer.strip_due(now), "flip drawn");
+        viewer.told = Some(DXGI_FRAME_PRESENTATION_MODE_NONE);
+        let presented = viewer.present(&still).unwrap();
+        assert_eq!(presented.path, None);
+        let now = Instant::now();
+        viewer.pictured_at = now - STILL;
+        viewer.presented_at = now - QUIET;
+        assert!(viewer.strip_due(now), "flip lost and still drawn");
+        viewer.present(&still).unwrap();
+        let now = Instant::now();
+        viewer.pictured_at = now - STILL;
+        viewer.presented_at = now - QUIET;
+        assert!(!viewer.strip_due(now), "no word drawn");
     }
 }
