@@ -723,6 +723,7 @@ impl Sharer {
             self.take_options(options);
             return Ok(false);
         }
+        let current = self.codec();
         // Windows allows one duplication of a monitor per process, so the
         // old one goes before the new one opens, and the last picture with
         // it, since it is on the old one's texture.
@@ -738,6 +739,9 @@ impl Sharer {
             self.hevc_offer.clone(),
             say,
         )?;
+        if current.is_some_and(|was| was != opened.encoder.codec()) {
+            self.numbers.codec_changes += 1;
+        }
         if let Some(offer) = opened.hevc.take() {
             self.hevc_offer = Some(offer);
         }

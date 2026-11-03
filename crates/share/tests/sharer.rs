@@ -441,6 +441,7 @@ fn hevc_coming_back_brings_the_4k_limit() {
         "{:?}",
         watching.lines
     );
+    assert_eq!(sharer.numbers().codec_changes, 1);
     let before = watching.sent.len();
     for _ in 0..10 {
         sharer
