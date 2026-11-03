@@ -733,6 +733,18 @@ impl Sharer {
         let now = Instant::now();
         let current = self.codec().or(self.held_in.take());
         let pick = self.pick_in(current, now);
+        // HEVC can come back with this encoder, and a watchers' limit past
+        // capture's default counts in it. If H.264 opens after all, source::open
+        // brings the box in again.
+        let options = if current == Some(Codec::H264)
+            && pick.codec.is_none()
+            && pick.takes_hevc
+            && options == self.source_options_in(current, options.max_fps)
+        {
+            self.source_options_in(Some(Codec::Hevc), options.max_fps)
+        } else {
+            options
+        };
         // Windows allows one duplication of a monitor per process, so the
         // old one goes before the new one opens, and the last picture with
         // it, since it is on the old one's texture.
@@ -2118,6 +2130,51 @@ mod tests {
             .unwrap_or_else(|err| panic!("{err}"));
         assert_eq!(sharer.reopens, 0);
         assert_eq!(sharer.codec(), Some(Codec::H264));
+    }
+
+    // HEVC coming back with a new encoder that opened for another reason, once
+    // the gap is over and before pick_codec has changed back, brings the 4K
+    // limit as pick_codec's change does.
+    #[test]
+    fn a_new_encoder_that_brings_hevc_back_brings_the_4k_limit() {
+        let Some((_turn, adapter)) = gpu() else {
+            return;
+        };
+        if adapter.vendor_id != NVIDIA {
+            println!("skipped: no NVIDIA GPU, so no NVENC to share 4K in HEVC with");
+            return;
+        }
+        let mut sharer = pattern_share(adapter, (3840, 2160), None);
+        let four_k = capture::Options {
+            max_width: 4096,
+            max_height: 2160,
+            max_fps: 60,
+        };
+        sharer
+            .set_limit(four_k, &mut |_| {})
+            .unwrap_or_else(|err| panic!("{err}"));
+        let mut watching = Watching::default();
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(
+            (sharer.size(), sharer.codec()),
+            ((2560, 1440), Some(Codec::H264))
+        );
+        watching.takes_hevc = true;
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        sharer.pause();
+        std::thread::sleep(SWITCH_GAP);
+        sharer
+            .resume(&mut |_| {})
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(
+            (sharer.size(), sharer.codec()),
+            ((3840, 2160), Some(Codec::Hevc))
+        );
+        assert_eq!(sharer.numbers().codec_changes, 2);
     }
 
     // A change of codec that came with a new encoder for a new rate is a
