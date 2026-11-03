@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use net::upnp::{
     Action, Fault, Ignored, Kind, LEASE, MAX_ANSWER, Mapped, Owner, Search, Service, UpnpError,
-    Url, add_mapping, delete_mapping, describe, external_ip, find, http_response, mapping_entry,
-    renew_mapping, services, soap_answer, ssdp_answer,
+    Url, add_mapping, delete_mapping, describe, external_ip, find, http_response, keep_mapping,
+    mapping_entry, renew_mapping, services, soap_answer, ssdp_answer,
 };
 use proptest::prelude::*;
 use proptest::test_runner::FileFailurePersistence;
@@ -1367,6 +1367,105 @@ fn renewal_uses_a_forward_made_since() {
         (41062, 0, false)
     );
     assert_eq!(requests(&rx).len(), 1);
+}
+
+// One bad answer says nothing about the forward the room is using.
+#[test]
+fn kept_forward_stays_when_the_read_fails() {
+    for lease in [0, 900] {
+        let (addr, rx) = fake_router(1, |_| entry_answer("192.168.100.38", 41062, "1", "soon"));
+        let mapped = keep_mapping(
+            &ip_service(addr),
+            OUR_LAN_ADDR,
+            41062,
+            Some(lease),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            mapped,
+            Mapped {
+                external_port: 41062,
+                lease,
+                delete_on_close: false
+            }
+        );
+        assert_eq!(requests(&rx).len(), 1);
+    }
+}
+
+#[test]
+fn kept_forward_read_again_gives_its_lease() {
+    let (addr, rx) = fake_router(1, |_| entry_answer("192.168.100.38", 41062, "1", "300"));
+    let mapped = keep_mapping(
+        &ip_service(addr),
+        OUR_LAN_ADDR,
+        41062,
+        Some(900),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(
+        (mapped.external_port, mapped.lease, mapped.delete_on_close),
+        (41062, 300, false)
+    );
+    assert_eq!(requests(&rx).len(), 1);
+}
+
+// Whoever made it may have renewed it, so a read still goes first. With a read
+// that fails, what was there has run out and asking replaces nothing.
+#[test]
+fn kept_forward_run_out_is_asked_for_when_the_read_fails() {
+    let (addr, rx) = fake_router(1, |_| entry_answer("192.168.100.38", 41062, "1", "300"));
+    let mapped = keep_mapping(&ip_service(addr), OUR_LAN_ADDR, 41062, None, &mut |_| {}).unwrap();
+    assert_eq!(
+        (mapped.external_port, mapped.lease, mapped.delete_on_close),
+        (41062, 300, false)
+    );
+    assert_eq!(requests(&rx).len(), 1);
+
+    let (addr, rx) = fake_router(2, |request| match soap_action(request) {
+        "AddPortMapping" => http("200 OK", &soap_ok("AddPortMapping", "")),
+        _ => entry_answer("192.168.100.38", 41062, "1", "soon"),
+    });
+    let mapped = keep_mapping(&ip_service(addr), OUR_LAN_ADDR, 41062, None, &mut |_| {}).unwrap();
+    assert_eq!(
+        (mapped.external_port, mapped.lease, mapped.delete_on_close),
+        (41062, LEASE, true)
+    );
+    assert_eq!(soap_action(&requests(&rx)[1]), "AddPortMapping");
+}
+
+// The router restarted and forgot it, so what is asked for now is the room's.
+#[test]
+fn kept_forward_gone_is_asked_for() {
+    let (addr, rx) = fake_router(2, |request| match soap_action(request) {
+        "AddPortMapping" => http("200 OK", &soap_ok("AddPortMapping", "")),
+        _ => no_entry(),
+    });
+    let mapped =
+        keep_mapping(&ip_service(addr), OUR_LAN_ADDR, 41062, Some(0), &mut |_| {}).unwrap();
+    assert_eq!(
+        (mapped.external_port, mapped.lease, mapped.delete_on_close),
+        (41062, LEASE, true)
+    );
+    assert_eq!(requests(&rx).len(), 2);
+}
+
+#[test]
+fn kept_forward_taken_moves_to_a_random_port() {
+    let (addr, rx) = fake_router(3, |request| match soap_action(request) {
+        "AddPortMapping" => http("200 OK", &soap_ok("AddPortMapping", "")),
+        _ if arg(request, "NewExternalPort") == Some("41062") => {
+            entry_answer("192.168.100.20", 41062, "1", "0")
+        }
+        _ => no_entry(),
+    });
+    let mapped =
+        keep_mapping(&ip_service(addr), OUR_LAN_ADDR, 41062, Some(0), &mut |_| {}).unwrap();
+    assert_ne!(mapped.external_port, 41062);
+    assert_eq!((mapped.lease, mapped.delete_on_close), (LEASE, true));
+    assert_eq!(requests(&rx).len(), 3);
 }
 
 #[test]

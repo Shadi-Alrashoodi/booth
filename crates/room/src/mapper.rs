@@ -165,6 +165,7 @@ impl Mapper {
             earlier: finishing_on(port),
             closed: false,
             stale: Vec::new(),
+            lost: None,
         };
         let thread = thread::Builder::new()
             .name("room port mapping".into())
@@ -283,9 +284,22 @@ struct UpnpHeld {
     internal: SocketAddrV4,
     external_port: u16,
     lease: u32,
+    // When `lease` was what was left of it.
+    lease_at: Instant,
     // False for a forward the router already had to this PC that Booth did
     // not make, most likely the user's own. It is not the room's to remove.
     delete_on_close: bool,
+}
+
+impl UpnpHeld {
+    // None once the lease has run out. No lease never does.
+    fn lease_left(&self) -> Option<u32> {
+        if self.lease == 0 {
+            return Some(0);
+        }
+        let gone = u32::try_from(self.lease_at.elapsed().as_secs()).unwrap_or(u32::MAX);
+        Some(self.lease.saturating_sub(gone)).filter(|left| *left > 0)
+    }
 }
 
 impl Held {
@@ -305,15 +319,6 @@ impl Held {
             (Held::Pcp(_), Held::Pcp(_)) | (Held::NatPmp(_), Held::NatPmp(_)) => true,
             (Held::Upnp(a), Held::Upnp(b)) => a.external_port == b.external_port,
             _ => false,
-        }
-    }
-
-    // The same mapping, asked for again after a renewal failed. What the room
-    // made stays the room's to delete, also on a router that shows it under
-    // no name and so as someone else's.
-    fn take_over(&mut self, old: &Held) {
-        if let (Held::Upnp(new), Held::Upnp(old)) = (self, old) {
-            new.delete_on_close |= old.delete_on_close;
         }
     }
 }
@@ -401,6 +406,11 @@ struct Job {
     // Mappings that stopped renewing but may still be on the router. They
     // are deleted at close with the current one.
     stale: Vec<Held>,
+    // The UPnP mapping the room held until a renewal failed or it was to be
+    // made again. The next UPnP ask is for its port, as what it was to the
+    // room: the room's own entry can read back as a forward set up by hand,
+    // and a read that fails must not move a port the room holds.
+    lost: Option<UpnpHeld>,
 }
 
 impl Job {
@@ -736,11 +746,21 @@ impl Job {
             "upnp: asking {} ({}) to map udp {} to {internal} for {} s",
             router.service.control,
             router.service.kind,
-            self.port,
+            self.lost
+                .as_ref()
+                .map_or(self.port, |lost| lost.external_port),
             upnp::LEASE
         );
-        match upnp::add_mapping(&router.service, internal, self.port, note) {
+        let asked = match &self.lost {
+            Some(lost) => ask_again(&router.service, internal, lost, note),
+            None => upnp::add_mapping(&router.service, internal, self.port, note),
+        };
+        match asked {
             Ok(mapped) => {
+                self.lost = None;
+                if !mapped.delete_on_close {
+                    self.forget_stale(&router.service, mapped.external_port);
+                }
                 let external = SocketAddrV4::new(router.external_ip, mapped.external_port);
                 let kept = if mapped.delete_on_close {
                     ""
@@ -757,6 +777,7 @@ impl Job {
                     internal,
                     external_port: mapped.external_port,
                     lease: mapped.lease,
+                    lease_at: Instant::now(),
                     delete_on_close: mapped.delete_on_close,
                 });
                 Ok(Holding::new(
@@ -799,6 +820,9 @@ impl Job {
                 .map_err(|err| err.to_string())
                 .and_then(long_enough),
             Held::Upnp(held) => renew_upnp(held, note).map(|renewed| {
+                if !held.delete_on_close {
+                    self.forget_stale(&held.service, held.external_port);
+                }
                 if let Some(old) = renewed.retired {
                     log!(
                         self.log,
@@ -841,11 +865,11 @@ impl Job {
                     self.log,
                     "{word}: the renewal failed: {err}; asking the router again from the start"
                 );
+                if let Held::Upnp(held) = &old {
+                    self.lost = Some(held.clone());
+                }
                 match self.ladder_and_report() {
-                    Some(mut fresh) if old.same_as(&fresh.held) => {
-                        fresh.held.take_over(&old);
-                        Some(fresh)
-                    }
+                    Some(fresh) if old.same_as(&fresh.held) => Some(fresh),
                     fresh => {
                         self.stale.push(old);
                         fresh
@@ -866,7 +890,17 @@ impl Job {
             holding.held.protocol().word(),
             holding.external
         );
-        self.delete(holding.held);
+        if let Some(left) = self.delete(holding.held) {
+            if left.delete_on_close {
+                log!(
+                    self.log,
+                    "upnp: udp {} may still be the room's on the router, deleted when the room closes",
+                    left.external_port
+                );
+                self.stale.push(Held::Upnp(left.clone()));
+            }
+            self.lost = Some(left);
+        }
         if self.closing() {
             log!(
                 self.log,
@@ -923,10 +957,22 @@ impl Job {
                 gateway.local
             );
             self.target.moved_to(gateway);
+            // What that port holds now says nothing about what the room had.
+            self.lost = None;
         }
     }
 
-    fn delete(&mut self, held: Held) {
+    // The port holds a forward the room did not make now, so nothing of the
+    // room's is left on it, and a read that fails at close must not delete it.
+    fn forget_stale(&mut self, service: &upnp::Service, port: u16) {
+        self.stale.retain(|held| match held {
+            Held::Upnp(held) => held.external_port != port || held.service != *service,
+            _ => true,
+        });
+    }
+
+    // A UPnP entry that stays on the router comes back.
+    fn delete(&mut self, held: Held) -> Option<UpnpHeld> {
         let log = self.log.clone();
         match held {
             Held::Pcp(mut client) => {
@@ -949,14 +995,17 @@ impl Job {
                     ),
                 }
             }
-            Held::Upnp(held) if !held.delete_on_close => log!(
-                log,
-                "upnp: udp {} forwarded to this pc before the room asked, left in place",
-                held.external_port
-            ),
+            Held::Upnp(held) if !held.delete_on_close => {
+                log!(
+                    log,
+                    "upnp: udp {} forwarded to this pc before the room asked, left in place",
+                    held.external_port
+                );
+                return Some(held);
+            }
             Held::Upnp(held) => {
                 if !still_the_rooms(&log, &held) {
-                    return;
+                    return None;
                 }
                 let port = held.external_port;
                 log!(
@@ -964,7 +1013,8 @@ impl Job {
                     "upnp: asking {} to delete the mapping for udp {port}",
                     held.service.control
                 );
-                match upnp::delete_mapping(&held.service, port) {
+                let deleted = upnp::delete_mapping(&held.service, port);
+                match &deleted {
                     Ok(()) => log!(log, "upnp: the router deleted the mapping for udp {port}"),
                     Err(err) if held.lease == 0 => log!(
                         log,
@@ -976,8 +1026,12 @@ impl Job {
                         held.lease
                     ),
                 }
+                if deleted.is_err() {
+                    return Some(held);
+                }
             }
         }
+        None
     }
 }
 
@@ -1033,15 +1087,10 @@ fn renew_upnp(
     note: &mut dyn FnMut(fmt::Arguments<'_>),
 ) -> Result<Renewed, String> {
     let ip = upnp::external_ip(&held.service).map_err(|err| err.to_string())?;
-    let ask = if held.delete_on_close {
-        upnp::renew_mapping
-    } else {
-        upnp::add_mapping
-    };
-    let mapped = ask(&held.service, held.internal, held.external_port, note)
-        .map_err(|err| err.to_string())?;
+    let mapped =
+        ask_again(&held.service, held.internal, held, note).map_err(|err| err.to_string())?;
     let retired = if mapped.external_port == held.external_port {
-        held.delete_on_close |= mapped.delete_on_close;
+        held.delete_on_close = mapped.delete_on_close;
         None
     } else {
         let old = held.clone();
@@ -1050,11 +1099,26 @@ fn renew_upnp(
         Some(old)
     };
     held.lease = mapped.lease;
+    held.lease_at = Instant::now();
     Ok(Renewed {
         external: SocketAddrV4::new(ip, mapped.external_port),
         lease: mapped.lease,
         retired,
     })
+}
+
+fn ask_again(
+    service: &upnp::Service,
+    internal: SocketAddrV4,
+    held: &UpnpHeld,
+    note: &mut dyn FnMut(fmt::Arguments<'_>),
+) -> Result<upnp::Mapped, UpnpError> {
+    let port = held.external_port;
+    if held.delete_on_close {
+        upnp::renew_mapping(service, internal, port, note)
+    } else {
+        upnp::keep_mapping(service, internal, port, held.lease_left(), note)
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

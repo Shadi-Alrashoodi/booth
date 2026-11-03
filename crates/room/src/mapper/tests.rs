@@ -504,6 +504,8 @@ struct FakeIgd {
     lease: Arc<AtomicU32>,
     // False for a router that shows every entry with no name.
     keeps_names: Arc<AtomicBool>,
+    // Calls to answer with a fault that is not 714, each name once.
+    fails: Arc<Mutex<Vec<&'static str>>>,
 }
 
 impl FakeIgd {
@@ -514,17 +516,18 @@ impl FakeIgd {
         let table = Arc::new(Mutex::new(Vec::new()));
         let lease = Arc::new(AtomicU32::new(3600));
         let keeps_names = Arc::new(AtomicBool::new(true));
+        let fails = Arc::new(Mutex::new(Vec::new()));
         thread::spawn({
             let (actions, table, lease) =
                 (Arc::clone(&actions), Arc::clone(&table), Arc::clone(&lease));
-            let keeps_names = Arc::clone(&keeps_names);
+            let (keeps_names, fails) = (Arc::clone(&keeps_names), Arc::clone(&fails));
             move || {
                 for stream in listener.incoming() {
                     let Ok(mut stream) = stream else { return };
                     let request = read_request(&mut stream);
                     let lease = lease.load(Ordering::Relaxed);
                     let keeps_names = keeps_names.load(Ordering::Relaxed);
-                    let reply = igd_answer(&request, &actions, &table, lease, keeps_names);
+                    let reply = igd_answer(&request, &actions, &table, lease, keeps_names, &fails);
                     let _ = stream.write_all(reply.as_bytes());
                 }
             }
@@ -547,11 +550,16 @@ impl FakeIgd {
             table,
             lease,
             keeps_names,
+            fails,
         }
     }
 
     fn actions(&self) -> Vec<String> {
         lock(&self.actions).clone()
+    }
+
+    fn fail_once(&self, actions: &[&'static str]) {
+        lock(&self.fails).extend_from_slice(actions);
     }
 }
 
@@ -598,6 +606,7 @@ fn igd_answer(
     table: &Table,
     lease: u32,
     keeps_names: bool,
+    fails: &Mutex<Vec<&'static str>>,
 ) -> String {
     const URN: &str = "urn:schemas-upnp-org:service:WANIPConnection:1";
     let (status, body) = if request.starts_with("GET ") {
@@ -617,7 +626,13 @@ fn igd_answer(
         let port: u16 = arg(request, "NewExternalPort").parse().unwrap_or(0);
         let mut table = lock(table);
         let found = table.iter().position(|(on, ..)| *on == port);
+        let failing = {
+            let mut fails = lock(fails);
+            let at = fails.iter().position(|name| *name == action);
+            at.map(|at| fails.remove(at)).is_some()
+        };
         let values = match action.as_str() {
+            _ if failing => None,
             "GetExternalIPAddress" => Some(format!(
                 "<NewExternalIPAddress>{OUTSIDE}</NewExternalIPAddress>"
             )),
@@ -660,8 +675,9 @@ fn igd_answer(
             ),
             None => (
                 "500 Internal Server Error",
-                String::from(
-                    "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><s:Fault><detail><UPnPError><errorCode>714</errorCode></UPnPError></detail></s:Fault></s:Body></s:Envelope>",
+                format!(
+                    "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><s:Fault><detail><UPnPError><errorCode>{}</errorCode></UPnPError></detail></s:Fault></s:Body></s:Envelope>",
+                    if failing { 501 } else { 714 }
                 ),
             ),
         }
@@ -848,6 +864,350 @@ fn hand_made_forward_named_booth_left_alone() {
     assert_eq!(count(&actions, "AddPortMapping"), 0, "{actions:?}");
     assert_eq!(count(&actions, "DeletePortMapping"), 0, "{actions:?}");
     assert_eq!(*lock(&igd.table), [forward]);
+}
+
+// A renewal that fails on a router that shows the room's own entry as a
+// forward set up by hand, permanent or nameless. Asked for again it is still
+// the room's: its lease starts again, and Close room removes it.
+#[test]
+fn own_entry_stays_the_rooms_after_a_failed_renewal() {
+    for (lease, keeps_names) in [(0, true), (3600, false)] {
+        let igd = FakeIgd::start();
+        igd.keeps_names.store(keeps_names, Ordering::Relaxed);
+        let (mut mapper, reports) = start(target(closed_port(), igd.ssdp), Log::off());
+        let wait = Duration::from_secs(5);
+        assert_eq!(
+            reports.recv_timeout(wait),
+            Ok(mapped(Protocol::Upnp, upnp::LEASE))
+        );
+        igd.lease.store(lease, Ordering::Relaxed);
+        igd.fail_once(&["GetExternalIPAddress"]);
+        mapper.renewer().send(()).unwrap();
+        assert_eq!(
+            reports.recv_timeout(wait),
+            Ok(mapped(Protocol::Upnp, upnp::LEASE))
+        );
+        assert_eq!(count(&igd.actions(), "AddPortMapping"), 2);
+        mapper.close();
+        assert!(mapper.wait(Instant::now() + wait));
+        assert!(lock(&igd.table).is_empty());
+    }
+}
+
+// The same when the mapping comes back only on a later try: its renewals
+// still ask, or the lease counts down to nothing.
+#[test]
+fn nameless_entry_renewed_after_it_was_lost() {
+    let igd = FakeIgd::start();
+    igd.keeps_names.store(false, Ordering::Relaxed);
+    let quick = Target {
+        again: [Duration::from_millis(100); 3],
+        ..target(closed_port(), igd.ssdp)
+    };
+    let (mut mapper, reports) = start(quick, Log::off());
+    let wait = Duration::from_secs(5);
+    assert_eq!(
+        reports.recv_timeout(wait),
+        Ok(mapped(Protocol::Upnp, upnp::LEASE))
+    );
+    igd.fail_once(&["GetExternalIPAddress", "GetExternalIPAddress"]);
+    mapper.renewer().send(()).unwrap();
+    assert!(matches!(
+        reports.recv_timeout(wait),
+        Ok(Report::Unmapped { .. })
+    ));
+    assert_eq!(
+        reports.recv_timeout(wait),
+        Ok(mapped(Protocol::Upnp, upnp::LEASE))
+    );
+    mapper.renewer().send(()).unwrap();
+    assert_eq!(
+        reports.recv_timeout(wait),
+        Ok(mapped(Protocol::Upnp, upnp::LEASE))
+    );
+    assert_eq!(count(&igd.actions(), "AddPortMapping"), 3);
+    mapper.close();
+    assert!(mapper.wait(Instant::now() + wait));
+    assert!(lock(&igd.table).is_empty());
+}
+
+// A router that cannot read its table, and a renewal that fails, on a port
+// that is not the one the room started from. Friends keep their address.
+#[test]
+fn failed_renewal_keeps_the_port_when_the_read_fails() {
+    let igd = FakeIgd::start();
+    igd.fail_once(&["GetSpecificPortMappingEntry"]);
+    let (mut mapper, reports) = start(target(closed_port(), igd.ssdp), Log::off());
+    let wait = Duration::from_secs(5);
+    let Ok(Report::Mapped { external, .. }) = reports.recv_timeout(wait) else {
+        panic!("no mapping");
+    };
+    assert_ne!(external.port(), PORT);
+    igd.fail_once(&["GetExternalIPAddress", "GetSpecificPortMappingEntry"]);
+    mapper.renewer().send(()).unwrap();
+    assert_eq!(
+        reports.recv_timeout(wait),
+        Ok(mapped_on(external.port(), Protocol::Upnp, upnp::LEASE))
+    );
+    mapper.close();
+    assert!(mapper.wait(Instant::now() + wait));
+    assert!(lock(&igd.table).is_empty());
+}
+
+// The outside address changed on a router that keeps only permanent mappings,
+// and the delete failed. Asked for again the entry is still the room's, not a
+// forward set up by hand, and Close room removes it.
+#[test]
+fn failed_delete_at_remap_stays_the_rooms() {
+    let igd = FakeIgd::start();
+    let (mut mapper, reports) = start(target(closed_port(), igd.ssdp), Log::off());
+    let wait = Duration::from_secs(5);
+    assert_eq!(
+        reports.recv_timeout(wait),
+        Ok(mapped(Protocol::Upnp, upnp::LEASE))
+    );
+    igd.lease.store(0, Ordering::Relaxed);
+    igd.fail_once(&["DeletePortMapping"]);
+    mapper.remapper().send(GATEWAY).unwrap();
+    assert_eq!(
+        reports.recv_timeout(wait),
+        Ok(mapped(Protocol::Upnp, upnp::LEASE))
+    );
+    assert_eq!(count(&igd.actions(), "AddPortMapping"), 2);
+    mapper.close();
+    assert!(mapper.wait(Instant::now() + wait));
+    assert!(lock(&igd.table).is_empty());
+}
+
+// This PC has another address now, so what stays on the old port forwards to
+// where it used to be. Nothing says whose the port is, so it is not asked for
+// over an entry it cannot read, and the old entry is deleted at close.
+#[test]
+fn failed_delete_at_remap_deleted_from_another_address() {
+    let igd = FakeIgd::start();
+    let (mut mapper, reports) = start(target(closed_port(), igd.ssdp), Log::off());
+    let wait = Duration::from_secs(5);
+    assert_eq!(
+        reports.recv_timeout(wait),
+        Ok(mapped(Protocol::Upnp, upnp::LEASE))
+    );
+    igd.fail_once(&[
+        "GetSpecificPortMappingEntry",
+        "DeletePortMapping",
+        "GetSpecificPortMappingEntry",
+    ]);
+    mapper
+        .remapper()
+        .send(Gateway {
+            local: Ipv4Addr::new(127, 0, 0, 2),
+            ..GATEWAY
+        })
+        .unwrap();
+    let Ok(Report::Mapped { external, .. }) = reports.recv_timeout(wait) else {
+        panic!("no mapping");
+    };
+    assert_ne!(external.port(), PORT);
+    assert_eq!(lock(&igd.table).len(), 2);
+    mapper.close();
+    assert!(mapper.wait(Instant::now() + wait));
+    assert!(lock(&igd.table).is_empty());
+}
+
+// A mapping made again and then deleted leaves nothing of the room's on the
+// port, so the next first ask goes by what it reads there.
+#[test]
+fn deleted_port_is_a_first_ask_again() {
+    let igd = FakeIgd::start();
+    let (mut mapper, reports) = start(target(closed_port(), igd.ssdp), Log::off());
+    let wait = Duration::from_secs(5);
+    assert_eq!(
+        reports.recv_timeout(wait),
+        Ok(mapped(Protocol::Upnp, upnp::LEASE))
+    );
+    igd.fail_once(&["GetExternalIPAddress"]);
+    mapper.renewer().send(()).unwrap();
+    assert_eq!(
+        reports.recv_timeout(wait),
+        Ok(mapped(Protocol::Upnp, upnp::LEASE))
+    );
+    igd.fail_once(&["GetSpecificPortMappingEntry", "GetSpecificPortMappingEntry"]);
+    mapper.remapper().send(GATEWAY).unwrap();
+    let Ok(Report::Mapped { external, .. }) = reports.recv_timeout(wait) else {
+        panic!("no mapping");
+    };
+    assert_ne!(external.port(), PORT);
+    mapper.close();
+    assert!(mapper.wait(Instant::now() + wait));
+    assert!(lock(&igd.table).is_empty());
+}
+
+fn forward_by_hand(igd: &FakeIgd) -> (u16, String, u16, String) {
+    let forward = (PORT, LOCALHOST.to_string(), PORT, String::from("mine"));
+    *lock(&igd.table) = vec![forward.clone()];
+    igd.lease.store(0, Ordering::Relaxed);
+    forward
+}
+
+// One bad read says nothing about the forward, so the room stays on it, also
+// when the renewal failed before it or the outside address changed.
+#[test]
+fn kept_forward_stays_on_a_bad_read() {
+    let igd = FakeIgd::start();
+    let forward = forward_by_hand(&igd);
+    let (mut mapper, reports) = start(target(closed_port(), igd.ssdp), Log::off());
+    let wait = Duration::from_secs(5);
+    assert_eq!(reports.recv_timeout(wait), Ok(mapped(Protocol::Upnp, 0)));
+
+    igd.fail_once(&["GetSpecificPortMappingEntry"]);
+    mapper.renewer().send(()).unwrap();
+    assert_eq!(reports.recv_timeout(wait), Ok(mapped(Protocol::Upnp, 0)));
+
+    igd.fail_once(&["GetExternalIPAddress", "GetSpecificPortMappingEntry"]);
+    mapper.renewer().send(()).unwrap();
+    assert_eq!(reports.recv_timeout(wait), Ok(mapped(Protocol::Upnp, 0)));
+
+    igd.fail_once(&["GetSpecificPortMappingEntry"]);
+    mapper.remapper().send(GATEWAY).unwrap();
+    assert_eq!(reports.recv_timeout(wait), Ok(mapped(Protocol::Upnp, 0)));
+
+    mapper.close();
+    assert!(mapper.wait(Instant::now() + wait));
+    let actions = igd.actions();
+    assert_eq!(count(&actions, "AddPortMapping"), 0, "{actions:?}");
+    assert_eq!(count(&actions, "DeletePortMapping"), 0, "{actions:?}");
+    assert_eq!(*lock(&igd.table), [forward]);
+}
+
+// A forward made on the port the room holds, friends not getting in being the
+// likely reason. From the renewal that reads it on, it is the user's: a read
+// that fails, then or at close, does not put the room back on it.
+#[test]
+fn forward_made_on_the_rooms_port_left_alone() {
+    for read_at_close in [true, false] {
+        let igd = FakeIgd::start();
+        let (mut mapper, reports) = start(target(closed_port(), igd.ssdp), Log::off());
+        let wait = Duration::from_secs(5);
+        assert_eq!(
+            reports.recv_timeout(wait),
+            Ok(mapped(Protocol::Upnp, upnp::LEASE))
+        );
+        let forward = forward_by_hand(&igd);
+        mapper.renewer().send(()).unwrap();
+        assert_eq!(reports.recv_timeout(wait), Ok(mapped(Protocol::Upnp, 0)));
+
+        igd.fail_once(&["GetSpecificPortMappingEntry"]);
+        mapper.renewer().send(()).unwrap();
+        assert_eq!(reports.recv_timeout(wait), Ok(mapped(Protocol::Upnp, 0)));
+
+        if !read_at_close {
+            igd.fail_once(&["GetSpecificPortMappingEntry"]);
+        }
+        mapper.close();
+        assert!(mapper.wait(Instant::now() + wait));
+        let actions = igd.actions();
+        assert_eq!(count(&actions, "AddPortMapping"), 1, "{actions:?}");
+        assert_eq!(count(&actions, "DeletePortMapping"), 0, "{actions:?}");
+        assert_eq!(*lock(&igd.table), [forward]);
+    }
+}
+
+// The same when the room lost the mapping before it read the forward: what it
+// kept to delete at close is on that port, and it is not the room's any more.
+#[test]
+fn forward_made_after_a_failed_renewal_left_alone() {
+    let igd = FakeIgd::start();
+    let quick = Target {
+        again: [Duration::from_millis(100); 3],
+        ..target(closed_port(), igd.ssdp)
+    };
+    let (mut mapper, reports) = start(quick, Log::off());
+    let wait = Duration::from_secs(5);
+    assert_eq!(
+        reports.recv_timeout(wait),
+        Ok(mapped(Protocol::Upnp, upnp::LEASE))
+    );
+    let forward = forward_by_hand(&igd);
+    igd.fail_once(&["GetExternalIPAddress", "GetExternalIPAddress"]);
+    mapper.renewer().send(()).unwrap();
+    assert!(matches!(
+        reports.recv_timeout(wait),
+        Ok(Report::Unmapped { .. })
+    ));
+    assert_eq!(reports.recv_timeout(wait), Ok(mapped(Protocol::Upnp, 0)));
+
+    igd.fail_once(&["GetSpecificPortMappingEntry"]);
+    mapper.close();
+    assert!(mapper.wait(Instant::now() + wait));
+    let actions = igd.actions();
+    assert_eq!(count(&actions, "AddPortMapping"), 1, "{actions:?}");
+    assert_eq!(count(&actions, "DeletePortMapping"), 0, "{actions:?}");
+    assert_eq!(*lock(&igd.table), [forward]);
+}
+
+// And when the room held the port again while it still had the entry a failed
+// delete left, to delete at close.
+#[test]
+fn forward_made_after_a_failed_delete_left_alone() {
+    let igd = FakeIgd::start();
+    let (mut mapper, reports) = start(target(closed_port(), igd.ssdp), Log::off());
+    let wait = Duration::from_secs(5);
+    assert_eq!(
+        reports.recv_timeout(wait),
+        Ok(mapped(Protocol::Upnp, upnp::LEASE))
+    );
+    igd.fail_once(&["DeletePortMapping"]);
+    mapper.remapper().send(GATEWAY).unwrap();
+    assert_eq!(
+        reports.recv_timeout(wait),
+        Ok(mapped(Protocol::Upnp, upnp::LEASE))
+    );
+    let forward = forward_by_hand(&igd);
+    mapper.renewer().send(()).unwrap();
+    assert_eq!(reports.recv_timeout(wait), Ok(mapped(Protocol::Upnp, 0)));
+
+    igd.fail_once(&["GetSpecificPortMappingEntry"]);
+    mapper.close();
+    assert!(mapper.wait(Instant::now() + wait));
+    let actions = igd.actions();
+    assert_eq!(count(&actions, "DeletePortMapping"), 1, "the failed one");
+    assert_eq!(*lock(&igd.table), [forward]);
+}
+
+// A router that faults on an entry it no longer has, so no read shows the
+// forward gone. Its lease still runs out, and the room offers no dead address
+// after that.
+#[test]
+fn kept_forward_asked_for_when_its_lease_ran_out() {
+    let igd = FakeIgd::start();
+    forward_by_hand(&igd);
+    igd.lease.store(3, Ordering::Relaxed);
+    let every_second = Target {
+        least_lifetime: 2,
+        ..target(closed_port(), igd.ssdp)
+    };
+    let (mut mapper, reports) = start(every_second, Log::off());
+    let wait = Duration::from_secs(5);
+    assert_eq!(reports.recv_timeout(wait), Ok(mapped(Protocol::Upnp, 3)));
+    lock(&igd.table).clear();
+    igd.fail_once(&["GetSpecificPortMappingEntry"; 8]);
+
+    let mut left = 3;
+    loop {
+        let Ok(Report::Mapped { lifetime, .. }) = reports.recv_timeout(wait) else {
+            panic!("no renewal");
+        };
+        if lifetime == upnp::LEASE {
+            break;
+        }
+        assert!(lifetime < left, "{lifetime} s after {left} s");
+        assert_eq!(count(&igd.actions(), "AddPortMapping"), 0);
+        left = lifetime;
+    }
+    assert_eq!(count(&igd.actions(), "AddPortMapping"), 1);
+    lock(&igd.fails).clear();
+    mapper.close();
+    assert!(mapper.wait(Instant::now() + wait));
+    assert!(lock(&igd.table).is_empty());
 }
 
 // The router gave the room's port to another device, so the renewal moves

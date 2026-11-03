@@ -831,12 +831,29 @@ pub fn renew_mapping(
     map_port(service, internal, external_port, Asking::Made, note)
 }
 
+// The same for a forward the room uses as it is, with `lease` what is left of
+// it since it was last read, None once that has run out. A read that fails says
+// nothing about that forward, and moving off it would give friends a new address
+// and never come back to it, so it stays until a read shows it gone or taken. A
+// lease that ran out is gone whatever the reads say, so the port is asked for.
+pub fn keep_mapping(
+    service: &Service,
+    internal: SocketAddrV4,
+    external_port: u16,
+    lease: Option<u32>,
+    note: &mut dyn FnMut(fmt::Arguments<'_>),
+) -> Result<Mapped, UpnpError> {
+    map_port(service, internal, external_port, Asking::Kept(lease), note)
+}
+
 // What the port is to the room when it asks for it.
 #[derive(Clone, Copy)]
 enum Asking {
     First,
     // The room made its own mapping on it.
     Made,
+    // The room uses the forward on it as it is.
+    Kept(Option<u32>),
 }
 
 // Entry::owner, with what the room knows when it asks for the port.
@@ -883,11 +900,21 @@ fn map_port(
         },
         Err(UpnpError::Fault(_, Fault::NO_SUCH_ENTRY)) => true,
         Err(err) => match asking {
-            Asking::Made => {
+            Asking::Made | Asking::Kept(None) => {
                 note(format_args!(
                     "could not read the entry for port {external_port}: {err}; asking for it all the same"
                 ));
                 true
+            }
+            Asking::Kept(Some(lease)) => {
+                note(format_args!(
+                    "could not read the entry for port {external_port}: {err}; going on using it"
+                ));
+                return Ok(Mapped {
+                    external_port,
+                    lease,
+                    delete_on_close: false,
+                });
             }
             Asking::First => {
                 note(format_args!(
