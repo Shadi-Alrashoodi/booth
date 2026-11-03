@@ -357,9 +357,10 @@ impl<K: PartialEq, S: FrameSource, T: StereoSource> Mixer<K, S, T> {
     }
 
     // Deafened, the mixer plays silence and pulls nothing once the fade out
-    // is done (within the next render call at any period over 2.5 ms), so
-    // every jitter buffer drains and starts again at its own depth when this
-    // is turned off.
+    // is done (within the next render call at any period over 2.5 ms), and
+    // tells every source so each period. A talker's jitter buffer lets go of
+    // what it holds then, so only the last period's packets and what arrives
+    // after this is turned off play, from the buffer's own depth.
     pub fn set_deafened(&mut self, deafened: bool) {
         self.deafened = deafened;
     }

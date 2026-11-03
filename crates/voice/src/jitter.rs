@@ -311,7 +311,11 @@ impl JitterBuffer {
                     && ext <= newest
                     && newest - ext < window_frames(self.frame)
                 {
-                    // A straggler from a transmission that has ended.
+                    // A straggler from a transmission that has ended. After a
+                    // pause its number may not be judged yet, and it did arrive.
+                    if !self.judged.is_some_and(|judged| ext <= judged) {
+                        self.see(ext);
+                    }
                     return Ok(());
                 }
                 self.start(ext, &packet);
@@ -335,14 +339,13 @@ impl JitterBuffer {
                     && (info.samples >= self.frame || lead > 2 * self.cap())
                 {
                     // The play point fell too far behind the packets: pulls
-                    // stopped (deafen, a stalled audio thread) or the talker
-                    // jumped ahead. Start again from the newest packets, at
-                    // the depth from before: what arrived since the last pull
-                    // only looks early because nobody was pulling. Shorter
-                    // frames ahead of a mode switch go by their own cap, twice
-                    // as many numbers: the longer frames before them are still
-                    // due to play, and the same delay takes twice the numbers
-                    // at the new size.
+                    // stopped (a stalled audio thread) or the talker jumped
+                    // ahead. Start again from the newest packets, at the depth
+                    // from before: what arrived since the last pull only looks
+                    // early because nobody was pulling. Shorter frames ahead of
+                    // a mode switch go by their own cap, twice as many numbers:
+                    // the longer frames before them are still due to play, and
+                    // the same delay takes twice the numbers at the new size.
                     let since_last_pull = self.pulls;
                     self.arrivals.retain(|arrival| arrival.at < since_last_pull);
                     self.measure_depth();
@@ -386,10 +389,18 @@ impl JitterBuffer {
         Ok(())
     }
 
-    // The mixer stopped pulling: deafened. A buffer that timed out before
-    // this would otherwise count everything the talker says next as lost,
-    // since nothing tells it the time is passing.
+    // The mixer stopped pulling: deafened. It calls this every period until
+    // it pulls again. What is held would come out then as old speech, so it
+    // goes, uncounted, and so does what the decoder remembers: the next pull
+    // starts at the depth kept, from silence, with the last period's packets
+    // at most. Their numbers are still judged as packets arrive. A buffer that
+    // timed out before this would otherwise count everything the talker says
+    // next as lost, since nothing tells it the time is passing.
     pub fn pause(&mut self) {
+        if self.phase != Phase::Idle {
+            self.let_go();
+            let _ = self.decoder.reset();
+        }
         self.paused = true;
         self.timed_out = false;
     }
@@ -619,10 +630,7 @@ impl JitterBuffer {
         if let Some(newest) = self.newest {
             self.judge_through(newest, false);
         }
-        self.slots = [EMPTY_SLOT; SLOTS];
-        self.late = EMPTY_SLOT;
-        self.made_up = false;
-        self.phase = Phase::Idle;
+        self.let_go();
         self.timed_out = timed_out;
         if !timed_out {
             // The talker said it stopped, so its next transmission starts
@@ -631,6 +639,13 @@ impl JitterBuffer {
             // an outage the talker's encoder carried on, and so does this.
             let _ = self.decoder.reset();
         }
+    }
+
+    fn let_go(&mut self) {
+        self.slots = [EMPTY_SLOT; SLOTS];
+        self.late = EMPTY_SLOT;
+        self.made_up = false;
+        self.phase = Phase::Idle;
         self.audible = false;
         self.fade_in = true;
     }

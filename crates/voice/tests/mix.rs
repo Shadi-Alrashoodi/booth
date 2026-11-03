@@ -405,6 +405,83 @@ fn a_10_ms_period_starts_two_frames_deep() {
     );
 }
 
+// A real talker through their jitter buffer. Deafened, they say something and
+// stop, with an end mark or without one, and much later the listener comes
+// back: nothing of what they said plays, and what they say next does.
+#[test]
+fn nothing_said_while_deafened_plays_after_it() {
+    for marked in [true, false] {
+        let mut mixer: Mixer<u32, JitterBuffer> = Mixer::new();
+        mixer.add(1, JitterBuffer::new().unwrap());
+        let mut encoder = Encoder::new(Mode::LowDelay, true).unwrap();
+        let mut seq = 0u16;
+        let mut say = |mixer: &mut Mixer<u32, JitterBuffer>, last: bool| {
+            let mut packet = [0u8; MAX_PACKET];
+            let pcm: Vec<f32> = (0..240)
+                .map(|k| {
+                    let t = (u64::from(seq) * 240 + k) as f32 / SAMPLE_RATE as f32;
+                    0.4 * (TAU * 330.0 * t).sin()
+                })
+                .collect();
+            let len = encoder.encode(&pcm, &mut packet).unwrap();
+            mixer
+                .source_mut(&1)
+                .unwrap()
+                .push(VoicePacket {
+                    seq,
+                    frame: &packet[..len],
+                    previous: None,
+                    redundancy: false,
+                    last,
+                })
+                .unwrap();
+            seq += 1;
+        };
+        let mut out = [0.0f32; 240];
+        for _ in 0..20 {
+            say(&mut mixer, false);
+            mixer.render(&mut out);
+        }
+        assert!(out.iter().any(|s| s.abs() > 0.1));
+
+        mixer.set_deafened(true);
+        say(&mut mixer, false);
+        mixer.render(&mut out);
+        for period in 0..20 {
+            say(&mut mixer, marked && period == 19);
+            mixer.render(&mut out);
+            assert!(out.iter().all(|&s| s == 0.0));
+        }
+        for _ in 0..200 {
+            mixer.render(&mut out);
+        }
+
+        mixer.set_deafened(false);
+        for _ in 0..4 {
+            mixer.render(&mut out);
+            assert!(out.iter().all(|&s| s == 0.0));
+        }
+        let mut frame = [0.0f32; MAX_FRAME];
+        assert_eq!(mixer.source_mut(&1).unwrap().pull(&mut frame), None);
+
+        for _ in 0..20 {
+            say(&mut mixer, false);
+            mixer.render(&mut out);
+        }
+        assert!(out.iter().any(|s| s.abs() > 0.1));
+        let stats = mixer.source_mut(&1).unwrap().stats();
+        assert_eq!(
+            (
+                stats.lost,
+                stats.dropped,
+                stats.concealed,
+                stats.depth_frames
+            ),
+            (0, 0, 0, 1)
+        );
+    }
+}
+
 // Two real talkers through their jitter buffers, rendered at 128 frames
 // (2.67 ms) while packets arrive every 5 ms: once both are talking, every
 // period has sound and none of it goes past full scale.

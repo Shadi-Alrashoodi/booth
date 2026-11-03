@@ -1,6 +1,6 @@
 use std::f32::consts::TAU;
 
-use voice::codec::{Encoder, MAX_FRAME, MAX_PACKET, Mode, SAMPLE_RATE};
+use voice::codec::{Decoder, Encoder, MAX_FRAME, MAX_PACKET, Mode, SAMPLE_RATE};
 use voice::jitter::{JitterBuffer, JitterStats, MAX_DEPTH_MS, Pulled, Source, VoicePacket};
 
 // No step between two output samples may be larger than this, joins included:
@@ -741,14 +741,15 @@ fn without_an_end_mark_the_tail_is_concealed_then_idle() {
 
 #[test]
 fn after_pulls_stop_it_restarts_at_its_depth() {
-    // As when deafened: a second with no pulls while the packets keep coming.
+    // As when the render thread stalls: a second with no pulls while the
+    // packets keep coming.
     let sent = low_delay(&tone(4.0), 0);
-    let deaf = SECOND..2 * SECOND;
+    let stall = SECOND..2 * SECOND;
     let mut listener = Listener::new();
     listener.run(&sent, &on_time(&sent), 4 * SECOND + TICK, |now| {
-        !deaf.contains(&now)
+        !stall.contains(&now)
     });
-    for packet in sent.iter().filter(|packet| packet.sent_at >= deaf.end) {
+    for packet in sent.iter().filter(|packet| packet.sent_at >= stall.end) {
         assert_eq!(listener.played_at(packet.seq), Some(packet.sent_at));
     }
     let stats = listener.stats();
@@ -1324,6 +1325,19 @@ fn late_frame_decoded_only_while_in_reach() {
     listener.assert_no_clicks();
 }
 
+// What a fresh decoder makes of a transmission, frame by frame, which is what
+// the talker's reset encoder meant.
+fn decoded_fresh(sent: &[Sent]) -> Vec<Vec<f32>> {
+    let mut decoder = Decoder::new().unwrap();
+    sent.iter()
+        .map(|packet| {
+            let mut out = [0f32; MAX_FRAME];
+            let len = decoder.decode(&packet.frame, &mut out).unwrap();
+            out[..len].to_vec()
+        })
+        .collect()
+}
+
 // Three frames deep, the second packet of a word overtakes the first and one
 // pull goes by. The first still has its turn ahead, so it plays.
 #[test]
@@ -1556,6 +1570,49 @@ fn back_from_the_10_ms_mode_deep_in_the_buffer_no_frame_goes() {
     }
 }
 
+// Deafened: the mixer tells the buffer every period, packets keep coming, some
+// of them out of order. It holds nothing, counts nothing as dropped or lost,
+// and what plays after is what came in last, at the depth it had.
+#[test]
+fn a_pause_lets_go_of_what_is_held() {
+    let sent = low_delay(&tone(1.0), 0);
+    let mut buffer = JitterBuffer::new().unwrap();
+    let mut frame = [0f32; MAX_FRAME];
+    for packet in &sent[..20] {
+        buffer.push(packet.packet()).unwrap();
+        assert_eq!(
+            buffer.pull(&mut frame).unwrap().source,
+            Source::Packet(packet.seq)
+        );
+    }
+    buffer.pause();
+    for pair in sent[20..120].chunks(2) {
+        for packet in pair.iter().rev() {
+            buffer.push(packet.packet()).unwrap();
+            buffer.pause();
+            let stats = buffer.stats();
+            assert_eq!((stats.playing, stats.held_frames), (false, 0));
+        }
+    }
+    for packet in &sent[120..180] {
+        buffer.push(packet.packet()).unwrap();
+        if packet.seq < 179 {
+            buffer.pause();
+        }
+    }
+    assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Packet(179));
+    buffer.push(sent[180].packet()).unwrap();
+    assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Packet(180));
+    // The decoder remembers nothing from before either.
+    assert_eq!(frame[..240], decoded_fresh(&sent[179..181])[1]);
+    let stats = buffer.stats();
+    assert_eq!(
+        (stats.depth_frames, stats.lost, stats.dropped, stats.late),
+        (1, 0, 0, 0)
+    );
+    assert_eq!(stats.loss_percent, 0.0);
+}
+
 // The same stall with a time out earlier on, which says nothing about this
 // transmission: what played is no loss, and what never will play is dropped.
 #[test]
@@ -1676,4 +1733,41 @@ fn a_stall_past_the_cap_of_the_shorter_frames_keeps_the_newest() {
     assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Packet(23));
     let stats = buffer.stats();
     assert_eq!((stats.frame_ms, stats.dropped, stats.lost), (5, 13, 0));
+}
+
+// Deafened three frames deep: the depth is kept, so the first packet after it
+// plays that far behind, from silence and a decoder that remembers nothing.
+#[test]
+fn back_from_a_pause_it_starts_at_the_depth_kept() {
+    let sent = low_delay(&tone(3.0), 0);
+    let mut arrive = on_time(&sent);
+    for i in [100, 110, 120, 130, 140, 150] {
+        arrive[i] = Some(sent[i].sent_at + 2 * TICK);
+    }
+    let mut listener = Listener::new();
+    listener.run(&sent, &arrive, sent[400].sent_at, always);
+    assert_eq!(listener.stats().depth_frames, 3);
+
+    let buffer = &mut listener.buffer;
+    let mut frame = [0f32; MAX_FRAME];
+    buffer.pause();
+    for packet in &sent[400..500] {
+        buffer.push(packet.packet()).unwrap();
+        buffer.pause();
+    }
+    let dropped = buffer.stats().dropped;
+    for packet in &sent[500..502] {
+        buffer.push(packet.packet()).unwrap();
+        assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Silence);
+        assert!(frame[..240].iter().all(|&s| s == 0.0));
+    }
+    for packet in &sent[502..510] {
+        buffer.push(packet.packet()).unwrap();
+        let seq = packet.seq - 2;
+        assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Packet(seq));
+    }
+    assert_eq!(frame[..240], decoded_fresh(&sent[500..508])[7]);
+    let stats = buffer.stats();
+    assert_eq!((stats.depth_frames, stats.lost), (3, 0));
+    assert_eq!(stats.dropped, dropped);
 }
