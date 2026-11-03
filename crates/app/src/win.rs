@@ -31,10 +31,11 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_PROCESSKEY, VK_RBUTTON, VK_RMENU, VK_RWIN, VK_SHIFT, VK_XBUTTON1, VK_XBUTTON2,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DestroyIcon, HWND_TOP, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW,
-    MB_ICONERROR, MB_OK, MSG, MessageBoxW, SM_CXICON, SM_CXSMICON, SPI_GETCLIENTAREAANIMATION,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetForegroundWindow, SetWindowPos,
-    SystemParametersInfoW, WM_KEYDOWN, WM_KEYUP, WM_SETICON, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    DestroyIcon, DispatchMessageW, HWND_TOP, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR,
+    LoadImageW, MB_ICONERROR, MB_OK, MB_TOPMOST, MSG, MessageBoxW, PM_QS_POSTMESSAGE, PM_REMOVE,
+    PeekMessageW, SM_CXICON, SM_CXSMICON, SPI_GETCLIENTAREAANIMATION, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SendMessageW, SetForegroundWindow, SetWindowPos, SystemParametersInfoW, WM_KEYDOWN,
+    WM_KEYUP, WM_SETICON, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 use windows_sys::core::BOOL;
 
@@ -297,8 +298,31 @@ fn destroy_icon(icon: isize) {
     }
 }
 
-// Only for a window that could not open, or a start the arguments stopped;
-// a release build has no console to print to.
+// A window winit drops is only posted its destroy, for winit's loop to read,
+// and a panic leaves that loop first. Posted messages only: outside the loop
+// winit asks again for every paint of a window still up, and the queue would
+// never empty.
+pub fn handle_posted_messages() {
+    let mut msg = MSG::default();
+    // SAFETY: `msg` is a live MSG for the call to write and is read only after
+    // the call filled it in.
+    unsafe {
+        while PeekMessageW(
+            &mut msg,
+            ptr::null_mut(),
+            0,
+            0,
+            PM_REMOVE | PM_QS_POSTMESSAGE,
+        ) != 0
+        {
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+// For a run that is ending with something to say; a release build has no
+// console to print to. On top, as a panel can stop behind a game, where Windows
+// would not let a plain box come forward, or under the region picker's dimming.
 pub fn error_box(text: &str) {
     let text: Vec<u16> = text.encode_utf16().chain([0]).collect();
     let title: Vec<u16> = "Booth".encode_utf16().chain([0]).collect();
@@ -308,7 +332,7 @@ pub fn error_box(text: &str) {
             std::ptr::null_mut(),
             text.as_ptr(),
             title.as_ptr(),
-            MB_OK | MB_ICONERROR,
+            MB_OK | MB_ICONERROR | MB_TOPMOST,
         );
     }
 }
@@ -480,10 +504,20 @@ fn local(unix: u64) -> Option<SYSTEMTIME> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::Graphics::Gdi::{RDW_INTERNALPAINT, RedrawWindow};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         VK_BACK, VK_F10, VK_LMENU, VK_M, VK_PACKET, VK_RETURN, VK_SPACE,
     };
-    use windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, HWND_MESSAGE, IsWindow, PostMessageW, RegisterClassExW,
+        WM_CHAR, WM_CLOSE, WM_PAINT, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+        WS_VISIBLE,
+    };
 
     use super::*;
 
@@ -506,6 +540,107 @@ mod tests {
 
     fn up(vk: u16, scan: u32) -> MSG {
         message(WM_KEYUP, vk, scan, AGAIN | (1 << 31))
+    }
+
+    // A window asked to go by a posted message, as winit does it, with no
+    // loop left to read it. A message-only window never shows.
+    #[test]
+    fn a_window_posted_its_end_goes() {
+        let class: Vec<u16> = "STATIC".encode_utf16().chain([0]).collect();
+        // SAFETY: a zero terminated class name that lives across the call, a
+        // parent Windows defines, and null for everything else.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                ptr::null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null(),
+            )
+        };
+        assert!(!hwnd.is_null(), "no window");
+        // SAFETY: this thread's own window, and a message with no pointers.
+        unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+        // SAFETY: a plain query; it answers 0 for a window that is gone.
+        assert_ne!(unsafe { IsWindow(hwnd) }, 0, "gone before anything read it");
+        handle_posted_messages();
+        // SAFETY: as above.
+        assert_eq!(unsafe { IsWindow(hwnd) }, 0, "the window is still up");
+    }
+
+    // A window still up, doing what winit does with a paint outside its loop.
+    // Shown, as Windows paints nothing else, but with no size and never active.
+    // On a thread of its own, so a drain that never returns fails the test
+    // rather than hanging it.
+    #[test]
+    fn a_window_asking_for_paints_does_not_hold_the_drain() {
+        unsafe extern "system" fn window_proc(
+            hwnd: HWND,
+            message: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            // SAFETY: the arguments are the ones Windows called with.
+            let result = unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+            if message == WM_PAINT {
+                // SAFETY: this thread's own window, and no rectangle or region.
+                unsafe { RedrawWindow(hwnd, ptr::null(), ptr::null_mut(), RDW_INTERNALPAINT) };
+            }
+            result
+        }
+        let (drained, was_drained) = mpsc::channel();
+        thread::spawn(move || {
+            let class: Vec<u16> = "BoothPaintsAgain".encode_utf16().chain([0]).collect();
+            // SAFETY: a null name asks for this exe's own module handle, which
+            // needs no closing.
+            let instance = unsafe { GetModuleHandleW(ptr::null()) };
+            let info = WNDCLASSEXW {
+                cbSize: size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(window_proc),
+                hInstance: instance,
+                lpszClassName: class.as_ptr(),
+                ..WNDCLASSEXW::default()
+            };
+            // SAFETY: `info` carries its own size, and the class name is zero
+            // terminated and outlives the call, which copies it.
+            assert_ne!(unsafe { RegisterClassExW(&info) }, 0, "no class");
+            // SAFETY: the class was registered above with this module, the
+            // name is zero terminated, and every other pointer is null.
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                    class.as_ptr(),
+                    ptr::null(),
+                    WS_POPUP | WS_VISIBLE,
+                    0,
+                    0,
+                    0,
+                    0,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    instance,
+                    ptr::null(),
+                )
+            };
+            assert!(!hwnd.is_null(), "no window");
+            // SAFETY: this thread's own window, and no rectangle or region.
+            let asked =
+                unsafe { RedrawWindow(hwnd, ptr::null(), ptr::null_mut(), RDW_INTERNALPAINT) };
+            assert_ne!(asked, 0, "no paint asked for");
+            handle_posted_messages();
+            drained.send(()).expect("the test is waiting");
+        });
+        assert!(
+            was_drained.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "the drain did not return"
+        );
     }
 
     // No bindings, so the hotkeys take no press and the keyboard's real

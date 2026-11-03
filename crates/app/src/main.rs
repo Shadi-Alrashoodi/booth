@@ -27,8 +27,10 @@ mod winver;
 
 use std::cell::RefCell;
 use std::ffi::OsString;
+use std::fmt::Display;
 use std::iter::Peekable;
 use std::ops::RangeInclusive;
+use std::panic::{self, AssertUnwindSafe};
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -159,29 +161,55 @@ fn main() -> ExitCode {
     }
     // The message hook and the panel both run on this thread.
     let panel_keys = Rc::new(RefCell::new(PanelKeys::default()));
-    let result = eframe::run_native(
-        "Booth",
-        native_options(Rc::clone(&panel_keys)),
-        Box::new(move |cc| {
-            Ok(Box::new(app::App::new(
-                cc, setup, firewall, backlog, panel_keys,
-            )))
-        }),
+    let ended = run_panel(
+        || {
+            eframe::run_native(
+                "Booth",
+                native_options(Rc::clone(&panel_keys)),
+                Box::new(move |cc| {
+                    Ok(Box::new(app::App::new(
+                        cc, setup, firewall, backlog, panel_keys,
+                    )))
+                }),
+            )
+        },
+        || {
+            win::handle_posted_messages();
+            win::drop_window_icons();
+            // The window is gone and the room with it, but a router slow to
+            // delete the port mapping may still be answering. Returning ends
+            // the process and that thread with it, and the forward to this PC
+            // would stay open. Nobody sees this wait.
+            room::finish_port_mappings(MAPPINGS_WAIT);
+        },
     );
-    win::drop_window_icons();
-    // The window is gone and the room with it, but a router slow to delete
-    // the port mapping may still be answering. Returning ends the process
-    // and that thread with it, and the forward to this PC would stay open.
-    // Nobody sees this wait.
-    room::finish_port_mappings(MAPPINGS_WAIT);
-    match result {
+    match ended {
         Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            win::error_box(&format!(
-                "Could not open the Booth window: {err}. Booth draws with DirectX 12. Update the graphics driver and start Booth again."
-            ));
+        Err(problem) => {
+            win::error_box(&problem);
             ExitCode::FAILURE
         }
+    }
+}
+
+// The sentence for the box when the panel ended badly. `clean_up` runs first,
+// however it ended.
+fn run_panel<E: Display>(
+    run: impl FnOnce() -> Result<(), E>,
+    clean_up: impl FnOnce(),
+) -> Result<(), String> {
+    // A graphics device lost to a driver update or reset panics in the next
+    // frame's paint, inside eframe, and the panel cannot go on without one.
+    // The App and the graphics state drop on the way out, and what runs after
+    // this touches neither.
+    let ran = panic::catch_unwind(AssertUnwindSafe(run));
+    clean_up();
+    match ran {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(format!(
+            "Could not open the Booth window: {err}. Booth draws with DirectX 12. Update the graphics driver and start Booth again."
+        )),
+        Err(payload) => Err(messages::panel_stopped(loopback::panic_text(&*payload))),
     }
 }
 
@@ -584,6 +612,7 @@ fn native_options(panel_keys: Rc<RefCell<PanelKeys>>) -> eframe::NativeOptions {
 mod tests {
     use super::*;
 
+    use std::cell::Cell;
     use std::path::PathBuf;
     use std::process::Command;
 
@@ -992,6 +1021,39 @@ mod tests {
                 "{args:?}"
             );
         }
+    }
+
+    // A lost graphics device reaches main as a panic out of run_native.
+    #[test]
+    fn a_panel_that_panics_cleans_up_and_says_so() {
+        let cleaned = Cell::new(false);
+        let ended = run_panel(
+            || -> Result<(), String> { panic!("no device") },
+            || cleaned.set(true),
+        );
+        assert!(cleaned.get(), "the cleanup was skipped");
+        assert_eq!(
+            ended,
+            Err(String::from(
+                "Booth stopped unexpectedly, most likely because the graphics driver updated or reset. Start Booth again. Details: no device"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_panel_that_returns_cleans_up_and_says_what_it_returned() {
+        let cleaned = Cell::new(false);
+        let ended = run_panel(|| Ok::<(), String>(()), || cleaned.set(true));
+        assert!(cleaned.take(), "the cleanup was skipped");
+        assert_eq!(ended, Ok(()));
+        let ended = run_panel(|| Err("no adapter"), || cleaned.set(true));
+        assert!(cleaned.take(), "the cleanup was skipped");
+        assert_eq!(
+            ended,
+            Err(String::from(
+                "Could not open the Booth window: no adapter. Booth draws with DirectX 12. Update the graphics driver and start Booth again."
+            ))
+        );
     }
 
     // wgpu's DX12 backend asks for these by bare name as the window opens,

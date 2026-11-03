@@ -420,6 +420,14 @@ pub fn firewall_prompt_error(err: &io::Error) -> String {
     )
 }
 
+// The panic's own words, as a release build has no console to print them to,
+// and any other panic on the panel's thread gets the same guess.
+pub fn panel_stopped(details: &str) -> String {
+    format!(
+        "Booth stopped unexpectedly, most likely because the graphics driver updated or reset. Start Booth again. Details: {details}"
+    )
+}
+
 pub const RUNNING_ELEVATED: &str = "Booth was started as administrator. Start it again the usual way, not with Run as administrator. The firewall step asks for administrator by itself when it needs it.";
 
 pub const ADDRESS_NAME_ABOUT: &str = "If you run dynamic DNS, put the name here so friends can find you again after your address changes. Booth does not update it; your dynamic DNS client does.";

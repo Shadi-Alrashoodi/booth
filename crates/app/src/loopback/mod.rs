@@ -348,7 +348,7 @@ fn joined<T>(result: thread::Result<Result<T, String>>, which: &str) -> Result<T
     })
 }
 
-fn panic_text(payload: &(dyn Any + Send)) -> &str {
+pub fn panic_text(payload: &(dyn Any + Send)) -> &str {
     payload
         .downcast_ref::<&str>()
         .copied()
