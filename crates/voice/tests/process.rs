@@ -180,6 +180,60 @@ fn automatic_volume_evens_out_quiet_and_loud() {
     assert!(processor.gain_db() > 5.0);
 }
 
+// White noise at `db` dBFS RMS, a fan or a room, for `samples` samples.
+fn room(samples: usize, db: f32, seed: &mut u32) -> Vec<f32> {
+    let amplitude = 10f32.powf(db / 20.0) * 3f32.sqrt();
+    (0..samples)
+        .map(|_| {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 17;
+            *seed ^= *seed << 5;
+            amplitude * (*seed as f32 / u32::MAX as f32 * 2.0 - 1.0)
+        })
+        .collect()
+}
+
+// Digital silence, a packet Windows marks silent or a microphone's own mute,
+// is not the room's floor: a steady room after it is not taken for a voice
+// and pumped up, whether the silence comes first or after the room, a 5 ms
+// block or a 10 ms packet of it, or a run that starts and ends partway
+// through blocks, 8 samples of the room in each.
+#[test]
+fn digital_silence_does_not_pump_the_room() {
+    let mut seed = 0x2545_f491;
+    for (before, zeros) in [
+        (2 * 48_000, 240),
+        (0, 240),
+        (2 * 48_000, 480),
+        (2 * 48_000 + 8, 464),
+        (8, 464),
+    ] {
+        let mut processor = Processor::new(Arc::new(Switches::new(false, true)));
+        let mut signal = room(before, -50.0, &mut seed);
+        signal.extend(vec![0.0; zeros]);
+        signal.extend(room(5 * 48_000, -50.0, &mut seed));
+        through(&mut processor, &signal);
+        assert_eq!(
+            processor.gain_db(),
+            0.0,
+            "{zeros} zeros after {before} samples"
+        );
+    }
+}
+
+// Nor is a mute that leaves the converter's last bit toggling, about
+// -120 dBFS and never zero.
+#[test]
+fn a_toggling_last_bit_does_not_pump_the_room() {
+    let mut seed = 0x2545_f491;
+    let mut processor = Processor::new(Arc::new(Switches::new(false, true)));
+    let mut signal = room(2 * 48_000, -50.0, &mut seed);
+    signal.extend((0..240).map(|n| if n % 2 == 0 { 1e-6 } else { -1e-6 }));
+    signal.extend(room(5 * 48_000, -50.0, &mut seed));
+    through(&mut processor, &signal);
+    assert_eq!(processor.gain_db(), 0.0);
+}
+
 // Something RNNoise takes for a voice, which a steady tone is not (it takes
 // a 440 Hz tone out by 20 dB): 150 Hz with its harmonics and a little
 // vibrato, in 250 ms syllables 150 ms apart from the second second on, and

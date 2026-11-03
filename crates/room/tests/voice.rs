@@ -1374,12 +1374,18 @@ fn noise_suppression_end_to_end() {
     assert!(quiet[1] < quiet[0] - 10.0, "{quiet:?}");
 }
 
-// A quiet microphone: a second of nothing, then 440 Hz at -37 dBFS RMS.
+// A quiet microphone: a second of its own hiss at about -71 dBFS, then
+// 440 Hz at -37 dBFS RMS over it. Digital silence would tell automatic
+// volume nothing of the room.
 fn quiet_after_a_second(frame: u64, _: u16) -> f32 {
+    let mut hashed = frame.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    hashed ^= hashed >> 29;
+    hashed = hashed.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let hiss = ((hashed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.001;
     if frame < RATE {
-        0.0
+        hiss
     } else {
-        sine(frame, 440.0, 0.02)
+        hiss + sine(frame, 440.0, 0.02)
     }
 }
 

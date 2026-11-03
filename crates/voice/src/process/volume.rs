@@ -17,12 +17,15 @@ const LEAST_DB: f32 = -10.0;
 const UP_DB: f32 = 6.0 / BLOCKS_PER_SECOND as f32;
 const DOWN_DB: f32 = 12.0 / BLOCKS_PER_SECOND as f32;
 // A block is voice when it is over this, and this far over the room's floor:
-// the quietest block of the last second, rising no faster than FLOOR_RISE_DB
-// a block, as the open mic gate keeps it.
+// the quietest block of the last second of sound, digital silence left out,
+// rising no faster than FLOOR_RISE_DB a block, as the open mic gate keeps it.
 const QUIETEST_DB: f32 = -55.0;
 const OVER_FLOOR_DB: f32 = 10.0;
 const FLOOR_RISE_DB: f32 = 3.0 / BLOCKS_PER_SECOND as f32;
 const SILENCE_DB: f32 = -100.0;
+// Exact zeros this many in a row, a millisecond, are digital silence: no
+// room's own noise stays that still.
+const SILENT_RUN: usize = 48;
 
 pub(super) struct Volume {
     gain_db: f32,
@@ -33,6 +36,10 @@ pub(super) struct Volume {
     floor: f32,
     squares: f32,
     count: usize,
+    // Exact zeros in a row so far in this block, and whether SILENT_RUN of
+    // them came.
+    zeros: usize,
+    silent: bool,
 }
 
 impl Volume {
@@ -46,6 +53,8 @@ impl Volume {
             floor: SILENCE_DB,
             squares: 0.0,
             count: 0,
+            zeros: 0,
+            silent: false,
         }
     }
 
@@ -58,6 +67,8 @@ impl Volume {
             let heard = *sample;
             self.squares += heard * heard;
             self.count += 1;
+            self.zeros = if heard == 0.0 { self.zeros + 1 } else { 0 };
+            self.silent |= self.zeros >= SILENT_RUN;
             *sample = limit(heard * self.gain);
             if self.count == BLOCK {
                 self.block();
@@ -72,8 +83,19 @@ impl Volume {
         } else {
             SILENCE_DB
         };
+        let silent = self.silent;
         self.squares = 0.0;
         self.count = 0;
+        self.zeros = 0;
+        self.silent = false;
+        // Digital silence, a packet Windows marks silent or a microphone's
+        // own mute, is not the room. As the floor it would make the room's
+        // noise after it a voice, and pump it up. A block it starts or ends
+        // in is left out too: its zeros pull the block's level under the
+        // room's.
+        if level <= SILENCE_DB || silent {
+            return;
+        }
         self.levels[self.next] = level;
         self.next = (self.next + 1) % BLOCKS_PER_SECOND;
         self.heard = (self.heard + 1).min(BLOCKS_PER_SECOND);
