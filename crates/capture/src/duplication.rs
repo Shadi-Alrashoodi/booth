@@ -263,13 +263,17 @@ impl Capture {
                 "could not duplicate {name}: this process is not per-monitor DPI aware (v2), which Windows requires for it. Call make_process_dpi_aware() before any window opens"
             )));
         }
-        let (adapter, output) = find(&monitor.id)?;
+        let (adapter, output) = find(&monitor.id).map_err(|err| match err.kind() {
+            ErrorKind::MonitorGone => err.pausing(missing_reason(crate::desktop_away())),
+            _ => err,
+        })?;
         let gpu = &monitor.adapter.description;
         let (device, context) = device::create(&adapter, gpu)?;
         let converter = Converter::new(&device, gpu)?;
         let (duplication, plan) = duplicate(&device, &output, monitor, options, region).map_err(
             |refused| match refused {
-                Refused::Paused(_, err) | Refused::Failed(err) => err,
+                Refused::Paused(reason, err) => err.pausing(reason),
+                Refused::Failed(err) => err,
             },
         )?;
         let layout = converter.layout(plan)?;
@@ -593,16 +597,8 @@ impl Capture {
         crate::desktop_away().is_some()
     }
 
-    // A monitor that is not listed gets no further than find(), so Desktop
-    // Duplication is not there to say the lock screen came up meanwhile. A
-    // look that could not ask counts as a lost session, as for a window
-    // share: only an answer that the session is active keeps the PC sound.
     fn missing_reason(&self) -> PauseReason {
-        match self.look() {
-            None => PauseReason::Missing,
-            Some(PauseReason::Changing(_)) => PauseReason::Disconnected,
-            Some(reason) => reason,
-        }
+        missing_reason(self.look())
     }
 
     fn look(&self) -> Option<PauseReason> {
@@ -907,11 +903,30 @@ pub(crate) fn present_instant(
     acquired.checked_sub(age).unwrap_or(acquired)
 }
 
+// A monitor that is not listed gets no further than find(), so Desktop
+// Duplication is not there to say the lock screen came up meanwhile. A look
+// that could not ask counts as a lost session, as for a window share: only
+// an answer that the session is active keeps the PC sound.
+fn missing_reason(look: Option<PauseReason>) -> PauseReason {
+    match look {
+        None => PauseReason::Missing,
+        Some(PauseReason::Changing(_)) => PauseReason::Disconnected,
+        Some(reason) => reason,
+    }
+}
+
 // Paused carries the error too: while sharing it means wait and try again,
-// but at open it is the answer.
+// but at open it is the answer, which says the reason (CaptureError::paused).
 enum Refused {
     Paused(PauseReason, CaptureError),
     Failed(CaptureError),
+}
+
+// What the next duplicate() on this thread is refused for, before Windows is
+// asked: no test can make Windows refuse a monitor at open.
+#[cfg(test)]
+thread_local! {
+    static REFUSE_NEXT: std::cell::Cell<Option<PauseReason>> = const { std::cell::Cell::new(None) };
 }
 
 fn duplicate(
@@ -922,6 +937,13 @@ fn duplicate(
     region: Option<(Region, (u32, u32))>,
 ) -> Result<(IDXGIOutputDuplication, Plan), Refused> {
     let name = &monitor.name;
+    #[cfg(test)]
+    if let Some(reason) = REFUSE_NEXT.take() {
+        return Err(Refused::Paused(
+            reason,
+            CaptureError::other(format!("could not duplicate {name}: a test refused it")),
+        ));
+    }
     let output: IDXGIOutput5 = output.cast().map_err(|_| {
         Refused::Failed(CaptureError::other(format!(
             "could not duplicate {name}: this Windows is older than Windows 10 1703, which Booth needs for screen sharing"
@@ -1739,5 +1761,42 @@ mod tests {
         thread::sleep(LOOK_EVERY);
         let gave_up = capture.next().expect_err("the wait ran out");
         assert_eq!(gave_up.kind(), ErrorKind::MonitorGone);
+    }
+
+    // At open, a monitor that is not listed says why as a running capture
+    // would, the desktop looked at too, so a share that opens it again can
+    // wait for it. The monitors are only listed: it is never found, so
+    // nothing is captured.
+    #[test]
+    fn a_monitor_not_listed_at_open_says_it_is_missing() {
+        make_process_dpi_aware().unwrap();
+        let Some(mut monitor) = crate::monitors().unwrap().into_iter().next() else {
+            println!("skipped: no monitor is attached to the desktop");
+            return;
+        };
+        monitor.id.device_name = String::from("not a listed monitor");
+        let Err(err) = Capture::open(&monitor, Options::default()) else {
+            panic!("a monitor that is not listed opened");
+        };
+        assert_eq!(err.kind(), ErrorKind::MonitorGone);
+        assert_eq!(err.paused(), Some(&missing_reason(crate::desktop_away())));
+    }
+
+    // At open, Windows refusing a listed monitor's duplication for what a
+    // running capture waits out says why as well. No test can make Windows
+    // refuse, so the test refuses in its place, after the device and
+    // capture's shaders are made: nothing is captured.
+    #[test]
+    fn a_duplication_refused_at_open_says_why() {
+        make_process_dpi_aware().unwrap();
+        let Some(monitor) = crate::monitors().unwrap().into_iter().next() else {
+            println!("skipped: no monitor is attached to the desktop");
+            return;
+        };
+        REFUSE_NEXT.set(Some(PauseReason::Taken));
+        let Err(err) = Capture::open(&monitor, Options::default()) else {
+            panic!("a monitor refused at open opened");
+        };
+        assert_eq!(err.paused(), Some(&PauseReason::Taken));
     }
 }

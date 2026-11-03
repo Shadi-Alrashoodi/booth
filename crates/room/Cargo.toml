@@ -23,16 +23,19 @@ unicode-bidi.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-# tests/video.rs makes NVENC fail a frame during a share, and the GPU's encoders
-# not open.
+# tests/video.rs makes NVENC fail a frame during a share, and it and
+# src/screen/sharer.rs's tests make the GPU's encoders not open.
 encode = { workspace = true, features = ["fault"] }
 # tests/sound.rs and tests/video.rs say what a window share's look at the
-# desktop finds, and tests/video.rs holds up a window capture's close.
+# desktop finds, tests/video.rs and src/screen/sharer.rs's tests what a
+# monitor share's finds while it waits for its capture after Resume, and
+# tests/video.rs holds up a window capture's close.
 capture = { workspace = true, features = ["fault"] }
 # tests/video.rs gives the test pattern a pointer and reads back what each
 # viewer drew it with, pauses the pattern as a monitor's capture pauses and
 # brings it a monitor's new mode; src/screen.rs's tests read what waits in a
-# viewer's inbox, and src/screen/sharer.rs's pause the pattern during a rest.
+# viewer's inbox, and src/screen/sharer.rs's pause the pattern during a rest
+# and refuse it at Resume.
 share = { workspace = true, features = ["fault"] }
 # tests/common/window.rs makes the windows tests/video.rs shares;
 # examples/share_numbers.rs reads a window's bounds from DWM.

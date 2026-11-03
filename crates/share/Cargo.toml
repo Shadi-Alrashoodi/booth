@@ -30,6 +30,8 @@ fault = []
 # tests/sharer.rs, tests/window.rs and the tests in src/sharer.rs make the
 # encoders stall, fail and not open.
 encode = { workspace = true, features = ["fault"] }
+# The tests in src/sharer.rs say what a look at the desktop finds.
+capture = { workspace = true, features = ["fault"] }
 # tests/window.rs makes the window it shares.
 windows = { workspace = true, features = [
     "Win32_Foundation",

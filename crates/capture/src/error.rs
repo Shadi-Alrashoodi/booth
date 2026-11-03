@@ -9,6 +9,8 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::core::HRESULT;
 
+use crate::PauseReason;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
     // The GPU was removed, reset or its driver restarted. The device is dead,
@@ -25,6 +27,7 @@ pub enum ErrorKind {
 pub struct CaptureError {
     kind: ErrorKind,
     message: String,
+    paused: Option<PauseReason>,
 }
 
 impl CaptureError {
@@ -32,6 +35,15 @@ impl CaptureError {
         CaptureError {
             kind,
             message: message.into(),
+            paused: None,
+        }
+    }
+
+    // Refused at open for `reason`, which a running capture waits out.
+    pub(crate) fn pausing(self, reason: PauseReason) -> CaptureError {
+        CaptureError {
+            paused: Some(reason),
+            ..self
         }
     }
 
@@ -51,6 +63,13 @@ impl CaptureError {
 
     pub fn kind(&self) -> ErrorKind {
         self.kind
+    }
+
+    // Why a monitor's capture did not open, when it is what the capture
+    // pauses for while it runs: a share that opens it again can wait as
+    // well.
+    pub fn paused(&self) -> Option<&PauseReason> {
+        self.paused.as_ref()
     }
 }
 

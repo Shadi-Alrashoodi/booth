@@ -287,18 +287,29 @@ fn share(
                 // lock screen can have come and gone meanwhile, so a window
                 // share looks again first. A window whose desktop is away
                 // stays let go: the look that finds the desktop back takes
-                // it up.
+                // it up. A monitor's capture that Windows will not give back
+                // yet leaves the share standing away until it opens
+                // (Sharer::resume), and the panel hears why at once: a share
+                // nobody watches rests from here on and tries nothing.
                 if let Some(desktop) = &mut desktop {
                     desktop.follow(&mut unseen, share::desktop_away);
                 }
                 if !desktop.as_ref().is_some_and(Desktop::away) {
                     sharer.resume(&mut say).map_err(ran)?;
-                    let (width, height) = sharer.size();
-                    log!(
-                        log,
-                        "share {number}: resumed at {width}x{height} and {} fps",
-                        sharer.fps()
-                    );
+                    if let Some(reason) = sharer.away() {
+                        log!(
+                            log,
+                            "share {number}: resumed, and the capture did not open again: {reason}"
+                        );
+                        sharer.tell_away(&mut watchers);
+                    } else {
+                        let (width, height) = sharer.size();
+                        log!(
+                            log,
+                            "share {number}: resumed at {width}x{height} and {} fps",
+                            sharer.fps()
+                        );
+                    }
                 }
                 sharing.set_running(sharing.running().map(|running| RunningShare {
                     held: false,
@@ -448,9 +459,11 @@ fn share(
             // new mode or a window's new size, and the software encoder took
             // the share over, at 60 fps from now on if it ran faster. Only a
             // failure keeps it there: otherwise a later new encoder tries the
-            // GPU first, and one that opens runs the share again.
+            // GPU first, and one that opens runs the share again. A share
+            // resumed while its capture would not open has no encoder until
+            // it does, which changes nothing.
             let on = software_sentence(sharer.kind(), sharer.software());
-            if on != software {
+            if on != software && sharer.kind().is_some() {
                 software = on;
                 software_changed(sharing, number, &sharer, on, &mut told);
             }
@@ -2461,5 +2474,167 @@ mod tests {
             !lines.iter().any(|line| line.contains("a risen round trip")),
             "{lines:#?}"
         );
+    }
+
+    // The GPU's encoders refusing, and what looks at the desktop find, from
+    // the test, until it ends.
+    struct Faults;
+
+    impl Drop for Faults {
+        fn drop(&mut self) {
+            encode::fault::clear();
+            capture::fault::clear();
+        }
+    }
+
+    // Paused by hand, a monitor's share is refused its capture at Resume, as
+    // when another program took the monitor meanwhile (the pattern stands in
+    // for it, through share::fault). The log says the capture did not open,
+    // not the size it ran at before the pause, and the share stands away
+    // until it opens. The lock screen coming up meanwhile stops the PC sound
+    // at the next look, not at the next try a second later, and someone who
+    // stops watching lets the share rest though an answer of theirs waits.
+    // On the software encoder since it opened, as no GPU encoder would
+    // (encode::fault), the share stays on it for the panel while it stands
+    // away with no encoder.
+    #[test]
+    fn a_share_resumed_while_its_capture_is_away_stands_away() {
+        let _turn = pattern_turn();
+        if no_adapter() {
+            return;
+        }
+        let _faults = Faults;
+        encode::fault::refuse_gpu(0);
+        // The desktop is here, also on a PC locked while the tests run.
+        capture::fault::set_desktop(None, Duration::ZERO);
+        let (log, captured) = Log::capture(1024);
+        let resting = Resting::start(log);
+        let sharing = &resting.sharing;
+        let sound = sharing.sound();
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done() {
+                assert!(
+                    Instant::now() < deadline,
+                    "{what}: {:?}, {:?}",
+                    sharing.running(),
+                    resting.failed()
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let away_at_resume = || {
+            sharing.set_held(true);
+            until("the pause taken in", &|| {
+                sharing.running().is_some_and(|running| running.held)
+            });
+            share::fault::pattern_away(Some(PauseReason::Taken));
+            sharing.set_held(false);
+            until("standing away", &|| {
+                sharing
+                    .running()
+                    .is_some_and(|running| !running.held && running.paused == Some(Paused::Taken))
+            });
+        };
+        resting.watch(1);
+        assert!(sharing.running().is_some_and(|running| running.software));
+
+        away_at_resume();
+        assert!(!sound.shut(), "taken keeps the PC sound");
+        capture::fault::set_desktop(Some(PauseReason::SecureDesktop), Duration::ZERO);
+        let locked = Instant::now();
+        until("the PC sound stopped", &|| sound.paused());
+        assert!(
+            locked.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            locked.elapsed()
+        );
+        assert!(sharing.running().is_some_and(|running| running.software));
+        capture::fault::set_desktop(None, Duration::ZERO);
+        share::fault::pattern_away(None);
+        until("the capture back", &|| {
+            sharing
+                .running()
+                .is_some_and(|running| running.paused.is_none())
+                && !sound.paused()
+        });
+
+        away_at_resume();
+        sharing.answer(Answer::Idr { seen: Some(0) });
+        resting.watch(0);
+
+        let failed = resting.failed();
+        let lines = captured.lines();
+        assert!(failed.is_empty(), "{failed:?}: {lines:#?}");
+        let resumed: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains(": resumed"))
+            .collect();
+        let away = format!(
+            "share 1: resumed, and the capture did not open again: {}",
+            PauseReason::Taken
+        );
+        assert!(
+            resumed.len() == 2 && resumed.iter().all(|line| line.contains(&away)),
+            "{lines:#?}"
+        );
+    }
+
+    // Resumed while nobody watches, a share whose capture would not open
+    // again rests at once and tries nothing, so the panel hears why at
+    // Resume, not once someone watches. Someone who does then brings the
+    // tries, which say nothing more of the same reason, and the capture
+    // comes back.
+    #[test]
+    fn a_share_resumed_away_while_nobody_watches_says_why() {
+        let _turn = pattern_turn();
+        if no_adapter() {
+            return;
+        }
+        let _faults = Faults;
+        capture::fault::set_desktop(None, Duration::ZERO);
+        let (log, captured) = Log::capture(1024);
+        let resting = Resting::start(log);
+        let sharing = &resting.sharing;
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done() {
+                assert!(
+                    Instant::now() < deadline,
+                    "{what}: {:?}, {:?}",
+                    sharing.running(),
+                    resting.failed()
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        sharing.set_held(true);
+        until("the pause taken in", &|| {
+            sharing.running().is_some_and(|running| running.held)
+        });
+        share::fault::pattern_away(Some(PauseReason::Missing));
+        sharing.set_held(false);
+        until("the reason told", &|| {
+            sharing
+                .running()
+                .is_some_and(|running| !running.held && running.paused == Some(Paused::Missing))
+        });
+
+        sharing.set_facts(&watched_by(1));
+        thread::sleep(Duration::from_millis(500));
+        share::fault::pattern_away(None);
+        until("the capture back", &|| {
+            sharing
+                .running()
+                .is_some_and(|running| running.paused.is_none())
+        });
+        let failed = resting.failed();
+        let lines = captured.lines();
+        assert!(failed.is_empty(), "{failed:?}: {lines:#?}");
+        let told = lines
+            .iter()
+            .filter(|line| line.contains("capture paused"))
+            .count();
+        assert_eq!(told, 1, "{lines:#?}");
     }
 }

@@ -3,11 +3,12 @@
 // pattern standing in for a monitor, and the encoder opened on the same
 // device.
 
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use capture::{
-    Adapter, Capture, CaptureError, CursorUpdate, Frame, Monitor, Next, Pattern, Rotation,
-    WindowCapture,
+    Adapter, Capture, CaptureError, CursorUpdate, ErrorKind, Frame, Monitor, Next, Pattern,
+    PauseReason, Rotation, WindowCapture,
 };
 use encode::{Codec, EncodeError, Encoder, Fit, Kind, Settings};
 use net::Timer;
@@ -181,6 +182,48 @@ pub(crate) enum Source {
     Busy(Box<Busy>),
 }
 
+// Why a source did not open, and for a monitor's capture, or the test
+// pattern standing in for one, the pause a running capture waits out
+// (CaptureError::paused): a share opening it again can wait as well. A
+// monitor that is not listed is waited for only so long.
+pub(crate) struct Unopened {
+    pub why: String,
+    pub away: Option<PauseReason>,
+    pub gone: bool,
+}
+
+impl From<CaptureError> for Unopened {
+    fn from(err: CaptureError) -> Unopened {
+        Unopened {
+            away: err.paused().cloned(),
+            gone: err.kind() == ErrorKind::MonitorGone,
+            why: err.to_string(),
+        }
+    }
+}
+
+impl From<String> for Unopened {
+    fn from(why: String) -> Unopened {
+        Unopened {
+            why,
+            away: None,
+            gone: false,
+        }
+    }
+}
+
+impl From<Unopened> for String {
+    fn from(unopened: Unopened) -> String {
+        unopened.why
+    }
+}
+
+impl fmt::Display for Unopened {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
 impl Source {
     // `last` is the size of a window's newest picture in the share's capture
     // of it before, if it had one (WindowCapture::reopen).
@@ -188,18 +231,15 @@ impl Source {
         choice: &Choice,
         options: capture::Options,
         last: Option<(u32, u32)>,
-    ) -> Result<Source, String> {
-        let text = |err: CaptureError| err.to_string();
+    ) -> Result<Source, Unopened> {
         Ok(match choice {
-            Choice::Screen(monitor) => {
-                Source::Screen(Box::new(Capture::open(monitor, options).map_err(text)?))
+            Choice::Screen(monitor) => Source::Screen(Box::new(Capture::open(monitor, options)?)),
+            Choice::Region { monitor, region } => {
+                Source::Screen(Box::new(Capture::open_region(monitor, *region, options)?))
             }
-            Choice::Region { monitor, region } => Source::Screen(Box::new(
-                Capture::open_region(monitor, *region, options).map_err(text)?,
-            )),
-            Choice::Window { window, adapter } => Source::Window(Box::new(
-                WindowCapture::reopen(*window, adapter, options, last).map_err(text)?,
-            )),
+            Choice::Window { window, adapter } => Source::Window(Box::new(WindowCapture::reopen(
+                *window, adapter, options, last,
+            )?)),
             Choice::Pattern {
                 adapter,
                 width,
@@ -208,10 +248,9 @@ impl Source {
             } => {
                 #[cfg(feature = "fault")]
                 crate::fault::pattern_opens()?;
-                let device = capture::device_on(adapter).map_err(text)?;
+                let device = capture::device_on(adapter)?;
                 let pattern =
-                    Pattern::with_source(&device, *width, *height, Rotation::Identity, options)
-                        .map_err(text)?;
+                    Pattern::with_source(&device, *width, *height, Rotation::Identity, options)?;
                 if *busy {
                     Source::Busy(Box::new(Busy::new(pattern, options)?))
                 } else {
@@ -452,7 +491,7 @@ pub(crate) fn open(
     mut known: Option<HevcOffer>,
     last: Option<(u32, u32)>,
     say: &mut dyn FnMut(Line),
-) -> Result<Opened, String> {
+) -> Result<Opened, Unopened> {
     let mut fitted = false;
     loop {
         let source = Source::open(choice, options, last)?;
@@ -528,7 +567,7 @@ pub(crate) fn open(
                 };
                 fitted = true;
             }
-            Err(err) => return Err(err.to_string()),
+            Err(err) => return Err(err.to_string().into()),
         }
     }
 }
@@ -698,5 +737,26 @@ mod tests {
         };
         assert!(new_reason(Some(&offered), &first));
         assert!(!new_reason(Some(&first), &offered));
+    }
+
+    // A monitor's capture refused at open for what a running capture waits
+    // out stands away, and one that is not listed is gone as well: a share
+    // opening it again waits for it, so long. The monitors are only listed:
+    // it is never found, so nothing is captured.
+    #[test]
+    fn a_monitor_not_listed_is_away_and_gone() {
+        capture::make_process_dpi_aware().unwrap_or_else(|err| panic!("{err}"));
+        let monitors = capture::monitors().unwrap_or_else(|err| panic!("{err}"));
+        let Some(mut monitor) = monitors.into_iter().next() else {
+            println!("skipped: no monitor is attached to the desktop");
+            return;
+        };
+        monitor.id.device_name = String::from("not a listed monitor");
+        let Err(unopened) =
+            Source::open(&Choice::Screen(monitor), capture::Options::default(), None)
+        else {
+            panic!("a monitor that is not listed opened");
+        };
+        assert!(unopened.away.is_some() && unopened.gone, "{unopened}");
     }
 }

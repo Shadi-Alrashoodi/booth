@@ -16,6 +16,7 @@ use capture::{CursorKind, CursorShape, CursorUpdate, Next, Pattern, PauseReason}
 use viewer::Cursor;
 
 use crate::Inbox;
+use crate::source::Unopened;
 
 // Each picture of the pattern carries a pointer STEP pixels right of the
 // one before, the first with a 32x32 shape. Every fourth pointer goes alone
@@ -126,10 +127,15 @@ pub fn pattern_away(reason: Option<PauseReason>) {
     *lock(&AWAY) = reason.map(|reason| (reason, false));
 }
 
-// The pattern's source opens, or the reason it is away as the error.
-pub(crate) fn pattern_opens() -> Result<(), String> {
+// The pattern's source opens, or is refused for the reason it is away, as a
+// monitor's capture is.
+pub(crate) fn pattern_opens() -> Result<(), Unopened> {
     match &*lock(&AWAY) {
-        Some((reason, _)) => Err(format!("the test pattern is away: {reason}")),
+        Some((reason, _)) => Err(Unopened {
+            why: format!("the test pattern is away: {reason}"),
+            away: Some(reason.clone()),
+            gone: false,
+        }),
         None => Ok(()),
     }
 }

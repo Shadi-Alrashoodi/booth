@@ -8,8 +8,8 @@
 
 use std::time::{Duration, Instant};
 
-pub(crate) const LOOK_EVERY: Duration = Duration::from_secs(1);
-pub(crate) const LOOKS: u32 = 30;
+pub const LOOK_EVERY: Duration = Duration::from_secs(1);
+pub const LOOKS: u32 = 30;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Missed {

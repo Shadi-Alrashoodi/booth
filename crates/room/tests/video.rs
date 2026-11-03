@@ -2006,8 +2006,8 @@ fn first_after(heard: &Heard, at: Instant) -> f64 {
     first.saturating_duration_since(at).as_secs_f64() * 1000.0
 }
 
-// What a window share's looks at the desktop find, from the test, until it
-// is dropped and they ask Windows again.
+// What a share's looks at the desktop find, from the test, until it is
+// dropped and they ask Windows again.
 struct Looks;
 
 impl Looks {
@@ -2404,4 +2404,75 @@ fn a_screen_share_keeps_no_picture_through_the_secure_desktop() {
         "watching after a rest, the monitor gone: told live, then away, and no frame or shape in 1 s; back, the first picture, an IDR, {:.0} ms after",
         first_after(&back[ANA], came)
     );
+}
+
+// Paused by hand, a monitor's share lets go of its capture, and Windows can
+// refuse it back at Resume: another program took the monitor meanwhile, or
+// it left the desktop (the pattern does here, through share::fault). The
+// share stands away until the capture opens: its watchers hear it is away
+// and get nothing, the panel says why, and the first picture once the
+// capture opens is an IDR.
+#[test]
+fn a_screen_share_resumed_while_its_capture_is_away_waits_for_it() {
+    let _turn = turn();
+    if !ready() {
+        return;
+    }
+    let _away = PatternAway;
+    let _looks = Looks::find(None);
+    let small = VideoConfig {
+        source: VideoSource::Pattern {
+            width: 640,
+            height: 360,
+            busy: false,
+        },
+        ..pattern(None)
+    };
+    let (host, invite) = hosting(small);
+    let mut hands = hand_watchers(&host, &invite, &["Ana"]);
+    let number = shares(&host, 60);
+    hands[ANA].say(&watch(number, true));
+    watched_by(&host, 1);
+    let live = listen(&mut hands, Duration::from_millis(500));
+    assert!(live[ANA].frames.len() >= 5, "{:?}", live[ANA]);
+    for (what, away, paused) in [
+        (
+            "another program took the monitor",
+            PauseReason::Taken,
+            Paused::Taken,
+        ),
+        (
+            "the monitor left the desktop",
+            PauseReason::Missing,
+            Paused::Missing,
+        ),
+    ] {
+        host.room().pause_share(true);
+        until_told(&mut hands, ANA, PAUSED, Duration::ZERO);
+        PatternAway::set(Some(away));
+        host.room().pause_share(false);
+        let resumed = until_told(&mut hands, ANA, AWAY, Duration::from_secs(1));
+        assert!(resumed[ANA].frames.is_empty(), "{what}: {:?}", resumed[ANA]);
+        let view = host.view();
+        assert!(
+            view.share
+                .running
+                .as_ref()
+                .is_some_and(|running| running.paused == Some(paused) && !running.held),
+            "{what}: {:?}",
+            view.share
+        );
+        let came = Instant::now();
+        PatternAway::set(None);
+        let back = until_told(&mut hands, ANA, LIVE, Duration::from_millis(500));
+        assert!(
+            back[ANA].frames.len() >= 5 && back[ANA].frames[0].1,
+            "{what}: {:?}",
+            back[ANA]
+        );
+        println!(
+            "{what} during a pause by hand, then Resume: told away, no frame in 1 s; back, the first picture, an IDR, {:.0} ms after",
+            first_after(&back[ANA], came)
+        );
+    }
 }

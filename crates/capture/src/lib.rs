@@ -31,6 +31,7 @@ pub use desktop::desktop_away;
 pub use device::device_on;
 pub use duplication::{Capture, make_process_dpi_aware};
 pub use error::{CaptureError, ErrorKind};
+pub use missing::{LOOK_EVERY, LOOKS};
 pub use monitors::{Adapter, Monitor, MonitorId, Rotation, adapters, monitors, window_monitor};
 pub use pattern::{Pattern, pattern_image, read_frame_number};
 pub use reference::Nv12Image;
@@ -185,7 +186,7 @@ impl fmt::Display for PauseReason {
             ),
             PauseReason::Missing => write!(
                 f,
-                "the monitor left the desktop: it was turned off, went to sleep or was unplugged. Sharing goes on if it is back within {} s of leaving",
+                "the monitor left the desktop: it was turned off, went to sleep or was unplugged. Sharing goes on if it is back within {} s",
                 (missing::LOOK_EVERY * missing::LOOKS).as_secs()
             ),
         }

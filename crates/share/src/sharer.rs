@@ -14,7 +14,7 @@ use net::{PaceNumbers, Pacer};
 
 use crate::numbers::{SharerNumbers, ms};
 use crate::recovery::{Again, Answers, Back};
-use crate::source::{self, Choice, HevcOffer, Opened, Pick, Source};
+use crate::source::{self, Choice, HevcOffer, Opened, Pick, Source, Unopened};
 use crate::{Clock, Line};
 
 // A frame the fps cap held went out on a later call of next(), when its time
@@ -30,6 +30,14 @@ const SMALL_FPS: u32 = 60;
 // presented long before: capture to display counts from when it was asked
 // for. Calls come back to back otherwise, capture's own wait being 100 ms.
 const RESTED_AFTER: Duration = Duration::from_millis(250);
+
+// A source that did not open again at resume() is tried again once a
+// capture::LOOK_EVERY: a monitor that is not listed, as often as capture
+// looks for one, and one Windows refuses, since each such try makes a
+// Direct3D device and compiles capture's shaders before Windows answers. In
+// between next() waits this long and looks at the desktop, as capture does
+// while it is paused.
+const AWAY_WAIT: Duration = Duration::from_millis(100);
 
 // A share left to pick its codec (Setup::codec) changes it at most this
 // often. Each change opens a new encoder, which holds up the frame it opens
@@ -199,7 +207,8 @@ pub struct Sent {
 }
 
 pub struct Sharer {
-    // None only after a failed step_down: the share is over.
+    // None while paused by hand or resumed while its source would not open
+    // again (away), and after a failed reopen, when the share is over.
     opened: Option<Opened>,
     setup: Setup,
     size: (u32, u32),
@@ -272,6 +281,8 @@ pub struct Sharer {
     // The codec it was in when paused by hand: resume's new encoder keeps to
     // SWITCH_GAP as any other does.
     held_in: Option<Codec>,
+    // Resumed while its source would not open again (open_away).
+    away: Option<Away>,
     // When the last new encoder opened, and for a window share, when a new
     // size may try again after a new encoder did not open and how many did
     // not in a row (RESIZE_SPACING, RESIZE_TRIES).
@@ -283,6 +294,27 @@ pub struct Sharer {
     // it, since its caption says nothing of its size and its placement
     // nothing of a snap to a side of its monitor.
     window_size: Option<(u32, u32)>,
+}
+
+// A monitor's capture, or the test pattern standing in for one, that did not
+// open again at resume() for what a running capture waits out: why, whether
+// the audience heard it, when it was last tried, and how many tries in a row
+// did not find the monitor listed.
+struct Away {
+    reason: PauseReason,
+    told: bool,
+    tried: Instant,
+    misses: u32,
+}
+
+impl Away {
+    // A try that did not open. False once a monitor still not listed
+    // capture::LOOKS tries after the first is given up on, as a running
+    // capture gives up on it; one found listed starts the count again.
+    fn refused(&mut self, gone: bool) -> bool {
+        self.misses = if gone { self.misses + 1 } else { 0 };
+        self.misses <= capture::LOOKS
+    }
 }
 
 // The change from a failed GPU encoder to the software one, timed for the
@@ -434,6 +466,7 @@ impl Sharer {
             fallback: None,
             held: false,
             held_in: None,
+            away: None,
             last_encoder: Some(Instant::now()),
             resize_retry: None,
             resizes_failed: 0,
@@ -457,8 +490,8 @@ impl Sharer {
             .map_or("no encoder", |opened| opened.encoder.name())
     }
 
-    // None while paused by hand, and after a failed reopen, when the share
-    // is over.
+    // None while paused by hand or resumed while its source would not open
+    // again, and after a failed reopen, when the share is over.
     pub fn codec(&self) -> Option<Codec> {
         self.opened.as_ref().map(|opened| opened.encoder.codec())
     }
@@ -540,6 +573,7 @@ impl Sharer {
         self.keep_window_size();
         self.opened = None;
         self.held = true;
+        self.away = None;
     }
 
     // Before the source goes (window_size).
@@ -558,19 +592,55 @@ impl Sharer {
     }
 
     // The same source again, at what it ran at before the pause, its first
-    // frame an IDR; frame numbers go on. False when it was not paused. An
-    // error ends the share.
+    // frame an IDR; frame numbers go on. False when it was not paused. A
+    // monitor's capture that Windows will not give the desktop yet, or that
+    // is not listed, leaves the share paused as a running capture does:
+    // next() says why and opens it once it can (open_away). Any other error
+    // ends the share.
     pub fn resume(&mut self, say: &mut dyn FnMut(Line)) -> Result<bool, String> {
         if !std::mem::take(&mut self.held) {
             return Ok(false);
         }
-        self.reopen(self.options, say)?;
+        match self.reopen(self.options, say) {
+            Ok(_) => {}
+            Err(Unopened {
+                away: Some(reason),
+                gone,
+                ..
+            }) => {
+                self.paused = true;
+                self.away = Some(Away {
+                    reason,
+                    told: false,
+                    tried: Instant::now(),
+                    misses: u32::from(gone),
+                });
+            }
+            Err(unopened) => return Err(unopened.why),
+        }
         self.answers.force_idr();
         Ok(true)
     }
 
     pub fn held(&self) -> bool {
         self.held
+    }
+
+    // Why a source that did not open again at resume() stands away, until
+    // it opens.
+    pub fn away(&self) -> Option<&PauseReason> {
+        self.away.as_ref().map(|away| &away.reason)
+    }
+
+    // The audience hears that reason now rather than at the next call, which
+    // a share nobody watches does not make while it rests; next() then says
+    // it only once it changes in kind.
+    pub fn tell_away(&mut self, audience: &mut dyn Audience) {
+        if let Some(away) = &mut self.away
+            && !std::mem::replace(&mut away.told, true)
+        {
+            audience.paused(&away.reason);
+        }
     }
 
     // No picture was asked for a while, as while nobody watches and the
@@ -611,6 +681,7 @@ impl Sharer {
             return Ok(false);
         }
         self.reopen(self.source_options(self.setup.fps), say)
+            .map_err(String::from)
     }
 
     // The frame rate the share is asked for from now on. Stepped down or on
@@ -625,7 +696,7 @@ impl Sharer {
         if options.max_fps == self.fps {
             return Ok(false);
         }
-        self.reopen(options, say)
+        self.reopen(options, say).map_err(String::from)
     }
 
     // The largest picture and the most frames a second every watcher takes,
@@ -642,6 +713,7 @@ impl Sharer {
         }
         self.limit = Some(limit);
         self.reopen(self.source_options(self.setup.fps), say)
+            .map_err(String::from)
     }
 
     pub fn stepped_down(&self) -> bool {
@@ -668,8 +740,8 @@ impl Sharer {
         }
     }
 
-    // None while paused by hand, and after a failed reopen, when the share
-    // is over.
+    // None while paused by hand or resumed while its source would not open
+    // again, and after a failed reopen, when the share is over.
     pub fn kind(&self) -> Option<Kind> {
         self.opened.as_ref().map(|opened| opened.encoder.kind())
     }
@@ -741,13 +813,13 @@ impl Sharer {
         &mut self,
         options: capture::Options,
         say: &mut dyn FnMut(Line),
-    ) -> Result<bool, String> {
+    ) -> Result<bool, Unopened> {
         if self.keeps(options) {
             self.take_options(options);
             return Ok(false);
         }
         let now = Instant::now();
-        let current = self.codec().or(self.held_in.take());
+        let current = self.codec().or(self.held_in);
         let pick = self.pick_in(current, now);
         // HEVC can come back with this encoder, and a watchers' limit past
         // capture's default counts in it. If H.264 opens after all, source::open
@@ -778,6 +850,7 @@ impl Sharer {
             self.window_size,
             say,
         )?;
+        self.held_in = None;
         if current.is_some_and(|was| was != opened.encoder.codec()) {
             self.switches.changed(now);
             self.numbers.codec_changes += 1;
@@ -888,6 +961,9 @@ impl Sharer {
         rested: bool,
         audience: &mut dyn Audience,
     ) -> Result<(), String> {
+        if self.away.is_some() && !self.open_away(audience)? {
+            return Ok(());
+        }
         let Some(opened) = &mut self.opened else {
             return Err(String::from(
                 "the share has no picture: its source did not open again",
@@ -948,6 +1024,60 @@ impl Sharer {
             }
         }
         Ok(())
+    }
+
+    // A source that did not open again at resume(): the audience hears why,
+    // as for capture's own pause, and again when the reason changes in
+    // kind. It is tried again once a capture::LOOK_EVERY, first if that
+    // long went by since the last try, as after a rest, so a reason that
+    // no longer holds is not told. Between tries the desktop is looked at,
+    // so the lock screen stops the PC sound as soon as it would for a
+    // running capture, and what came back is answered, as still() does
+    // during capture's pause, so the share can rest once nobody watches. A
+    // monitor still not listed capture::LOOKS tries after the first ends
+    // the share, as it would while it runs. True once it opened.
+    fn open_away(&mut self, audience: &mut dyn Audience) -> Result<bool, String> {
+        let Some(mut away) = self.away.take() else {
+            return Ok(true);
+        };
+        if away.told {
+            std::thread::sleep(AWAY_WAIT);
+        }
+        let now = Instant::now();
+        let reason = if now.saturating_duration_since(away.tried) >= capture::LOOK_EVERY {
+            away.tried = now;
+            match self.reopen(self.options, &mut |line| audience.line(line)) {
+                Ok(_) => return Ok(true),
+                Err(Unopened {
+                    away: Some(reason),
+                    gone,
+                    why,
+                }) => {
+                    if !away.refused(gone) {
+                        return Err(why);
+                    }
+                    reason
+                }
+                Err(unopened) => return Err(unopened.why),
+            }
+        } else {
+            // As capture's look for a monitor that is not listed: one that
+            // could not ask counts as a lost session.
+            match capture::desktop_away() {
+                None => away.reason.clone(),
+                Some(PauseReason::Changing(_)) => PauseReason::Disconnected,
+                Some(reason) => reason,
+            }
+        };
+        if !std::mem::replace(&mut away.told, true)
+            || std::mem::discriminant(&reason) != std::mem::discriminant(&away.reason)
+        {
+            audience.paused(&reason);
+        }
+        away.reason = reason;
+        self.away = Some(away);
+        self.answer(audience);
+        Ok(false)
     }
 
     // A picture from capture out to the viewers, through a new encoder
@@ -1305,6 +1435,7 @@ impl Sharer {
         } else {
             self.reopen(options, &mut |line| audience.line(line))
                 .map(|_| ())
+                .map_err(String::from)
         };
         // After it: a reopen asks whether HEVC may come back, and due has
         // just said it may.
@@ -1850,12 +1981,17 @@ mod tests {
         takes_hevc: bool,
         sent: Vec<Sent>,
         lines: Vec<Line>,
+        paused: Vec<PauseReason>,
+        // How many times what came back was asked for.
+        asked: usize,
     }
 
     impl Audience for Watching {
         fn cursor(&mut self, _: CursorUpdate, _: bool) {}
 
-        fn back(&mut self, _: &mut Vec<Back>) {}
+        fn back(&mut self, _: &mut Vec<Back>) {
+            self.asked += 1;
+        }
 
         fn takes_hevc(&mut self) -> bool {
             self.takes_hevc
@@ -1867,6 +2003,10 @@ mod tests {
 
         fn line(&mut self, line: Line) {
             self.lines.push(line);
+        }
+
+        fn paused(&mut self, reason: &PauseReason) {
+            self.paused.push(reason.clone());
         }
     }
 
@@ -2498,5 +2638,246 @@ mod tests {
                 "{why}"
             );
         }
+    }
+
+    // This PC's first monitor under a name no monitor has, which capture
+    // never finds. None, with the reason printed, with no monitor attached.
+    fn unlisted_monitor() -> Option<capture::Monitor> {
+        capture::make_process_dpi_aware().unwrap_or_else(|err| panic!("{err}"));
+        let monitors = capture::monitors().unwrap_or_else(|err| panic!("{err}"));
+        let Some(mut monitor) = monitors.into_iter().next() else {
+            println!("skipped: no monitor is attached to the desktop");
+            return None;
+        };
+        monitor.id.device_name = String::from("not a listed monitor");
+        Some(monitor)
+    }
+
+    // What looks at the desktop find, from the test, until it is dropped and
+    // they ask Windows again.
+    struct Looks;
+
+    impl Looks {
+        fn find(away: Option<PauseReason>) -> Looks {
+            Looks::set(away);
+            Looks
+        }
+
+        fn set(away: Option<PauseReason>) {
+            capture::fault::set_desktop(away, Duration::ZERO);
+        }
+    }
+
+    impl Drop for Looks {
+        fn drop(&mut self) {
+            capture::fault::clear();
+        }
+    }
+
+    // The next call of a share standing away tries its source again.
+    fn try_due(sharer: &mut Sharer) {
+        let away = sharer.away.as_mut().expect("a share standing away");
+        away.tried = Instant::now()
+            .checked_sub(capture::LOOK_EVERY)
+            .expect("the PC started more than a second ago");
+    }
+
+    // A monitor that is not listed at resume() is waited for as a running
+    // capture waits for it (capture's missing.rs): the try that still misses
+    // it capture::LOOKS tries after the first gives up, and a try that finds
+    // it listed but refused, as when another program took it, starts the
+    // count again.
+    #[test]
+    fn a_monitor_away_at_resume_is_given_up_as_capture_gives_up() {
+        let mut away = Away {
+            reason: PauseReason::Missing,
+            told: true,
+            tried: Instant::now(),
+            misses: 1,
+        };
+        for _ in 1..capture::LOOKS {
+            assert!(away.refused(true));
+        }
+        assert!(away.refused(false), "found, and taken");
+        for _ in 0..capture::LOOKS {
+            assert!(away.refused(true));
+        }
+        assert!(!away.refused(true));
+    }
+
+    // A monitor that is not listed when the share resumes leaves it standing
+    // away. Its first call says why from the try resume() made, with no try
+    // of its own. The calls between tries look at the desktop and say the
+    // lock screen at once, a try says a reason of a new kind too, and what
+    // came back is answered on every call. The try that still misses the
+    // monitor capture::LOOKS tries after the first ends the share. The
+    // pattern shares before the pause, and the monitors are only listed:
+    // nothing of the screen is captured.
+    #[test]
+    fn a_monitor_not_listed_at_resume_stands_away_until_it_is_given_up() {
+        let Some((_turn, adapter)) = gpu() else {
+            return;
+        };
+        let Some(gone) = unlisted_monitor() else {
+            return;
+        };
+        let _looks = Looks::find(None);
+        let mut sharer = pattern_share(adapter, (640, 360), None);
+        sharer.pause();
+        sharer.setup.choice = Choice::Screen(gone);
+        assert_eq!(sharer.resume(&mut |_| {}), Ok(true));
+        assert!(sharer.paused() && sharer.codec().is_none());
+        assert_eq!(sharer.away(), Some(&PauseReason::Missing));
+        let reopens = sharer.reopens;
+        let mut watching = Watching::default();
+        let next = |sharer: &mut Sharer, watching: &mut Watching| {
+            sharer.next(watching).unwrap_or_else(|err| panic!("{err}"));
+        };
+        next(&mut sharer, &mut watching);
+        assert_eq!(watching.paused, [PauseReason::Missing]);
+        assert_eq!((sharer.reopens, watching.asked), (reopens, 1));
+
+        Looks::set(Some(PauseReason::SecureDesktop));
+        next(&mut sharer, &mut watching);
+        let locked = [PauseReason::Missing, PauseReason::SecureDesktop];
+        assert_eq!(watching.paused, locked);
+        assert_eq!((sharer.reopens, watching.asked), (reopens, 2));
+        // A try on the lock screen says the same, and nothing new.
+        try_due(&mut sharer);
+        next(&mut sharer, &mut watching);
+        assert_eq!((sharer.reopens, watching.asked), (reopens + 1, 3));
+        assert_eq!(watching.paused, locked);
+        // Back from it, the look keeps the reason until a try finds the
+        // monitor still missing.
+        Looks::set(None);
+        next(&mut sharer, &mut watching);
+        assert_eq!(watching.paused, locked);
+        try_due(&mut sharer);
+        next(&mut sharer, &mut watching);
+        assert_eq!(watching.paused[2..], [PauseReason::Missing]);
+
+        // Three tries have missed it, resume()'s with them.
+        for _ in 3..capture::LOOKS {
+            try_due(&mut sharer);
+            next(&mut sharer, &mut watching);
+        }
+        try_due(&mut sharer);
+        sharer
+            .next(&mut watching)
+            .expect_err("the wait for the monitor ran out");
+        assert_eq!(sharer.reopens, reopens + u64::from(capture::LOOKS));
+        assert_eq!(watching.paused.len(), 3);
+    }
+
+    // Resumed while its monitor is not listed, a share keeps the codec it
+    // was paused in for its next encoder: within a SWITCH_GAP of the change
+    // to H.264 the source opens again in H.264, and no change is counted.
+    // With no call for as long as the wait between tries, as with nobody
+    // watching since resume(), the first call tries first, and with the
+    // source back says nothing of the reason resume() found: it opens, its
+    // first frame an IDR.
+    #[test]
+    fn a_share_resumed_while_away_keeps_its_codec_and_tries_first() {
+        let Some((_turn, adapter)) = gpu() else {
+            return;
+        };
+        let Some(gone) = unlisted_monitor() else {
+            return;
+        };
+        let mut sharer = pattern_share(adapter, (2560, 1440), None);
+        if sharer.codec() != Some(Codec::Hevc) {
+            println!("skipped: no encoder here takes HEVC at 2560x1440 and 60 fps");
+            return;
+        }
+        sharer.setup.takes_hevc = false;
+        sharer
+            .set_fps(30, &mut |_| {})
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(sharer.codec(), Some(Codec::H264));
+        sharer.setup.takes_hevc = true;
+        sharer.pause();
+        let pattern = std::mem::replace(&mut sharer.setup.choice, Choice::Screen(gone));
+        assert_eq!(sharer.resume(&mut |_| {}), Ok(true));
+        assert!(sharer.away().is_some());
+        sharer.setup.choice = pattern;
+        try_due(&mut sharer);
+        let mut watching = Watching {
+            takes_hevc: true,
+            ..Watching::default()
+        };
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert!(watching.paused.is_empty(), "{:?}", watching.paused);
+        assert!(sharer.away().is_none());
+        assert!(
+            watching.sent.len() == 1 && watching.sent[0].idr,
+            "{:?}",
+            watching.sent
+        );
+        assert_eq!(sharer.codec(), Some(Codec::H264));
+        assert_eq!(sharer.numbers().codec_changes, 1);
+    }
+
+    // A pause by hand while the share stands away ends the wait: resumed
+    // with its source back, it opens at once, its first frame an IDR, with
+    // no word of the reason it stood away for. Between tries a look that
+    // cannot ask counts as a lost session, as capture's look for a monitor
+    // that is not listed has it. A try refused for anything a running
+    // capture does not wait out, as a window gone, ends the share.
+    #[test]
+    fn a_pause_by_hand_ends_the_wait_for_a_source_away() {
+        let Some((_turn, adapter)) = gpu() else {
+            return;
+        };
+        let Some(gone) = unlisted_monitor() else {
+            return;
+        };
+        let _looks = Looks::find(None);
+        let mut sharer = pattern_share(adapter.clone(), (640, 360), None);
+        let mut watching = Watching {
+            takes_hevc: true,
+            ..Watching::default()
+        };
+        let next = |sharer: &mut Sharer, watching: &mut Watching| {
+            sharer.next(watching).unwrap_or_else(|err| panic!("{err}"));
+        };
+        sharer.pause();
+        let pattern = std::mem::replace(&mut sharer.setup.choice, Choice::Screen(gone.clone()));
+        assert_eq!(sharer.resume(&mut |_| {}), Ok(true));
+        next(&mut sharer, &mut watching);
+        Looks::set(Some(PauseReason::Changing(String::from("a test"))));
+        next(&mut sharer, &mut watching);
+        let lost = [PauseReason::Missing, PauseReason::Disconnected];
+        assert_eq!(watching.paused, lost);
+
+        sharer.pause();
+        assert!(sharer.away().is_none());
+        Looks::set(None);
+        sharer.setup.choice = pattern;
+        assert_eq!(sharer.resume(&mut |_| {}), Ok(true));
+        assert!(sharer.away().is_none());
+        next(&mut sharer, &mut watching);
+        assert_eq!(watching.paused, lost);
+        assert!(
+            watching.sent.len() == 1 && watching.sent[0].idr,
+            "{:?}",
+            watching.sent
+        );
+
+        sharer.pause();
+        sharer.setup.choice = Choice::Screen(gone);
+        assert_eq!(sharer.resume(&mut |_| {}), Ok(true));
+        sharer.setup.choice = Choice::Window {
+            window: capture::WindowId {
+                hwnd: 0,
+                process: 0,
+            },
+            adapter,
+        };
+        try_due(&mut sharer);
+        sharer
+            .next(&mut watching)
+            .expect_err("a window gone ends the share");
     }
 }
