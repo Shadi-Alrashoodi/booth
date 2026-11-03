@@ -1207,6 +1207,112 @@ fn renewal_asks_for_its_port_when_the_read_fails() {
     assert_eq!(requests(&rx).len(), 2);
 }
 
+// A forward set up by hand under Booth's own name, as anyone told to forward
+// the port for Booth might call it.
+#[test]
+fn permanent_forward_named_booth_is_used() {
+    for name in ["Booth", "booth"] {
+        let (addr, rx) = fake_router(1, move |_| {
+            entry_named("192.168.100.38", 41062, "1", "0", name)
+        });
+        let mapped = add_mapping(&ip_service(addr), OUR_LAN_ADDR, 41062, &mut |_| {}).unwrap();
+        assert_eq!(
+            mapped,
+            Mapped {
+                external_port: 41062,
+                lease: 0,
+                delete_on_close: false
+            },
+            "{name}"
+        );
+        assert_eq!(requests(&rx).len(), 1, "no AddPortMapping over it");
+    }
+}
+
+#[test]
+fn switched_off_permanent_forward_named_booth_is_not_taken() {
+    let (addr, rx) = fake_router(3, |request| match soap_action(request) {
+        "AddPortMapping" => http("200 OK", &soap_ok("AddPortMapping", "")),
+        _ if arg(request, "NewExternalPort") == Some("41062") => {
+            entry_named("192.168.100.38", 41062, "0", "0", "Booth")
+        }
+        _ => no_entry(),
+    });
+    let mapped = add_mapping(&ip_service(addr), OUR_LAN_ADDR, 41062, &mut |_| {}).unwrap();
+    assert_ne!(mapped.external_port, 41062);
+    assert!(mapped.delete_on_close);
+    let sent = requests(&rx);
+    assert_eq!(soap_action(&sent[2]), "AddPortMapping");
+    assert_ne!(arg(&sent[2], "NewExternalPort"), Some("41062"));
+}
+
+// A conflict must not turn into the delete Booth's own entry would get.
+#[test]
+fn permanent_forward_named_booth_survives_a_conflict() {
+    let mut reads = 0;
+    let (addr, rx) = fake_router(3, move |request| match soap_action(request) {
+        "AddPortMapping" => conflict(),
+        _ => {
+            reads += 1;
+            if reads == 1 {
+                no_entry()
+            } else {
+                entry_named("192.168.100.38", 41062, "1", "0", "Booth")
+            }
+        }
+    });
+    let mapped = add_mapping(&ip_service(addr), OUR_LAN_ADDR, 41062, &mut |_| {}).unwrap();
+    assert_eq!(
+        (mapped.external_port, mapped.lease, mapped.delete_on_close),
+        (41062, 0, false)
+    );
+    let sent = requests(&rx);
+    assert!(
+        sent.iter().all(|r| soap_action(r) != "DeletePortMapping"),
+        "{sent:?}"
+    );
+}
+
+// On a router that keeps only permanent mappings the room's own entry has no
+// lease either. It stays the room's to delete.
+#[test]
+fn renewal_asks_again_for_its_permanent_entry() {
+    let (addr, rx) = fake_router(3, |request| {
+        if soap_action(request) == "GetSpecificPortMappingEntry" {
+            entry_named("192.168.100.38", 41062, "1", "0", "Booth")
+        } else if arg(request, "NewLeaseDuration") == Some("0") {
+            http("200 OK", &soap_ok("AddPortMapping", ""))
+        } else {
+            http(
+                "500 Internal Server Error",
+                &soap_fault("725", "OnlyPermanentLeasesSupported"),
+            )
+        }
+    });
+    let mapped = renew_mapping(&ip_service(addr), OUR_LAN_ADDR, 41062, &mut |_| {}).unwrap();
+    assert_eq!(
+        mapped,
+        Mapped {
+            external_port: 41062,
+            lease: 0,
+            delete_on_close: true
+        }
+    );
+    assert_eq!(requests(&rx).len(), 3);
+}
+
+// A forward under a name is someone's, even on a port the room held.
+#[test]
+fn renewal_uses_a_forward_made_since() {
+    let (addr, rx) = fake_router(1, |_| entry_answer("192.168.100.38", 41062, "1", "0"));
+    let mapped = renew_mapping(&ip_service(addr), OUR_LAN_ADDR, 41062, &mut |_| {}).unwrap();
+    assert_eq!(
+        (mapped.external_port, mapped.lease, mapped.delete_on_close),
+        (41062, 0, false)
+    );
+    assert_eq!(requests(&rx).len(), 1);
+}
+
 #[test]
 fn disabled_forward_is_not_taken() {
     let (addr, _rx) = fake_router(3, |request| match soap_action(request) {

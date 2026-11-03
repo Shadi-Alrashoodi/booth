@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::net::{Ipv6Addr, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::*;
 
@@ -500,6 +500,8 @@ struct FakeIgd {
     ssdp: SocketAddr,
     actions: Arc<Mutex<Vec<String>>>,
     table: Arc<Table>,
+    // What a read says about the lease of any entry.
+    lease: Arc<AtomicU32>,
 }
 
 impl FakeIgd {
@@ -508,13 +510,16 @@ impl FakeIgd {
         let web = listener.local_addr().unwrap();
         let actions = Arc::new(Mutex::new(Vec::new()));
         let table = Arc::new(Mutex::new(Vec::new()));
+        let lease = Arc::new(AtomicU32::new(3600));
         thread::spawn({
-            let (actions, table) = (Arc::clone(&actions), Arc::clone(&table));
+            let (actions, table, lease) =
+                (Arc::clone(&actions), Arc::clone(&table), Arc::clone(&lease));
             move || {
                 for stream in listener.incoming() {
                     let Ok(mut stream) = stream else { return };
                     let request = read_request(&mut stream);
-                    let reply = igd_answer(&request, &actions, &table);
+                    let lease = lease.load(Ordering::Relaxed);
+                    let reply = igd_answer(&request, &actions, &table, lease);
                     let _ = stream.write_all(reply.as_bytes());
                 }
             }
@@ -535,6 +540,7 @@ impl FakeIgd {
             ssdp: ssdp_addr,
             actions,
             table,
+            lease,
         }
     }
 
@@ -580,7 +586,7 @@ fn arg(request: &str, name: &str) -> String {
     request[start..end].to_owned()
 }
 
-fn igd_answer(request: &str, actions: &Mutex<Vec<String>>, table: &Table) -> String {
+fn igd_answer(request: &str, actions: &Mutex<Vec<String>>, table: &Table, lease: u32) -> String {
     const URN: &str = "urn:schemas-upnp-org:service:WANIPConnection:1";
     let (status, body) = if request.starts_with("GET ") {
         (
@@ -606,7 +612,7 @@ fn igd_answer(request: &str, actions: &Mutex<Vec<String>>, table: &Table) -> Str
             "GetSpecificPortMappingEntry" => found.map(|at| {
                 let (_, client, internal_port, name) = &table[at];
                 format!(
-                    "<NewInternalPort>{internal_port}</NewInternalPort><NewInternalClient>{client}</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>{name}</NewPortMappingDescription><NewLeaseDuration>3600</NewLeaseDuration>"
+                    "<NewInternalPort>{internal_port}</NewInternalPort><NewInternalClient>{client}</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>{name}</NewPortMappingDescription><NewLeaseDuration>{lease}</NewLeaseDuration>"
                 )
             }),
             "AddPortMapping" => {
@@ -755,6 +761,54 @@ fn nameless_entry_still_deleted() {
         has_line(&lines, "upnp: the router deleted the mapping for udp 41105"),
         "{lines:#?}"
     );
+}
+
+fn count(actions: &[String], action: &str) -> usize {
+    actions.iter().filter(|name| *name == action).count()
+}
+
+// The room's own entry on a router that keeps only permanent mappings. Read
+// back it looks like a forward set up by hand, but it is not one.
+#[test]
+fn own_permanent_entry_renewed_and_deleted() {
+    let igd = FakeIgd::start();
+    let (mut mapper, reports) = start(target(closed_port(), igd.ssdp), Log::off());
+    let wait = Duration::from_secs(5);
+    assert_eq!(
+        reports.recv_timeout(wait),
+        Ok(mapped(Protocol::Upnp, upnp::LEASE))
+    );
+    igd.lease.store(0, Ordering::Relaxed);
+    mapper.renewer().send(()).unwrap();
+    assert_eq!(
+        reports.recv_timeout(wait),
+        Ok(mapped(Protocol::Upnp, upnp::LEASE))
+    );
+    assert_eq!(count(&igd.actions(), "AddPortMapping"), 2);
+    mapper.close();
+    assert!(mapper.wait(Instant::now() + wait));
+    assert!(lock(&igd.table).is_empty());
+}
+
+// A forward the user made under Booth's name, on a router that keeps those
+// and UPnP's in one table. Neither a renewal nor Close room may touch it.
+#[test]
+fn hand_made_forward_named_booth_left_alone() {
+    let igd = FakeIgd::start();
+    let forward = (PORT, LOCALHOST.to_string(), PORT, String::from("Booth"));
+    *lock(&igd.table) = vec![forward.clone()];
+    igd.lease.store(0, Ordering::Relaxed);
+    let (mut mapper, reports) = start(target(closed_port(), igd.ssdp), Log::off());
+    let wait = Duration::from_secs(5);
+    assert_eq!(reports.recv_timeout(wait), Ok(mapped(Protocol::Upnp, 0)));
+    mapper.renewer().send(()).unwrap();
+    assert_eq!(reports.recv_timeout(wait), Ok(mapped(Protocol::Upnp, 0)));
+    mapper.close();
+    assert!(mapper.wait(Instant::now() + wait));
+    let actions = igd.actions();
+    assert_eq!(count(&actions, "AddPortMapping"), 0, "{actions:?}");
+    assert_eq!(count(&actions, "DeletePortMapping"), 0, "{actions:?}");
+    assert_eq!(*lock(&igd.table), [forward]);
 }
 
 // The router gave the room's port to another device, so the renewal moves

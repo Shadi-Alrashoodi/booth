@@ -839,6 +839,22 @@ enum Asking {
     Made,
 }
 
+// Entry::owner, with what the room knows when it asks for the port.
+fn owner_to_ask(entry: &Entry, internal: SocketAddrV4, held: bool) -> Owner {
+    match entry.owner(internal) {
+        // No lease means it may well be the user's own, set up by hand under
+        // this name, and Booth tells people to forward the port by hand.
+        Owner::Booth if !held && entry.lease == 0 => {
+            if entry.enabled {
+                Owner::ThisPc
+            } else {
+                Owner::Other
+            }
+        }
+        owner => owner,
+    }
+}
+
 fn map_port(
     service: &Service,
     internal: SocketAddrV4,
@@ -849,7 +865,7 @@ fn map_port(
     let held = matches!(asking, Asking::Made);
     let mut lease = LEASE;
     let free = match mapping_entry(service, external_port) {
-        Ok(entry) => match entry.owner(internal) {
+        Ok(entry) => match owner_to_ask(&entry, internal, held) {
             Owner::Booth => {
                 note(format_args!(
                     "port {external_port} already forwards to {internal} for Booth, {} s left, asking for it again",
@@ -898,7 +914,7 @@ fn map_port(
             Err(err) => return Err(err),
         }
         match mapping_entry(service, external_port) {
-            Ok(entry) => match entry.owner(internal) {
+            Ok(entry) => match owner_to_ask(&entry, internal, held) {
                 // Some routers answer a conflict even for the entry the
                 // request would only renew. Its lease must start again, or
                 // it runs out while the room still counts on it.
