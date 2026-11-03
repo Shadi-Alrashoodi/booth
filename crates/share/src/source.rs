@@ -199,6 +199,8 @@ impl Source {
                 height,
                 busy,
             } => {
+                #[cfg(feature = "fault")]
+                crate::fault::pattern_opens()?;
                 let device = capture::device_on(adapter).map_err(text)?;
                 let pattern =
                     Pattern::with_source(&device, *width, *height, Rotation::Identity, options)

@@ -120,9 +120,18 @@ const RETRY: Duration = Duration::from_millis(100);
 /// From now on the test pattern pauses for `reason` as a monitor's capture
 /// does when Windows takes the desktop away: it says so once, then that
 /// nothing is new every 100 ms, until pattern_away(None) gives its pictures
-/// back.
+/// back. Meanwhile it does not open again either, as a monitor's capture
+/// does not open on the secure desktop.
 pub fn pattern_away(reason: Option<PauseReason>) {
     *lock(&AWAY) = reason.map(|reason| (reason, false));
+}
+
+// The pattern's source opens, or the reason it is away as the error.
+pub(crate) fn pattern_opens() -> Result<(), String> {
+    match &*lock(&AWAY) {
+        Some((reason, _)) => Err(format!("the test pattern is away: {reason}")),
+        None => Ok(()),
+    }
 }
 
 // The size and rate the pattern takes at its next picture.

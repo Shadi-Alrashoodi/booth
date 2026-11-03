@@ -32,7 +32,7 @@ capture = { workspace = true, features = ["fault"] }
 # tests/video.rs gives the test pattern a pointer and reads back what each
 # viewer drew it with, pauses the pattern as a monitor's capture pauses and
 # brings it a monitor's new mode; src/screen.rs's tests read what waits in a
-# viewer's inbox.
+# viewer's inbox, and src/screen/sharer.rs's pause the pattern during a rest.
 share = { workspace = true, features = ["fault"] }
 # tests/common/window.rs makes the windows tests/video.rs shares;
 # examples/share_numbers.rs reads a window's bounds from DWM.

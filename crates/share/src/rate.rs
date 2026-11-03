@@ -702,6 +702,24 @@ impl Rate {
         (self.rate_kbps != was).then_some(self.rate_kbps)
     }
 
+    // The share rested with nobody watching, and is judged again only once
+    // it is watched, which can be much later and by others. What the seconds
+    // before counted in a row or over their window starts again; the rate,
+    // its climb back and the last backoff and step stay.
+    pub fn rested(&mut self) {
+        self.bytes.clear();
+        self.loss.clear();
+        self.near = false;
+        self.risen = 0;
+        self.far = 0;
+        self.rise_before = None;
+        self.clean = 0;
+        self.cuts = 0;
+        self.ignored_run = 0;
+        self.slow = 0;
+        self.shard_high = 0;
+    }
+
     pub fn second(&mut self, now: Instant, second: &Second) -> Decision {
         let was = self.rate_kbps;
         if self.bytes.len() == NEAR_SECONDS {

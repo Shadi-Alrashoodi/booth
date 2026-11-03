@@ -209,6 +209,59 @@ fn no_new_round_trip_keeps_the_count() {
     assert_eq!(rate.judged().risen_seconds, 2);
 }
 
+// A share that rests is not judged, and the next watch can come long after:
+// a risen second before the rest and one after it are not two in a row, nor
+// a cut before it and one after it the two that step a LAN share down. Clean
+// and far seconds start again too.
+#[test]
+fn a_rest_starts_the_counts_again() {
+    let start = Instant::now();
+    let mut rate = Rate::new(15_000);
+    let risen = Second {
+        round_trip: rtt(40.0),
+        ..sending(14_000)
+    };
+    assert_eq!(rate.second(at(start, 0), &risen), Decision::default());
+    rate.rested();
+    assert_eq!(rate.second(at(start, 600), &risen), Decision::default());
+    assert_eq!(rate.judged().risen_seconds, 1);
+
+    // 9 Mbit/s allowed on a LAN path, under 8 from the first cut.
+    let mut rate = Rate::new(9_000);
+    let lossy = Second {
+        lost: 10,
+        round_trip: queue_beside(),
+        ..sending(14_000)
+    };
+    assert_eq!(rate.second(at(start, 0), &lossy).backoff, Some(Sign::Loss));
+    rate.rested();
+    let cut = rate.second(at(start, 600), &lossy);
+    assert_eq!((cut.backoff, cut.step), (Some(Sign::Loss), None));
+
+    // Four clean seconds after a cut and one after the rest are not the five
+    // the careful climb waits for.
+    let mut rate = Rate::new(15_000);
+    assert_eq!(rate.second(at(start, 0), &lossy).rate_kbps, Some(12_000));
+    run(&mut rate, start, 1, 4, sending(14_000));
+    rate.rested();
+    assert_eq!(
+        rate.second(at(start, 600), &sending(14_000)),
+        Decision::default()
+    );
+
+    // Four seconds 42 ms over the floor while sending too little to be near
+    // the rate, and one after the rest, are not the five that cut through
+    // the gate.
+    let mut rate = Rate::new(15_000);
+    let far = Second {
+        round_trip: rtt(60.0),
+        ..sending(2_000)
+    };
+    run(&mut rate, start, 0, 4, far);
+    rate.rested();
+    assert_eq!(rate.second(at(start, 600), &far).backoff, None);
+}
+
 // The room gives the worst of the watchers' links, which can be another
 // link from one second to the next. Going from one with a high floor to one
 // with a low floor, both risen, is no queue draining.

@@ -307,9 +307,11 @@ fn share(
             }
         }
         // Not while capture is paused either: a new box or rate opens the
-        // source again.
+        // source again. Nor after a rest until capture has looked: the lock
+        // screen can have come up unseen, and the source would not open on
+        // it.
         let limits = sharing.limits();
-        if limits != applied_limits && !sharer.paused() && !sharer.held() {
+        if limits != applied_limits && !sharer.paused() && !sharer.held() && !unseen {
             applied_limits = limits;
             if let Some(limits) = limits {
                 let limit = CaptureOptions {
@@ -390,9 +392,12 @@ fn share(
             // lock screen can come up meanwhile: the PC sound waits until
             // the capture, or for a window the share itself, has looked
             // again, and a monitor's capture looks before a picture it held
-            // from before goes out, however short the rest.
+            // from before goes out, however short the rest. The rate is not
+            // judged until then either, and what it counted before the rest
+            // starts again.
             if nobody && !std::mem::replace(&mut unseen, true) {
                 sharing.set_unseen(number, true);
+                rate.rested();
             }
             sharer.rested();
             rest.until(sharing, next_second);
@@ -505,8 +510,12 @@ fn share(
                 .is_some_and(|ms| ms > second.interval.as_secs_f32() * 1000.0);
             // While capture is paused nothing goes out to judge the link by,
             // and a step opens the source again, which a monitor that left
-            // the desktop would not survive.
-            let decision = (!sharer.paused() && !sharer.held()).then(|| rate.second(now, &second));
+            // the desktop would not survive. The same holds while the share
+            // rests, and after it until capture has looked: nothing goes out
+            // that could have filled a queue, and the lock screen can have
+            // come up unseen.
+            let decision =
+                (!sharer.paused() && !sharer.held() && !unseen).then(|| rate.second(now, &second));
             if let Some(decision) = &decision {
                 if let Some(line) = rate.line(decision) {
                     log!(log, "share {number}: {line}");
@@ -1339,9 +1348,13 @@ fn kbps(bytes: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
     use session::Session;
+    use share::rate::RoundTrip;
     use share::{CursorKind, MonitorId, Region, WindowId};
 
+    use crate::control::{Facts, ShareLimits};
     use crate::screen::ShareOutlet;
     use crate::screen::wire::{SENT, read_pointer};
     use crate::socket::Socket;
@@ -1948,6 +1961,7 @@ mod tests {
     // The test pattern only; nothing of the screen is captured.
     #[test]
     fn new_watcher_idr_skips_floor() {
+        let _turn = pattern_turn();
         let adapters = share::adapters().unwrap_or_else(|err| panic!("{err}"));
         let Some(adapter) = adapters.first().cloned() else {
             println!("skipped: this PC has no graphics card to make the pattern on");
@@ -2021,6 +2035,255 @@ mod tests {
             watchers.lost.take(),
             1,
             "only the viewer's ask counts as a loss"
+        );
+    }
+
+    // One test at a time on the test pattern: its pause (share::fault) is
+    // the whole process's.
+    static PATTERN: Mutex<()> = Mutex::new(());
+
+    fn pattern_turn() -> MutexGuard<'static, ()> {
+        PATTERN.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    // True, with the reason printed, on a PC with no graphics card to make
+    // the pattern on.
+    fn no_adapter() -> bool {
+        let adapters = share::adapters().unwrap_or_else(|err| panic!("{err}"));
+        if adapters.is_empty() {
+            println!("skipped: this PC has no graphics card to make the pattern on");
+        }
+        adapters.is_empty()
+    }
+
+    // The host's facts for share 1, watched by `watchers`, none of them over
+    // the internet.
+    fn watched_by(watchers: u8) -> Facts {
+        Facts {
+            share: 1,
+            watchers,
+            internet: 0,
+            cap_kbps: 0,
+            lan: false,
+            hevc: true,
+            idr: watchers > 0,
+        }
+    }
+
+    // The share's thread on the 1440p test pattern, as a friend's share
+    // nobody watches yet, so it rests from the start. The pattern is back
+    // and the thread over however the test ends.
+    struct Resting {
+        sharing: Arc<Sharing>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl Resting {
+        fn start(log: Log) -> Resting {
+            let wake = net::pace::Signal::new().expect("create an event");
+            let clock = crate::peer::Clock::new(Instant::now());
+            let sharing = Sharing::new(clock, false, None, 15_000, wake);
+            sharing.set_state(OwnShare::Sharing { number: 1, fps: 60 });
+            sharing.set_facts(&watched_by(0));
+            let pattern = VideoSource::Pattern {
+                width: 2560,
+                height: 1440,
+                busy: false,
+            };
+            let thread =
+                start(Arc::clone(&sharing), pattern, log).expect("start the share's thread");
+            let resting = Resting {
+                sharing,
+                thread: Some(thread),
+            };
+            // Open, and rested: the share counts as running before its first
+            // pass, and only a rest shuts its PC sound here.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while resting.sharing.running().is_none() || !resting.sharing.sound().shut() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the share did not open and rest: {:?}",
+                    resting.failed()
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            resting
+        }
+
+        // Watched by `watchers`, until the share has rested for none or
+        // looked at the screen again for some: its PC sound is shut from a
+        // rest until that look.
+        fn watch(&self, watchers: u8) {
+            self.sharing.set_facts(&watched_by(watchers));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.sharing.sound().shut() != (watchers == 0) {
+                assert!(
+                    Instant::now() < deadline,
+                    "watched by {watchers}, the share never followed: {:?}",
+                    self.failed()
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        // A round trip, until the share's next second has taken it in.
+        fn round_trip(&self, round_trip: RoundTrip) {
+            self.sharing.set_round_trip(Some(round_trip), None);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let waiting = || {
+                let reading = self.sharing.round_trip.lock();
+                reading.unwrap_or_else(PoisonError::into_inner).0.is_some()
+            };
+            while waiting() {
+                assert!(Instant::now() < deadline, "the share never took it");
+                thread::sleep(Duration::from_millis(10));
+            }
+            // The second is judged right after, on the share's thread.
+            thread::sleep(Duration::from_millis(200));
+        }
+
+        // Why the share failed, since the last look.
+        fn failed(&self) -> Vec<String> {
+            self.sharing
+                .take_news()
+                .into_iter()
+                .filter_map(|news| match news {
+                    ShareNews::Failed { why, .. } => Some(why),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    impl Drop for Resting {
+        fn drop(&mut self) {
+            share::fault::pattern_away(None);
+            self.sharing.close();
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    // A share that rests with nobody watching sends nothing, so a round trip
+    // that rises meanwhile is no queue it filled: its rate is not cut, and
+    // it takes no step, which would open the source again on the lock screen
+    // that came up during the rest and end the share. The test pattern stands
+    // in for a monitor's capture there (share::fault), and uses the GPU's
+    // encoder. This is the rest itself, not the wait after it for capture's
+    // look, which outlasts the rest only when the fps cap held a picture.
+    #[test]
+    fn a_resting_share_takes_no_cut_and_no_step() {
+        let _turn = pattern_turn();
+        if no_adapter() {
+            return;
+        }
+        let (log, captured) = Log::capture(1024);
+        let resting = Resting::start(log);
+        share::fault::pattern_away(Some(PauseReason::SecureDesktop));
+        // Past twice the least margin, and long enough for two cuts through
+        // the gate and the step down they bring.
+        let risen = RoundTrip {
+            recent_ms: 60.0,
+            floor_ms: 18.0,
+            spread_ms: 1.0,
+        };
+        let until = Instant::now() + Duration::from_secs(13);
+        while Instant::now() < until {
+            resting.sharing.set_round_trip(Some(risen), None);
+            thread::sleep(Duration::from_millis(200));
+        }
+        let failed = resting.failed();
+        let lines = captured.lines();
+        assert!(failed.is_empty(), "{failed:?}: {lines:#?}");
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("backed off") || line.contains("stepped down")),
+            "{lines:#?}"
+        );
+    }
+
+    // A new box for the watchers opens the source again, which does not
+    // open on the lock screen. After a rest it waits for capture to have
+    // looked: that finds the lock, the share stands away until the desktop
+    // is back, and the box comes then.
+    #[test]
+    fn a_limit_after_a_rest_waits_for_a_look() {
+        let _turn = pattern_turn();
+        if no_adapter() {
+            return;
+        }
+        let (log, captured) = Log::capture(1024);
+        let mut lines = Vec::new();
+        let resting = Resting::start(log);
+        share::fault::pattern_away(Some(PauseReason::SecureDesktop));
+        resting.sharing.set_limits(ShareLimits {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            kbps: None,
+        });
+        thread::sleep(Duration::from_millis(500));
+        resting.sharing.set_facts(&watched_by(1));
+        thread::sleep(Duration::from_millis(500));
+        let failed = resting.failed();
+        lines.extend(captured.lines());
+        assert!(failed.is_empty(), "{failed:?}: {lines:#?}");
+        let boxed = |lines: &[String]| {
+            lines
+                .iter()
+                .any(|line| line.contains("running at 1280x720"))
+        };
+        assert!(
+            !boxed(&lines),
+            "opened again on the lock screen: {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("capture paused")),
+            "never stood away: {lines:#?}"
+        );
+
+        share::fault::pattern_away(None);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !boxed(&lines) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+            lines.extend(captured.lines());
+        }
+        let failed = resting.failed();
+        assert!(failed.is_empty(), "{failed:?}: {lines:#?}");
+        assert!(boxed(&lines), "the box never came: {lines:#?}");
+    }
+
+    // The next watch after a rest can come much later, from other watchers,
+    // so the rate counts nothing on from before it: a round trip risen in
+    // the last second judged before the rest and in the first after it is
+    // not two seconds in a row.
+    #[test]
+    fn a_rest_starts_the_rates_counts_again() {
+        let _turn = pattern_turn();
+        if no_adapter() {
+            return;
+        }
+        let (log, captured) = Log::capture(1024);
+        let resting = Resting::start(log);
+        // Past the least margin, not twice it: one second is not a queue.
+        let risen = RoundTrip {
+            recent_ms: 38.0,
+            floor_ms: 18.0,
+            spread_ms: 1.0,
+        };
+        resting.watch(1);
+        resting.round_trip(risen);
+        resting.watch(0);
+        resting.watch(1);
+        resting.round_trip(risen);
+        let failed = resting.failed();
+        let lines = captured.lines();
+        assert!(failed.is_empty(), "{failed:?}: {lines:#?}");
+        assert!(
+            !lines.iter().any(|line| line.contains("a risen round trip")),
+            "{lines:#?}"
         );
     }
 }
