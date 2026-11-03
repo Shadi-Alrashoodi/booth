@@ -33,11 +33,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_F11};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CheckMenuItem, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow,
     DispatchMessageW, GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetCursorPos, GetMessageW,
-    GetSystemMenu, GetWindowLongPtrW, GetWindowPlacement, HICON, HTCLIENT, HWND_NOTOPMOST,
-    HWND_TOP, HWND_TOPMOST, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_HAND, IMAGE_ICON, IsIconic,
-    IsWindowVisible, IsZoomed, LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MF_BYCOMMAND, MF_CHECKED,
-    MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MINMAXINFO, MSG, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SC_KEYMENU, SIZE_MINIMIZED, SM_CXICON, SM_CXSMICON,
+    GetSystemMenu, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, HICON, HTCLIENT,
+    HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_HAND, IMAGE_ICON,
+    IsIconic, IsWindowVisible, IsZoomed, LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MF_BYCOMMAND,
+    MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MINMAXINFO, MSG, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SC_KEYMENU, SIZE_MINIMIZED, SM_CXICON, SM_CXSMICON,
     SPI_GETCLIENTAREAANIMATION, SW_HIDE, SW_RESTORE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetCursor, SetWindowDisplayAffinity,
@@ -71,6 +71,10 @@ const WM_PRETEND_FRONT: u32 = WM_APP + 4;
 // In UI::Controls, which has nothing else this crate needs.
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_SMALL: u32 = WM_APP + 5;
+// For tests, on one monitor: the window counts as on another monitor before,
+// so its next move or new size lands it on a new one.
+#[cfg(test)]
+const WM_PRETEND_ELSEWHERE: u32 = WM_APP + 6;
 // The system menu's "Small on top". A window's own system commands sit
 // below 0xF000 with the low four bits clear, which Windows keeps for itself.
 const SMALL_ON_TOP: usize = 0x0010;
@@ -859,6 +863,14 @@ fn monitor_rects(monitor: HMONITOR) -> Option<(RECT, RECT)> {
         .then_some((info.rcMonitor, info.rcWork))
 }
 
+fn window_rect(hwnd: HWND) -> Option<RECT> {
+    let mut rect = RECT::default();
+    // SAFETY: a live window and a live out parameter.
+    unsafe { GetWindowRect(hwnd, &mut rect) }
+        .ok()
+        .map(|()| rect)
+}
+
 fn record_size(hwnd: HWND, shared: &Shared) {
     let mut client = RECT::default();
     // SAFETY: a live window and a live out parameter.
@@ -928,13 +940,16 @@ fn set_fullscreen(hwnd: HWND, shared: &Shared, on: bool) {
     follow_control(hwnd, shared, false);
 }
 
-fn note_monitor(hwnd: HWND, shared: &Shared) {
+// True when the window is on another monitor than before.
+fn note_monitor(hwnd: HWND, shared: &Shared) -> bool {
     // SAFETY: a plain lookup on a live window.
     let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }.0 as isize;
     let before = MONITOR.with(|last| last.replace(Some(monitor)));
-    if before.is_some_and(|before| before != monitor) {
+    let moved = before.is_some_and(|before| before != monitor);
+    if moved {
         shared.new_output();
     }
+    moved
 }
 
 // Borderless over the whole monitor the window is on, which is what lets
@@ -973,6 +988,41 @@ fn enter_fullscreen(hwnd: HWND, shared: &Shared) {
             SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE,
         );
     }
+}
+
+// Fullscreen over the whole of the monitor the window is on now. Windows
+// leaves a window that moved to another monitor, or whose monitor changed
+// its resolution, at the size it had.
+fn cover_monitor(hwnd: HWND) {
+    // Not while minimized, where SetWindowPos would put the minimized window
+    // on the monitor and leave the size it comes back at as it was. WM_SIZE
+    // covers the monitor once it is back.
+    // SAFETY: a getter on a live window.
+    if unsafe { IsIconic(hwnd) }.as_bool() {
+        return;
+    }
+    // SAFETY: a plain lookup on a live window.
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let Some((whole, _)) = monitor_rects(monitor) else {
+        return;
+    };
+    // Only when it does not already, as the move this makes comes back
+    // here.
+    if window_rect(hwnd) == Some(whole) {
+        return;
+    }
+    // SAFETY: a live window.
+    let _ = unsafe {
+        SetWindowPos(
+            hwnd,
+            None,
+            whole.left,
+            whole.top,
+            whole.right - whole.left,
+            whole.bottom - whole.top,
+            SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE,
+        )
+    };
 }
 
 fn leave_fullscreen(hwnd: HWND, shared: &Shared) {
@@ -1137,7 +1187,13 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             if wparam.0 as u32 == SIZE_MINIMIZED {
                 shared.minimized.store(true, Ordering::Release);
             } else {
-                shared.minimized.store(false, Ordering::Release);
+                // Fullscreen comes back from minimized at the size it had,
+                // which new display settings in the meantime may have made
+                // wrong.
+                let restored = shared.minimized.swap(false, Ordering::AcqRel);
+                if restored && shared.fullscreen() {
+                    cover_monitor(hwnd);
+                }
                 record_size(hwnd, &shared);
             }
             follow_control(hwnd, &shared, false);
@@ -1180,6 +1236,12 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             follow_control(hwnd, &shared, false);
             LRESULT(0)
         }
+        // No monitor has the number 0.
+        #[cfg(test)]
+        WM_PRETEND_ELSEWHERE => {
+            MONITOR.with(|last| last.set(Some(0)));
+            LRESULT(0)
+        }
         WM_SYSCOMMAND
             if (wparam.0 & 0xfff0) as u32 == SC_KEYMENU
                 && control::menu_key_is_the_sharers(shared.mode(), lparam.0) =>
@@ -1202,8 +1264,9 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             // stays the same.
             shared.mark_changed();
             if shared.fullscreen() {
-                // The window already covers its monitor; Windows' suggested
-                // rectangle is for a framed window.
+                // Windows' suggested rectangle is for a framed window; this
+                // one covers the monitor it is on now.
+                cover_monitor(hwnd);
                 record_size(hwnd, &shared);
             } else {
                 // SAFETY: for WM_DPICHANGED, lparam points at the suggested
@@ -1371,15 +1434,21 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         }
         // The default handling is what sends WM_SIZE, so it runs too.
         WM_WINDOWPOSCHANGED => {
-            note_monitor(hwnd, &shared);
+            let moved = note_monitor(hwnd, &shared);
             // SAFETY: the default handling.
             let result = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            if moved && shared.fullscreen() {
+                cover_monitor(hwnd);
+            }
             // A pointer held in the window moves with it.
             follow_control(hwnd, &shared, false);
             result
         }
         WM_DISPLAYCHANGE => {
             shared.new_output();
+            if shared.fullscreen() {
+                cover_monitor(hwnd);
+            }
             // SAFETY: the default handling.
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -1434,7 +1503,59 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 
 #[cfg(test)]
 mod tests {
+    use windows::Win32::Graphics::Gdi::EnumDisplayMonitors;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CMONITORS, SW_SHOWMINNOACTIVE,
+    };
+
     use super::*;
+
+    // A window as Viewer::open makes it, without the GPU.
+    fn open(show: Show) -> Window {
+        // The window is per-monitor aware; this thread has to be too, or
+        // Windows scales every rectangle it reports here.
+        // SAFETY: a constant context; the previous one is not needed.
+        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        Window::open("Booth viewer placement test", (1280, 720), show, None, None).unwrap()
+    }
+
+    fn send(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) {
+        // SAFETY: a test's live window; SendMessageW returns once the
+        // window's thread has handled the message.
+        unsafe { SendMessageW(hwnd, msg, Some(WPARAM(wparam)), Some(LPARAM(lparam))) };
+    }
+
+    fn monitor_of(hwnd: HWND) -> (RECT, RECT) {
+        // SAFETY: a plain lookup on a live window.
+        monitor_rects(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }).unwrap()
+    }
+
+    fn monitors() -> Vec<HMONITOR> {
+        unsafe extern "system" fn add(
+            monitor: HMONITOR,
+            _: HDC,
+            _: *mut RECT,
+            all: LPARAM,
+        ) -> BOOL {
+            // SAFETY: the Vec that monitors() passes, alive for the call.
+            unsafe { (*(all.0 as *mut Vec<HMONITOR>)).push(monitor) };
+            TRUE
+        }
+        let mut all = Vec::new();
+        // SAFETY: a callback that only adds to `all`, which outlives the
+        // call.
+        unsafe {
+            EnumDisplayMonitors(
+                None,
+                None,
+                Some(add),
+                LPARAM(&mut all as *mut Vec<HMONITOR> as isize),
+            )
+        }
+        .ok()
+        .unwrap();
+        all
+    }
 
     #[test]
     fn opens_at_one_to_one_when_the_video_fits() {
@@ -1596,5 +1717,171 @@ mod tests {
         assert_eq!(woken.load(Ordering::Relaxed), 1);
         assert!(shared.take_changed());
         assert_eq!(shared.band(false), Band::Below);
+    }
+
+    // Fullscreen covers the monitor the window is on after what Windows
+    // leaves to the window: new display settings, which a smaller window
+    // stands for here, and a new DPI. Never shown.
+    #[test]
+    fn fullscreen_covers_its_monitor_again_after_a_change() {
+        let _screen = crate::tests::one_at_a_time();
+        let window = open(Show::Hidden);
+        let hwnd = window.hwnd();
+        let windowed = window_rect(hwnd);
+        let (whole, _) = monitor_of(hwnd);
+        send(hwnd, WM_FULLSCREEN, 1, 0);
+        assert_eq!(window_rect(hwnd), Some(whole));
+        let shrink = || {
+            // SAFETY: this test's live window. SetWindowPos returns once the
+            // window's thread has handled the new size.
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    800,
+                    600,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+            }
+            .unwrap();
+            assert_ne!(window_rect(hwnd), Some(whole));
+        };
+        shrink();
+        send(hwnd, WM_DISPLAYCHANGE, 32, 0);
+        assert_eq!(window_rect(hwnd), Some(whole), "after new display settings");
+        shrink();
+        // The DPI it has, so only the message is new.
+        // SAFETY: a live window.
+        let dpi = unsafe { GetDpiForWindow(hwnd) } as usize;
+        let suggested = RECT {
+            left: 0,
+            top: 0,
+            right: 800,
+            bottom: 600,
+        };
+        send(
+            hwnd,
+            WM_DPICHANGED,
+            dpi << 16 | dpi,
+            &suggested as *const RECT as isize,
+        );
+        assert_eq!(window_rect(hwnd), Some(whole), "after a new DPI");
+        assert!(window.shared().fullscreen());
+        send(hwnd, WM_FULLSCREEN, 0, 0);
+        assert_eq!(window_rect(hwnd), windowed);
+    }
+
+    // Fullscreen covers the monitor the window lands on at the size it had,
+    // as after Win+Shift+Arrow or with its monitor unplugged. With one
+    // monitor, the window is told it was on another before its size
+    // changes. Never shown.
+    #[test]
+    fn fullscreen_covers_the_monitor_it_moves_to() {
+        let _screen = crate::tests::one_at_a_time();
+        let window = open(Show::Hidden);
+        let hwnd = window.hwnd();
+        let windowed = window_rect(hwnd);
+        let (whole, _) = monitor_of(hwnd);
+        send(hwnd, WM_FULLSCREEN, 1, 0);
+        send(hwnd, WM_PRETEND_ELSEWHERE, 0, 0);
+        // SAFETY: this test's live window. SetWindowPos returns once the
+        // window's thread has handled the new size.
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                800,
+                600,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        }
+        .unwrap();
+        assert_eq!(window_rect(hwnd), Some(whole));
+        send(hwnd, WM_FULLSCREEN, 0, 0);
+        assert_eq!(window_rect(hwnd), windowed);
+    }
+
+    // As above, to a real other monitor, which may have another size and
+    // DPI, and back where it was on the first. Only with two monitors or
+    // more. Never shown.
+    #[test]
+    fn fullscreen_follows_the_window_to_another_monitor() {
+        // SAFETY: a plain getter.
+        if unsafe { GetSystemMetrics(SM_CMONITORS) } < 2 {
+            return;
+        }
+        let _screen = crate::tests::one_at_a_time();
+        let window = open(Show::Hidden);
+        let hwnd = window.hwnd();
+        let windowed = window_rect(hwnd);
+        send(hwnd, WM_FULLSCREEN, 1, 0);
+        // SAFETY: a plain lookup on a live window.
+        let first = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        let other = monitors().into_iter().find(|&monitor| monitor != first);
+        let (whole, _) = monitor_rects(other.unwrap()).unwrap();
+        // Half its size, so that it is on the other monitor whatever the
+        // sizes of the two.
+        // SAFETY: this test's live window. SetWindowPos returns once the
+        // window's thread has handled the move.
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                None,
+                whole.left,
+                whole.top,
+                (whole.right - whole.left) / 2,
+                (whole.bottom - whole.top) / 2,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        }
+        .unwrap();
+        assert_eq!(window_rect(hwnd), Some(whole));
+        send(hwnd, WM_FULLSCREEN, 0, 0);
+        assert_eq!(window_rect(hwnd), windowed);
+    }
+
+    // A fullscreen viewer minimized, as Win+D leaves it, when the display
+    // settings change: it stays minimized where Windows keeps it, and once
+    // back at the size it had, which a smaller one stands for here, it
+    // covers its monitor again. On screen for a moment, minimized and over
+    // the whole monitor.
+    #[test]
+    #[ignore]
+    fn a_minimized_fullscreen_window_covers_its_monitor_once_back() {
+        let _screen = crate::tests::one_at_a_time();
+        let window = open(Show::Hidden);
+        let hwnd = window.hwnd();
+        let (whole, _) = monitor_of(hwnd);
+        send(hwnd, WM_FULLSCREEN, 1, 0);
+        // SAFETY: a getter on a live window.
+        let minimized = || unsafe { IsIconic(hwnd) }.as_bool();
+        // SAFETY: this test's live window.
+        let _ = unsafe { ShowWindow(hwnd, SW_SHOWMINNOACTIVE) };
+        assert!(minimized());
+        let parked = window_rect(hwnd);
+        send(hwnd, WM_DISPLAYCHANGE, 32, 0);
+        assert!(minimized(), "new display settings brought it back");
+        assert_eq!(window_rect(hwnd), parked, "moved while minimized");
+        let mut placement = WINDOWPLACEMENT {
+            length: size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: this test's live window and a WINDOWPLACEMENT with its
+        // length set. It stays minimized, to come back at 800 by 600.
+        unsafe {
+            GetWindowPlacement(hwnd, &mut placement).unwrap();
+            let normal = &mut placement.rcNormalPosition;
+            normal.right = normal.left + 800;
+            normal.bottom = normal.top + 600;
+            placement.showCmd = SW_SHOWMINNOACTIVE.0 as u32;
+            SetWindowPlacement(hwnd, &placement).unwrap();
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        assert!(!minimized());
+        assert_eq!(window_rect(hwnd), Some(whole), "once back");
     }
 }
