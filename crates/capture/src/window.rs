@@ -537,6 +537,8 @@ impl WindowCapture {
                     }
                 }
                 let bounds = self.size();
+                #[cfg(feature = "fault")]
+                let bounds = crate::fault::bounds_while_minimized(self.window.hwnd).or(bounds);
                 if !self.window.minimized() && self.window.exists() {
                     self.minimized = false;
                     self.restoring_until = Some(Instant::now() + RESTORING);
@@ -550,7 +552,13 @@ impl WindowCapture {
                 if let Some(frame) = newest {
                     let _ = frame.Close();
                 }
-                if let Some(size) = bounds {
+                // Bounds of the newest picture's size say nothing of the
+                // caption: DWM can still have the window's own as IsIconic
+                // turns, and a restore before the next pass would then drop
+                // the restored window's every picture as the caption's.
+                if let Some(size) = bounds
+                    && self.content != Some((size.0 as u32, size.1 as u32))
+                {
                     self.caption = Some(size);
                 }
                 self.natural = None;

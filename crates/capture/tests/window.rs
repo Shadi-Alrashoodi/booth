@@ -597,6 +597,60 @@ fn minimized_and_restored_within_one_pass() {
     assert!(after.iter().all(|&&(each, _)| each == size), "{frames:?}");
 }
 
+// A pass that finds the window minimized while DWM still has the window's
+// own bounds, made so here, and a restore before the next pass: the restored
+// window still comes out, its pictures judged by the caption of the
+// minimize before. Judged by the window's own size, its pictures were all
+// dropped, or a caption's let through ahead of them.
+#[cfg(feature = "fault")]
+#[test]
+fn a_restore_after_a_late_caption_comes_out() {
+    let _turn = ALONE.write().unwrap_or_else(|p| p.into_inner());
+    let Some(adapter) = adapter() else { return };
+    let window = Window::with_style(WS_OVERLAPPEDWINDOW, 640, 360);
+    let mut capture = WindowCapture::open(window.id(), &adapter, Options::default()).unwrap();
+    let size = frame_size(&mut capture, Duration::from_secs(2)).unwrap();
+    let plan = capture.plan();
+    let own = (plan.source_width as i32, plan.source_height as i32);
+    for late in [false, true] {
+        if late {
+            capture::fault::set_bounds_while_minimized(window.0, own);
+        }
+        window.show(SW_MINIMIZE);
+        let start = Instant::now();
+        let mut paused = None;
+        while start.elapsed() < Duration::from_secs(2) && paused.is_none() {
+            if let Next::Paused(why) = capture.next().unwrap() {
+                paused = Some(why);
+            }
+        }
+        assert_eq!(paused, Some(PauseReason::Minimized));
+        // The first time, later passes read the caption once DWM has it.
+        if !late {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(300) {
+                capture.next().unwrap();
+            }
+        }
+        window.show(SW_SHOWNOACTIVATE);
+        let start = Instant::now();
+        while window.id().minimized() {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "the window did not come back"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let sizes = sizes_for(&mut capture, Duration::from_secs(2));
+        println!("the window comes out {size:?}; restored, late {late}: {sizes:?}");
+        assert!(!sizes.is_empty(), "late {late}: no frame");
+        assert!(
+            sizes.iter().all(|&each| each == size),
+            "late {late}: {sizes:?}"
+        );
+    }
+}
+
 #[test]
 fn a_closed_window_ends_the_capture() {
     let _turn = ALONE.read().unwrap_or_else(|p| p.into_inner());

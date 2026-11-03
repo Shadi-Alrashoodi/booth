@@ -52,6 +52,28 @@ pub(crate) fn hold_after_minimized(window: isize) -> Option<Duration> {
     Some(holds.swap_remove(at).1)
 }
 
+static BOUNDS_WHILE_MINIMIZED: Mutex<Vec<(isize, (i32, i32))>> = Mutex::new(Vec::new());
+
+/// The next pass of `window`'s capture that finds it minimized reads
+/// `bounds` for DWM's, once, as a read that comes before DWM has moved the
+/// window to its caption does. Only that window's, as with
+/// set_hold_after_minimized.
+pub fn set_bounds_while_minimized(window: isize, bounds: (i32, i32)) {
+    let mut all = BOUNDS_WHILE_MINIMIZED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    all.retain(|&(set_for, _)| set_for != window);
+    all.push((window, bounds));
+}
+
+pub(crate) fn bounds_while_minimized(window: isize) -> Option<(i32, i32)> {
+    let mut all = BOUNDS_WHILE_MINIMIZED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let at = all.iter().position(|&(set_for, _)| set_for == window)?;
+    Some(all.swap_remove(at).1)
+}
+
 static DROP_TAKES: Mutex<Option<(isize, Duration)>> = Mutex::new(None);
 
 /// The next capture of `window` to be dropped takes `takes` before it
