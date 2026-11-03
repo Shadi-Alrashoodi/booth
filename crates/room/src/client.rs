@@ -714,7 +714,9 @@ impl Client {
         if self.log.is_on() {
             self.strays.tick(now, &self.log);
         }
+        let own = self.stun.invite_mapping();
         self.stun.tick(now, socket);
+        changed |= self.own_mapping_changed(own, now);
         if self.sessions.expire(now) {
             // Past reject_after without a rekey: the host has dropped it too.
             log!(
@@ -957,7 +959,13 @@ impl Client {
     }
 
     pub(crate) fn stun_resolved(&mut self, now: Instant) -> bool {
-        self.state != LinkState::Closed && self.stun.resolved(now) && self.reply_step(now)
+        if self.state == LinkState::Closed {
+            return false;
+        }
+        let own = self.stun.invite_mapping();
+        let settled = self.stun.resolved(now);
+        let remade = self.own_mapping_changed(own, now);
+        (settled && self.reply_step(now)) || remade
     }
 
     // The timer thread starts the lookup once the fast round has gone
@@ -1369,7 +1377,12 @@ impl Client {
     }
 
     fn on_stun(&mut self, packet: &[u8], from: SocketAddr, now: Instant) -> bool {
-        match self.stun.on_answer(packet, from, now) {
+        let own = self.stun.invite_mapping();
+        let answer = self.stun.on_answer(packet, from, now);
+        // First, so what the answer makes below goes by the word as it is now
+        // and is not made twice.
+        let remade = self.own_mapping_changed(own, now);
+        let changed = match answer {
             Answer::NotOurs(why) => {
                 if self.log.is_on() && self.strays.allow(from.ip(), now, &self.log) {
                     self.log.line(format!(
@@ -1379,10 +1392,59 @@ impl Client {
                 }
                 self.drops.bad(now)
             }
-            Answer::Recorded => false,
+            Answer::Recorded => self.first_address_came(now),
             Answer::Settled => self.reply_step(now),
             Answer::Moved(moved) => self.own_address_moved(moved, now),
+        };
+        remade || changed
+    }
+
+    // The first round gave nothing and its screen says so. A later round's
+    // answer can change that, and reply_step only looks while STUN is
+    // unfinished.
+    fn first_address_came(&mut self, now: Instant) -> bool {
+        let no_address = self
+            .reply
+            .as_ref()
+            .is_some_and(|reply| reply.state == ReplyState::NoAddress && reply.stun_finished);
+        if !no_address || (self.stun.public_v4().is_none() && self.stun.public_v6().is_none()) {
+            return false;
         }
+        log!(
+            self.log,
+            "stun answered after the reply screen said it gave nothing, so it is made again"
+        );
+        self.make_reply(now);
+        true
+    }
+
+    // The move shows on a round's first answer, and the kind of router only
+    // when the round ends, so the screen made for the move can be the wrong
+    // one by then. Of the word, only hard decides which screen applies; a
+    // screen with no address waits for an address, not for a word.
+    fn own_mapping_changed(&mut self, before: Mapping, now: Instant) -> bool {
+        let hard = self.stun.invite_mapping() == Mapping::Hard;
+        if hard == (before == Mapping::Hard) {
+            return false;
+        }
+        let showing = self.reply.as_ref().map(|reply| &reply.state);
+        let code = matches!(showing, Some(ReplyState::Code { .. }));
+        if code && self.reply_in_room {
+            self.reply = None;
+            self.reply_in_room = false;
+        } else if code || matches!(showing, Some(ReplyState::OwnHard)) {
+            log!(
+                self.log,
+                "the reply screen on show is made again, this pc's mapping changed"
+            );
+            self.make_reply(now);
+        }
+        if self.own_moved.is_some()
+            && matches!(self.state, LinkState::Reconnecting | LinkState::Lost)
+        {
+            self.in_room_code(now);
+        }
+        true
     }
 
     // The tries to the host go on from the new address either way; a host
@@ -3447,6 +3509,187 @@ mod tests {
         Some((net::stun::Mapping::Easy, Some(OUTSIDE)))
     }
 
+    impl Joining {
+        // Windows reports an address change, so a round goes to these.
+        fn asks(&mut self, servers: &[&Wire], now: Instant) {
+            let addrs = servers.iter().map(|server| server.addr()).collect();
+            self.client.stun_found(addrs, &self.socket);
+            self.client.address_changed(now, &self.socket);
+            assert!(self.client.stun.next_deadline().is_some());
+        }
+
+        fn stun_answers(&mut self, server: &Wire, seen: SocketAddrV4, now: Instant) -> bool {
+            let request = server.packets().pop().expect("a stun request");
+            let txid: [u8; 12] = request[8..20].try_into().expect("a transaction id");
+            let answer = crate::testing::stun_answer(&txid, seen);
+            self.client
+                .on_packet(&answer, server.addr(), now, &self.socket)
+        }
+    }
+
+    // The screen still trying shows goes by the kind of router this PC is
+    // behind now, not the kind the first round saw.
+    #[test]
+    fn the_reply_screen_follows_the_mapping() {
+        let moved = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 4), 52100);
+        let other_port = SocketAddrV4::new(*moved.ip(), moved.port() + 7);
+        let hard = Some((net::stun::Mapping::Hard, Some(OUTSIDE)));
+        for (first_round, last_seen, code_after) in
+            [(hard, moved, true), (easy(), other_port, false)]
+        {
+            let mut joining = Joining::new(first_round, |_| {});
+            let before = joining.tick(DUE).reply.expect("a reply screen").state;
+            assert_eq!(matches!(before, ReplyState::Code { .. }), !code_after);
+
+            let (one, two) = (Wire::new(), Wire::at(Ipv4Addr::new(127, 0, 0, 6)));
+            let now = joining.start + DUE + Duration::from_secs(1);
+            joining.asks(&[&one, &two], now);
+            joining.stun_answers(&one, moved, now);
+            assert!(
+                joining.stun_answers(&two, last_seen, now),
+                "the panel keeps the old screen"
+            );
+            let state = joining
+                .client
+                .view(now, 0)
+                .reply
+                .expect("a reply screen")
+                .state;
+            let shows_code = matches!(state, ReplyState::Code { .. });
+            assert_eq!(shows_code, code_after, "{state:?}");
+            assert_eq!(state == ReplyState::OwnHard, !code_after, "{state:?}");
+        }
+    }
+
+    // A third server stays silent, so it is stun_wait that ends the round.
+    #[test]
+    fn the_reply_screen_follows_a_round_cut_short() {
+        let mut joining = Joining::new(Some((net::stun::Mapping::Hard, Some(OUTSIDE))), |_| {});
+        assert_eq!(
+            joining.tick(DUE).reply.expect("a reply screen").state,
+            ReplyState::OwnHard
+        );
+        let (one, two, three) = (
+            Wire::new(),
+            Wire::at(Ipv4Addr::new(127, 0, 0, 6)),
+            Wire::at(Ipv4Addr::new(127, 0, 0, 7)),
+        );
+        let now = joining.start + DUE + Duration::from_secs(1);
+        joining.asks(&[&one, &two, &three], now);
+        let moved = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 4), 52100);
+        joining.stun_answers(&one, moved, now);
+        joining.stun_answers(&two, moved, now);
+        let view = joining.client.view(now, 0);
+        assert_eq!(
+            view.reply.expect("the old screen").state,
+            ReplyState::OwnHard
+        );
+
+        let ended = now + joining.client.timers.stun_wait;
+        assert!(joining.client.on_timer(ended, &joining.socket));
+        let state = joining.client.view(ended, 0).reply.expect("a screen").state;
+        assert!(matches!(state, ReplyState::Code { .. }), "{state:?}");
+    }
+
+    // The first round got nothing, then a later one does. The screen that
+    // said so goes, for a code or for the hard router's screen.
+    #[test]
+    fn the_no_address_screen_goes_when_a_later_round_answers() {
+        let moved = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 4), 52100);
+        let other_port = SocketAddrV4::new(*moved.ip(), moved.port() + 7);
+        for (last_seen, code_after) in [(moved, true), (other_port, false)] {
+            let mut joining = Joining::new(Some((net::stun::Mapping::Unknown, None)), |_| {});
+            let before = joining.tick(DUE).reply.expect("a reply screen").state;
+            assert_eq!(before, ReplyState::NoAddress);
+
+            let (one, two) = (Wire::new(), Wire::at(Ipv4Addr::new(127, 0, 0, 6)));
+            let now = joining.start + DUE + Duration::from_secs(1);
+            joining.asks(&[&one, &two], now);
+            assert!(joining.stun_answers(&one, moved, now));
+            joining.stun_answers(&two, last_seen, now);
+            let state = joining
+                .client
+                .view(now, 0)
+                .reply
+                .expect("a reply screen")
+                .state;
+            let shows_code = matches!(state, ReplyState::Code { .. });
+            assert_eq!(shows_code, code_after, "{state:?}");
+            assert_eq!(state == ReplyState::OwnHard, !code_after, "{state:?}");
+        }
+    }
+
+    // STUN is slow, so the code goes out at stun_wait with what it has. Then
+    // the word says hard, and the code carries a port good for one server
+    // only, whichever way the first round ends.
+    #[test]
+    fn a_code_made_early_goes_when_the_first_round_says_hard() {
+        let wait = Timers::default().stun_wait;
+        let (one, two) = (Wire::new(), Wire::at(Ipv4Addr::new(127, 0, 0, 6)));
+        let other_port = SocketAddrV4::new(*OUTSIDE.ip(), OUTSIDE.port() + 7);
+        let early_code = |joining: &mut Joining| {
+            let state = joining.tick(DUE + wait).reply.expect("a screen").state;
+            assert!(matches!(state, ReplyState::Code { .. }), "{state:?}");
+        };
+
+        // The last answer settles it.
+        let mut joining = Joining::new(None, |_| {});
+        assert_eq!(joining.tick(DUE).reply, None);
+        let addrs = vec![one.addr(), two.addr()];
+        joining.client.stun_found(addrs.clone(), &joining.socket);
+        let now = joining.start + DUE;
+        joining.stun_answers(&one, OUTSIDE, now);
+        early_code(&mut joining);
+        let later = now + wait;
+        assert!(!joining.client.stun_resolved(later));
+        assert!(joining.stun_answers(&two, other_port, later));
+        let state = joining.client.view(later, 0).reply.expect("a screen").state;
+        assert_eq!(state, ReplyState::OwnHard);
+
+        // The last lookup settles it: everything asked was answered by then.
+        let mut joining = Joining::new(None, |_| {});
+        assert_eq!(joining.tick(DUE).reply, None);
+        joining.client.stun_found(addrs, &joining.socket);
+        let now = joining.start + DUE;
+        joining.stun_answers(&one, OUTSIDE, now);
+        joining.stun_answers(&two, other_port, now);
+        early_code(&mut joining);
+        let later = now + wait;
+        assert!(joining.client.stun_resolved(later));
+        let state = joining.client.view(later, 0).reply.expect("a screen").state;
+        assert_eq!(state, ReplyState::OwnHard);
+    }
+
+    // The screen the last answer brings is made once, and the log does not
+    // call it made again.
+    #[test]
+    fn the_first_round_settling_hard_makes_the_screen_once() {
+        let mut joining = Joining::new(None, |_| {});
+        let (log, captured) = Log::capture(64);
+        joining.client.log = log;
+        assert_eq!(joining.tick(DUE).reply, None);
+        let (one, two) = (Wire::new(), Wire::at(Ipv4Addr::new(127, 0, 0, 6)));
+        let addrs = vec![one.addr(), two.addr()];
+        joining.client.stun_found(addrs, &joining.socket);
+        let now = joining.start + DUE;
+        assert!(!joining.client.stun_resolved(now));
+        let other_port = SocketAddrV4::new(*OUTSIDE.ip(), OUTSIDE.port() + 7);
+        joining.stun_answers(&one, OUTSIDE, now);
+        assert!(joining.stun_answers(&two, other_port, now));
+        let state = joining.client.view(now, 0).reply.expect("a screen").state;
+        assert_eq!(state, ReplyState::OwnHard);
+        let lines = captured.lines();
+        let made = lines
+            .iter()
+            .filter(|line| line.starts_with("no reply code:"))
+            .count();
+        assert_eq!(made, 1, "{lines:#?}");
+        assert!(
+            !lines.iter().any(|line| line.contains("made again")),
+            "{lines:#?}"
+        );
+    }
+
     #[test]
     fn code_shows_with_still_trying() {
         let mut joining = Joining::new(easy(), |_| {});
@@ -4041,6 +4284,116 @@ mod tests {
         let fresh = rig.client.view(expiry, 0).reply.expect("a new code");
         assert!(matches!(fresh.state, ReplyState::Code { .. }));
         assert!(!fresh.code.is_empty());
+    }
+
+    // STUN on two addresses of their own, so agreement can say easy, with
+    // this PC at `first` and `second` in the first round. Then the host goes
+    // silent.
+    fn silent_after_round(
+        rig: &mut Rig,
+        servers: &[Wire; 2],
+        first: SocketAddrV4,
+        second: SocketAddrV4,
+        start: Instant,
+    ) -> Instant {
+        let addrs = servers.iter().map(Wire::addr).collect();
+        rig.client.stun_found(addrs, &rig.socket);
+        assert!(!rig.client.stun_resolved(start));
+        answer_stun(rig, &servers[0], first, start);
+        answer_stun(rig, &servers[1], second, start);
+        assert!(rig.client.stun.is_settled());
+        let quiet = start + rig.client.timers.reconnecting_after;
+        rig.tick(quiet);
+        quiet
+    }
+
+    fn two_stun_wires() -> [Wire; 2] {
+        [Wire::new(), Wire::at(Ipv4Addr::new(127, 0, 0, 5))]
+    }
+
+    // From a hard router to an easy one while the host is silent. The move
+    // shows on the first answer, when the word is still the old router's,
+    // and the second answer says a code can help after all.
+    #[test]
+    fn code_in_room_after_moving_to_an_easy_router() {
+        let start = Instant::now();
+        let (mut rig, _) = Rig::connected(Timers::default(), start);
+        let servers = two_stun_wires();
+        let quiet = silent_after_round(&mut rig, &servers, OUTSIDE, MOVED, start);
+        assert_eq!(rig.client.stun.invite_mapping(), Mapping::Hard);
+
+        let home = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 4), 52100);
+        answer_stun(&mut rig, &servers[0], home, quiet);
+        assert_eq!(rig.client.view(quiet, 0).reply, None, "not known yet");
+        answer_stun(&mut rig, &servers[1], home, quiet);
+        let view = rig.client.view(quiet, 0);
+        let reply = view.reply.expect("the code");
+        assert!(matches!(reply.state, ReplyState::Code { .. }));
+        let code = ReplyCode::decode(&reply.code).expect("the code decodes");
+        assert_eq!(code.outside_v4, Some(home));
+        assert_eq!(code.mapping, Mapping::Easy);
+    }
+
+    // The same with the second answer lost, so the word stays the old router's
+    // until a round can tell. The code comes then, reconnecting or lost.
+    #[test]
+    fn code_in_room_after_a_move_with_an_answer_lost() {
+        for lost in [false, true] {
+            let timers = Timers::default();
+            let start = Instant::now();
+            let (mut rig, _) = Rig::connected(timers, start);
+            let servers = two_stun_wires();
+            let quiet = silent_after_round(&mut rig, &servers, OUTSIDE, MOVED, start);
+
+            let home = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 4), 52100);
+            answer_stun(&mut rig, &servers[0], home, quiet);
+            servers[1].packets();
+            let ended = quiet + timers.stun_wait;
+            rig.tick(ended);
+            assert_eq!(rig.client.stun.invite_mapping(), Mapping::Hard);
+            assert_eq!(rig.client.view(ended, 0).reply, None);
+
+            let again = if lost {
+                start + timers.lost_after
+            } else {
+                quiet + timers.stun_retry
+            };
+            rig.tick(again);
+            let state = if lost {
+                LinkState::Lost
+            } else {
+                LinkState::Reconnecting
+            };
+            assert_eq!(rig.client.state, state);
+            answer_stun(&mut rig, &servers[0], home, again);
+            answer_stun(&mut rig, &servers[1], home, again);
+            let reply = rig.client.view(again, 0).reply.expect("the code");
+            let code = ReplyCode::decode(&reply.code).expect("the code decodes");
+            assert_eq!(code.outside_v4, Some(home));
+            assert_eq!(code.mapping, Mapping::Easy);
+        }
+    }
+
+    // From an easy router to a hard one: the code made on the first answer
+    // carries a port good only for that STUN server, so it goes on the
+    // second, and that second port is no second move.
+    #[test]
+    fn code_in_room_goes_after_moving_to_a_hard_router() {
+        let start = Instant::now();
+        let (mut rig, _) = Rig::connected(Timers::default(), start);
+        let servers = two_stun_wires();
+        let quiet = silent_after_round(&mut rig, &servers, OUTSIDE, OUTSIDE, start);
+        assert_eq!(rig.client.stun.invite_mapping(), Mapping::Easy);
+
+        let hotspot = |port| SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 4), port);
+        answer_stun(&mut rig, &servers[0], hotspot(52100), quiet);
+        assert!(rig.client.view(quiet, 0).reply.is_some(), "not known yet");
+        answer_stun(&mut rig, &servers[1], hotspot(52107), quiet);
+        let view = rig.client.view(quiet, 0);
+        assert_eq!(view.reply, None);
+        let change = view.numbers.address_change.expect("the move");
+        assert_eq!(change.to, SocketAddr::V4(hotspot(52100)));
+        assert!(!rig.client.reply_in_room);
     }
 
     // The host takes this PC back through its mapped port, so the code
