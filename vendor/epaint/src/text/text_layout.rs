@@ -2618,7 +2618,8 @@ mod tests {
     }
 
     // Every cursor position lands on the row, and the x it lands on gives
-    // back a position drawn at the same x.
+    // back a position drawn at the same x. A position between a letter and
+    // its marks gives back the one beside it, up to a pixel away.
     #[test]
     fn bidi_cursor_positions_round_trip_through_x() {
         let mut fonts = plex_fonts();
@@ -2641,7 +2642,38 @@ mod tests {
                     row.size.x
                 );
                 let back = row.char_at(x);
-                assert_eq!(row.x_offset(back), x, "{text:?} {i} came back as {back:?}");
+                if joins_previous(&row.glyphs, i) {
+                    let off = (row.x_offset(back) - x).abs();
+                    assert!(off <= 1.0, "{text:?} {i} came back as {back:?}, {off} off");
+                } else {
+                    assert_eq!(row.x_offset(back), x, "{text:?} {i} came back as {back:?}");
+                }
+            }
+        }
+    }
+
+    // Anywhere on a row a click stays out of a letter and its marks. Between
+    // them a letter typed would take the marks, Backspace would leave them
+    // alone on the row, and a drag could copy one without the other.
+    #[test]
+    fn a_click_never_lands_between_a_letter_and_its_marks() {
+        let mut fonts = plex_fonts();
+        for text in [
+            "بِسْمِ",
+            "بِسْمِ اللَّهِ الرَّحْمَنِ الرَّحِيمِ",
+            "hello بِسْمِ 123",
+            "لا شكراً 12.5%",
+        ] {
+            let galley = layout_simple(&mut fonts, text);
+            let row = &galley.rows[0].row;
+            let mut x = -1.0;
+            while x <= row.size.x + 1.0 {
+                let back = row.char_at(x);
+                assert!(
+                    !joins_previous(&row.glyphs, back.0),
+                    "{text:?} at {x} came back as {back:?}"
+                );
+                x += 0.25;
             }
         }
     }

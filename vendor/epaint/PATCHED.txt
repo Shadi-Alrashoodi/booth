@@ -57,8 +57,13 @@ Changed from the pull request
   the last digit or letter instead of the right end of the row, where the
   line starts. A caret between a letter and its marks sits at the letter's
   far edge.
-- Row::char_at takes the nearest caret place, and on a tie one that is not
-  between a letter and its marks.
+- Row::char_at takes the nearest caret place that is not between a letter
+  and its marks or inside a ligature. Those places sit at the far edge of
+  the letter, and the next place at the near edge of the next letter, up to
+  a pixel away since advances are not whole, so preferring the outer place
+  only on an exact tie sent about half a letter's width of clicks inside. A
+  letter typed there took the marks, and Backspace left them alone. The
+  keyboard still goes there.
 - A row with no right-to-left glyph keeps 0.36.2's char_at and x_offset.
 - Shaping asks for no dotted circle under a mark that has no letter before
   it: the circle would be a glyph without a char.

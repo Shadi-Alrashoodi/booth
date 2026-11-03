@@ -270,8 +270,9 @@ fn a_right_aligned_arabic_message_stays_inside_the_column() {
 }
 
 // The caret can go to every place in each message, each place is on the
-// row, a click there puts it back, and the end of a right-to-left line
-// that ends in digits is just after the last digit.
+// row, a click there puts it back, or beside it inside the ligature of في,
+// and the end of a right-to-left line that ends in digits is just after the
+// last digit.
 #[test]
 fn caret_places_click_back() {
     let ctx = Context::default();
@@ -298,10 +299,18 @@ fn caret_places_click_back() {
             );
             let back = galley.cursor_from_pos(place.center().to_vec2());
             let again = galley.pos_from_cursor(back);
-            assert_eq!(
-                again.min.x, place.min.x,
-                "{text} {index} came back as {back:?}"
-            );
+            if with_previous(row, index) {
+                let off = (again.min.x - place.min.x).abs();
+                assert!(
+                    off <= 1.0,
+                    "{text} {index} came back as {back:?}, {off} off"
+                );
+            } else {
+                assert_eq!(
+                    again.min.x, place.min.x,
+                    "{text} {index} came back as {back:?}"
+                );
+            }
         }
     }
 
@@ -1149,9 +1158,11 @@ fn chat_text() -> impl Strategy<Value = String> {
 
 // One glyph per character, and every caret place on its row. In a row with
 // right-to-left text, which this port lays out, a click at a caret's x also
-// gives back a caret drawn at that x. Left-to-right rows keep egui's own
-// rule, where a caret between a letter and a combining accent the font
-// draws over it sits inside the letter, so there only the index is checked.
+// gives back a caret drawn at that x, and never one between a letter and its
+// marks, so a place between them gives back one beside it. Left-to-right rows
+// keep egui's own rule, where a caret between a letter and a combining accent
+// the font draws over it sits inside the letter, so there only the index is
+// checked.
 //
 // Plex has no glyph of its own for some rarer letters, among them the dotted
 // ones of Arabic transliteration, and the shaper builds each from a letter
@@ -1190,11 +1201,26 @@ fn check_rows(galley: &Galley, pieced: bool) -> Result<(), TestCaseError> {
             let back = row.char_at(x);
             prop_assert!(back.0 <= row.glyphs.len());
             if bidi {
-                prop_assert_eq!(row.x_offset(back), x, "{:?} {}", text, index);
+                prop_assert!(!with_previous(row, back.0), "{:?} {}", text, index);
+                if with_previous(row, index) {
+                    let off = (row.x_offset(back) - x).abs();
+                    prop_assert!(off <= 1.0, "{:?} {}: {} off", text, index, off);
+                } else {
+                    prop_assert_eq!(row.x_offset(back), x, "{:?} {}", text, index);
+                }
             }
         }
     }
     Ok(())
+}
+
+// Whether glyph `index` is a mark or the rest of a cluster, placed as one with
+// the glyph before it.
+fn with_previous(row: &Row, index: usize) -> bool {
+    0 < index
+        && row.glyphs.get(index).is_some_and(|glyph| {
+            glyph.advance_width <= 0.0 && glyph.bidi_level == row.glyphs[index - 1].bidi_level
+        })
 }
 
 // Whether the fonts draw this char from more than one glyph.

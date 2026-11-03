@@ -997,8 +997,9 @@ impl Row {
     /// Returns something in the range `[0, char_count_excluding_newline()]`.
     ///
     /// In a row with right-to-left text the cursor positions are not in
-    /// order of x, so this picks the one nearest to `desired_x`. A tie goes
-    /// to the lowest index that is not between a letter and its marks.
+    /// order of x, so this picks the one nearest to `desired_x`, the lowest
+    /// index on a tie. It never picks one between a letter and its marks,
+    /// where a letter typed would take the marks; only the keyboard goes there.
     pub fn char_at(&self, desired_x: f32) -> CharIndex {
         if !self.has_rtl() {
             for (i, glyph) in self.glyphs.iter().enumerate() {
@@ -1008,13 +1009,13 @@ impl Row {
             }
             return self.char_count_excluding_newline();
         }
-        let inside_block = |i: usize| joins_previous(&self.glyphs, i);
         let mut nearest = (f32::INFINITY, 0);
         for i in 0..=self.glyphs.len() {
+            if joins_previous(&self.glyphs, i) {
+                continue;
+            }
             let distance = (self.bidi_x(i) - desired_x).abs();
-            if distance < nearest.0
-                || (distance == nearest.0 && inside_block(nearest.1) && !inside_block(i))
-            {
+            if distance < nearest.0 {
                 nearest = (distance, i);
             }
         }
