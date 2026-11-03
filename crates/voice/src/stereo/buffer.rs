@@ -163,6 +163,18 @@ struct Arrival {
     lag: i64,
 }
 
+// A spell's first frame that came in order while the spell before still
+// played: its lag, the smallest lag of its spell's frames since, and before
+// it the smallest lag lately, which the depth is measured from, and the
+// largest of the last 2 s.
+struct NextSpell {
+    first: i64,
+    lag: i64,
+    fastest: i64,
+    fastest_before: i64,
+    slowest_before: i64,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Adjust {
     Insert,
@@ -186,14 +198,22 @@ pub struct Buffer {
     ends_after: Option<i64>,
     // Where the last spell that began at a frame marked first started:
     // anything older came from before that and never plays. A first frame
-    // that came after a later one is held in reset_at instead.
+    // that came after a later one, or while the spell before still played,
+    // is held in reset_at instead.
     spell_first: Option<i64>,
     // The decoder starts over before the next frame it decodes.
     reset_due: bool,
-    // A frame marked first that did not start its spell, since a later
-    // frame came before it: the decoder starts over before it, or before the
-    // first frame after it that it decodes.
-    reset_at: Option<i64>,
+    // The frames marked first that did not start their spell, since a later
+    // frame came before them or the spell before still played, placed like
+    // the slots: the decoder starts over before each, or before the first
+    // frame after it that it decodes. The next spell's first frame can come
+    // before playing reaches one.
+    reset_at: [Option<i64>; SLOTS],
+    // The last frame marked first that came in order while the spell before
+    // still played, with the timing then. Once what is held of the spell
+    // before has played, it says whether a gap at the sharer left its spell
+    // short of the depth kept.
+    next_spell: Option<NextSpell>,
     // Idle because the frames stopped, not because the sharer said so. What
     // comes next and is older than where playing restarts was later than the
     // cap, so it counts as lost rather than dropped.
@@ -218,10 +238,12 @@ pub struct Buffer {
     // Measured: how far behind the fastest frame lately the play point is.
     depth: i64,
     // What the rules asked for: the minimum at first, a frame more for each
-    // grow, one less for each shrink. A spell starts at this depth. Measured
-    // depth above it is excess: the play point fell behind (a stalled render
-    // thread) or started late (a slow first frame), and no late frame asked
-    // for it, so it comes off without the 5 s wait.
+    // grow, one less for each shrink. A spell starts at this depth, except
+    // one that follows the spell before in order: that goes on at the depth
+    // there was, and starts over at this one only where a gap at the sharer
+    // left it short. Measured depth above it is excess: the play point fell
+    // behind (a stalled render thread) or started late (a slow first frame),
+    // and no late frame asked for it, so it comes off without the 5 s wait.
     target: i64,
     min_lag: i64,
     arrivals: VecDeque<Arrival>,
@@ -261,7 +283,8 @@ impl Buffer {
             ends_after: None,
             spell_first: None,
             reset_due: false,
-            reset_at: None,
+            reset_at: [None; SLOTS],
+            next_spell: None,
             timed_out: false,
             paused: false,
             paused_for: 0,
@@ -303,7 +326,18 @@ impl Buffer {
         if newer {
             self.paused_for = 0;
         }
-        let fresh = packet.first && newer;
+        // A frame marked first starts its spell from nothing when the buffer
+        // is idle or playing has passed its turn. Otherwise what is held of
+        // the spell before still plays first, from the decoder as it is, and
+        // the spell goes on after it at the depth there was, made up where a
+        // gap at the sharer left it short.
+        let fresh = packet.first
+            && newer
+            && match self.phase {
+                Phase::Idle => true,
+                Phase::Starting => false,
+                Phase::Playing => ext < self.play,
+            };
         if fresh {
             self.begin(ext, packet.last, true);
         } else if self.phase == Phase::Idle {
@@ -350,8 +384,26 @@ impl Buffer {
             return Ok(());
         }
         if packet.first && !fresh {
-            // It came after a later frame of its spell.
-            self.reset_at = Some(ext);
+            // It came after a later frame of its spell, or before the spell
+            // before it has played out.
+            self.mark_reset(ext);
+            if newer && self.phase == Phase::Playing && !self.paused {
+                let lag = self.pulls - ext;
+                let since = self.pulls - LATE_WINDOW;
+                let slowest = self
+                    .arrivals
+                    .iter()
+                    .filter(|arrival| arrival.at >= since)
+                    .map(|arrival| arrival.lag)
+                    .fold(self.min_lag, i64::max);
+                self.next_spell = Some(NextSpell {
+                    first: ext,
+                    lag,
+                    fastest: lag,
+                    fastest_before: self.min_lag,
+                    slowest_before: slowest,
+                });
+            }
         }
         self.store(ext, packet.frame);
         self.see(ext);
@@ -416,9 +468,15 @@ impl Buffer {
                 self.paused = false;
                 return None;
             }
-            Phase::Starting => self.restart(),
+            Phase::Starting => {
+                let newest = self.newest.expect("a starting buffer holds a frame");
+                self.restart(newest);
+            }
             Phase::Playing if self.paused => self.resume(),
-            Phase::Playing => self.line_up(),
+            Phase::Playing => match self.next_spell_short() {
+                Some(newest) => self.restart(newest),
+                None => self.line_up(),
+            },
         }
         let pulled = self.next_frame(&mut out[..FRAME * CHANNELS]);
         self.pulls += 1;
@@ -480,7 +538,7 @@ impl Buffer {
         if fresh {
             self.spell_first = Some(ext);
             self.reset_due = true;
-            self.reset_at = None;
+            self.reset_at = [None; SLOTS];
             self.judged = Some(self.judged.map_or(ext - 1, |judged| judged.max(ext - 1)));
         }
         self.slots = [EMPTY_SLOT; SLOTS];
@@ -489,12 +547,13 @@ impl Buffer {
         self.phase = Phase::Starting;
     }
 
-    // Playing starts `depth - 1` frames behind the newest one, at the depth
-    // the buffer learned. What came before the newest is judged as frames
-    // arrive, a cap behind it, so a frame that overtook the one before it
-    // still finds room.
-    fn restart(&mut self) {
-        let newest = self.newest.expect("a starting buffer holds a frame");
+    // Playing starts `depth - 1` frames behind `newest`, at the depth the
+    // buffer learned: the newest frame, or for a spell that came while the
+    // one before played, the frame the depth kept reaches past its first,
+    // less what a gap at the sharer took. What came before the newest is
+    // judged as frames arrive, a cap behind it, so a frame that overtook the
+    // one before it still finds room.
+    fn restart(&mut self, newest: i64) {
         let first_contact = self.last_change.is_none();
         let min = self.min_depth();
         let kept = self.target.clamp(min, CAP);
@@ -540,6 +599,7 @@ impl Buffer {
         // after it, so the history starts over. What in it would have been
         // late at one frame less still holds a shrink off for 5 s.
         self.arrivals.clear();
+        self.next_spell = None;
         self.last_close = close.or(self.last_close);
         self.started = self.pulls;
         if first_contact || shrink {
@@ -561,12 +621,34 @@ impl Buffer {
     // that depth behind the newest, letting the rest go uncounted.
     fn resume(&mut self) {
         let kept = self.target.clamp(self.min_depth(), CAP);
-        if self
-            .newest
-            .is_some_and(|newest| newest - (kept - 1) > self.play)
+        if let Some(newest) = self.newest
+            && newest - (kept - 1) > self.play
         {
-            self.restart();
+            self.restart(newest);
         }
+    }
+
+    // When the play point reaches the first frame of a spell that came while
+    // the one before played: a gap at the sharer within the depth leaves the
+    // spell's frames that much closer to their turn, and when that leaves it
+    // short of the depth kept, playing starts over, so the shortfall is made
+    // up here, in the gap, as for a spell that starts from nothing. Frames
+    // come anywhere within the spread of their lags (two frames at a render
+    // period of 22 ms, which pulls two or three at once), so the gap shows
+    // only so far. The first frame's lag above the slowest of the 2 s before
+    // is gap for certain; its spell's fastest frame since, above the fastest
+    // of them, may be. All of the first is made up and all but a frame of
+    // the second: a frame left short is made up by the first frame that
+    // comes late, as a lone late frame grows the buffer at once, for the
+    // same 10 ms of concealment, where a frame made up for nothing costs
+    // that and a frame dropped later.
+    fn next_spell_short(&mut self) -> Option<i64> {
+        let spell = self.next_spell.take_if(|spell| spell.first <= self.play)?;
+        let kept = self.target.clamp(self.min_depth(), CAP);
+        let gap = (spell.lag - spell.slowest_before).max(spell.fastest - spell.fastest_before - 1);
+        // Depth there was above the depth kept takes up the gap first.
+        let short = gap - (self.play_lag - (kept - 1) - spell.fastest_before);
+        (spell.first == self.play && short > 0).then_some(spell.first + kept - 1 - short)
     }
 
     fn go_idle(&mut self, timed_out: bool) {
@@ -583,7 +665,7 @@ impl Buffer {
             // does this decoder.
             let _ = self.decoder.reset();
             self.reset_due = false;
-            self.reset_at = None;
+            self.reset_at = [None; SLOTS];
         }
         self.audible = false;
         self.fade_in = true;
@@ -616,7 +698,7 @@ impl Buffer {
             // Only its stand-in has played, so nothing of its spell has been
             // decoded yet. Further behind, some of it may have been, from the
             // old decoder, as when a first frame is lost.
-            self.reset_at = Some(ext);
+            self.mark_reset(ext);
         }
         let lone = self
             .last_late
@@ -677,6 +759,11 @@ impl Buffer {
             lag,
         });
         self.gap_fastest = self.gap_fastest.min(lag);
+        if let Some(spell) = &mut self.next_spell
+            && ext >= spell.first
+        {
+            spell.fastest = spell.fastest.min(lag);
+        }
         if lag < self.gap_floor {
             self.gap_early += 1;
         }
@@ -865,8 +952,8 @@ impl Buffer {
     // over while sound plays starts from nothing, so the sound before it is
     // carried on by concealment and blended out instead.
     fn decode(&mut self, slot: &Slot, out: &mut [f32]) -> bool {
-        if self.reset_at.is_some_and(|at| slot.ext >= at) {
-            self.reset_at = None;
+        if self.reset_through(slot.ext) {
+            self.reset_at = self.reset_at.map(|at| at.filter(|&at| at > slot.ext));
             self.reset_due = true;
         }
         let blend = self.reset_due && self.audible;
@@ -909,7 +996,7 @@ impl Buffer {
             return None;
         }
         let ext = self.play + 1;
-        if self.reset_at.is_some_and(|at| ext >= at) {
+        if self.reset_through(ext) {
             // The decoder starts over there, which only decode does.
             return None;
         }
@@ -994,6 +1081,23 @@ impl Buffer {
 
     fn see(&mut self, ext: i64) {
         self.seen[ext.rem_euclid(SEEN as i64) as usize] = ext;
+    }
+
+    fn mark_reset(&mut self, ext: i64) {
+        let mark = &mut self.reset_at[ext.rem_euclid(SLOTS as i64) as usize];
+        if mark.is_some_and(|at| at < ext) {
+            // The mark in its place still waits, SLOTS frames or more back:
+            // over a cap behind the newest frame, further back than anything
+            // still to be decoded, so the decoder starts over at the next
+            // frame it decodes, as that mark asks.
+            self.reset_due = true;
+        }
+        *mark = (*mark).max(Some(ext));
+    }
+
+    // A mark at or before `ext` that the decoder has not started over for.
+    fn reset_through(&self, ext: i64) -> bool {
+        self.reset_at.iter().flatten().any(|&at| at <= ext)
     }
 
     // Settles, for every frame number up to `upto`, whether it counts as

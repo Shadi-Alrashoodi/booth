@@ -1316,6 +1316,274 @@ fn a_first_frame_overtaken_by_the_next_still_starts_the_decoder_over() {
     listener.assert_no_clicks();
 }
 
+// Three deep, the next spell's first frame while sound plays comes in order:
+// on time, with the last two frames of the spell before still held; one or
+// two frames later, after a gap at the sharer; or three, when playing has
+// passed its turn. Every frame plays two pulls after it was sent, the frames
+// held from the decoder as it was, and the decoder starts over at the first
+// frame. Only the gap is made up, where it was, and the new spell keeps the
+// depth after the spell before has gone from the 2 s the depth is measured
+// over.
+#[test]
+fn a_first_frame_in_order_three_deep_lets_the_spell_before_play_out() {
+    let first = spell(&music(1.0), 0, 0);
+    for gap in 0..4 {
+        let second = spell(&music(3.0), 100, SECOND + gap * TICK);
+        let mut sent = first.clone();
+        sent.extend(second.iter().cloned());
+        let mut listener = Listener::new();
+        listener.buffer.set_period(1056);
+        let until = 4 * SECOND + (gap + 2) * TICK;
+        listener.run(&sent, &on_time(&sent), until, always);
+        for packet in &sent[..sent.len() - 1] {
+            assert_eq!(
+                listener.played_at(packet.seq),
+                Some(packet.sent_at + 2 * TICK),
+                "gap {gap}, seq {}",
+                packet.seq
+            );
+        }
+        let at = listener.pull_at(second[0].sent_at + 2 * TICK);
+        if gap < 3 {
+            let mut old = decoded(&first);
+            for _ in 0..gap {
+                old.conceal(&mut [0f32; SAMPLES]).unwrap();
+            }
+            starts_over(&listener, at, old, &second);
+        } else {
+            // After its turn, it follows the concealment of that turn.
+            let mut fresh = decoded(&second[..1]);
+            let mut out = [0f32; SAMPLES];
+            for (n, packet) in second.iter().enumerate().take(5).skip(1) {
+                fresh.decode(&packet.frame, &mut out).unwrap();
+                assert_eq!(listener.heard[at + n].audio, out, "frame {n}");
+            }
+        }
+        let stats = listener.stats();
+        assert_eq!(
+            (
+                stats.late,
+                stats.lost,
+                stats.concealed,
+                stats.inserted,
+                stats.depth_frames
+            ),
+            (0, 0, gap, 0, 3),
+            "gap {gap}: {stats:?}"
+        );
+        listener.assert_no_clicks();
+    }
+}
+
+// Through the mixer at a render period of 1056 frames, frames are pulled two
+// or three at once, so three deep a frame on time comes anywhere from two
+// frames before its turn to just in time. The next spell's first frame,
+// numbered straight on with no gap at the sharer, comes as a frame of the
+// spell before would, wherever in that pattern it falls, and every frame of
+// both spells plays in its turn: nothing is made up at the first frame, and
+// nothing is dropped later for depth that was never needed.
+#[test]
+fn a_first_frame_in_order_through_the_mixer_makes_nothing_up() {
+    // The pattern repeats every 11 frames.
+    for len in 100..111u16 {
+        let mut sent = spell(&music(f64::from(len) / 100.0), 0, 0);
+        sent.extend(spell(&music(4.0), len, u64::from(len) * TICK));
+        let stream = mixed(&sent, true);
+        let played: Vec<Source> = stream
+            .sources
+            .iter()
+            .copied()
+            .skip_while(|&source| source == Source::Silence)
+            .collect();
+        assert!(played.len() > 480, "{} played", played.len());
+        let expected: Vec<Source> = sent
+            .iter()
+            .take(played.len())
+            .map(|packet| Source::Packet(packet.seq))
+            .collect();
+        assert_eq!(played, expected, "seam at {len}");
+        let stats = stream.buffer.stats();
+        assert_eq!(
+            (
+                stats.late,
+                stats.lost,
+                stats.concealed,
+                stats.inserted,
+                stats.dropped,
+                stats.depth_frames
+            ),
+            (0, 0, 0, 0, 0, 3),
+            "seam at {len}: {stats:?}"
+        );
+    }
+}
+
+// The same with a gap of one or two frames at the sharer, which brings the
+// next spell's frames that much closer to their turn. Frames that come two
+// or three at once tell the gap only to within a frame, so playing starts
+// over at the first frame to make up all of it or all but a frame, and the
+// first frame that comes late makes up the one left; a first frame after its
+// own turn starts its spell from nothing, as any does. Every frame of the
+// spell before plays, none is lost, at most one comes late, at most a frame
+// more than the gap is made up, and at most one frame is added or dropped.
+#[test]
+fn a_gap_at_the_sharer_through_the_mixer_costs_at_most_a_frame_more() {
+    for gap in 1..3u16 {
+        for len in 100..111u16 {
+            let mut sent = spell(&music(f64::from(len) / 100.0), 0, 0);
+            sent.extend(spell(&music(4.0), len, u64::from(len + gap) * TICK));
+            let stream = mixed(&sent, true);
+            let stats = stream.buffer.stats();
+            let case = format!("gap {gap}, seam at {len}: {stats:?}");
+            let skipped = |packets: &[Sent]| {
+                packets
+                    .iter()
+                    .filter(|packet| !stream.sources.contains(&Source::Packet(packet.seq)))
+                    .count() as u64
+            };
+            let second = usize::from(len);
+            assert_eq!(skipped(&sent[..second]), 0, "{case}");
+            assert_eq!(skipped(&sent[second..480]), stats.dropped, "{case}");
+            assert_eq!((stats.lost, stats.depth_frames), (0, 3), "{case}");
+            assert!(stats.late <= 1, "{case}");
+            assert!(stats.concealed <= u64::from(gap) + 1, "{case}");
+            assert!(stats.inserted + stats.dropped <= 1, "{case}");
+        }
+    }
+}
+
+// The same three deep, with the last two frames of a spell and the next
+// spell's first frame all in when playing starts: before the first pull, or
+// when the listener comes back from a deafen. The two play from the decoder
+// as it was, and the decoder starts over at the first frame.
+#[test]
+fn a_first_frame_in_order_before_playing_starts_lets_the_spell_before_play_out() {
+    let first = spell(&music(1.0), 0, 0);
+    let second = spell(&music(1.0), 100, SECOND);
+    let held = &first[98..];
+    let until = second[5].sent_at + 2 * TICK;
+
+    let mut sent = held.to_vec();
+    sent.extend(second.iter().cloned());
+    let mut arrive = on_time(&sent);
+    arrive[0] = Some(second[0].sent_at);
+    arrive[1] = Some(second[0].sent_at);
+    let mut joined = Listener::new();
+    joined.buffer.set_period(1056);
+    joined.run(&sent, &arrive, until, always);
+
+    let mut sent = first.clone();
+    sent.extend(second.iter().cloned());
+    let deaf = SECOND / 2..second[0].sent_at;
+    let ear = |now: u64| {
+        if deaf.contains(&now) {
+            Ear::Deafened
+        } else {
+            Ear::Pulling
+        }
+    };
+    let mut back = Listener::new();
+    back.buffer.set_period(1056);
+    back.run(&sent, &on_time(&sent), until, ear);
+
+    for listener in [&joined, &back] {
+        for packet in held.iter().chain(&second[..5]) {
+            assert_eq!(
+                listener.played_at(packet.seq),
+                Some(packet.sent_at + 2 * TICK),
+                "seq {}",
+                packet.seq
+            );
+        }
+        let played: Vec<Sent> = first
+            .iter()
+            .filter(|packet| listener.played_at(packet.seq).is_some())
+            .cloned()
+            .collect();
+        let at = listener.pull_at(second[0].sent_at + 2 * TICK);
+        starts_over(listener, at, decoded(&played), &second);
+        listener.assert_no_clicks();
+    }
+}
+
+// Three deep, a spell of one frame between two others, every frame on time:
+// the first frames of the second and third spells both come while frames of
+// the spell before are held, and the decoder starts over at each.
+#[test]
+fn two_first_frames_in_order_within_the_depth_each_start_the_decoder_over() {
+    let first = spell(&music(1.0), 0, 0);
+    let second = spell(&music(0.01), 100, SECOND);
+    let third = spell(&music(1.0), 101, SECOND + TICK);
+    let mut sent = first.clone();
+    sent.extend(second.iter().cloned());
+    sent.extend(third.iter().cloned());
+    let mut listener = Listener::new();
+    listener.buffer.set_period(1056);
+    listener.run(&sent, &on_time(&sent), 2 * SECOND + 3 * TICK, always);
+    for packet in &sent[..sent.len() - 1] {
+        assert_eq!(
+            listener.played_at(packet.seq),
+            Some(packet.sent_at + 2 * TICK),
+            "seq {}",
+            packet.seq
+        );
+    }
+    let at = listener.pull_at(second[0].sent_at + 2 * TICK);
+    starts_over(&listener, at, decoded(&first), &second);
+    starts_over(&listener, at + 1, decoded(&second), &third);
+    let stats = listener.stats();
+    assert_eq!(
+        (stats.late, stats.lost, stats.concealed, stats.depth_frames),
+        (0, 0, 0, 3),
+        "{stats:?}"
+    );
+    listener.assert_no_clicks();
+}
+
+// Deafened from before the next spell's first frame until the first frame of
+// the spell after it, sixteen frames on, which takes its place among the
+// frames the decoder starts over at. Back within the depth of the later one,
+// playing starts at the end of the spell between, from a reset decoder as
+// the earlier one asked, faded in, and the decoder starts over again at the
+// later one.
+#[test]
+fn a_first_frame_in_the_place_of_one_not_yet_played_still_starts_the_decoder_over() {
+    let first = spell(&music(1.0), 0, 0);
+    let second = spell(&music(0.16), 100, SECOND);
+    let third = spell(&music(1.0), 116, SECOND + 16 * TICK);
+    let mut sent = first.clone();
+    sent.extend(second.iter().cloned());
+    sent.extend(third.iter().cloned());
+    let deaf = SECOND / 2..third[0].sent_at;
+    let ear = |now: u64| {
+        if deaf.contains(&now) {
+            Ear::Deafened
+        } else {
+            Ear::Pulling
+        }
+    };
+    let mut listener = Listener::new();
+    listener.buffer.set_period(1056);
+    listener.run(&sent, &on_time(&sent), third[5].sent_at + 2 * TICK, ear);
+    let at = listener.pull_at(third[0].sent_at);
+    assert_eq!(
+        listener.sources(at..at + 3),
+        [
+            Some(Source::Packet(114)),
+            Some(Source::Packet(115)),
+            Some(Source::Packet(116))
+        ]
+    );
+    let mut fresh = Decoder::new().unwrap();
+    let mut out = [0f32; SAMPLES];
+    fresh.decode(&second[14].frame, &mut out).unwrap();
+    assert_eq!(listener.heard[at].audio, faded_in(&out));
+    fresh.decode(&second[15].frame, &mut out).unwrap();
+    assert_eq!(listener.heard[at + 1].audio, out);
+    starts_over(&listener, at + 2, decoded(&second[14..]), &third);
+    listener.assert_no_clicks();
+}
+
 // One frame deep, with the new spell's first frame coming after the frame
 // after it, and after its own turn. As a lone late frame it plays next, from
 // a reset decoder.
