@@ -222,6 +222,8 @@ pub struct JitterBuffer {
     fastest: i64,
     arrivals: VecDeque<Arrival>,
     pending: Option<Adjust>,
+    // `target` before the check that set the pending Trim lowered it.
+    trimmed_from: i64,
     preroll_until: i64,
 
     // Since the last pull: how many packets came faster than the fastest one
@@ -279,6 +281,7 @@ impl JitterBuffer {
             fastest: 0,
             arrivals: VecDeque::with_capacity(MAX_ARRIVALS),
             pending: None,
+            trimmed_from: 0,
             preroll_until: 0,
             gap_floor: i64::MIN,
             gap_early: 0,
@@ -533,6 +536,10 @@ impl JitterBuffer {
 
     fn restart(&mut self) {
         let newest = self.newest.expect("a starting buffer holds a packet");
+        // A shrink still waiting for its quiet frame goes as it would at one.
+        if !self.clean() {
+            self.cancel_shrink();
+        }
         if let Some(samples) = self.slot(newest).map(|slot| slot.samples)
             && samples != self.frame
         {
@@ -626,7 +633,6 @@ impl JitterBuffer {
         }
         self.audible = false;
         self.fade_in = true;
-        self.pending = None;
     }
 
     fn arrived_late(&mut self, ext: i64, frame: &[u8], info: PacketInfo) {
@@ -813,6 +819,7 @@ impl JitterBuffer {
         if self.pending.is_some() || self.depth <= self.min_depth() || !self.clean() {
             return;
         }
+        self.trimmed_from = self.target;
         if self.excess() > 0 {
             self.pending = Some(Adjust::Trim);
         } else if self.settled() && self.target > self.min_depth() {
@@ -826,6 +833,15 @@ impl JitterBuffer {
                 self.pending = Some(Adjust::Drop);
             }
         }
+    }
+
+    // A Trim has lowered the target already, and the next transmission would
+    // start there. What of it has come off stays off for this one.
+    fn cancel_shrink(&mut self) {
+        if self.pending == Some(Adjust::Trim) {
+            self.target = self.target.max(self.trimmed_from.min(self.depth));
+        }
+        self.pending = None;
     }
 
     // Nothing in the history would have been late with one frame less.
@@ -935,6 +951,14 @@ impl JitterBuffer {
             self.hear(level, samples);
         }
 
+        // An arrival since the check can have ended the clean history the
+        // shrink was decided on, and would be late at the depth it leads to.
+        if matches!(self.pending, Some(Adjust::Drop | Adjust::Trim))
+            && level < self.quiet_level()
+            && !self.clean()
+        {
+            self.cancel_shrink();
+        }
         let shrinking = match self.pending {
             Some(Adjust::Drop) => Some(Adjust::Drop),
             Some(Adjust::Trim) if self.excess() > 0 => Some(Adjust::Trim),
@@ -1075,6 +1099,11 @@ impl JitterBuffer {
     // buffered, and then playing starts again from the newest packets, as it
     // does when packets overflow.
     fn switch_frame(&mut self, samples: usize) {
+        // A shrink still waiting for its quiet frame goes as it would at one,
+        // while the arrivals are still there to say so.
+        if !self.clean() {
+            self.cancel_shrink();
+        }
         self.carry_target_to(samples);
         let held = self.newest.map_or(1, |newest| newest - self.play + 1);
         if held > self.cap() {

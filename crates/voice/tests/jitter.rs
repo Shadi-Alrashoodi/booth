@@ -1435,6 +1435,36 @@ fn a_transmission_at_the_other_frame_size_carries_only_learned_depth() {
     assert_eq!((stats.frame_ms, stats.depth_frames), (10, 2));
 }
 
+// A shrink is due and waiting for a quiet frame when a packet comes just in
+// time, which it would not be at one frame less. The quiet frame does not
+// shrink the buffer until that packet has left the 5 s history.
+#[test]
+fn a_packet_that_needs_the_depth_cancels_a_shrink_already_due() {
+    let mut signal = tone(1.5);
+    signal.extend(silence(1.5));
+    signal.extend(tone(6.0));
+    signal.extend(silence(6.0));
+    let sent = low_delay(&signal, 0);
+    let mut arrive = on_time(&sent);
+    for i in [150, 160, 170, 180, 190] {
+        arrive[i] = Some(sent[i].sent_at + TICK);
+    }
+    arrive[1780] = Some(sent[1780].sent_at + TICK);
+    let mut listener = Listener::new();
+    listener.run(&sent, &arrive, 9 * SECOND, always);
+    let stats = listener.stats();
+    assert_eq!((stats.depth_frames, stats.dropped, stats.late), (2, 0, 5));
+
+    listener.run(&sent, &arrive, 13 * SECOND, always);
+    let stats = listener.stats();
+    assert_eq!((stats.depth_frames, stats.dropped), (2, 0));
+
+    listener.run(&sent, &arrive, 15 * SECOND, always);
+    let stats = listener.stats();
+    assert_eq!((stats.depth_frames, stats.dropped, stats.late), (1, 1, 5));
+    listener.assert_no_clicks();
+}
+
 // Pulls stop and the numbers jump past the cap. What played is not dropped
 // for it, only what arrived and never will.
 #[test]
@@ -1545,6 +1575,79 @@ fn a_stall_over_the_switch_after_a_time_out_counts_the_same() {
     assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Packet(8));
     let stats = buffer.stats();
     assert_eq!((stats.frame_ms, stats.dropped, stats.lost), (10, 6, 0));
+}
+
+// Three frames deep with a frame to spare, so the check has lowered the target
+// for a Trim when a packet comes just in time. The next transmission starts at
+// the depth that packet needed, whether a quiet frame came first or the
+// talker stopped while still loud.
+#[test]
+fn a_cancelled_trim_keeps_the_depth_for_the_next_transmission() {
+    for pause_at_the_end in [true, false] {
+        let mut signal = tone(9.0);
+        if pause_at_the_end {
+            signal.extend(silence(0.5));
+        }
+        let mut first = low_delay(&signal, 0);
+        first.last_mut().unwrap().last = true;
+        let start = first.last().unwrap().sent_at + SECOND / 5;
+        let second = talk(
+            &[(Mode::LowDelay, &tone(0.5))],
+            first.len() as u16,
+            start,
+            false,
+        );
+        let mut sent = first.clone();
+        sent.extend(second.iter().cloned());
+        let mut arrive = on_time(&sent);
+        for i in [100, 110, 120, 130, 140, 150, 1780] {
+            arrive[i] = Some(sent[i].sent_at + 2 * TICK);
+        }
+        let mut listener = Listener::new();
+        listener.run(&sent, &arrive, start + SECOND / 2 + 4 * TICK, always);
+        for packet in &second {
+            assert_eq!(
+                listener.played_at(packet.seq),
+                Some(packet.sent_at + 2 * TICK),
+                "pause at the end {pause_at_the_end}"
+            );
+        }
+        let stats = listener.stats();
+        assert_eq!((stats.depth_frames, stats.dropped), (3, 0));
+    }
+
+    // The talker moves to the 10 ms mode instead, still loud: the 5 ms that
+    // packet needed go along into the frame size after the move.
+    let mut first = talk(
+        &[(Mode::LowDelay, &tone(9.0)), (Mode::Repair, &tone(0.5))],
+        0,
+        0,
+        false,
+    );
+    first.last_mut().unwrap().last = true;
+    let start = first.last().unwrap().sent_at + SECOND / 5;
+    let second = talk(
+        &[(Mode::Repair, &tone(0.5))],
+        first.len() as u16,
+        start,
+        false,
+    );
+    let mut sent = first.clone();
+    sent.extend(second.iter().cloned());
+    let mut arrive = on_time(&sent);
+    for i in [100, 110, 120, 130, 140, 150, 1780] {
+        arrive[i] = Some(sent[i].sent_at + 2 * TICK);
+    }
+    let mut listener = Listener::new();
+    listener.run(&sent, &arrive, start + SECOND / 2 + 8 * TICK, always);
+    for packet in &second {
+        assert_eq!(
+            listener.played_at(packet.seq),
+            Some(packet.sent_at + 4 * TICK)
+        );
+    }
+    let stats = listener.stats();
+    assert_eq!((stats.frame_ms, stats.depth_frames), (10, 3));
 }
 
 // The render side stalls in the 10 ms mode while the talker moves to 5 ms
