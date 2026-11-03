@@ -16,7 +16,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use net::pace::Timer;
-use share::rate::{Lost, Rate, Second, Step};
+use share::rate::{Lost, Rate, Second, Step, next_reading};
 use share::{
     Audience, Back, CaptureOptions, Choice, CursorShape, CursorUpdate, FineTimer, Kind, Line,
     PauseReason, Preset, SMALLEST_REGION, Sent, Settings, Setup, Sharer, SharerNumbers, Software,
@@ -220,7 +220,7 @@ fn share(
     let mut applied = facts;
     let mut applied_limits = None;
     let mut asked_fps = start.fps;
-    let mut tally = Tally::new(sharing.upload_bytes());
+    let mut tally = Tally::new(sharing.upload_bytes(), Instant::now());
     let mut next_second = Instant::now() + Duration::from_secs(1);
     let mut seconds = 0u64;
     let mut lost_here_before = 0u64;
@@ -479,7 +479,7 @@ fn share(
 
         let now = Instant::now();
         if now >= next_second {
-            next_second = (next_second + Duration::from_secs(1)).max(now);
+            next_second = next_reading(next_second, now);
             stats::gauge!("room.outbox.plain", watchers.outbox.plain);
             stats::gauge!("room.outbox.sealed", watchers.outbox.sealed);
             stats::gauge!("room.share_tally.minute", tally.minute);
@@ -552,6 +552,7 @@ fn share(
                 software.is_some(),
                 slow,
                 sharing.upload_bytes(),
+                now,
             );
             seconds += 1;
             if seconds.is_multiple_of(LOG_EVERY_SECONDS) {
@@ -967,7 +968,7 @@ fn summary(numbers: &SharerNumbers) -> String {
 
 fn numbers_line(numbers: &SharingNumbers) -> String {
     format!(
-        "{} at {}x{} {} fps, {} frames encoded in the last second, encode {}, {} kbit/s of video at a rate of {} ({} allowed, {} backoffs), parity {}%, {} IDRs and {} invalidations in the last minute, {} frames let go by the send thread, upload {} kbit/s{}",
+        "{} at {}x{} {} fps, {} frames a second encoded, encode {}, {} kbit/s of video at a rate of {} ({} allowed, {} backoffs), parity {}%, {} IDRs and {} invalidations in the last minute, {} frames let go by the send thread, upload {} kbit/s{}",
         numbers.encoder,
         numbers.width,
         numbers.height,
@@ -1284,6 +1285,10 @@ fn room_shape(shape: &CursorShape, scale: f32) -> Option<Shape> {
 // Each second's numbers for the stats panel.
 struct Tally {
     upload_before: Option<u64>,
+    // When the last reading was taken: a reading comes a frame late or more,
+    // and seconds late after the share's thread was held up, so its rates
+    // are over the time it took.
+    read_at: Instant,
     idrs_before: u64,
     invalidated_before: u64,
     // Per second, newest last: IDRs and invalidations.
@@ -1291,9 +1296,10 @@ struct Tally {
 }
 
 impl Tally {
-    fn new(upload: Option<u64>) -> Tally {
+    fn new(upload: Option<u64>, at: Instant) -> Tally {
         Tally {
             upload_before: upload,
+            read_at: at,
             idrs_before: 0,
             invalidated_before: 0,
             minute: VecDeque::with_capacity(MINUTE),
@@ -1311,7 +1317,9 @@ impl Tally {
         software: bool,
         slow: bool,
         upload: Option<u64>,
+        at: Instant,
     ) -> SharingNumbers {
+        let (encoded_fps, video_kbps, upload_kbps) = self.rates(frames, upload, at);
         let numbers = sharer.numbers();
         let idrs = numbers.idrs.saturating_sub(self.idrs_before);
         let invalidated = numbers.invalidated.saturating_sub(self.invalidated_before);
@@ -1324,13 +1332,7 @@ impl Tally {
             u32::try_from(idrs).unwrap_or(u32::MAX),
             u32::try_from(invalidated).unwrap_or(u32::MAX),
         ));
-        let upload_kbps = match (self.upload_before, upload) {
-            (Some(before), Some(now)) => kbps(now.saturating_sub(before)),
-            _ => 0,
-        };
-        self.upload_before = upload;
         let (width, height) = sharer.size();
-        let bytes: u64 = frames.iter().map(|frame| frame.bytes as u64).sum();
         let encode_ms = spread(encode_ms).map(|(median_ms, p95_ms)| Latency {
             median_ms,
             p95_ms,
@@ -1343,9 +1345,9 @@ impl Tally {
             height,
             fps: sharer.fps(),
             fps_level: if slow { Level::Warn } else { Level::Good },
-            encoded_fps: u32::try_from(frames.len()).unwrap_or(u32::MAX),
+            encoded_fps,
             encode_ms,
-            video_kbps: kbps(bytes),
+            video_kbps,
             rate_kbps: rate.rate_kbps(),
             allowed_kbps: rate.allowed_kbps(),
             encoder_kbps: sharer.encoder_bitrate() / 1000,
@@ -1360,10 +1362,35 @@ impl Tally {
             upload_kbps,
         }
     }
+
+    // The reading's frames encoded a second, kbit/s of video and kbit/s of
+    // the whole upload, over the time since the last reading.
+    fn rates(&mut self, frames: &[Sent], upload: Option<u64>, at: Instant) -> (u32, u32, u32) {
+        let took = at.saturating_duration_since(std::mem::replace(&mut self.read_at, at));
+        let upload_kbps = match (self.upload_before, upload) {
+            (Some(before), Some(now)) => kbps(now.saturating_sub(before), took),
+            _ => 0,
+        };
+        self.upload_before = upload;
+        let bytes: u64 = frames.iter().map(|frame| frame.bytes as u64).sum();
+        (
+            per_second(frames.len(), took),
+            kbps(bytes, took),
+            upload_kbps,
+        )
+    }
 }
 
-fn kbps(bytes: u64) -> u32 {
-    u32::try_from(bytes.saturating_mul(8) / 1000).unwrap_or(u32::MAX)
+// Bytes sent over `took` as kbit/s.
+fn kbps(bytes: u64, took: Duration) -> u32 {
+    let ms = took.as_millis().max(1);
+    u32::try_from(u128::from(bytes) * 8 / ms).unwrap_or(u32::MAX)
+}
+
+// A count over `took` as so many a second.
+fn per_second(count: usize, took: Duration) -> u32 {
+    let ms = took.as_millis().max(1);
+    u32::try_from((count as u128 * 1000 + ms / 2) / ms).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -1926,6 +1953,41 @@ mod tests {
         assert_eq!(
             arrived(),
             [None, Some((0, false, again)), Some((9, true, again))]
+        );
+    }
+
+    // A reading's rates are over the time since the last one, which a stall
+    // makes longer than a second.
+    #[test]
+    fn a_late_reading_counts_over_the_time_it_took() {
+        let second = Duration::from_secs(1);
+        assert_eq!(kbps(1_000_000, second), 8_000);
+        assert_eq!(kbps(1_000_000, second * 3), 2_666);
+        assert_eq!(per_second(60, second), 60);
+        assert_eq!(per_second(180, second * 3), 60);
+        assert_eq!(per_second(61, Duration::from_millis(1016)), 60);
+
+        // 60 frames of 12,500 bytes and 1,000,000 bytes of upload in each
+        // reading, the second 3 s after the first.
+        let frame = Sent {
+            number: 0,
+            idr: false,
+            bytes: 12_500,
+            packets: 12,
+            packet_bytes: 15_000,
+            encode_ms: 2.5,
+            parity: 20,
+        };
+        let frames = [frame; 60];
+        let start = Instant::now();
+        let mut tally = Tally::new(Some(0), start);
+        assert_eq!(
+            tally.rates(&frames, Some(1_000_000), start + second),
+            (60, 6_000, 8_000)
+        );
+        assert_eq!(
+            tally.rates(&frames, Some(2_000_000), start + second * 4),
+            (20, 2_000, 2_666)
         );
     }
 

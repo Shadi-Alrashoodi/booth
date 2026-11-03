@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use share::rate::{Rate, Second, Step};
+use share::rate::{Rate, Second, Step, next_reading};
 use share::{Codec, FineTimer, Knob, Line, Sharer, SharerNumbers, spread};
 
 use super::link::{Link, SharerEnd};
@@ -180,7 +180,7 @@ impl Rating {
         if now < self.next {
             return Ok(());
         }
-        self.next = (self.next + Duration::from_secs(1)).max(now);
+        self.next = next_reading(self.next, now);
         self.seconds += 1;
         let frames = std::mem::take(&mut end.sent);
         let mut encode_ms: Vec<f32> = frames.iter().map(|frame| frame.encode_ms).collect();

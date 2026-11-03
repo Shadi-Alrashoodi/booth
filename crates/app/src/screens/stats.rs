@@ -564,8 +564,8 @@ fn video_out(out: &mut Lines, s: &SharingNumbers) {
     // Fewer than the frame rate on a still screen, and none while nobody
     // watches.
     out.add(
-        "Encoded, last second",
-        Some(format!("{} frames", s.encoded_fps)),
+        "Encoded",
+        Some(format!("{} frames a second", s.encoded_fps)),
     );
     if let Some(encode) = s.encode_ms {
         let level = frame_level(encode.median_ms, s.fps);
@@ -1191,7 +1191,7 @@ mod tests {
             [
                 line("Encoder", "NVENC H.264", good),
                 line("Video size", "2560x1440, 120 fps", good),
-                line("Encoded, last second", "118 frames", good),
+                line("Encoded", "118 frames a second", good),
                 line("Encode", "2.6 ms, p95 3.0 ms", good),
                 line("Video bitrate", "11.2 of 15.0 Mbit/s", good),
                 line("Parity", "10%", good),

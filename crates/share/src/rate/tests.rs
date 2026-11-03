@@ -1874,3 +1874,24 @@ fn a_second_copy_shares_out_what_the_link_carried() {
     assert_eq!(rate.copies(15_000, 2, 1), None);
     assert_eq!(rate.allowed_kbps(), 15_000);
 }
+
+// A second taken a frame late, or up to half a second late, keeps the next
+// on the second after it. After a longer stall the next is a second away,
+// never due at once or a moment later.
+#[test]
+fn the_second_after_a_stall_is_a_second_away() {
+    let due = Instant::now();
+    let second = Duration::from_secs(1);
+    let ms = Duration::from_millis;
+    assert_eq!(next_reading(due, due), due + second);
+    for late in [ms(100), ms(499), ms(500)] {
+        assert_eq!(next_reading(due, due + late), due + second, "{late:?} late");
+    }
+    for stall in [ms(501), ms(990), second * 2, second * 3] {
+        assert_eq!(
+            next_reading(due, due + stall),
+            due + stall + second,
+            "{stall:?} late"
+        );
+    }
+}

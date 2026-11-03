@@ -257,7 +257,7 @@ fn print_watched(who: &str, numbers: &WatchingNumbers) {
 
 fn print_shared(numbers: &SharingNumbers) {
     println!(
-        "sharer: {} at {}x{} {} fps ({} encoded last second), encode {}, video {} kbit/s at a rate of {} of {} allowed ({} backoffs), parity {}%, {} IDRs ({} in the last minute), {} invalidations in the last minute, upload {} kbit/s, stepped down {:?}",
+        "sharer: {} at {}x{} {} fps ({} frames a second encoded), encode {}, video {} kbit/s at a rate of {} of {} allowed ({} backoffs), parity {}%, {} IDRs ({} in the last minute), {} invalidations in the last minute, upload {} kbit/s, stepped down {:?}",
         numbers.encoder,
         numbers.width,
         numbers.height,

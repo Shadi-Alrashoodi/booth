@@ -1012,6 +1012,20 @@ impl Rate {
     }
 }
 
+// When the next second is due, after one due at `due` was taken at `now`: a
+// second after `due`, which keeps them a second apart on average while each
+// comes a frame late, unless a stall left under half a second to it. Then it
+// is a second from now: the rate judges each as a second, and a moment's
+// numbers taken as a second say nothing.
+pub fn next_reading(due: Instant, now: Instant) -> Instant {
+    let next = due + Duration::from_secs(1);
+    if next >= now + Duration::from_millis(500) {
+        next
+    } else {
+        now + Duration::from_secs(1)
+    }
+}
+
 // HEAVY_LOST_PER_HUNDRED or more in 100 of `frames`, and never fewer than
 // LOST_AT_LEAST, which also makes it loss by the ordinary rule.
 fn heavy_loss(frames: u32, lost: u32) -> bool {

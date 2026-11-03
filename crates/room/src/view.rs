@@ -685,12 +685,15 @@ pub struct SharingNumbers {
     pub fps: u32,
     // In warn while encode time is past the frame interval.
     pub fps_level: Level,
-    // Frames encoded in the last second: fewer than fps on a still screen.
+    // Frames encoded a second, over the time since the last reading: about a
+    // second, from half a second after a late one to longer after a stall.
+    // Fewer than fps on a still screen.
     pub encoded_fps: u32,
-    // Over the last second; None when no frame was encoded in it.
+    // Over the frames since the last reading; None when none was encoded.
     pub encode_ms: Option<Latency>,
-    // The encoder's output over the last second, without parity, against
-    // the rate in use; and what the bitrate rule allows before any backoff.
+    // The encoder's output over the time since the last reading, without
+    // parity, against the rate in use; and what the bitrate rule allows
+    // before any backoff.
     pub video_kbps: u32,
     pub rate_kbps: u32,
     pub allowed_kbps: u32,
@@ -711,9 +714,9 @@ pub struct SharingNumbers {
     // Of those, IDRs: each was made again at once, and `idrs` counts both.
     pub idrs_let_go: u64,
     pub stepped_down: Option<SteppedDown>,
-    // Everything this PC sent over the last second, voice and control
-    // included, with IP and UDP headers: what the upload setting has to
-    // leave room for.
+    // Everything this PC sent over the time since the last reading, voice
+    // and control included, with IP and UDP headers: what the upload
+    // setting has to leave room for.
     pub upload_kbps: u32,
 }
 
