@@ -74,6 +74,23 @@ Changed in src/text_selection/text_cursor_state.rs
   so copying it would put an empty string on the clipboard.
 - Three tests for it, and one more in src/widgets/text_edit/text_buffer.rs.
 
+Changed in src/text_selection/accesskit_text.rs
+- 0.36.2 gives a text run's positions from its first glyph and calls them
+  left to right. The first glyph of a right-to-left row is its rightmost, so
+  every other position came out negative, and a magnifier or a screen
+  reader's highlight was sent left of the row. Now a row all right to left
+  says so and gives each caret place counted from the row's right end, as
+  AccessKit reads them.
+- A row of both directions gets no positions or widths, which AccessKit
+  allows: it then gives no box for any range that touches the row, and most
+  text functions still work. One text run per direction is what would give
+  it boxes.
+- The runs a row longer than 255 chars is cut into: on a row all right to
+  left each one's bounds hold its own letters; on a row of both directions
+  each one's bounds are the whole row, since its chars need not be one
+  stretch of it. Before, the left end could come out past the right.
+- Rows with no right-to-left glyph are as in 0.36.2.
+
 Other changes to the crate
 - Ten doc examples marked ignore. They include images by paths inside
   egui's own repository (assets/ferris.png, and eframe/data/icon.png),
@@ -96,4 +113,4 @@ selected without its letter, in the composer, any selection of the
 property test's texts, and against a copy of 0.36.2's painter, unchanged
 but for its name and with its comments left out, which every row with no
 right-to-left glyph must still match. The word keys past the last char are
-tested there too, in the composer.
+tested there too, in the composer, and the positions AccessKit is given.

@@ -5,14 +5,17 @@
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
+use eframe::egui::accesskit;
+use eframe::egui::emath::TSTransform;
 use eframe::egui::epaint::WHITE_UV;
 use eframe::egui::epaint::text::cursor::CCursor;
 use eframe::egui::epaint::text::{Glyph, PlacedRow, Row};
 use eframe::egui::text::{CCursorRange, CharIndex, LayoutJob};
 use eframe::egui::text_edit::TextEditState;
+use eframe::egui::text_selection::accesskit_text::update_accesskit_for_text_widget;
 use eframe::egui::text_selection::visuals::{RowVertexIndices, paint_text_selection};
 use eframe::egui::{
-    Align, Context, Event, FullOutput, Galley, Key, Modifiers, MouseWheelUnit, OutputCommand,
+    Align, Context, Event, FullOutput, Galley, Id, Key, Modifiers, MouseWheelUnit, OutputCommand,
     PlatformOutput, PointerButton, Pos2, RawInput, Rect, Response, Shape, TextFormat, TouchPhase,
     Ui, UiBuilder, Visuals, pos2, vec2,
 };
@@ -1107,6 +1110,216 @@ fn word_keys_past_the_last_char() {
                 composer(&ctx, &mut draft, vec![key(pressed, modifiers)], modifiers);
             assert_eq!(draft, "\u{1E25}asan");
             assert_eq!(caret(&ctx, &response), 6, "{pressed:?} {modifiers:?}");
+        }
+    }
+}
+
+fn accesskit_node(output: &PlatformOutput, id: Id) -> &accesskit::Node {
+    let update = output.accesskit_update.as_ref().expect("AccessKit is on");
+    let wanted = id.accesskit_id();
+    let (_, node) = update
+        .nodes
+        .iter()
+        .find(|(id, _)| *id == wanted)
+        .expect("a node for this id");
+    node
+}
+
+fn text_run<'a>(output: &'a PlatformOutput, value: &str) -> &'a accesskit::Node {
+    let update = output.accesskit_update.as_ref().expect("AccessKit is on");
+    let (_, node) = update
+        .nodes
+        .iter()
+        .find(|(_, node)| node.role() == accesskit::Role::TextRun && node.value() == Some(value))
+        .unwrap_or_else(|| panic!("no text run for {value:?}"));
+    node
+}
+
+fn assert_near(got: f64, wanted: f32, what: &str) {
+    assert!(
+        (got as f32 - wanted).abs() < 0.01,
+        "{what}: {got} is not {wanted}"
+    );
+}
+
+// A magnifier follows the caret, and a screen reader draws its highlight, by
+// the box AccessKit works out from a text run's bounds and positions. On a
+// right-to-left row that box is where the letter and the caret are drawn, also
+// around a mark and at the newline.
+#[test]
+fn accesskit_finds_the_letters_of_a_right_to_left_row() {
+    let ctx = Context::default();
+    theme::apply(&ctx);
+    ctx.enable_accesskit();
+    let text = "بِسْمِ اللَّهِ\nمرحبا";
+    frame(&ctx, Vec::new(), Modifiers::NONE, |ui| message(ui, text));
+    let (_, painted, output) = frame(&ctx, Vec::new(), Modifiers::NONE, |ui| message(ui, text));
+    let (pos, galley) = typed(&painted, text);
+    assert_eq!(galley.rows.len(), 2);
+    for row in &galley.rows {
+        let origin = pos.x + row.pos.x;
+        let newline = if row.ends_with_newline { "\n" } else { "" };
+        let run = text_run(&output, &format!("{}{newline}", row.text()));
+        assert_eq!(
+            run.text_direction(),
+            Some(accesskit::TextDirection::RightToLeft)
+        );
+        let right = run.bounds().expect("bounds").x1;
+        let positions = run.character_positions().expect("positions");
+        let widths = run.character_widths().expect("widths");
+        let count = row.glyphs.len();
+        assert_eq!(positions.len(), count + usize::from(row.ends_with_newline));
+        for (i, glyph) in row.glyphs.iter().enumerate() {
+            let caret = origin + row.x_offset(CharIndex(i));
+            assert_near(right - f64::from(positions[i]), caret, "the caret");
+            if 0.0 < glyph.advance_width {
+                let left = right - f64::from(positions[i] + widths[i]);
+                assert_near(left, origin + glyph.pos.x, "the letter's left");
+            }
+        }
+        let end = origin + row.x_offset(CharIndex(count));
+        let last = right - f64::from(positions[count - 1] + widths[count - 1]);
+        assert_near(last, end, "the row's end");
+        if row.ends_with_newline {
+            assert_near(right - f64::from(positions[count]), end, "the newline");
+        }
+    }
+}
+
+// One text run has one direction, so a row of both gets no positions rather
+// than wrong ones, and a left-to-right row stays as egui has it.
+#[test]
+fn accesskit_positions_on_other_rows() {
+    let ctx = Context::default();
+    theme::apply(&ctx);
+    ctx.enable_accesskit();
+    frame(&ctx, Vec::new(), Modifiers::NONE, |ui| message(ui, MIXED));
+    let (_, painted, output) = frame(&ctx, Vec::new(), Modifiers::NONE, |ui| message(ui, MIXED));
+    let (pos, galley) = typed(&painted, MIXED);
+    let row = &galley.rows[0];
+    let run = text_run(&output, MIXED);
+    assert_eq!(run.character_positions(), None);
+    assert_eq!(run.character_widths(), None);
+    let bounds = run.bounds().expect("bounds");
+    assert_near(bounds.x0, pos.x + row.pos.x, "the row's left");
+    assert_near(bounds.x1, pos.x + row.pos.x + row.size.x, "the row's right");
+
+    frame(&ctx, Vec::new(), Modifiers::NONE, |ui| message(ui, ENGLISH));
+    let (_, painted, output) = frame(&ctx, Vec::new(), Modifiers::NONE, |ui| message(ui, ENGLISH));
+    let (_, galley) = typed(&painted, ENGLISH);
+    let row = &galley.rows[0];
+    let run = text_run(&output, ENGLISH);
+    assert_eq!(
+        run.text_direction(),
+        Some(accesskit::TextDirection::LeftToRight)
+    );
+    let positions = run.character_positions().expect("positions");
+    assert_eq!(positions[0], 0.0);
+    for (position, glyph) in positions.iter().zip(&row.glyphs) {
+        assert_eq!(*position, glyph.pos.x - row.glyphs[0].pos.x);
+    }
+}
+
+// A row longer than a text run can hold is cut into runs by char count. Each
+// run's bounds hold its own letters, and on a row of both directions, where
+// they are not one stretch, the whole row.
+#[test]
+fn accesskit_long_rows_are_cut_into_runs_on_the_row() {
+    const RUN: usize = 255;
+    let ctx = Context::default();
+    theme::apply(&ctx);
+    ctx.enable_accesskit();
+    let arabic = format!("{}\n", [ARABIC; 16].join(" "));
+    let mixed = [MIXED; 16].join(" ");
+    let english = [ENGLISH; 20].join(" ");
+    let (arabic_id, mixed_id, english_id) =
+        (Id::new("arabic"), Id::new("mixed"), Id::new("english"));
+    let run_frame = || {
+        frame(&ctx, Vec::new(), Modifiers::NONE, |ui| {
+            [
+                (arabic_id, &arabic),
+                (mixed_id, &mixed),
+                (english_id, &english),
+            ]
+            .map(|(id, text)| {
+                let galley = body_galley(ui, text, f32::INFINITY);
+                update_accesskit_for_text_widget(
+                    ui.ctx(),
+                    id,
+                    None,
+                    accesskit::Role::Label,
+                    TSTransform::IDENTITY,
+                    &galley,
+                );
+                galley
+            })
+        })
+    };
+    run_frame();
+    let ([arabic_galley, mixed_galley, english_galley], _, output) = run_frame();
+
+    assert_eq!(arabic_galley.rows.len(), 2);
+    let row = &arabic_galley.rows[0];
+    assert!(row.ends_with_newline);
+    assert!(RUN < row.glyphs.len());
+    let place = |index: usize| row.pos.x + row.x_offset(CharIndex(index));
+    for (index, letters) in row.glyphs.chunks(RUN).enumerate() {
+        let start = index * RUN;
+        let run = accesskit_node(&output, arabic_id.with(0usize).with(index));
+        assert_eq!(
+            run.text_direction(),
+            Some(accesskit::TextDirection::RightToLeft)
+        );
+        let bounds = run.bounds().expect("bounds");
+        assert_near(bounds.x1, place(start), "the run's right");
+        let end = start + letters.len() - 1;
+        let width = letters.last().expect("a letter").advance_width;
+        assert_near(bounds.x0, place(end) - width, "the run's left");
+        let positions = run.character_positions().expect("positions");
+        // The newline's place is the last run's last, at the row's end.
+        let newline = usize::from(start + letters.len() == row.glyphs.len());
+        assert_eq!(positions.len(), letters.len() + newline);
+        for (i, position) in positions.iter().enumerate() {
+            let x = bounds.x1 - f64::from(*position);
+            assert_near(x, place(start + i), "the caret");
+        }
+    }
+
+    assert_eq!(mixed_galley.rows.len(), 1);
+    let row = &mixed_galley.rows[0];
+    assert!(RUN < row.glyphs.len());
+    for index in 0..row.glyphs.len().div_ceil(RUN) {
+        let run = accesskit_node(&output, mixed_id.with(0usize).with(index));
+        assert_eq!(run.character_positions(), None);
+        let bounds = run.bounds().expect("bounds");
+        assert_near(bounds.x0, row.pos.x, "the row's left");
+        assert_near(bounds.x1, row.pos.x + row.size.x, "the row's right");
+    }
+
+    assert_eq!(english_galley.rows.len(), 1);
+    let row = &english_galley.rows[0];
+    assert!(RUN < row.glyphs.len());
+    for (index, letters) in row.glyphs.chunks(RUN).enumerate() {
+        let run = accesskit_node(&output, english_id.with(0usize).with(index));
+        assert_eq!(
+            run.text_direction(),
+            Some(accesskit::TextDirection::LeftToRight)
+        );
+        let (first, last) = (&letters[0], letters.last().expect("a letter"));
+        let bounds = run.bounds().expect("bounds");
+        assert_near(bounds.x0, first.pos.x, "the run's left");
+        assert_near(
+            bounds.x1,
+            last.pos.x + last.advance_width,
+            "the run's right",
+        );
+        let positions = run.character_positions().expect("positions");
+        let widths = run.character_widths().expect("widths");
+        assert_eq!(positions.len(), letters.len());
+        assert_eq!(widths.len(), letters.len());
+        for (i, letter) in letters.iter().enumerate() {
+            assert_eq!(positions[i], letter.pos.x - first.pos.x);
+            assert_eq!(widths[i], letter.advance_width);
         }
     }
 }

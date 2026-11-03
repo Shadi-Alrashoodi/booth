@@ -1,5 +1,5 @@
 use emath::TSTransform;
-use epaint::text::CharIndex;
+use epaint::text::{CharIndex, Glyph};
 
 use crate::{Context, Galley, Id};
 
@@ -93,13 +93,33 @@ pub fn update_accesskit_for_text_widget(
 
         let total_chars = character_lengths.len();
 
+        // A text run has one direction, and its positions count from that
+        // end of its bounds. Glyphs stay in logical order, so on a row all
+        // right to left they count from the right end, the row's, to each
+        // caret place, which is also where a mark's or the newline's box goes.
+        // On a row of both directions no one count fits and the positions are
+        // left out: AccessKit then gives no box for any range touching the
+        // row, even all of it, rather than one in the wrong place.
+        let has_rtl = row.glyphs.iter().any(Glyph::is_rtl);
+        let all_rtl = has_rtl && row.glyphs.iter().all(Glyph::is_rtl);
+        let direction = if all_rtl {
+            accesskit::TextDirection::RightToLeft
+        } else {
+            accesskit::TextDirection::LeftToRight
+        };
+        if all_rtl {
+            for (i, p) in character_positions.iter_mut().enumerate() {
+                *p = row.size.x - row.x_offset(CharIndex(i));
+            }
+        }
+
         if total_chars <= MAX_CHARS_PER_TEXT_RUN {
             let run_id = parent_id.with(row_index).with(0usize);
             ctx.register_accesskit_parent(run_id, parent_id);
 
             ctx.accesskit_node_builder(run_id, |builder| {
                 builder.set_role(accesskit::Role::TextRun);
-                builder.set_text_direction(accesskit::TextDirection::LeftToRight);
+                builder.set_text_direction(direction);
                 // TODO(mwcampbell): Set more node fields for the row
                 // once AccessKit adapters expose text formatting info.
 
@@ -113,12 +133,18 @@ pub fn update_accesskit_for_text_widget(
                 builder.set_value(value);
                 builder.set_character_lengths(character_lengths);
 
-                let pos_offset = character_positions.first().copied().unwrap_or(0.0);
-                for p in &mut character_positions {
-                    *p -= pos_offset;
+                if !has_rtl || all_rtl {
+                    let pos_offset = if all_rtl {
+                        0.0
+                    } else {
+                        character_positions.first().copied().unwrap_or(0.0)
+                    };
+                    for p in &mut character_positions {
+                        *p -= pos_offset;
+                    }
+                    builder.set_character_positions(character_positions);
+                    builder.set_character_widths(character_widths);
                 }
-                builder.set_character_positions(character_positions);
-                builder.set_character_widths(character_widths);
 
                 let chunk_word_starts: Vec<u8> = word_starts.iter().map(|&ws| ws as u8).collect();
                 builder.set_word_starts(chunk_word_starts);
@@ -144,7 +170,7 @@ pub fn update_accesskit_for_text_widget(
 
                 ctx.accesskit_node_builder(run_id, |builder| {
                     builder.set_role(accesskit::Role::TextRun);
-                    builder.set_text_direction(accesskit::TextDirection::LeftToRight);
+                    builder.set_text_direction(direction);
                     // TODO(mwcampbell): Set more node fields for the row
                     // once AccessKit adapters expose text formatting info.
 
@@ -158,10 +184,22 @@ pub fn update_accesskit_for_text_widget(
                     }
 
                     let row_rect = row.rect_without_leading_space();
-                    let chunk_x0 = row.pos.x + character_positions[char_start];
-                    let chunk_x1 = row.pos.x
-                        + character_positions[char_end - 1]
-                        + character_widths[char_end - 1];
+                    let chunk_end =
+                        character_positions[char_end - 1] + character_widths[char_end - 1];
+                    let (chunk_x0, chunk_x1) = if all_rtl {
+                        (
+                            row_rect.max.x - chunk_end,
+                            row_rect.max.x - character_positions[char_start],
+                        )
+                    } else if has_rtl {
+                        // The chars of a chunk need not be one stretch of the row.
+                        (row_rect.min.x, row_rect.max.x)
+                    } else {
+                        (
+                            row.pos.x + character_positions[char_start],
+                            row.pos.x + chunk_end,
+                        )
+                    };
                     let chunk_rect = emath::Rect::from_min_max(
                         emath::pos2(chunk_x0, row_rect.min.y),
                         emath::pos2(chunk_x1, row_rect.max.y),
@@ -176,13 +214,16 @@ pub fn update_accesskit_for_text_widget(
                     builder.set_value(value[byte_start..byte_end].to_owned());
                     builder.set_character_lengths(character_lengths[char_start..char_end].to_vec());
 
-                    let pos_offset = character_positions[char_start];
-                    let chunk_positions: Vec<f32> = character_positions[char_start..char_end]
-                        .iter()
-                        .map(|&p| p - pos_offset)
-                        .collect();
-                    builder.set_character_positions(chunk_positions);
-                    builder.set_character_widths(character_widths[char_start..char_end].to_vec());
+                    if !has_rtl || all_rtl {
+                        let pos_offset = character_positions[char_start];
+                        let chunk_positions: Vec<f32> = character_positions[char_start..char_end]
+                            .iter()
+                            .map(|&p| p - pos_offset)
+                            .collect();
+                        builder.set_character_positions(chunk_positions);
+                        builder
+                            .set_character_widths(character_widths[char_start..char_end].to_vec());
+                    }
 
                     let chunk_word_starts: Vec<u8> = word_starts
                         .iter()
