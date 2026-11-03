@@ -1023,7 +1023,10 @@ struct Watchers<'a> {
     shape_refused: bool,
     // A monitor's capture is paused, and nothing of the pointer goes out until
     // the next picture, as nothing of the picture does. Someone who started
-    // watching meanwhile gets the shape then.
+    // watching meanwhile gets the shape then. Paused by hand, nothing of it
+    // goes out from the press on either, and a shape read before this thread
+    // takes the pause in, or owed to someone who started watching then, goes
+    // with the first pointer update after Resume.
     away: bool,
     shape_owed: bool,
     // Frames watchers reported lost since the rate last looked.
@@ -1088,7 +1091,7 @@ impl<'a> Watchers<'a> {
     // under a new id, with the pointer where it is. No picture comes with
     // that pointer, so it is not marked.
     fn shape_again(&mut self) {
-        if self.away {
+        if self.away || self.sharing.held() {
             self.shape_owed = true;
             return;
         }
@@ -1114,6 +1117,24 @@ impl<'a> Watchers<'a> {
 
 impl Audience for Watchers<'_> {
     fn cursor(&mut self, update: CursorUpdate, with_picture: bool) {
+        // Paused by hand, read in the wait before this thread takes the pause
+        // in: none of it goes out. A new shape is kept in place of the last,
+        // to go under a new id after Resume.
+        if self.sharing.held() {
+            if let Some(shape) = update
+                .shape
+                .as_ref()
+                .and_then(|shape| room_shape(shape, update.scale))
+            {
+                let id = self.shape.as_ref().map_or(0, |(id, _)| *id);
+                self.shape = Some((id, shape));
+                self.shape_owed = true;
+            }
+            return;
+        }
+        if !self.away && std::mem::take(&mut self.shape_owed) {
+            self.shape_again();
+        }
         if let Some(shape) = &update.shape {
             match room_shape(shape, update.scale) {
                 Some(shape) => self.send_shape(shape),
@@ -1813,6 +1834,99 @@ mod tests {
         watchers.hide_pointer();
         assert_eq!(pointers(&reads, &mut far), [(0, false, false)], "a pause's");
         assert_eq!(pointers(&older, &mut older_far).len(), 3);
+    }
+
+    // A pause stops the video and the pointer at the press, before the
+    // share's thread takes it in after its wait for a picture: nothing it
+    // reads meanwhile, nor the rest of a frame the send thread has, goes
+    // out, and someone who starts watching then gets no shape. The pointer
+    // update that hides it for the pause still does. A shape read meanwhile
+    // goes with the first pointer update after Resume.
+    #[test]
+    fn a_pause_stops_the_video_at_the_press() {
+        let wake = net::pace::Signal::new().expect("create an event");
+        let clock = crate::peer::Clock::new(Instant::now());
+        let socket = Arc::new(Socket::bind(0, Log::off()).expect("bind a socket"));
+        let sharing = Sharing::new(clock, false, Some(socket), 1000, wake);
+        let wire = Wire::new();
+        let (near, mut far) = session_pair();
+        sharing.set_outlets(vec![ShareOutlet {
+            link: Outlet {
+                sealer: near.sealer().expect("the initiator may send"),
+                to: wire.addr(),
+                sent: Arc::default(),
+            },
+            marks: true,
+        }]);
+        let log = Log::off();
+        let mut watchers = Watchers::new(&sharing, &log, 1, false);
+        // None for video, and for a pointer update x, shown and the shape it
+        // names.
+        let mut arrived = || {
+            let mut plain = Vec::new();
+            wire.packets()
+                .iter()
+                .map(|packet| {
+                    far.decrypt(packet, &mut plain).expect("opens");
+                    let (channel, payload) = channels::unframe(&plain).expect("a frame");
+                    (channel == channels::Channel::Cursor).then(|| {
+                        let (_, pointer) =
+                            read_pointer(payload, SENT, true).expect("an update Booth sends");
+                        (pointer.x, pointer.visible, pointer.shape)
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let at = |x: i32, shape: Option<CursorShape>| CursorUpdate {
+            x,
+            y: 6,
+            visible: true,
+            scale: 1.0,
+            shape,
+        };
+        let arrow = CursorShape {
+            kind: CursorKind::Color,
+            width: 32,
+            height: 32,
+            pitch: 128,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            bytes: vec![7; 32 * 32 * 4],
+        };
+        let beam = CursorShape {
+            bytes: vec![9; 32 * 32 * 4],
+            ..arrow.clone()
+        };
+        let waiting = || sharing.take_shape_if(|_| true);
+        let mut outbox = sharing.outbox();
+        assert_eq!(outbox.video(&[0; 64]), 1);
+        watchers.cursor(at(5, Some(arrow)), true);
+        let (first, _) = waiting().expect("the shape");
+
+        sharing.set_held(true);
+        assert_eq!(outbox.video(&[0; 64]), 0, "video after the press");
+        watchers.cursor(at(7, Some(beam.clone())), true);
+        watchers.cursor(at(8, None), false);
+        sharing.answer(Answer::Idr { seen: None });
+        watchers.back(&mut Vec::new());
+        assert!(watchers.started_watching());
+        assert_eq!(waiting(), None, "a shape after the press");
+        watchers.hide_pointer();
+        assert_eq!(
+            arrived(),
+            [None, Some((5, true, first)), Some((0, false, first))]
+        );
+
+        sharing.set_held(false);
+        assert_eq!(outbox.video(&[0; 64]), 1, "video after Resume");
+        watchers.cursor(at(9, None), true);
+        let (again, shape) = waiting().expect("the shape read in the pause");
+        assert_ne!(again, first);
+        assert_eq!(Some(shape), room_shape(&beam, 1.0));
+        assert_eq!(
+            arrived(),
+            [None, Some((0, false, again)), Some((9, true, again))]
+        );
     }
 
     // A monitor's pause lets go of the pointer as of the picture: it is hidden

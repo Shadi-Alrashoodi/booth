@@ -447,14 +447,18 @@ impl Room {
         self.threads.stop_sharing();
     }
 
-    /// Pauses this PC's share, or resumes it. Paused, its thread lets go of
-    /// the screen and the encoder and sends nothing, not even to someone who
-    /// starts watching, until it resumes with an IDR; `share.running.held`
-    /// says so as soon as the thread stops reading the screen, before it
-    /// lets go of the capture and the encoder. Watchers keep the last
-    /// picture they had. A share of a window resumed while its desktop is
-    /// away goes on once the desktop is back. A share that ends and a new
-    /// one are not paused.
+    /// Pauses this PC's share, or resumes it. Paused, no video goes out from
+    /// the press on, past a packet already on its way out then, and nothing
+    /// of the pointer but the update that hides it, past a shape passed on
+    /// before then that still waits for its budget. Its thread stops reading
+    /// the screen at its next pass, after its wait for a picture, then lets
+    /// go of the screen and the encoder, and sends nothing, not even to
+    /// someone who starts watching, until it resumes with an IDR;
+    /// `share.running.held` says so as soon as the thread stops reading the
+    /// screen, before it lets go of the capture and the encoder. Watchers
+    /// keep the last picture they had. A share of a window resumed while its
+    /// desktop is away goes on once the desktop is back. A share that ends
+    /// and a new one are not paused.
     pub fn pause_share(&self, on: bool) {
         self.threads.sharing().set_held(on);
     }

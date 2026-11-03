@@ -564,9 +564,11 @@ impl Sharing {
         self.wake.set();
     }
 
-    // While it holds, the share's thread has let go of capture and the
-    // encoder and sends nothing, not even to someone who starts watching.
-    // A new share starts unheld.
+    // While it holds, no video goes out from the press on, nor anything of
+    // the pointer but the update that hides it and a shape set before the
+    // press that still waits for its budget, and the share's thread lets go
+    // of capture and the encoder at its next pass, then sends nothing, not
+    // even to someone who starts watching. A new share starts unheld.
     pub(crate) fn set_held(&self, held: bool) {
         // First, on the thread that pressed: no PC sound captured from the
         // press on goes out, whatever the room is doing.
@@ -859,9 +861,13 @@ pub struct Outbox {
 
 impl Outbox {
     // A channels::video packet. Returns how many links it went to: none
-    // before the share is granted, and none while nobody watches the host's.
+    // before the share is granted, none while nobody watches the host's, and
+    // none while the share is paused. The share's thread takes a pause in
+    // only after its wait for a picture, up to 100 ms on a still screen, and
+    // what it reads in that wait stays here, as does the rest of a frame
+    // the send thread still has.
     pub fn video(&mut self, packet: &[u8]) -> usize {
-        if PREFIX + packet.len() > MAX_VIDEO {
+        if PREFIX + packet.len() > MAX_VIDEO || self.sharing.held() {
             return 0;
         }
         let (kind, slot) = self.prefix();
