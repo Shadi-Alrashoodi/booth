@@ -1324,6 +1324,61 @@ fn late_frame_decoded_only_while_in_reach() {
     listener.assert_no_clicks();
 }
 
+// A word in 10 ms frames, then one in 5 ms frames after a pause: the depth the
+// rules asked for carries over, without the 10 ms mode's extra frame, which
+// nothing else would take off for 5 s. The other way round the minimum of the
+// mode with copies does not count as growth.
+#[test]
+fn a_transmission_at_the_other_frame_size_carries_only_learned_depth() {
+    let spells = |first: Mode, redundancy: bool, then: Mode| {
+        let mut before = talk(&[(first, &tone(1.0))], 0, 0, redundancy);
+        before.last_mut().unwrap().last = true;
+        let after = talk(
+            &[(then, &tone(0.5))],
+            before.len() as u16,
+            2 * SECOND,
+            false,
+        );
+        (before, after)
+    };
+    let listen = |before: &[Sent], after: &[Sent], late: &[usize]| {
+        let mut sent = before.to_vec();
+        sent.extend_from_slice(after);
+        let mut arrive = on_time(&sent);
+        for &i in late {
+            arrive[i] = Some(sent[i].sent_at + 2 * 480);
+        }
+        let mut listener = Listener::new();
+        listener.run(&sent, &arrive, 5 * SECOND / 2 + 4 * TICK, always);
+        listener
+    };
+
+    let (before, after) = spells(Mode::Repair, false, Mode::LowDelay);
+    let listener = listen(&before, &after, &[]);
+    for packet in &after {
+        assert_eq!(listener.played_at(packet.seq), Some(packet.sent_at));
+    }
+    let stats = listener.stats();
+    assert_eq!((stats.frame_ms, stats.depth_frames), (5, 1));
+
+    // Packets a 10 ms frame too late for the two frames of the 10 ms mode grow
+    // it by that much, which is two frames over the minimum here.
+    let listener = listen(&before, &after, &[10, 12, 14]);
+    for packet in &after {
+        assert_eq!(
+            listener.played_at(packet.seq),
+            Some(packet.sent_at + 2 * TICK)
+        );
+    }
+    let stats = listener.stats();
+    assert_eq!((stats.frame_ms, stats.depth_frames), (5, 3));
+
+    let (before, after) = spells(Mode::LowDelay, true, Mode::Repair);
+    let listener = listen(&before, &after, &[]);
+    let stats = listener.stats();
+    assert_eq!((stats.frame_ms, stats.depth_frames), (10, 2));
+}
+
 // Pulls stop and the numbers jump past the cap. What played is not dropped
 // for it, only what arrived and never will.
 #[test]

@@ -530,7 +530,7 @@ impl JitterBuffer {
         if let Some(samples) = self.slot(newest).map(|slot| slot.samples)
             && samples != self.frame
         {
-            self.set_frame(samples);
+            self.carry_target_to(samples);
         }
         let first_contact = self.last_change.is_none();
         let measured = self.depth.max(1);
@@ -1063,14 +1063,11 @@ impl JitterBuffer {
 
     // The talker changed mode in the middle of a transmission. The depth is
     // read from what is buffered; the minimum-depth rule then adds a frame if
-    // the 10 ms mode needs one. What the rules asked for is the new mode's
-    // minimum plus whatever late packets had added to the old one. Back from
-    // the 10 ms mode, what is buffered includes that mode's extra frame,
-    // which 5 ms frames do not need, so it comes off as excess.
+    // the 10 ms mode needs one. Back from the 10 ms mode, what is buffered
+    // includes that mode's extra frame, which 5 ms frames do not need, so it
+    // comes off as excess.
     fn switch_frame(&mut self, samples: usize) {
-        let old_ms = i64::from(frame_ms(self.frame));
-        let grown_ms = (self.target - self.min_depth()).max(0) * old_ms;
-        self.set_frame(samples);
+        self.carry_target_to(samples);
         let beyond_cap = self.play + self.cap();
         for slot in &mut self.slots {
             if slot.held != Held::Empty && slot.ext >= beyond_cap {
@@ -1080,14 +1077,25 @@ impl JitterBuffer {
         }
         let held = self.newest.map_or(1, |newest| newest - self.play + 1);
         self.depth = held.clamp(1, self.cap());
-        let new_ms = i64::from(frame_ms(samples));
-        let grown = (grown_ms + new_ms - 1) / new_ms;
-        self.target = (self.min_depth() + grown).min(self.cap());
         self.min_lag = self.play_lag - self.depth + 1;
         self.fastest = self.min_lag;
         self.last_change = Some(self.pulls);
         // Whatever was pending was worked out in frames of the old size.
         self.pending = None;
+    }
+
+    // What the rules asked for at the new size is its minimum plus whatever
+    // late packets had added to the old one's. The newest packet may already
+    // have changed the redundancy flag, and the 10 ms mode never sets it, so
+    // the old minimum is taken with it on: 5 ms of growth lost that way is
+    // well inside what the 10 ms mode's minimum adds.
+    fn carry_target_to(&mut self, samples: usize) {
+        let old_ms = i64::from(frame_ms(self.frame));
+        let grown_ms = (self.target - self.min_depth_for(self.frame, true)).max(0) * old_ms;
+        self.set_frame(samples);
+        let new_ms = i64::from(frame_ms(samples));
+        let grown = (grown_ms + new_ms - 1) / new_ms;
+        self.target = (self.min_depth() + grown).min(self.cap());
     }
 
     // Frame size follows the talker's mode. The depths carry over in
