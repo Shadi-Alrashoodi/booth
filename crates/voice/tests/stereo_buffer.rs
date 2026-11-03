@@ -619,6 +619,45 @@ fn three_lost_fade_out_after_20_ms() {
     }
 }
 
+// Three deep, the next spell's first frame comes three or four frames after
+// the spell before ended at the sharer, after its own turn, and playing
+// starts over from it. The concealment under way goes on as any does, two
+// frames and a third faded out, then silence, and the first frame fades in
+// from a reset decoder.
+#[test]
+fn concealment_under_way_at_a_new_spell_still_fades_out_after_20_ms() {
+    let first = spell(&music(1.0), 0, 0);
+    for gap in [3, 4] {
+        let second = spell(&music(1.0), 100, SECOND + gap * TICK);
+        let mut sent = first.clone();
+        sent.extend(second.iter().cloned());
+        let mut listener = Listener::new();
+        listener.buffer.set_period(1056);
+        let until = 2 * SECOND + (gap + 2) * TICK;
+        listener.run(&sent, &on_time(&sent), until, always);
+        let at = listener.pull_at(second[0].sent_at + 2 * TICK);
+        let gap = gap as usize;
+        let mut expected = vec![Some(Source::Concealed); 3];
+        expected.extend(vec![Some(Source::Silence); gap - 3]);
+        expected.push(Some(Source::Packet(100)));
+        assert_eq!(listener.sources(at - gap..at + 1), expected, "gap {gap}");
+        let third = &listener.heard[at - gap + 2].audio;
+        assert_eq!(third[SAMPLES - CHANNELS..], [0.0, 0.0]);
+        let replayed = replay(&sent, &listener.heard);
+        assert_eq!(listener.heard[at].audio, faded_in(&replayed[at].frame));
+        for n in 1..5 {
+            assert_eq!(listener.heard[at + n].audio, replayed[at + n].frame);
+        }
+        let stats = listener.stats();
+        assert_eq!(
+            (stats.late, stats.lost, stats.concealed, stats.depth_frames),
+            (0, 0, 3, 3),
+            "gap {gap}: {stats:?}"
+        );
+        listener.assert_no_clicks();
+    }
+}
+
 // Four frames late within 2 s, 2 percent: the first two frames late, past
 // the frame after it, which has already played; the others one frame late,
 // each within 5 s of the late frame before it, so none grows the buffer at

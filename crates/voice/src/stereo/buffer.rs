@@ -609,7 +609,6 @@ impl Buffer {
             self.stats.dropped += 1;
         }
         self.pending = None;
-        self.missing_run = 0;
         self.made_up = false;
         self.fade_in = !self.audible;
         self.timed_out = false;
