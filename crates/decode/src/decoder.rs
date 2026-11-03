@@ -965,4 +965,41 @@ mod tests {
         );
         assert_eq!(decoder.sei_kept, 0);
     }
+
+    // With no picture coming, only this count's flush lets go of what FFmpeg
+    // kept of a peer's SEI, so it is held here to 256 KB: the leak test
+    // (tests/leaks.rs) sees that the flush comes, not how late.
+    #[test]
+    fn the_sei_count_flushes_past_256_kb() {
+        let adapters = capture::adapters().unwrap_or_else(|e| panic!("{e}"));
+        let Some(adapter) = adapters.iter().find(|a| a.vendor_id == 0x10de) else {
+            println!("skipped: no NVIDIA GPU on this PC");
+            return;
+        };
+        let device = capture::device_on(adapter).unwrap_or_else(|e| panic!("{e}"));
+        let mut decoder = match Decoder::new(&device, Codec::H264) {
+            Ok(decoder) => decoder,
+            Err(err @ (DecodeError::Missing { .. } | DecodeError::Unsupported { .. })) => {
+                println!("skipped: {err}");
+                return;
+            }
+            Err(err) => panic!("{err}"),
+        };
+        let sei = [
+            &[0u8, 0, 1, 6, 5, 0xff, 0xff, 0xff, 0][..],
+            &[0x11; 765],
+            &[0x80],
+        ]
+        .concat();
+        let mut kept = 0;
+        for unit in 1.. {
+            let _ = decoder.decode(&sei);
+            kept += sei.len() - 3;
+            if kept > 256 << 10 {
+                assert_eq!(decoder.sei_kept, 0, "unit {unit}");
+                break;
+            }
+            assert_eq!(decoder.sei_kept, kept, "unit {unit}");
+        }
+    }
 }
