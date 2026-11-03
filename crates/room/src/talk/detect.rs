@@ -1,9 +1,10 @@
 // Open mic: whether to send, from the sound itself. Each 5 ms block's level
 // is held against the room's noise floor, the quietest block of the last
-// second; a voice is well above it, the fan and the keyboard are not. After
-// the voice stops, sending goes on for a random 200 to 800 ms (RFC 6562), so
-// the moments sending stops do not trace the pauses in the speech. That tail
-// also carries a talker across the gaps between words.
+// second of sound, digital silence left out; a voice is well above it, the
+// fan and the keyboard are not. After the voice stops, sending goes on for a
+// random 200 to 800 ms (RFC 6562), so the moments sending stops do not trace
+// the pauses in the speech. That tail also carries a talker across the gaps
+// between words.
 
 use std::time::Duration;
 
@@ -21,24 +22,27 @@ const ONSET_DB: f32 = 12.0;
 // the end of a word does not end it early.
 const HOLD_DB: f32 = 6.0;
 // Nothing quieter is a voice however quiet the room, unless the open mic
-// sensitivity in Settings says otherwise: a microphone that gives digital
-// silence would otherwise send on its own hiss.
+// sensitivity in Settings says otherwise: in a very quiet room a key or a
+// breath is well over the floor.
 pub const QUIETEST_VOICE_DB: i8 = -50;
 // The floor follows a quieter room at once and a louder one no faster than
 // this, so a voice that goes on for more than a second, or music, does not
 // become the floor and cut itself off.
 const FLOOR_RISE_DB_PER_S: f32 = 3.0;
 const SILENCE_DB: f32 = -100.0;
+// Exact zeros this many in a row, a millisecond, are digital silence: no
+// room's own noise stays that still.
+const SILENT_RUN: usize = 48;
 
 pub(crate) const TAIL_SHORTEST: Duration = Duration::from_millis(200);
 pub(crate) const TAIL_LONGEST: Duration = Duration::from_millis(800);
 
 pub(crate) struct Detector {
-    // One level a block, the last second of them.
+    // One level a block of sound, the last second of them.
     levels: [f32; BLOCKS_PER_SECOND],
     next: usize,
-    // Blocks heard so far, up to a second's worth. Until a second has been
-    // heard the floor is simply the quietest block so far.
+    // Blocks of sound heard so far, up to a second's worth. Until a second
+    // has been heard the floor is simply the quietest block so far.
     heard: usize,
     floor: f32,
     voice: bool,
@@ -92,19 +96,26 @@ impl Detector {
 
     fn block(&mut self, block: &[f32]) -> bool {
         let level = level_db(block);
-        self.levels[self.next] = level;
-        self.next = (self.next + 1) % BLOCKS_PER_SECOND;
-        self.heard = (self.heard + 1).min(BLOCKS_PER_SECOND);
-        let quietest = self.levels[..self.heard]
-            .iter()
-            .copied()
-            .fold(f32::INFINITY, f32::min);
-        let rise = FLOOR_RISE_DB_PER_S * BLOCK as f32 / SAMPLE_RATE as f32;
-        self.floor = if self.heard < BLOCKS_PER_SECOND {
-            quietest
-        } else {
-            quietest.min(self.floor + rise)
-        };
+        // Digital silence, a packet Windows marks silent or a microphone's
+        // own mute, is not the room. As the floor it would let the room's
+        // noise after it pass for a voice until the floor climbed back. A
+        // block it starts or ends in is left out too: its zeros pull the
+        // block's level under the room's.
+        if level > SILENCE_DB && !digital_silence(block) {
+            self.levels[self.next] = level;
+            self.next = (self.next + 1) % BLOCKS_PER_SECOND;
+            self.heard = (self.heard + 1).min(BLOCKS_PER_SECOND);
+            let quietest = self.levels[..self.heard]
+                .iter()
+                .copied()
+                .fold(f32::INFINITY, f32::min);
+            let rise = FLOOR_RISE_DB_PER_S * BLOCK as f32 / SAMPLE_RATE as f32;
+            self.floor = if self.heard < BLOCKS_PER_SECOND {
+                quietest
+            } else {
+                quietest.min(self.floor + rise)
+            };
+        }
 
         let over = if self.voice { HOLD_DB } else { ONSET_DB };
         let voice = level >= self.quietest_db && level >= self.floor + over;
@@ -145,6 +156,14 @@ fn level_db(block: &[f32]) -> f32 {
         return SILENCE_DB;
     }
     (10.0 * power.log10()).max(SILENCE_DB)
+}
+
+fn digital_silence(block: &[f32]) -> bool {
+    let mut zeros = 0;
+    block.iter().any(|&sample| {
+        zeros = if sample == 0.0 { zeros + 1 } else { 0 };
+        zeros >= SILENT_RUN
+    })
 }
 
 pub(crate) fn random() -> u32 {
@@ -285,6 +304,57 @@ mod tests {
         let mut signal = vec![0.0; 48_000];
         signal.extend(noise(2000, -70.0, &mut seed));
         assert!(run(&mut detector, &signal).iter().all(|&on| !on));
+    }
+
+    // Digital silence in a fan, at the start or after the floor was learnt,
+    // leaves the floor at the fan's, so the fan does not send: a block of it,
+    // or a run that starts and ends partway through blocks, 8 samples of the
+    // fan in each.
+    #[test]
+    fn digital_silence_in_a_fan_is_not_the_floor() {
+        let mut seed = 17;
+        for before in [0, 2000] {
+            for (fan, zeros) in [(0, BLOCK), (8, 2 * BLOCK - 16)] {
+                let mut detector = Detector::with_random(|| 0);
+                let mut signal = noise(before + 1, -45.0, &mut seed);
+                signal.truncate(before * MS + fan);
+                signal.extend(vec![0.0; zeros]);
+                signal.extend(noise(20_000, -45.0, &mut seed));
+                let sent = run(&mut detector, &signal);
+                assert!(
+                    sent.iter().all(|&on| !on),
+                    "{zeros} zeros after {before} ms and {fan} samples of the fan"
+                );
+            }
+        }
+    }
+
+    // Nor is a mute that leaves the converter's last bit toggling, about
+    // -120 dBFS and never zero.
+    #[test]
+    fn a_toggling_last_bit_in_a_fan_is_not_the_floor() {
+        let mut seed = 23;
+        let mut detector = Detector::with_random(|| 0);
+        let mut signal = noise(2000, -45.0, &mut seed);
+        signal.extend((0..BLOCK).map(|i| if i % 2 == 0 { 1e-6 } else { -1e-6 }));
+        signal.extend(noise(20_000, -45.0, &mut seed));
+        assert!(run(&mut detector, &signal).iter().all(|&on| !on));
+    }
+
+    // Digital silence after a voice is no voice either, so the spell ends
+    // with its tail.
+    #[test]
+    fn digital_silence_after_a_voice_ends_it_with_a_tail() {
+        let mut seed = 19;
+        let mut detector = Detector::with_random(|| 0);
+        let mut signal = noise(1000, -60.0, &mut seed);
+        signal.extend(tone(300, 0.2, 0));
+        let loud_end = signal.len() / MS;
+        signal.extend(vec![0.0; 1000 * MS]);
+        let sent = run(&mut detector, &signal);
+        let last = sent.iter().rposition(|&on| on).expect("sent at all");
+        let tail = ms_of(last + 1) - loud_end;
+        assert!(tail.abs_diff(200) <= 5, "{tail} ms");
     }
 
     // A voice that never pauses, or music: the floor creeps up slowly, so

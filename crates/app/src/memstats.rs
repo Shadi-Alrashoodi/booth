@@ -78,12 +78,16 @@ pub fn devices() -> Option<Devices> {
 }
 
 // 440 Hz at 48 kHz, 2.5 s on and 0.5 s off: open mic takes the quietest
-// block of the last second as the room's noise, so a tone that never stops
-// would never count as a voice. A whole number of cycles a second, so the
-// phase never jumps where the frame count wraps.
+// block of the last second of sound as the room's noise, digital silence
+// left out, so a tone that never stops would never count as a voice, and the
+// off part is a hiss at about -71 dBFS rather than zeros. A whole number of
+// cycles a second, so the phase never jumps where the frame count wraps.
 fn tone(frame: u64, _channel: u16) -> f32 {
     if frame % 144_000 >= 120_000 {
-        return 0.0;
+        let mut hashed = frame.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        hashed ^= hashed >> 29;
+        hashed = hashed.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        return ((hashed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.001;
     }
     let at = (frame % 48_000) as f32 / 48_000.0;
     (at * 440.0 * std::f32::consts::TAU).sin() * 0.25
@@ -424,5 +428,29 @@ unsafe impl GlobalAlloc for Counting {
         }
         count(tag, new_size as isize - layout.size() as isize, 0);
         unsafe { base.add(offset) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Open mic counts the tone as a voice only over an off part that is the
+    // room's noise to it: sound, never a millisecond of zeros, and far under
+    // the tone.
+    #[test]
+    fn the_tone_comes_over_a_hiss() {
+        let level = |frames: std::ops::Range<u64>| {
+            let len = (frames.end - frames.start) as f32;
+            let power = frames.map(|frame| tone(frame, 0).powi(2)).sum::<f32>() / len;
+            10.0 * power.log10()
+        };
+        let (on, off) = (level(0..120_000), level(120_000..144_000));
+        assert!(off > -100.0 && on > off + 40.0, "{on} {off}");
+        let mut zeros = 0;
+        for frame in 0..144_000 {
+            zeros = if tone(frame, 0) == 0.0 { zeros + 1 } else { 0 };
+            assert!(zeros < 48, "{zeros} zeros at {frame}");
+        }
     }
 }
