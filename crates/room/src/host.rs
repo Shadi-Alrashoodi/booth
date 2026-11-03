@@ -1630,6 +1630,7 @@ impl Host {
             if peer.sessions.current.is_none() {
                 continue;
             }
+            peer.link.this_pc_moved();
             peer.send_ping(socket, clock);
             peer.link.next_ping = now + peer.link.ping_every(sending, now, &self.timers);
             pinged.push(peer.addr);
@@ -5856,6 +5857,40 @@ mod tests {
                 )
         });
         assert!(pinged, "no ping from the new address");
+    }
+
+    // The new address can be a new path to each friend, and the old one's
+    // floor would make a slower new one read as a queue to the host's own
+    // share, so the round trips start again.
+    #[test]
+    fn new_public_address_starts_the_round_trips_again() {
+        let ms = Duration::from_millis;
+        let start = Instant::now();
+        let (mut host, socket) = Rig::host(start, Log::off(), false);
+        let server = Wire::new();
+        host.stun_found(vec![server.addr()], &socket);
+        assert!(!host.stun_resolved(start));
+        answer_stun(&mut host, &socket, &server, OUTSIDE, start);
+        let mut rig = Rig::holding(host, socket, start);
+        let mut ana = Guest::new();
+        ana.join(&mut rig, "Ana", start);
+        // 30 s of the old path at 20 ms.
+        let link = &mut rig.host.peers[0].link;
+        for tenth in 1..=300 {
+            link.timed(start + ms(100) * tenth, ms(20));
+        }
+        let noticed = start + Duration::from_secs(30);
+        rig.host.address_changed(noticed, &rig.socket, None);
+        answer_stun(&mut rig.host, &rig.socket, &server, MOVED, noticed);
+        let link = &mut rig.host.peers[0].link;
+        let mut at = noticed;
+        for _ in 0..10 {
+            at += ms(100);
+            link.timed(at, ms(60));
+        }
+        let rtt = link.round_trip(at).expect("a round trip");
+        assert!((rtt.floor_ms - 60.0).abs() < 0.01, "{rtt:?}");
+        assert!(!rtt.risen(), "{rtt:?}");
     }
 
     // A round that one server left unanswered ends at stun_wait and shows

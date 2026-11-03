@@ -1483,6 +1483,7 @@ impl Client {
         if self.state != LinkState::Connecting {
             // Stamped the way Link::ping stamps a ping, when it is built.
             self.own_moved = Some(self.clock.micros(Instant::now()));
+            self.link.this_pc_moved();
             if matches!(self.state, LinkState::Reconnecting | LinkState::Lost) {
                 self.in_room_code(now);
             }
@@ -4515,6 +4516,34 @@ mod tests {
         let view = rig.client.view(quiet, 0);
         assert_eq!(view.strip.state, LinkState::Reconnecting);
         assert_eq!(view.reply, None);
+    }
+
+    // This PC's own move can be a new path to the host, and the old one's
+    // floor would make a slower new one read as a queue to the share's rate,
+    // so the round trips start again.
+    #[test]
+    fn own_move_starts_the_round_trips_again() {
+        let ms = Duration::from_millis;
+        let start = Instant::now();
+        let (mut rig, _) = Rig::connected(Timers::default(), start);
+        let server = Wire::new();
+        stun_on(&mut rig, &server, OUTSIDE, start);
+        // 30 s of the old path at 20 ms.
+        for tenth in 1..=300 {
+            rig.client.link.timed(start + ms(100) * tenth, ms(20));
+        }
+        let plugged = start + Duration::from_secs(30);
+        rig.client.address_changed(plugged, &rig.socket);
+        answer_stun(&mut rig, &server, MOVED, plugged);
+        assert!(rig.client.own_moved.is_some());
+        let mut at = plugged;
+        for _ in 0..10 {
+            at += ms(100);
+            rig.client.link.timed(at, ms(60));
+        }
+        let rtt = rig.client.link.round_trip(at).expect("a round trip");
+        assert!((rtt.floor_ms - 60.0).abs() < 0.01, "{rtt:?}");
+        assert!(!rtt.risen(), "{rtt:?}");
     }
 
     // Over the LAN or a tunnel, this PC's outside address is not where the

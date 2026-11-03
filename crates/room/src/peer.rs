@@ -682,6 +682,21 @@ impl Link {
         self.path_recovered(now);
         self.offset.clear();
         self.rtt.clear();
+        // Taken now, as a ping is stamped when built, so no ping built
+        // before the move counts.
+        self.minute.new_path(Instant::now());
+    }
+
+    // This PC's own outside address changed, which can be a new path to the
+    // other side too. Taken now, as in path_changed.
+    pub(crate) fn this_pc_moved(&mut self) {
+        self.minute.new_path(Instant::now());
+    }
+
+    // A round trip timed at `now`, as a pong gives it.
+    #[cfg(test)]
+    pub(crate) fn timed(&mut self, now: Instant, rtt: Duration) {
+        self.minute.ping(now, rtt);
     }
 
     pub(crate) fn queue(&mut self, message: &Message) {
@@ -889,6 +904,49 @@ mod tests {
         assert!(media.answered(new_home, 9, 3_000));
         assert_eq!(media.to(), new_home);
         assert!(!media.answered(new_home, 9, 4_000), "once");
+    }
+
+    // After a move the round trips start again from the new path: the old
+    // one's floor would make a slower new one read as a queue. The pong for
+    // a ping sent before the move, as the packet that moved the peer can be,
+    // timed part of the old path and does not count either.
+    #[test]
+    fn a_new_path_starts_its_round_trips_again() {
+        let ms = Duration::from_millis;
+        let start = Instant::now()
+            .checked_sub(Duration::from_secs(40))
+            .expect("a PC up for 40 s");
+        let clock = Clock::new(start);
+        let mut link = Link::new(start);
+        // 30 s of the old path at 20 ms, up to about now.
+        for tenth in 100..400 {
+            link.minute.ping(start + ms(100) * tenth, ms(20));
+        }
+        let before = Instant::now();
+        let Ok(PingMessage::Ping { seq, t1 }) = PingMessage::decode(&link.ping(clock)) else {
+            panic!("ping() built something else");
+        };
+        link.path_changed(before);
+        let moved = before + ms(40);
+        let t2 = clock.micros(moved);
+        assert!(link.pong(
+            PingMessage::Pong {
+                seq,
+                t1,
+                t2,
+                t3: t2
+            },
+            moved,
+            clock
+        ));
+        let mut at = moved;
+        for _ in 0..10 {
+            at += ms(100);
+            link.minute.ping(at, ms(60));
+        }
+        let rtt = link.round_trip(at).expect("a round trip");
+        assert!((rtt.floor_ms - 60.0).abs() < 0.01, "{rtt:?}");
+        assert!(!rtt.risen(), "{rtt:?}");
     }
 
     // Frames over to the other side's feedback stream and its ack back.

@@ -18,6 +18,8 @@ const MAX_SAMPLES: usize = 1024;
 pub(crate) struct Minute {
     acks: VecDeque<(Instant, Duration)>,
     pings: VecDeque<(Instant, Duration)>,
+    // When the link last moved to a new path, if it did.
+    path_since: Option<Instant>,
     next_line: Instant,
     // The link's retransmit count when the last line was written.
     retransmits_before: u64,
@@ -28,6 +30,7 @@ impl Minute {
         Minute {
             acks: VecDeque::new(),
             pings: VecDeque::new(),
+            path_since: None,
             next_line: now + SPAN,
             retransmits_before: 0,
         }
@@ -37,8 +40,25 @@ impl Minute {
         keep(&mut self.acks, now, delay);
     }
 
+    // `rtt` is from sending the ping to `now`. A ping sent before a move
+    // timed part of the old path, and is left out.
     pub(crate) fn ping(&mut self, now: Instant, rtt: Duration) {
+        if self
+            .path_since
+            .is_some_and(|since| now.saturating_duration_since(since) < rtt)
+        {
+            return;
+        }
         keep(&mut self.pings, now, rtt);
+    }
+
+    // The link moved to a new path at `at`. The old path's round trips go:
+    // its floor would make a slower new path read as a queue to the video
+    // rate's backoff for as long as it stays in the floor's span. The log's
+    // line loses them too.
+    pub(crate) fn new_path(&mut self, at: Instant) {
+        self.pings.clear();
+        self.path_since = Some(at);
     }
 
     pub(crate) fn ack_delay_avg(&self, now: Instant) -> Option<Duration> {
