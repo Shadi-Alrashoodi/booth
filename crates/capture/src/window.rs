@@ -26,6 +26,9 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+};
 use windows::Win32::System::Com::CoIncrementMTAUsage;
 use windows::Win32::System::Performance::QueryPerformanceFrequency;
 use windows::Win32::System::Threading::{
@@ -36,7 +39,9 @@ use windows::Win32::System::WinRT::Direct3D11::{
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
-use windows::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsIconic};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetWindowPlacement, GetWindowThreadProcessId, IsIconic, WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED,
+};
 use windows::core::{Interface, factory};
 
 use crate::border::{self, Border};
@@ -265,6 +270,18 @@ impl WindowCapture {
         adapter: &Adapter,
         options: Options,
     ) -> Result<WindowCapture, CaptureError> {
+        WindowCapture::reopen(window, adapter, options, None)
+    }
+
+    // As open, for a share that had a capture of the window before, whose
+    // newest picture was `last` (content): a window minimized since opens at
+    // that size.
+    pub fn reopen(
+        window: WindowId,
+        adapter: &Adapter,
+        options: Options,
+        last: Option<(u32, u32)>,
+    ) -> Result<WindowCapture, CaptureError> {
         if !window.exists() {
             return Err(CaptureError::other(WINDOW_GONE));
         }
@@ -292,8 +309,17 @@ impl WindowCapture {
             .map_err(fail("share the GPU with"))?;
         // The pictures are what DWM composes, without the shadow and the
         // invisible borders the item's own size counts, so the first plan
-        // is made from DWM's bounds where it has them.
-        let size = match frame_size(window) {
+        // is made from DWM's bounds where it has them. A minimized window's
+        // are its caption's, so it opens at the size of the share's last
+        // picture of it, or with none at the one its placement gives, which
+        // is not where a window snapped to a side of its monitor comes back.
+        let bounds = if window.minimized() {
+            last.map(|(width, height)| (width as i32, height as i32))
+                .or_else(|| restored_size(window))
+        } else {
+            frame_size(window)
+        };
+        let size = match bounds {
             Some((width, height)) => SizeInt32 {
                 Width: width,
                 Height: height,
@@ -430,6 +456,12 @@ impl WindowCapture {
     // The frame the newest picture would have of its own, under the limits.
     pub fn natural(&self) -> Option<(u32, u32)> {
         self.natural
+    }
+
+    // The newest picture's size before the limits, which a window minimized
+    // since still had; None until a picture comes.
+    pub fn content(&self) -> Option<(u32, u32)> {
+        self.content
     }
 
     // The newest picture converted once more under the frame set now, for a
@@ -920,6 +952,38 @@ fn frame_size(window: WindowId) -> Option<(i32, i32)> {
     }
     .ok()?;
     Some((bounds.right - bounds.left, bounds.bottom - bounds.top))
+}
+
+// The size a minimized window comes back at as its placement says: its
+// normal rectangle, which counts the invisible borders its pictures leave
+// out, or for one that comes back maximized the work area of its monitor,
+// which a window with a title bar then fills, while one without can cover
+// the taskbar too. A window snapped to a side of its monitor comes back
+// snapped, and its normal rectangle is where it was before the snap.
+fn restored_size(window: WindowId) -> Option<(i32, i32)> {
+    let mut placement = WINDOWPLACEMENT {
+        length: mem::size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: a live WINDOWPLACEMENT whose length says so; a gone window
+    // fails.
+    unsafe { GetWindowPlacement(window.handle(), &mut placement) }.ok()?;
+    let mut rect = placement.rcNormalPosition;
+    if placement.flags.0 & WPF_RESTORETOMAXIMIZED.0 != 0 {
+        // SAFETY: a plain query; for a minimized window it goes by where the
+        // window was before.
+        let monitor = unsafe { MonitorFromWindow(window.handle(), MONITOR_DEFAULTTONEAREST) };
+        let mut info = MONITORINFO {
+            cbSize: mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: a live MONITORINFO whose size says so; a stale monitor
+        // only makes it fail.
+        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            rect = info.rcWork;
+        }
+    }
+    Some((rect.right - rect.left, rect.bottom - rect.top))
 }
 
 // Windows hands a window's frame over as soon as DWM has composed it, and

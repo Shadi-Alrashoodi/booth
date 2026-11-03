@@ -37,13 +37,29 @@ struct Window(isize);
 
 impl Window {
     fn with_style(style: WINDOW_STYLE, width: i32, height: i32) -> Window {
+        Window::made(style, width, height, false)
+    }
+
+    // One Windows snaps to a side of its monitor: not a tool window, and of a
+    // class that leaves a double click on its edge to Windows, which STATIC
+    // does not.
+    fn snappable(width: i32, height: i32) -> Window {
+        Window::made(WS_OVERLAPPEDWINDOW, width, height, true)
+    }
+
+    fn made(style: WINDOW_STYLE, width: i32, height: i32, snaps: bool) -> Window {
         let (sent, got) = mpsc::channel();
         thread::spawn(move || {
+            let (ex, class) = if snaps {
+                (WS_EX_NOACTIVATE, w!("BUTTON"))
+            } else {
+                (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, w!("STATIC"))
+            };
             // SAFETY: a system class, constant strings, no parent.
             let hwnd = unsafe {
                 CreateWindowExW(
-                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                    w!("STATIC"),
+                    ex,
+                    class,
                     w!("Booth window share test"),
                     style | WS_VISIBLE,
                     120,
@@ -528,4 +544,68 @@ fn a_dragged_window_keeps_its_encoders_apart() {
         during as f64 >= dragged.as_secs_f64() * 30.0,
         "only {during} frames in {dragged:?}"
     );
+}
+
+// Paused by hand, minimized, and resumed while still minimized, a share opens
+// at the size it had: not its caption's, nor what the window's placement
+// says it comes back at, which counts the invisible borders the pictures
+// leave out and, for a window snapped to its monitor's full height as a
+// double click on its top edge does, is where it was before the snap.
+#[test]
+fn a_share_resumed_while_minimized_keeps_its_size() {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, HTTOP, IsIconic, SW_MINIMIZE, SendMessageW, ShowWindowAsync,
+        WM_NCLBUTTONDBLCLK,
+    };
+    let _turn = ALONE.read().unwrap_or_else(|p| p.into_inner());
+    let Some(adapter) = adapter() else { return };
+    let window = Window::snappable(640, 360);
+    let hwnd = HWND(window.0 as *mut _);
+    let rect = || {
+        let mut rect = RECT::default();
+        // SAFETY: a live RECT; a gone window fails.
+        let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
+        rect
+    };
+    let before = rect();
+    let edge = (before.top + 2) << 16 | (((before.left + before.right) / 2) & 0xffff);
+    // SAFETY: returns once the window's own thread has handled it.
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_NCLBUTTONDBLCLK,
+            Some(WPARAM(HTTOP as usize)),
+            Some(LPARAM(edge as isize)),
+        )
+    };
+    let snapped = rect() != before;
+    thread::sleep(Duration::from_millis(300));
+    let mut sharer = open(&window, adapter);
+    let mut watching = Watching::default();
+    run(&mut sharer, &mut watching, Duration::from_millis(300));
+    let size = sharer.size();
+    sharer.pause();
+    // SAFETY: posted to the window's own thread.
+    let _ = unsafe { ShowWindowAsync(hwnd, SW_MINIMIZE) };
+    let start = Instant::now();
+    // SAFETY: a plain query on a window of this process.
+    while !unsafe { IsIconic(hwnd) }.as_bool() {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the window did not minimize"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        sharer
+            .resume(&mut |_| {})
+            .unwrap_or_else(|err| panic!("{err}"))
+    );
+    println!(
+        "snapped {snapped}: shared at {size:?}, resumed minimized at {:?}",
+        sharer.size()
+    );
+    assert_eq!(sharer.size(), size);
 }

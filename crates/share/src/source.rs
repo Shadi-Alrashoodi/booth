@@ -182,7 +182,13 @@ pub(crate) enum Source {
 }
 
 impl Source {
-    pub(crate) fn open(choice: &Choice, options: capture::Options) -> Result<Source, String> {
+    // `last` is the size of a window's newest picture in the share's capture
+    // of it before, if it had one (WindowCapture::reopen).
+    pub(crate) fn open(
+        choice: &Choice,
+        options: capture::Options,
+        last: Option<(u32, u32)>,
+    ) -> Result<Source, String> {
         let text = |err: CaptureError| err.to_string();
         Ok(match choice {
             Choice::Screen(monitor) => {
@@ -192,7 +198,7 @@ impl Source {
                 Capture::open_region(monitor, *region, options).map_err(text)?,
             )),
             Choice::Window { window, adapter } => Source::Window(Box::new(
-                WindowCapture::open(*window, adapter, options).map_err(text)?,
+                WindowCapture::reopen(*window, adapter, options, last).map_err(text)?,
             )),
             Choice::Pattern {
                 adapter,
@@ -245,6 +251,15 @@ impl Source {
     pub(crate) fn natural(&self) -> Option<(u32, u32)> {
         match self {
             Source::Window(capture) => capture.natural(),
+            _ => None,
+        }
+    }
+
+    // A window's newest picture's size before the limits
+    // (WindowCapture::content); None for any other source.
+    pub(crate) fn content(&self) -> Option<(u32, u32)> {
+        match self {
+            Source::Window(capture) => capture.content(),
             _ => None,
         }
     }
@@ -426,7 +441,8 @@ pub(crate) struct Opened {
 // the software encoder is left and the share is larger than it takes, the
 // source opens again at the size and rate it takes (encode::open_codec
 // says why). `known` is what the share was told of HEVC before, as for
-// codec_for.
+// codec_for, and `last` a window's size before, as for Source::open.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn open(
     choice: &Choice,
     kind: Option<Kind>,
@@ -434,11 +450,12 @@ pub(crate) fn open(
     settings: &Settings,
     mut options: capture::Options,
     mut known: Option<HevcOffer>,
+    last: Option<(u32, u32)>,
     say: &mut dyn FnMut(Line),
 ) -> Result<Opened, String> {
     let mut fitted = false;
     loop {
-        let source = Source::open(choice, options)?;
+        let source = Source::open(choice, options, last)?;
         if let Source::Window(capture) = &source {
             say(Line::Log(capture.border().to_string()));
             if let Some(note) = capture.pacing_note() {

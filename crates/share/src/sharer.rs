@@ -278,6 +278,11 @@ pub struct Sharer {
     last_encoder: Option<Instant>,
     resize_retry: Option<Instant>,
     resizes_failed: u32,
+    // A shared window's size in the newest picture a source that went had
+    // of it: a source opened again while the window is minimized starts at
+    // it, since its caption says nothing of its size and its placement
+    // nothing of a snap to a side of its monitor.
+    window_size: Option<(u32, u32)>,
 }
 
 // The change from a failed GPU encoder to the software one, timed for the
@@ -377,6 +382,7 @@ impl Sharer {
             &setup.settings,
             options,
             None,
+            None,
             say,
         )?;
         let options = opened.options;
@@ -431,6 +437,7 @@ impl Sharer {
             last_encoder: Some(Instant::now()),
             resize_retry: None,
             resizes_failed: 0,
+            window_size: None,
         };
         sharer.box_software_window();
         Ok(sharer)
@@ -530,8 +537,17 @@ impl Sharer {
     pub fn pause(&mut self) {
         self.forget_pictures();
         self.held_in = self.codec().or(self.held_in);
+        self.keep_window_size();
         self.opened = None;
         self.held = true;
+    }
+
+    // Before the source goes (window_size).
+    fn keep_window_size(&mut self) {
+        let opened = self.opened.as_ref();
+        self.window_size = opened
+            .and_then(|opened| opened.source.content())
+            .or(self.window_size);
     }
 
     // Nothing from before goes out from here on: neither the last picture,
@@ -749,6 +765,7 @@ impl Sharer {
         // old one goes before the new one opens, and the last picture with
         // it, since it is on the old one's texture.
         self.last = None;
+        self.keep_window_size();
         self.opened = None;
         self.reopens += 1;
         let mut opened = source::open(
@@ -758,6 +775,7 @@ impl Sharer {
             &self.setup.settings,
             options,
             self.hevc_offer.clone(),
+            self.window_size,
             say,
         )?;
         if current.is_some_and(|was| was != opened.encoder.codec()) {
@@ -1478,6 +1496,7 @@ impl Sharer {
             }
             Some(fit) => {
                 audience.line(source::runs_smaller(fit, self.size, self.fps));
+                self.window_size = source.content().or(self.window_size);
                 // Windows allows one duplication of a monitor per process,
                 // and the last picture is on the old one's texture.
                 drop(source);
@@ -1490,7 +1509,8 @@ impl Sharer {
                 };
                 // Capture failing to open again is capture's own error, for
                 // which a new graphics driver is no answer.
-                let source = Source::open(&self.setup.choice, options).map_err(|why| {
+                let last = self.window_size;
+                let source = Source::open(&self.setup.choice, options, last).map_err(|why| {
                     audience.line(Line::Log(format!(
                         "the source did not open again for the software encoder after {was} failed: {why}"
                     )));

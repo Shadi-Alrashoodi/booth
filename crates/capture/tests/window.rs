@@ -10,10 +10,11 @@ use std::time::{Duration, Instant};
 use capture::{Next, Options, PauseReason, WINDOW_GONE, WindowCapture, WindowId};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DispatchMessageW, IsWindow, MSG, PM_REMOVE, PeekMessageW, PostMessageW,
-    SW_MINIMIZE, SW_RESTORE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
-    SetWindowPos, SetWindowTextW, ShowWindowAsync, TranslateMessage, WINDOW_STYLE, WM_CLOSE,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    CreateWindowExW, DispatchMessageW, IsWindow, IsZoomed, MSG, PM_REMOVE, PeekMessageW,
+    PostMessageW, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOZORDER, SetWindowPos, SetWindowTextW, ShowWindowAsync, TranslateMessage,
+    WINDOW_STYLE, WM_CLOSE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WS_VISIBLE,
 };
 use windows::core::{HSTRING, w};
 
@@ -437,6 +438,55 @@ fn a_minimized_window_pauses_and_comes_back() {
     println!("after restoring: {sizes:?}");
     assert!(!sizes.is_empty());
     assert!(sizes.iter().all(|&each| each == size), "{sizes:?}");
+}
+
+// Opened while minimized with no picture of it before, as a row picked then
+// opens it, a window opens at the size it comes back at, not its caption's:
+// a plain one at its own, one that comes back maximized at what it had
+// maximized.
+#[test]
+fn a_minimized_window_opens_at_the_size_it_comes_back_at() {
+    let _turn = ALONE.write().unwrap_or_else(|p| p.into_inner());
+    let Some(adapter) = adapter() else { return };
+    let options = Options {
+        max_width: 0,
+        max_height: 0,
+        max_fps: 0,
+    };
+    let source = |window: &Window| {
+        let plan = WindowCapture::open(window.id(), &adapter, options)
+            .unwrap()
+            .plan();
+        (plan.source_width, plan.source_height)
+    };
+    let plain = Window::open(640, 360);
+    let maximized = Window::with_style(WS_OVERLAPPEDWINDOW, 640, 360);
+    maximized.show(SW_MAXIMIZE);
+    let start = Instant::now();
+    // SAFETY: a plain query on a window of this process.
+    while !unsafe { IsZoomed(maximized.hwnd()) }.as_bool() {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the window did not maximize"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    thread::sleep(Duration::from_millis(300));
+    let shown = source(&maximized);
+    plain.show(SW_MINIMIZE);
+    maximized.show(SW_MINIMIZE);
+    let start = Instant::now();
+    while !plain.id().minimized() || !maximized.id().minimized() {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the windows did not minimize"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    thread::sleep(Duration::from_millis(300));
+    let opened = (source(&plain), source(&maximized));
+    println!("maximized {shown:?}; opened minimized at {opened:?}");
+    assert_eq!(opened, ((640, 360), shown));
 }
 
 // A restore that lands while a pass that found the window minimized is held
