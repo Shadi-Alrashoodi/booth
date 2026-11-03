@@ -147,8 +147,8 @@ fn next_watch(watching: &Watching, log: &Log) -> Option<Start> {
             }
         }
         // No inbox means the watch ended again before this thread got to it,
-        // or Windows would not make the inbox's event, which leaves nothing
-        // to show either way.
+        // or Windows would not make the inbox's event, which the room was
+        // told and logged, and it ends the watch. Nothing to show either way.
         if let Some((share, fps, name)) = pending.take() {
             match watching.inbox_for(share) {
                 Some(inbox) => {
@@ -159,7 +159,10 @@ fn next_watch(watching: &Watching, log: &Log) -> Option<Start> {
                         inbox,
                     });
                 }
-                None => log!(log, "watch {share}: over before the viewer opened"),
+                None => log!(
+                    log,
+                    "watch {share}: no viewer: the watch ended before it opened, or its inbox could not be made"
+                ),
             }
         }
         if let Err(err) = net::pace::wait(watching.signal(), None) {

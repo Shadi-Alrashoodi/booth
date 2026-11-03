@@ -413,11 +413,13 @@ impl Host {
         // Live until the answer below says how the share stands; a room
         // standing for an older copy gives none.
         self.screen.watching.set_share_state(ShareState::Live);
-        self.screen.watching.event(WatchEvent::Started {
+        if let Some(why) = self.screen.watching.event(WatchEvent::Started {
             share,
             fps,
             name: self.name_of(&sharer),
-        });
+        }) {
+            log!(self.log, "watch {share}: {why}");
+        }
         self.own_watcher.hevc = self.screen.watching.takes_hevc();
         self.own_watcher.limits = Some(self.own_limits());
         self.started_watching(By::Host, now, socket);
@@ -525,7 +527,8 @@ impl Host {
         true
     }
 
-    // From this host's viewer's thread.
+    // From this host's viewer's thread, or from a start of watching whose
+    // viewer's inbox could not be made.
     fn watch_news(&mut self, news: WatchNews, now: Instant, socket: &Socket) -> bool {
         let share = match news {
             WatchNews::Failed { share, name, why } => {

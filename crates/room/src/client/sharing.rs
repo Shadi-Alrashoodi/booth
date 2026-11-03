@@ -220,11 +220,13 @@ impl Client {
         // Live until the host's answer says how the share stands; a host
         // older than 1.3.0 gives none.
         self.screen.watching.set_share_state(ShareState::Live);
-        self.screen.watching.event(WatchEvent::Started {
+        if let Some(why) = self.screen.watching.event(WatchEvent::Started {
             share,
             fps: current.fps,
             name,
-        });
+        }) {
+            log!(self.log, "watch {share}: {why}");
+        }
         self.link.queue(&Message::Watch {
             share,
             on: true,
@@ -394,7 +396,8 @@ impl Client {
         true
     }
 
-    // From this PC's viewer's thread.
+    // From this PC's viewer's thread, or from a start of watching whose
+    // viewer's inbox could not be made.
     fn watch_news(&mut self, news: WatchNews, now: Instant, socket: &Socket) -> bool {
         let share = match news {
             WatchNews::Failed { share, name, why } => {

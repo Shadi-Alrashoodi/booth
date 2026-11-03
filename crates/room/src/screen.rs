@@ -32,6 +32,7 @@ pub(crate) mod wire;
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -1110,7 +1111,8 @@ struct Attached {
     one_way_ms: Option<f32>,
 }
 
-// What the viewer's thread tells the room about the share `share`.
+// What the viewer's thread tells the room about the share `share`, or a
+// start whose viewer's inbox could not be made.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum WatchNews {
     // The viewer could not open, or stopped on an error; the room stops
@@ -1397,10 +1399,14 @@ impl Watching {
         self.wake.set();
     }
 
-    pub(crate) fn event(&self, event: WatchEvent) {
-        if self.threads {
-            self.viewer_event(&event);
-        }
+    // Why the viewer's inbox could not be made for a start, for the log; the
+    // room hears of it as of a viewer that could not open.
+    pub(crate) fn event(&self, event: WatchEvent) -> Option<String> {
+        let refused = if self.threads {
+            self.viewer_event(&event, share::Inbox::new)
+        } else {
+            None
+        };
         let mut inbox = lock(&self.inbox);
         if let WatchEvent::Ended { share } = event {
             // What waits for a share that ended goes nowhere now.
@@ -1430,6 +1436,7 @@ impl Watching {
         inbox.events.push(event);
         drop(inbox);
         self.wake.set();
+        refused
     }
 
     pub(crate) fn take_backs(&self) -> Vec<Back> {
@@ -1454,43 +1461,64 @@ impl Watching {
 
     // The viewer's side of a start, an end or a new frame rate. The inbox is
     // made the moment watching starts, before the viewer's window opens, so
-    // the IDR asked for at the start never arrives to nobody.
-    fn viewer_event(&self, event: &WatchEvent) {
+    // the IDR asked for at the start never arrives to nobody. `new_inbox`
+    // makes it: share::Inbox::new, or a test's that fails.
+    fn viewer_event(
+        &self,
+        event: &WatchEvent,
+        new_inbox: impl FnOnce() -> io::Result<share::Inbox>,
+    ) -> Option<String> {
         let mut attached = lock(&self.attached);
         match *event {
-            WatchEvent::Started { share, fps, .. } => {
+            WatchEvent::Started {
+                share,
+                fps,
+                ref name,
+            } => {
                 if let Some(old) = attached.take() {
                     old.inbox.stop();
                 }
                 // Making an event is all Inbox::new does; if Windows refuses
-                // even that, the viewer's thread finds no inbox and says so.
-                if let Ok(inbox) = share::Inbox::new() {
-                    let offset = lock(&self.offset)
-                        .filter(|(watched, _, _)| *watched == share)
-                        .map(|(_, offset_us, _)| offset_us);
-                    if let Some(offset_us) = offset {
-                        inbox.set_clock(sharer_clock(self.clock, offset_us));
+                // even that, no viewer can open, and the room stops watching
+                // and says why, as for a viewer that could not open.
+                match new_inbox() {
+                    Ok(inbox) => {
+                        let offset = lock(&self.offset)
+                            .filter(|(watched, _, _)| *watched == share)
+                            .map(|(_, offset_us, _)| offset_us);
+                        if let Some(offset_us) = offset {
+                            inbox.set_clock(sharer_clock(self.clock, offset_us));
+                        }
+                        if let Some(control) = *lock(&self.control) {
+                            inbox.set_control(Some(control));
+                        }
+                        *attached = Some(Attached {
+                            share,
+                            inbox: Arc::new(inbox),
+                            knob: self
+                                .knob
+                                .filter(|knob| knob.percent > 0.0)
+                                .map(|knob| Knob::new(knob.percent, knob.seed)),
+                            knob_dropped: 0,
+                            shapes: VecDeque::new(),
+                            drawn: 0,
+                            scale: 1.0,
+                            pointer: None,
+                            offset,
+                            link_at: None,
+                            fps,
+                            one_way_ms: None,
+                        });
                     }
-                    if let Some(control) = *lock(&self.control) {
-                        inbox.set_control(Some(control));
+                    Err(err) => {
+                        drop(attached);
+                        self.tell(WatchNews::Failed {
+                            share,
+                            name: name.clone(),
+                            why: format!("{err}. Close some programs and press Watch again"),
+                        });
+                        return Some(err.to_string());
                     }
-                    *attached = Some(Attached {
-                        share,
-                        inbox: Arc::new(inbox),
-                        knob: self
-                            .knob
-                            .filter(|knob| knob.percent > 0.0)
-                            .map(|knob| Knob::new(knob.percent, knob.seed)),
-                        knob_dropped: 0,
-                        shapes: VecDeque::new(),
-                        drawn: 0,
-                        scale: 1.0,
-                        pointer: None,
-                        offset,
-                        link_at: None,
-                        fps,
-                        one_way_ms: None,
-                    });
                 }
             }
             WatchEvent::Ended { share } => {
@@ -1509,6 +1537,7 @@ impl Watching {
                 }
             }
         }
+        None
     }
 
     // The viewer's inbox for `share`, from its Started until its Ended.
@@ -2234,6 +2263,42 @@ mod tests {
             watching.shape(share, 7, color(1));
             assert_eq!(waiting(&inbox), Some((true, with_picture, false)));
         }
+    }
+
+    // An inbox Windows will not make an event for leaves no viewer to open:
+    // the room hears it failed, so it stops watching and says why, the log
+    // gets Windows' words, and the last share's viewer is stopped all the
+    // same.
+    #[test]
+    fn a_viewer_without_an_inbox_is_told_to_the_room() {
+        let wake = Signal::new().expect("create an event");
+        let watching = Watching::new(Clock::new(Instant::now()), wake, true, None, true);
+        let started = |share| WatchEvent::Started {
+            share,
+            fps: 60,
+            name: String::from("Ana"),
+        };
+        assert_eq!(watching.viewer_event(&started(1), share::Inbox::new), None);
+        let old = watching.inbox_for(1).expect("the viewer's inbox");
+        let refused = watching.viewer_event(&started(2), || {
+            Err(io::Error::other("could not create an event: none left"))
+        });
+        assert_eq!(
+            refused.as_deref(),
+            Some("could not create an event: none left")
+        );
+        assert!(old.stopped(), "the last viewer");
+        assert!(watching.inbox_for(2).is_none());
+        assert_eq!(
+            watching.take_news(),
+            [WatchNews::Failed {
+                share: 2,
+                name: String::from("Ana"),
+                why: String::from(
+                    "could not create an event: none left. Close some programs and press Watch again"
+                ),
+            }]
+        );
     }
 
     fn color(side: u16) -> Shape {
