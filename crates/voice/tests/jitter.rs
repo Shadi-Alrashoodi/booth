@@ -1324,6 +1324,34 @@ fn late_frame_decoded_only_while_in_reach() {
     listener.assert_no_clicks();
 }
 
+// Three frames deep, the second packet of a word overtakes the first and one
+// pull goes by. The first still has its turn ahead, so it plays.
+#[test]
+fn a_packet_that_beats_its_turn_during_the_preroll_plays() {
+    let mut first = low_delay(&tone(3.0), 0);
+    first.last_mut().unwrap().last = true;
+    let mut arrive = on_time(&first);
+    for i in [100, 110, 120, 130, 140, 150] {
+        arrive[i] = Some(first[i].sent_at + 2 * TICK);
+    }
+    let mut listener = Listener::new();
+    listener.run(&first, &arrive, 4 * SECOND, always);
+    assert_eq!(listener.stats().depth_frames, 3);
+
+    let second = low_delay(&tone(0.1), first.len() as u16);
+    let buffer = &mut listener.buffer;
+    let mut frame = [0f32; MAX_FRAME];
+    buffer.push(second[1].packet()).unwrap();
+    assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Silence);
+    buffer.push(second[0].packet()).unwrap();
+    for packet in &second[..2] {
+        let source = buffer.pull(&mut frame).unwrap().source;
+        assert_eq!(source, Source::Packet(packet.seq));
+    }
+    let stats = buffer.stats();
+    assert_eq!((stats.late, stats.lost, stats.depth_frames), (6, 0, 3));
+}
+
 // The render side stalls while the talker moves to 10 ms frames, for more
 // than that mode's cap: playing starts again from the newest frames, as it
 // does when packets overflow, not from the oldest with the newest thrown away.

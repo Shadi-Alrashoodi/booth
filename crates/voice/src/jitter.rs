@@ -885,7 +885,7 @@ impl JitterBuffer {
                 return self.stand_in(out);
             }
         }
-        if self.play < self.preroll_until {
+        if self.play < self.preroll_until && self.slot(self.play).is_none() {
             self.play += 1;
             self.made_up = true;
             return self.stand_in(out);
