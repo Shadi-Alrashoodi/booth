@@ -192,6 +192,9 @@ pub struct JitterBuffer {
     period: usize,
     newest: Option<i64>,
     ends_after: Option<i64>,
+    // The newest frame accepted after its stand-in had played. It stays out of
+    // `newest`, so that a delay step still times out and starts again soon.
+    late_newest: Option<i64>,
     redundancy: bool,
     // Idle because the packets stopped, not because the talker said so. What
     // arrives next and is older than where playing restarts was later than the
@@ -266,6 +269,7 @@ impl JitterBuffer {
             period: 0,
             newest: None,
             ends_after: None,
+            late_newest: None,
             redundancy: false,
             timed_out: false,
             paused: false,
@@ -330,7 +334,7 @@ impl JitterBuffer {
                 if lead < 0 {
                     if info.samples == self.frame || self.newest.is_some_and(|newest| ext <= newest)
                     {
-                        self.arrived_late(ext, packet.frame, info);
+                        self.arrived_late(ext, packet.frame, info, packet.last);
                         return Ok(());
                     }
                     let redundancy = packet.redundancy || packet.previous.is_some();
@@ -632,6 +636,9 @@ impl JitterBuffer {
     }
 
     fn go_idle(&mut self, timed_out: bool) {
+        // What was accepted late has arrived, so it is no loss when playing
+        // starts again past it.
+        self.newest = self.newest.max(self.late_newest);
         if let Some(newest) = self.newest {
             self.judge_through(newest, false);
         }
@@ -651,11 +658,12 @@ impl JitterBuffer {
         self.late = EMPTY_SLOT;
         self.made_up = false;
         self.phase = Phase::Idle;
+        self.late_newest = None;
         self.audible = false;
         self.fade_in = true;
     }
 
-    fn arrived_late(&mut self, ext: i64, frame: &[u8], info: PacketInfo) {
+    fn arrived_late(&mut self, ext: i64, frame: &[u8], info: PacketInfo, last: bool) {
         if self.is_seen(ext) {
             return;
         }
@@ -666,6 +674,11 @@ impl JitterBuffer {
         }
         self.see(ext);
         self.stats.late += 1;
+        self.late_newest = self.late_newest.max(Some(ext));
+        if last && self.newest.is_none_or(|newest| ext > newest) {
+            self.newest = Some(ext);
+            self.ends_after = Some(ext);
+        }
         self.record(ext, info.samples);
         // Its stand-in has played, so it never plays itself. Decoded before
         // the next frame, it still gives the decoder the history the

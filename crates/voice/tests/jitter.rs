@@ -1338,6 +1338,86 @@ fn decoded_fresh(sent: &[Sent]) -> Vec<Vec<f32>> {
         .collect()
 }
 
+// Past the frames that fade or blend in, a transmission sounds as it does from
+// a fresh decoder.
+fn assert_starts_from_a_reset_decoder(listener: &Listener, spell: &[Sent], blended: usize) {
+    let fresh = decoded_fresh(spell);
+    for (packet, fresh) in spell.iter().zip(&fresh).skip(blended) {
+        let heard = listener
+            .heard
+            .iter()
+            .find(|heard| heard.pulled.map(|p| p.source) == Some(Source::Packet(packet.seq)))
+            .unwrap();
+        assert_eq!(&heard.audio, fresh, "seq {}", packet.seq);
+    }
+}
+
+// The talker's last packet comes after its frame was made up. The word still
+// ends on its own frame instead of timing out, the next one starts from a
+// reset decoder, and a frame that arrived is not a loss.
+#[test]
+fn a_late_last_packet_still_ends_the_transmission() {
+    let mut first = low_delay(&tone(0.5), 0);
+    first.last_mut().unwrap().last = true;
+    let end = first.last().unwrap().sent_at;
+    let second = talk(
+        &[(Mode::LowDelay, &tone(0.5))],
+        first.len() as u16,
+        SECOND,
+        false,
+    );
+    let mut sent = first.clone();
+    sent.extend(second.iter().cloned());
+    let mut arrive = on_time(&sent);
+    arrive[first.len() - 1] = Some(end + 1);
+    let mut listener = Listener::new();
+    listener.run(&sent, &arrive, SECOND - TICK, always);
+
+    // The stand-in, the blend out of it, one faded frame, and nothing.
+    let tail: Vec<Option<Source>> = listener
+        .heard
+        .iter()
+        .filter(|heard| heard.at >= end)
+        .map(|heard| heard.pulled.map(|pulled| pulled.source))
+        .collect();
+    assert_eq!(
+        tail[..3],
+        [
+            Some(Source::Concealed),
+            Some(Source::Concealed),
+            Some(Source::Silence)
+        ]
+    );
+    assert!(tail[3..].iter().all(Option::is_none));
+    assert!(!listener.stats().playing);
+
+    listener.run(&sent, &arrive, 3 * SECOND / 2 + TICK, always);
+    for packet in &second {
+        assert_eq!(listener.played_at(packet.seq), Some(packet.sent_at));
+    }
+    let stats = listener.stats();
+    assert_eq!((stats.late, stats.late_decoded, stats.lost), (1, 1, 0));
+    assert_eq!(stats.scattered_percent, 0.0);
+    assert_starts_from_a_reset_decoder(&listener, &second, 1);
+    listener.assert_no_clicks();
+}
+
+// A delay step at one frame of buffer: every packet from the second on comes
+// just after its stand-in, and no check is due in time to grow, so the buffer
+// times out and starts again a frame later. The packets it accepted as late
+// arrived, and the restart does not turn them into an outage.
+#[test]
+fn packets_accepted_late_are_not_lost_at_a_time_out() {
+    let sent = low_delay(&tone(1.0), 0);
+    let mut arrive: Vec<Option<u64>> = sent.iter().map(|p| Some(p.sent_at + 1)).collect();
+    arrive[0] = Some(sent[0].sent_at);
+    let mut listener = Listener::new();
+    listener.run(&sent, &arrive, SECOND + TICK, always);
+    let stats = listener.stats();
+    assert_eq!((stats.late, stats.lost), (11, 0));
+    assert_eq!(stats.loss_percent, 0.0);
+}
+
 // Three frames deep, the second packet of a word overtakes the first and one
 // pull goes by. The first still has its turn ahead, so it plays.
 #[test]
