@@ -1238,9 +1238,9 @@ fn wait_until(bo: &mut Hand, at: Instant) {
 }
 
 // Ana stops watching Bo's share and watches it again while the pause the
-// host told her first watch is held up on its way to her, and by her second
-// Watch the share is live again. The pause reaches her after that Watch,
-// ahead of the host's answer to it, and only the answer counts.
+// host told her first watch is held up on its way to her, and her second
+// Watch on its way to the host. The pause reaches her with no answer behind
+// it, and only the answer counts: by then the share is live again.
 #[test]
 fn a_watch_again_takes_no_word_of_the_watch_before() {
     use ShareState::{Live, Paused};
@@ -1252,8 +1252,8 @@ fn a_watch_again_takes_no_word_of_the_watch_before() {
         code_to_invite(&code, link.addr),
     );
     both_watch(&host, &ana, &mut bo, share);
-    // Toward Ana only, and for well under reconnecting_after, so her link
-    // and its session stay as they are.
+    // Each way for well under reconnecting_after, so her link and its
+    // session stay as they are.
     let held = common::link::Shape {
         blocked: true,
         ..Default::default()
@@ -1271,6 +1271,19 @@ fn a_watch_again_takes_no_word_of_the_watch_before() {
             .as_ref()
             .is_some_and(|c| c.watchers == Some(1))
     });
+    link.shape(held, held);
+    ana.room().watch(share, true);
+    until(&ana, &mut bo, "Ana watching again", |v| v.share.watching);
+    link.shape(Default::default(), held);
+    // The host sends the pause again within as long again as it was held
+    // up, its timeouts doubling from a round trip on loopback.
+    holds(
+        &ana,
+        &mut bo,
+        paused.elapsed() + Duration::from_millis(200),
+        "Ana took the pause told her first watch",
+        |v| v.share.watched_state == Live,
+    );
     // Past the 250 ms the host leaves between two words it passes on, so
     // this one goes at once.
     wait_until(&mut bo, paused + Duration::from_millis(300));
@@ -1278,24 +1291,11 @@ fn a_watch_again_takes_no_word_of_the_watch_before() {
     until(&host, &mut bo, "the live at the host's viewer", |v| {
         v.share.watched_state == Live
     });
-    ana.room().watch(share, true);
-    until(&host, &mut bo, "Ana's second Watch at the host", |v| {
-        v.share
-            .current
-            .as_ref()
-            .is_some_and(|c| c.watchers == Some(2))
-    });
     link.shape(Default::default(), Default::default());
     until(&ana, &mut bo, "the answer to Ana's second Watch", |v| {
         v.share.watched_sound == Some(false)
     });
-    holds(
-        &ana,
-        &mut bo,
-        Duration::from_millis(300),
-        "Ana took the pause told her first watch",
-        |v| v.share.watched_state == Live,
-    );
+    assert_eq!(ana.view().share.watched_state, Live);
 }
 
 // Ana's session runs out while Bo's share is paused with its sound on, and
