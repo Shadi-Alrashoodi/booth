@@ -15,6 +15,7 @@ struct Faults {
     nvenc_fails: Option<u64>,
     software_fails: Option<u64>,
     software_refused: bool,
+    gpu_refuses_past: Option<u32>,
 }
 
 static FAULTS: Mutex<Faults> = Mutex::new(Faults {
@@ -22,6 +23,7 @@ static FAULTS: Mutex<Faults> = Mutex::new(Faults {
     nvenc_fails: None,
     software_fails: None,
     software_refused: false,
+    gpu_refuses_past: None,
 });
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static LIVE_AT_LAST_OPEN: AtomicUsize = AtomicUsize::new(0);
@@ -65,6 +67,14 @@ pub fn refuse_software() {
     faults().software_refused = true;
 }
 
+/// NVENC and the Media Foundation hardware encoder do not open for a picture
+/// taller than `height` from now on, until clear(), though they are still
+/// offered: as one that stops at a level does, or at 0, as when another program
+/// holds all of NVENC's sessions.
+pub fn refuse_gpu(height: u32) {
+    faults().gpu_refuses_past = Some(height);
+}
+
 /// Takes back faults set and not used yet, for a test that ended early.
 pub fn clear() {
     *faults() = Faults::default();
@@ -88,6 +98,10 @@ pub(crate) fn take_software_failure() -> Option<u64> {
 
 pub(crate) fn take_software_refusal() -> bool {
     std::mem::take(&mut faults().software_refused)
+}
+
+pub(crate) fn gpu_refuses(height: u32) -> bool {
+    faults().gpu_refuses_past.is_some_and(|most| height > most)
 }
 
 /// Media Foundation hardware encoders started and not yet shut down with

@@ -99,7 +99,8 @@ struct OnSoftware {
     why: Software,
     // The width and height limits capture had when the share went onto the
     // software encoder: its fit of the share, or capture's own when the
-    // share fitted already. Opened again, the source gets no more.
+    // share fitted already, until a monitor's new mode needs a fit too.
+    // Opened again, the source gets no more.
     limits: (u32, u32),
 }
 
@@ -918,7 +919,8 @@ impl Sharer {
 
     // A picture from capture out to the viewers, through a new encoder
     // first when its size is new. False when that encoder did not open for
-    // a window, which keeps the one it has: nothing went out.
+    // a window, which keeps the one it has, or when a monitor's new mode
+    // needs the software encoder's fit: nothing went out.
     fn go(&mut self, frame: Frame, audience: &mut dyn Audience) -> Result<bool, String> {
         if (frame.width, frame.height) != self.size && !self.new_size(&frame, audience)? {
             return Ok(false);
@@ -1047,7 +1049,10 @@ impl Sharer {
 
     // A mode change on the shared monitor, or a shared window's new size: a
     // new encoder, whose first frame is an IDR, as a new share would start.
-    // False when it did not open for a window, which keeps its encoder.
+    // False when it did not open for a window, which keeps its encoder, or
+    // when a monitor's new mode is past what the software encoder takes: its
+    // pictures go on at the fit from the next one, and this frame does not
+    // go out.
     fn new_size(&mut self, frame: &Frame, audience: &mut dyn Audience) -> Result<bool, String> {
         let size = (frame.width, frame.height);
         let now = Instant::now();
@@ -1105,17 +1110,40 @@ impl Sharer {
                 opened
                     .source
                     .encoder(self.setup.encoder, Codec::H264, size, fps, settings)
-                    .map_err(|err| err.to_string())
             }
-            Err(err) => Err(err.to_string()),
+            Err(err) => Err(err),
         };
         match encoder {
             Ok(encoder) => opened.encoder = encoder,
             Err(why) if window => {
-                self.resize_failed(size, &why, audience);
+                self.resize_failed(size, &why.to_string(), audience);
                 return Ok(false);
             }
-            Err(why) => return Err(why),
+            Err(
+                EncodeError::NoEncoderForGpu { fit: Some(fit), .. }
+                | EncodeError::SoftwareLimit { fit, .. },
+            ) => {
+                audience.line(source::runs_smaller(fit, size, fps));
+                let options = capture::Options {
+                    max_width: fit.width,
+                    max_height: fit.height,
+                    max_fps: fit.fps,
+                };
+                // Capture brings its next picture within the box by itself. A
+                // source opened now can be refused while the display is still
+                // changing, which would end the share, so only a lower rate
+                // opens one: capture's fps cap is set as it opens.
+                if fit.fps == fps {
+                    self.take_options(options);
+                } else {
+                    self.reopen(options, &mut |line| audience.line(line))?;
+                }
+                if let Some(software) = &mut self.software {
+                    software.limits = (fit.width, fit.height);
+                }
+                return Ok(false);
+            }
+            Err(why) => return Err(why.to_string()),
         }
         let codec_changed = current.is_some_and(|was| was != opened.encoder.codec());
         if codec_changed {
@@ -1762,6 +1790,7 @@ mod tests {
     use crate::PAYLOAD_LAN;
 
     const NVIDIA: u32 = 0x10de;
+    const INTEL: u32 = 0x8086;
 
     #[derive(Default)]
     struct Watching {
@@ -1856,6 +1885,155 @@ mod tests {
         )
         .unwrap_or_else(|err| panic!("{err}"));
         opened.source = Source::Pattern(Box::new(pattern));
+    }
+
+    // A monitor share that fitted the software encoder, whose mode then grows
+    // past it: capture takes the fit with no source opened, which a display
+    // still changing could refuse, the frame at the new size does not go out,
+    // and the next one goes on the encoder it has, the frame numbers going on.
+    #[test]
+    fn a_monitor_grown_past_the_software_encoder_goes_on_at_its_fit() {
+        let Some((_turn, adapter)) = gpu() else {
+            return;
+        };
+        let intel = capture::Adapter {
+            vendor_id: INTEL,
+            ..adapter.clone()
+        };
+        for (adapter, encoder, software) in [
+            (intel, None, Some(Software::Intel)),
+            (adapter.clone(), Some(Kind::MfSoftware), None),
+        ] {
+            let mut sharer = pattern_share(adapter, (1920, 1080), encoder);
+            assert_eq!(sharer.kind(), Some(Kind::MfSoftware));
+            assert_eq!(sharer.software(), software);
+            let mut watching = Watching::default();
+            sharer
+                .next(&mut watching)
+                .unwrap_or_else(|err| panic!("{err}"));
+            assert_eq!(watching.sent.len(), 1);
+            new_mode(&mut sharer, 2560, 1440);
+            sharer
+                .next(&mut watching)
+                .unwrap_or_else(|err| panic!("{err}"));
+            assert_eq!(watching.sent.len(), 1);
+            assert_eq!(sharer.reopens, 0);
+            assert_eq!((sharer.size(), sharer.fps()), ((1920, 1080), 60));
+            assert_eq!(sharer.kind(), Some(Kind::MfSoftware));
+            assert!(
+                watching.lines.contains(&Line::Say(String::from(
+                    "the software encoder takes up to 1080p at 60 fps, so this share runs at 1920x1080 and 60 fps instead of 2560x1440 and 60"
+                ))),
+                "{:?}",
+                watching.lines
+            );
+            new_mode(&mut sharer, 2560, 1440);
+            sharer
+                .next(&mut watching)
+                .unwrap_or_else(|err| panic!("{err}"));
+            assert_eq!(watching.sent.len(), 2);
+            assert!(!watching.sent[1].idr);
+            assert_eq!(watching.sent[1].number, 1);
+            assert_eq!(sharer.reopens, 0);
+            // Whatever opens the source next keeps to the fit.
+            if software.is_some() {
+                let options = sharer.source_options(60);
+                assert_eq!((options.max_width, options.max_height), (1920, 1080));
+            }
+        }
+
+        // A mode of another shape fits at another size, whose new encoder
+        // starts with an IDR.
+        let mut sharer = pattern_share(adapter, (1920, 1080), Some(Kind::MfSoftware));
+        let mut watching = Watching::default();
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        new_mode(&mut sharer, 2560, 1600);
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(watching.sent.len(), 1);
+        new_mode(&mut sharer, 2560, 1600);
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(watching.sent.len(), 2, "{:?}", watching.lines);
+        assert!(watching.sent[1].idr);
+        assert_eq!(watching.sent[1].number, 1);
+        assert_eq!(sharer.reopens, 0);
+        assert_eq!(sharer.size(), (1818, 1136));
+    }
+
+    // No GPU encoder takes a monitor's new mode, as when another program holds
+    // all of NVENC's sessions, and the software encoder only takes it smaller.
+    // At the rate it has, the share takes the fit with no source opened, and
+    // the encoder it has goes on. Faster than the software encoder takes, the
+    // source opens again for the rate and lands on the software encoder.
+    #[test]
+    fn a_monitor_mode_no_gpu_encoder_takes_goes_on_at_the_fit() {
+        let Some((_turn, adapter)) = gpu() else {
+            return;
+        };
+        let mut sharer = pattern_share(adapter.clone(), (1920, 1080), None);
+        let kind = sharer.kind();
+        if kind == Some(Kind::MfSoftware) {
+            println!("skipped: no GPU encoder here to refuse");
+            return;
+        }
+        let mut watching = Watching::default();
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        encode::fault::refuse_gpu(0);
+        new_mode(&mut sharer, 2560, 1440);
+        let refused = sharer.next(&mut watching);
+        encode::fault::clear();
+        refused.unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(watching.sent.len(), 1, "{:?}", watching.lines);
+        assert_eq!(sharer.reopens, 0);
+        assert_eq!(
+            (sharer.options.max_width, sharer.options.max_height),
+            (1920, 1080)
+        );
+        new_mode(&mut sharer, 2560, 1440);
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(watching.sent.len(), 2);
+        assert!(!watching.sent[1].idr);
+        assert_eq!(sharer.kind(), kind);
+        drop(sharer);
+
+        let mut sharer = pattern_share(adapter, (1280, 720), None);
+        sharer
+            .set_fps(120, &mut |_| {})
+            .unwrap_or_else(|err| panic!("{err}"));
+        if sharer.fps() != 120 {
+            println!("skipped: no GPU encoder here takes 1280x720 and 120 fps");
+            return;
+        }
+        let reopens = sharer.reopens;
+        let mut watching = Watching::default();
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        encode::fault::refuse_gpu(0);
+        new_mode(&mut sharer, 2560, 1440);
+        let refused = sharer.next(&mut watching);
+        encode::fault::clear();
+        refused.unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(watching.sent.len(), 1, "{:?}", watching.lines);
+        assert_eq!(sharer.reopens, reopens + 1);
+        assert_eq!((sharer.size(), sharer.fps()), ((1920, 1080), 60));
+        assert_eq!(sharer.kind(), Some(Kind::MfSoftware));
+        assert_eq!(sharer.software(), None);
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(watching.sent.len(), 2);
+        assert!(watching.sent[1].idr);
+        assert_eq!(watching.sent[1].number, 1);
     }
 
     // While capture is paused, a change of codec that would open the source

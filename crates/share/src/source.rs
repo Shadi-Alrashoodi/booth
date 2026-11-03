@@ -109,7 +109,8 @@ impl HevcOffer {
 
 // What a window share on the software encoder keeps to, whatever size the
 // window takes later: the software encoder takes up to 1080p at 60 fps,
-// and a window, unlike a monitor, changes size mid-share.
+// and a window changes size all through a share, where a monitor's new mode
+// past that takes its own fit once (Sharer::new_size).
 pub(crate) fn window_box(fps: u32) -> capture::Options {
     capture::Options {
         max_width: 1920,

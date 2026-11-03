@@ -22,12 +22,13 @@ windows-sys = { workspace = true, features = ["Win32_Media"] }
 # Tests only (room's tests turn it on): src/fault.rs, which gives the test
 # pattern a pointer that moves with its pictures, holds some pictures back,
 # keeps what a viewer drew for the pointers it held, reads what waits in a
-# viewer's inbox, and pauses the pattern as a monitor's capture pauses. A
-# release build never has it.
+# viewer's inbox, pauses the pattern as a monitor's capture pauses, and brings
+# it a monitor's new mode. A release build never has it.
 fault = []
 
 [dev-dependencies]
-# tests/sharer.rs makes the encoders stall and fail.
+# tests/sharer.rs and the tests in src/sharer.rs make the encoders stall, fail
+# and not open.
 encode = { workspace = true, features = ["fault"] }
 # tests/window.rs makes the window it shares.
 windows = { workspace = true, features = [

@@ -750,6 +750,177 @@ fn gpu_encoder_fails(sharer: &Member, watcher: &Member) {
     encode::fault::clear();
 }
 
+// The GPU's encoders refusing however the test ends.
+struct GpuRefused;
+
+impl GpuRefused {
+    fn past(height: u32) -> GpuRefused {
+        encode::fault::refuse_gpu(height);
+        GpuRefused
+    }
+}
+
+impl Drop for GpuRefused {
+    fn drop(&mut self) {
+        encode::fault::clear();
+    }
+}
+
+// No GPU encoder takes a monitor's new mode during a 120 fps share
+// (encode::fault makes them refuse, and share::fault brings the mode): the
+// share goes on at the software encoder's fit, and the watcher's roster gets
+// its 60 fps. A GPU encoder that takes the fit runs it and the panel has
+// nothing to say. With none that does, Windows' software encoder runs it, the
+// sharer's panel says so and its stats panel has the encoder in warn. The
+// pattern opened again is the size it was set up with, 720p for the reason
+// gpu_encoder_failure_goes_on_in_software gives.
+#[test]
+fn a_new_mode_no_gpu_encoder_takes_goes_on_at_the_fit() {
+    let _turn = turn();
+    if !ready() || !takes_hevc() {
+        return;
+    }
+    let small = || VideoConfig {
+        source: VideoSource::Pattern {
+            width: 1280,
+            height: 720,
+            busy: false,
+        },
+        ..pattern(None)
+    };
+    let (host, friends) = room_of(
+        config_with("Mara", small(), 2000),
+        vec![config_with("Ana", small(), 2000)],
+    );
+    let ana = &friends[0];
+    for (refused_past, on_software) in [(1080, false), (0, true)] {
+        let number = shares(&host, 120);
+        let on_nvenc = poll(WAIT, "the sharer's first numbers", || {
+            host.view().numbers.sharing
+        });
+        assert!(
+            on_nvenc.encoder.starts_with("NVENC") && !on_nvenc.software,
+            "{on_nvenc:?}"
+        );
+        watches(ana, number);
+        poll(WAIT, "the watcher's first frames", || {
+            ana.view()
+                .numbers
+                .watching
+                .filter(|numbers| numbers.fps > 0)
+        });
+
+        let refused = GpuRefused::past(refused_past);
+        share::fault::pattern_mode(2560, 1440, 120);
+        ana.wait_for(WAIT, "the roster at 60 fps", |v| {
+            v.share
+                .current
+                .as_ref()
+                .is_some_and(|current| current.number == number && current.fps == 60)
+        });
+        if on_software {
+            let view = host.wait_for(WAIT, "the sharer's panel saying why", |v| {
+                v.share.problem.is_some()
+            });
+            assert_eq!(
+                view.share.problem.as_deref(),
+                Some(
+                    "No GPU encoder on this PC would open. Sharing will use the software encoder at up to 1080p60."
+                )
+            );
+        }
+        let shared = poll(WAIT, "the stats panel at 60 fps", || {
+            Some(sharing_numbers(&host)).filter(|numbers| numbers.fps == 60)
+        });
+        assert_eq!(
+            shared.encoder.contains("software"),
+            on_software,
+            "{shared:?}"
+        );
+        assert_eq!(shared.software, on_software, "{shared:?}");
+        assert_eq!((shared.width, shared.height), (1280, 720));
+        assert_eq!(host.view().share.problem.is_some(), on_software);
+
+        host.room().stop_sharing();
+        ana.wait_for(WAIT, "the viewer closed", |v| !v.share.viewer_open);
+        host.wait_for(WAIT, "the share over", |v| {
+            v.share.running.is_none() && v.numbers.sharing.is_none()
+        });
+        drop(refused);
+    }
+    timers_held_come_to(0);
+}
+
+// A share that landed on the software encoder only because no GPU encoder
+// would open is not held to it: once they open again, a new rate's new encoder
+// is NVENC, and the stats panel's warn goes with the software encoder. The
+// chat keeps its one line of what went wrong.
+#[test]
+fn a_gpu_encoder_that_opens_again_takes_the_share_off_the_software_encoder() {
+    let _turn = turn();
+    if !ready() || !takes_hevc() {
+        return;
+    }
+    let small = || VideoConfig {
+        source: VideoSource::Pattern {
+            width: 1280,
+            height: 720,
+            busy: false,
+        },
+        ..pattern(None)
+    };
+    let (host, friends) = room_of(
+        config_with("Mara", small(), 2000),
+        vec![config_with("Ana", small(), 2000)],
+    );
+    let ana = &friends[0];
+    let number = shares(&host, 120);
+    poll(WAIT, "the sharer's first numbers", || {
+        host.view().numbers.sharing
+    });
+    watches(ana, number);
+
+    let refused = GpuRefused::past(0);
+    share::fault::pattern_mode(2560, 1440, 120);
+    let on_software = poll(WAIT, "the stats panel on the software encoder", || {
+        Some(sharing_numbers(&host)).filter(|numbers| numbers.encoder.contains("software"))
+    });
+    assert!(on_software.software, "{on_software:?}");
+    assert!(
+        host.view()
+            .share
+            .running
+            .is_some_and(|running| running.software)
+    );
+    drop(refused);
+
+    host.room().share(30, None);
+    let on_gpu = poll(WAIT, "the stats panel on NVENC", || {
+        Some(sharing_numbers(&host)).filter(|numbers| numbers.encoder.starts_with("NVENC"))
+    });
+    assert!(!on_gpu.software, "{on_gpu:?}");
+    let view = host.view();
+    assert!(
+        view.share
+            .running
+            .as_ref()
+            .is_some_and(|running| !running.software)
+    );
+    assert_eq!(
+        lines(&view, LineKind::Problem),
+        [
+            "No GPU encoder on this PC would open. Sharing will use the software encoder at up to 1080p60."
+        ]
+    );
+
+    host.room().stop_sharing();
+    ana.wait_for(WAIT, "the viewer closed", |v| !v.share.viewer_open);
+    host.wait_for(WAIT, "the share over", |v| {
+        v.share.running.is_none() && v.numbers.sharing.is_none()
+    });
+    timers_held_come_to(0);
+}
+
 // The switch to the software encoder as the watcher sees it, timed from the
 // two logs: from the sharer's line that NVENC failed to the watcher's first
 // H.264 frame, then each second's longest wait between frames for 5 s. Run

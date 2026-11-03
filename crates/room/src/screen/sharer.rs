@@ -212,6 +212,7 @@ fn share(
         },
     );
     announce_fps(sharing, number, &sharer);
+    let mut told = software;
 
     let ran = |why: String| Failed { ran: true, why };
     let mut watchers = Watchers::new(sharing, log, number, window.is_some());
@@ -411,6 +412,7 @@ fn share(
         } else {
             let asked = Instant::now();
             let late = sharer.numbers().held;
+            let fps = sharer.fps();
             sharer.next(&mut watchers).map_err(ran)?;
             // A monitor's capture that is not paused saw the desktop as it
             // is now: it loses its duplication when the secure desktop comes
@@ -437,13 +439,20 @@ fn share(
                 );
                 sharing.tell(ShareNews::NoPicture { share: number });
             }
-            // The GPU encoder failed on that frame and the software encoder
-            // took the share over, at 60 fps from now on if it ran faster.
-            if software.is_none()
-                && let Some(why) = sharer.software()
-            {
-                software = Some(why.sentence());
-                on_software(sharing, number, &sharer, why.sentence());
+            // The GPU encoder failed on that frame, or none took a monitor's
+            // new mode or a window's new size, and the software encoder took
+            // the share over, at 60 fps from now on if it ran faster. Only a
+            // failure keeps it there: otherwise a later new encoder tries the
+            // GPU first, and one that opens runs the share again.
+            let on = software_sentence(sharer.kind(), sharer.software());
+            if on != software {
+                software = on;
+                software_changed(sharing, number, &sharer, on, &mut told);
+            }
+            // A monitor whose new mode no encoder here takes goes on at the
+            // software encoder's fit, at 60 fps if it ran faster.
+            if sharer.fps() != fps {
+                announce_fps(sharing, number, &sharer);
             }
         }
 
@@ -891,16 +900,28 @@ fn software_sentence(kind: Option<Kind>, why: Option<Software>) -> Option<&'stat
     }
 }
 
-// The share went onto the software encoder after it opened: the panel says
-// why, the stats panel shows the encoder in warn from the next second, and
-// the roster gets the rate the share runs at now.
-fn on_software(sharing: &Sharing, number: u32, sharer: &Sharer, sentence: &'static str) {
-    sharing.tell(ShareNews::Software {
-        share: number,
-        sentence,
-    });
+// The share went onto the software encoder after it opened, or back off it:
+// the panel says why it is on it, once for each reason, the stats panel shows
+// the encoder in warn while it is, from the next second, and the roster gets
+// the rate the share runs at now.
+fn software_changed(
+    sharing: &Sharing,
+    number: u32,
+    sharer: &Sharer,
+    on: Option<&'static str>,
+    told: &mut Option<&'static str>,
+) {
+    if let Some(sentence) = on
+        && *told != on
+    {
+        *told = on;
+        sharing.tell(ShareNews::Software {
+            share: number,
+            sentence,
+        });
+    }
     sharing.set_running(sharing.running().map(|running| RunningShare {
-        software: true,
+        software: on.is_some(),
         ..running
     }));
     announce_fps(sharing, number, sharer);

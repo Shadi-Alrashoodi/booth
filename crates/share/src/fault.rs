@@ -4,8 +4,8 @@
 //! the sharer's pointer gives it one, and reads back what each viewer drew
 //! for the pointers it held for their pictures, and what waits for a viewer
 //! in its inbox. The pattern can also pause as a monitor's capture does
-//! when Windows takes the desktop away, which no test can bring about for
-//! real while it goes on using the desktop.
+//! when Windows takes the desktop away, or take a monitor's new mode, which
+//! no test can bring about for real while it goes on using the desktop.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -125,8 +125,18 @@ pub fn pattern_away(reason: Option<PauseReason>) {
     *lock(&AWAY) = reason.map(|reason| (reason, false));
 }
 
+// The size and rate the pattern takes at its next picture.
+static NEW_MODE: Mutex<Option<(u32, u32, u32)>> = Mutex::new(None);
+
+/// The test pattern's next picture comes at this size, as a monitor's does
+/// after a mode change, and those after it, at `fps`, until its source opens
+/// again, as what the share was set up with. It takes no box meanwhile.
+pub fn pattern_mode(width: u32, height: u32, fps: u32) {
+    *lock(&NEW_MODE) = Some((width, height, fps));
+}
+
 // The pattern's pause while it has one, else its next frame or lone pointer
-// while the pointer hook is on.
+// while the pointer hook is on, after any new mode.
 pub(crate) fn pattern_next(pattern: &mut Pattern) -> Option<Result<Next, String>> {
     let away = lock(&AWAY)
         .as_mut()
@@ -138,6 +148,12 @@ pub(crate) fn pattern_next(pattern: &mut Pattern) -> Option<Result<Next, String>
             return Some(Ok(Next::Idle));
         }
         None => {}
+    }
+    if let Some((width, height, fps)) = lock(&NEW_MODE).take() {
+        *pattern = match Pattern::new(pattern.device(), width, height, fps) {
+            Ok(new) => new,
+            Err(err) => return Some(Err(err.to_string())),
+        };
     }
     if !ON.load(Ordering::Acquire) {
         return None;

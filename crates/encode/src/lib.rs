@@ -520,6 +520,12 @@ fn open_one(
     settings: &Settings,
     passed_over: &[String],
 ) -> Result<Box<dyn Encoder>, EncodeError> {
+    #[cfg(feature = "fault")]
+    if kind != Kind::MfSoftware && fault::gpu_refuses(request.height) {
+        return Err(EncodeError::EncoderLacks {
+            problem: "this test keeps the GPU's encoders from opening",
+        });
+    }
     let notes = if passed_over.is_empty() {
         String::new()
     } else {

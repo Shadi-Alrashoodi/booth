@@ -384,8 +384,8 @@ pub(crate) enum ShareNews {
     // encoder, for the watchers' reassemblers.
     Fps { share: u32, fps: u8 },
     // It runs on Windows' software encoder, at up to 1080p60, from the
-    // start or from when its GPU encoder failed, with the sentence for why
-    // that the panel shows.
+    // start, from when its GPU encoder failed or from when none took a new
+    // size, with the sentence for why that the panel shows.
     Software { share: u32, sentence: &'static str },
     Paused { share: u32, paused: Paused },
     // A shared window gave no picture in its first second of being watched,
