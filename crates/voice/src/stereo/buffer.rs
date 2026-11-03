@@ -419,9 +419,13 @@ impl Buffer {
             // Anything a cap behind the newest frame cannot survive the
             // restart, so it is judged now, while it is still remembered,
             // and let go, so a buffer nobody pulls never holds more than the
-            // cap.
+            // cap. Before the first pull there is nothing to judge: the
+            // numbers before the first frame were never sent to this
+            // listener.
             let oldest_kept = newest - CAP + 1;
-            self.judge_through(oldest_kept - 1, self.timed_out);
+            if self.last_change.is_some() {
+                self.judge_through(oldest_kept - 1, self.timed_out);
+            }
             self.discard_before(oldest_kept, !self.timed_out && !self.paused);
         }
         Ok(())

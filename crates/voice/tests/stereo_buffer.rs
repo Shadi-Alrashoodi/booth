@@ -1091,6 +1091,51 @@ fn a_jump_ahead_counts_the_frames_skipped_as_lost_and_no_more() {
     );
 }
 
+// Nothing before the first frame was ever sent to this listener, whether
+// they start watching a spell under way while deafened or two of its frames
+// come before the first pull.
+#[test]
+fn numbers_before_the_first_frame_are_not_lost() {
+    let under_way = spell(&music(0.5), 80, 0);
+    let sent = &under_way[20..];
+    let mut frame = [0f32; SAMPLES];
+
+    let mut buffer = Buffer::new().unwrap();
+    buffer.pause();
+    for packet in &sent[..20] {
+        buffer.push(packet.packet()).unwrap();
+        buffer.pause();
+    }
+    let stats = buffer.stats();
+    assert_eq!((stats.lost, stats.loss_percent), (0, 0.0), "{stats:?}");
+    buffer.push(sent[20].packet()).unwrap();
+    assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Packet(120));
+    let stats = buffer.stats();
+    assert_eq!(
+        (stats.lost, stats.dropped, stats.loss_percent),
+        (0, 0, 0.0),
+        "{stats:?}"
+    );
+
+    let mut buffer = Buffer::new().unwrap();
+    buffer.push(sent[0].packet()).unwrap();
+    buffer.push(sent[1].packet()).unwrap();
+    assert_eq!(buffer.pull(&mut frame).unwrap().source, Source::Packet(101));
+    for packet in &sent[2..20] {
+        buffer.push(packet.packet()).unwrap();
+        assert_eq!(
+            buffer.pull(&mut frame).unwrap().source,
+            Source::Packet(packet.seq)
+        );
+    }
+    let stats = buffer.stats();
+    assert_eq!(
+        (stats.lost, stats.dropped, stats.loss_percent),
+        (0, 1, 0.0),
+        "{stats:?}"
+    );
+}
+
 // A frame of a spell that has ended, after its end, is a straggler however
 // far behind the newest it is, the spell's first frame too: the sharer's
 // numbering never goes back. The next spell, numbered on, starts from a
