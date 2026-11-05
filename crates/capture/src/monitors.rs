@@ -44,7 +44,8 @@ pub struct Adapter {
 }
 
 // What a monitor is opened by: its GDI device name, unique among the
-// monitors attached now, and the adapter that drives it.
+// monitors attached now, and the adapter that drives it. find() also
+// checks the monitor's device paths, since the name can pass to another.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MonitorId {
     pub device_name: String,
@@ -92,6 +93,8 @@ impl Rotation {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Monitor {
     pub id: MonitorId,
+    // GDI source names can move to another monitor after a topology change.
+    pub device_paths: Vec<String>,
     // What Windows Settings shows, or the device name if Windows has none.
     pub name: String,
     // Desktop coordinates in physical pixels, upright as the user sees it.
@@ -263,9 +266,11 @@ pub(crate) fn describe_output(output: &IDXGIOutput) -> Result<OutputDesc, Captur
 }
 
 // What DisplayConfig knows about one GDI source: the name Settings shows,
-// the refresh rate as a fraction, and the source mode in physical pixels.
+// the device paths of the monitors showing it, the refresh rate as a
+// fraction, and the source mode in physical pixels.
 struct Source {
     name: String,
+    device_paths: Vec<String>,
     refresh_hz: f64,
     rect: Option<(i32, i32, u32, u32)>,
 }
@@ -294,6 +299,7 @@ pub fn monitors() -> Result<Vec<Monitor>, CaptureError> {
                     device_name: desc.device_name.clone(),
                     adapter_luid: info.luid,
                 },
+                device_paths: source.map(|s| s.device_paths.clone()).unwrap_or_default(),
                 name: source
                     .map(|s| s.name.clone())
                     .filter(|name| !name.is_empty())
@@ -345,8 +351,9 @@ pub fn window_monitor(window: WindowId) -> Option<Monitor> {
         .find(|monitor| monitor.id.device_name == name)
 }
 
-// Keyed by GDI device name. A failure here only costs the friendly names and
-// refresh rates, so it gives an empty map rather than an error.
+// Keyed by GDI device name. A failure here costs the friendly names,
+// refresh rates and identity check, so it gives an empty map rather than
+// an error.
 fn display_config() -> HashMap<String, Source> {
     let mut sources = HashMap::new();
     let Some((paths, modes)) = active_paths() else {
@@ -368,10 +375,6 @@ fn display_config() -> HashMap<String, Source> {
             continue;
         }
         let device_name = wide_to_string(&source.viewGdiDeviceName);
-        if sources.contains_key(&device_name) {
-            // A cloned desktop: the first monitor showing it names it.
-            continue;
-        }
         let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME {
             header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
                 r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
@@ -382,12 +385,15 @@ fn display_config() -> HashMap<String, Source> {
             ..Default::default()
         };
         // SAFETY: as above, for a DISPLAYCONFIG_TARGET_DEVICE_NAME.
-        let name = if unsafe { DisplayConfigGetDeviceInfo(&mut target.header) }
+        let (name, device_path) = if unsafe { DisplayConfigGetDeviceInfo(&mut target.header) }
             == ERROR_SUCCESS.0 as i32
         {
-            wide_to_string(&target.monitorFriendlyDeviceName)
+            (
+                wide_to_string(&target.monitorFriendlyDeviceName),
+                wide_to_string(&target.monitorDevicePath),
+            )
         } else {
-            String::new()
+            (String::new(), String::new())
         };
         let rate = path.targetInfo.refreshRate;
         let refresh_hz = if rate.Denominator == 0 {
@@ -411,16 +417,26 @@ fn display_config() -> HashMap<String, Source> {
                     source_mode.height,
                 )
             });
-        sources.insert(
+        add_source(
+            &mut sources,
             device_name,
             Source {
                 name,
+                device_paths: vec![device_path],
                 refresh_hz,
                 rect,
             },
         );
     }
     sources
+}
+
+fn add_source(sources: &mut HashMap<String, Source>, device_name: String, source: Source) {
+    if let Some(kept) = sources.get_mut(&device_name) {
+        kept.device_paths.extend(source.device_paths);
+    } else {
+        sources.insert(device_name, source);
+    }
 }
 
 fn active_paths() -> Option<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>)> {
@@ -465,7 +481,8 @@ fn active_paths() -> Option<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MOD
 
 // The adapter by LUID and the output on it by device name, looked up fresh,
 // since outputs are recreated when monitors come and go.
-pub(crate) fn find(id: &MonitorId) -> Result<(IDXGIAdapter1, IDXGIOutput), CaptureError> {
+pub(crate) fn find(monitor: &Monitor) -> Result<(IDXGIAdapter1, IDXGIOutput), CaptureError> {
+    let id = &monitor.id;
     let factory = factory()?;
     let adapters = hardware_adapters(&factory)?;
     let Some((adapter, info)) = adapters
@@ -485,7 +502,20 @@ pub(crate) fn find(id: &MonitorId) -> Result<(IDXGIAdapter1, IDXGIOutput), Captu
     for output in outputs(&adapter)? {
         let desc = describe_output(&output)?;
         if desc.device_name == id.device_name && desc.attached {
-            return Ok((adapter, output));
+            let sources = display_config();
+            if same_target(
+                &monitor.device_paths,
+                listed_paths(&sources, &id.device_name),
+            ) {
+                return Ok((adapter, output));
+            }
+            return Err(CaptureError::new(
+                ErrorKind::MonitorGone,
+                format!(
+                    "could not confirm that {} on {} is the monitor you chose. Choose the monitor again",
+                    id.device_name, info.description
+                ),
+            ));
         }
     }
     Err(CaptureError::new(
@@ -495,4 +525,146 @@ pub(crate) fn find(id: &MonitorId) -> Result<(IDXGIAdapter1, IDXGIOutput), Captu
             id.device_name, info.description
         ),
     ))
+}
+
+// None only when DisplayConfig could not be read at all. A name it does not
+// list while it lists others is on no monitor it knows of.
+fn listed_paths<'a>(
+    sources: &'a HashMap<String, Source>,
+    device_name: &str,
+) -> Option<&'a [String]> {
+    if sources.is_empty() {
+        return None;
+    }
+    Some(
+        sources
+            .get(device_name)
+            .map_or(&[], |source| source.device_paths.as_slice()),
+    )
+}
+
+fn same_target(kept: &[String], now: Option<&[String]>) -> bool {
+    kept.is_empty()
+        || kept.iter().any(String::is_empty)
+        || now.is_none_or(|paths| {
+            paths.iter().any(|path| {
+                path.is_empty() || kept.iter().any(|kept| path.eq_ignore_ascii_case(kept))
+            })
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unreadable_target_does_not_mark_the_monitor_missing() {
+        let kept = vec![String::from("the chosen target")];
+        assert!(same_target(&kept, None));
+        assert!(!same_target(&kept, Some(&[])));
+        assert!(same_target(&kept, Some(&[String::new()])));
+        assert!(same_target(
+            &kept,
+            Some(&[String::from("another target"), String::new()])
+        ));
+        assert!(!same_target(&kept, Some(&[String::from("another target")])));
+        assert!(same_target(
+            &kept,
+            Some(&[String::from("THE CHOSEN TARGET")])
+        ));
+        assert!(same_target(&[], None));
+        assert!(same_target(&[], Some(&kept)));
+        assert!(same_target(&[String::new()], Some(&kept)));
+    }
+
+    #[test]
+    fn a_cloned_source_keeps_each_target() {
+        let mut sources = HashMap::new();
+        for path in ["the panel", "the television"] {
+            add_source(
+                &mut sources,
+                String::from("the source"),
+                Source {
+                    name: String::from(path),
+                    device_paths: vec![String::from(path)],
+                    refresh_hz: 60.0,
+                    rect: None,
+                },
+            );
+        }
+        let source = &sources["the source"];
+        assert_eq!(source.device_paths, ["the panel", "the television"]);
+        assert_eq!(source.name, "the panel");
+        for path in ["THE PANEL", "THE TELEVISION"] {
+            assert!(same_target(
+                &source.device_paths,
+                Some(&[String::from(path)])
+            ));
+        }
+        assert!(same_target(
+            &source.device_paths,
+            Some(&[String::from("another target"), String::from("the panel")])
+        ));
+        assert!(!same_target(
+            &source.device_paths,
+            Some(&[String::from("another target")])
+        ));
+    }
+
+    #[test]
+    fn a_name_display_config_no_longer_lists_is_not_the_chosen_monitor() {
+        let kept = vec![String::from("the chosen target")];
+        let mut sources = HashMap::new();
+        assert_eq!(listed_paths(&sources, "the source"), None);
+        assert!(same_target(&kept, listed_paths(&sources, "the source")));
+        add_source(
+            &mut sources,
+            String::from("another source"),
+            Source {
+                name: String::from("the panel"),
+                device_paths: kept.clone(),
+                refresh_hz: 60.0,
+                rect: None,
+            },
+        );
+        assert_eq!(listed_paths(&sources, "the source"), Some(&[][..]));
+        assert!(!same_target(&kept, listed_paths(&sources, "the source")));
+        assert_eq!(
+            listed_paths(&sources, "another source"),
+            Some(kept.as_slice())
+        );
+        assert!(same_target(&kept, listed_paths(&sources, "another source")));
+    }
+
+    #[test]
+    fn a_reused_source_name_does_not_find_another_monitor() {
+        let Some(monitor) = monitors().unwrap().into_iter().next() else {
+            println!("skipped: no monitor is attached to the desktop");
+            return;
+        };
+        if monitor.name != monitor.id.device_name {
+            assert!(monitor.device_paths.iter().any(|path| !path.is_empty()));
+        } else {
+            println!("skipped: DisplayConfig did not name the monitor");
+        }
+        assert!(find(&monitor).is_ok());
+        if monitor.device_paths.is_empty() || monitor.device_paths.iter().any(String::is_empty) {
+            println!("skipped: DisplayConfig did not report every target path");
+            return;
+        }
+        let mut other = monitor.clone();
+        other.device_paths = monitor
+            .device_paths
+            .iter()
+            .map(|path| path.to_uppercase())
+            .collect();
+        assert!(find(&other).is_ok());
+        other.device_paths = vec![String::from("another monitor at the same source")];
+        let Err(err) = find(&other) else {
+            panic!("another monitor with the same GDI name was found");
+        };
+        assert_eq!(err.kind(), ErrorKind::MonitorGone);
+        other.device_paths.clear();
+        assert!(find(&other).is_ok());
+    }
 }

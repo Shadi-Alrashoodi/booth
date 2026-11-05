@@ -10,24 +10,25 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_MODE_CHANGE_IN_PROGRESS, DXGI_ERROR_NOT_CURRENTLY_AVAILABLE,
-    DXGI_ERROR_SESSION_DISCONNECTED, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
-    DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR,
-    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME,
-    IDXGIOutput, IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
+    DXGI_ERROR_ACCESS_DENIED, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_MODE_CHANGE_IN_PROGRESS,
+    DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, DXGI_ERROR_SESSION_DISCONNECTED, DXGI_ERROR_UNSUPPORTED,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
+    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME, IDXGIOutput, IDXGIOutput5, IDXGIOutputDuplication,
+    IDXGIResource,
 };
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::UI::HiDpi::{
     AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     GetDpiAwarenessContextForProcess, SetProcessDpiAwarenessContext,
 };
-use windows::core::Interface;
+use windows::core::{HRESULT, Interface};
 
 use crate::cap::{Decision, FpsCap};
 use crate::convert::{Converter, Layout, Plan, Region, Target};
 use crate::device;
 use crate::error::{CaptureError, ErrorKind, is_device_lost, meaning};
-use crate::missing::{Missed, Missing};
+use crate::missing::{LOOK_EVERY, Missed, Missing};
 use crate::monitors::{Monitor, Rotation, describe_output, find};
 use crate::pointer::{AGAIN_AFTER, HIDDEN_AGAIN};
 use crate::{CursorKind, CursorShape, CursorUpdate, Frame, Next, Options, PauseReason};
@@ -38,6 +39,14 @@ use crate::{CursorKind, CursorShape, CursorUpdate, Frame, Next, Options, PauseRe
 // a share thread may take to notice it was told to stop.
 pub(crate) const IDLE_WAIT: Duration = Duration::from_millis(100);
 const RETRY: Duration = Duration::from_millis(100);
+
+// For a while after a change, each new duplication can be lost before its
+// first picture, so a call makes new ones AGAIN apart until IDLE_WAIT has
+// gone by: the picture is back soon after Windows lets go, and the share can
+// still stop. After LOST_CALLS such calls, about LOOK_EVERY, the share is
+// told why and the tries go LOOK_EVERY apart.
+const AGAIN: Duration = Duration::from_millis(10);
+const LOST_CALLS: u32 = (LOOK_EVERY.as_millis() / IDLE_WAIT.as_millis()) as u32;
 
 // DuplicateOutput1 works only for a process that is per-monitor DPI aware
 // (v2). booth.exe becomes that when eframe starts its window: winit calls
@@ -92,6 +101,8 @@ pub struct Capture {
     skipped: u32,
     // While paused, the reason last told.
     paused: Option<PauseReason>,
+    // Calls in a row whose duplications were each lost before a picture.
+    lost_at_once: u32,
     // A monitor that left the desktop is waited for (missing.rs).
     missing: Missing,
     number: u64,
@@ -115,6 +126,8 @@ pub struct Capture {
     look: Option<PauseReason>,
     #[cfg(test)]
     reopens: u32,
+    #[cfg(test)]
+    lose_next: u32,
 }
 
 struct Pending {
@@ -205,8 +218,22 @@ fn cursor_at(
 
 enum Acquired {
     Timeout,
-    Lost,
+    Lost(HRESULT),
     Frame(DXGI_OUTDUPL_FRAME_INFO, IDXGIResource),
+}
+
+// A desktop switch or a mode change can answer with more than ACCESS_LOST.
+// A new duplication then says whether to wait, and why (reopen()).
+fn acquire_failed(code: HRESULT) -> Option<Acquired> {
+    match code {
+        DXGI_ERROR_WAIT_TIMEOUT => Some(Acquired::Timeout),
+        DXGI_ERROR_ACCESS_LOST
+        | DXGI_ERROR_ACCESS_DENIED
+        | E_ACCESSDENIED
+        | DXGI_ERROR_SESSION_DISCONNECTED
+        | DXGI_ERROR_MODE_CHANGE_IN_PROGRESS => Some(Acquired::Lost(code)),
+        _ => None,
+    }
 }
 
 // Releases the duplication frame when dropped, so an error on the way out
@@ -263,7 +290,7 @@ impl Capture {
                 "could not duplicate {name}: this process is not per-monitor DPI aware (v2), which Windows requires for it. Call make_process_dpi_aware() before any window opens"
             )));
         }
-        let (adapter, output) = find(&monitor.id).map_err(|err| match err.kind() {
+        let (adapter, output) = find(monitor).map_err(|err| match err.kind() {
             ErrorKind::MonitorGone => err.pausing(missing_reason(crate::desktop_away())),
             _ => err,
         })?;
@@ -302,6 +329,7 @@ impl Capture {
             rested: false,
             skipped: 0,
             paused: None,
+            lost_at_once: 0,
             missing: Missing::default(),
             number: 0,
             pointer: (0, 0, false),
@@ -315,6 +343,8 @@ impl Capture {
             look: None,
             #[cfg(test)]
             reopens: 0,
+            #[cfg(test)]
+            lose_next: 0,
         })
     }
 
@@ -357,17 +387,35 @@ impl Capture {
         // AcquireNextFrame can time out early, on a refresh that brought
         // nothing new, so Idle waits for the whole of IDLE_WAIT.
         let mut idle_at = Instant::now() + IDLE_WAIT;
+        let tries_until = idle_at;
         // For this call only: one that returns with a picture still held has
         // asked Windows for a newer one, which tells of a lock by itself.
         let mut rested = mem::take(&mut self.rested);
+        // The duplication was made in this call and has given no frame yet;
+        // `lost` is what took the last one away.
+        let mut made = false;
+        let mut lost = DXGI_ERROR_ACCESS_LOST;
         loop {
             if self.duplication.is_none() {
-                // The first try is at once, since a mode change is often
-                // over by then; while paused, one try per call, RETRY apart.
-                if self.paused.is_some() {
+                if made {
+                    if self.lost_at_once >= LOST_CALLS || Instant::now() >= tries_until {
+                        return Ok(self.lost_again(lost));
+                    }
+                    thread::sleep(AGAIN);
+                } else if self.paused.is_some() || self.lost_at_once >= LOST_CALLS {
+                    // The first try is at once, since a mode change is often
+                    // over by then; while paused, or told of the losses, one
+                    // try per call at most, RETRY apart.
                     thread::sleep(RETRY);
                 }
+                // Once told, one call in LOST_CALLS tries.
+                let call = self.lost_at_once + 1;
+                if call > LOST_CALLS && !call.is_multiple_of(LOST_CALLS) {
+                    self.lost_at_once = call;
+                    return Ok(Next::Idle);
+                }
                 if let Some(reason) = self.reopen()? {
+                    self.lost_at_once = 0;
                     // Told again only when the reason changes in kind: a
                     // monitor that left the desktop has a deadline the
                     // others do not, and a lock after it left stops the PC
@@ -381,6 +429,7 @@ impl Capture {
                     return Ok(Next::Paused(reason));
                 }
                 self.paused = None;
+                made = true;
                 idle_at = Instant::now() + IDLE_WAIT;
             }
             let now = Instant::now();
@@ -431,8 +480,13 @@ impl Capture {
                     }
                 }
                 // A mode change, a rotation or the secure desktop.
-                Acquired::Lost => self.lose(),
+                Acquired::Lost(code) => {
+                    lost = code;
+                    self.lose();
+                }
                 Acquired::Frame(info, resource) => {
+                    self.lost_at_once = 0;
+                    made = false;
                     if let Some(next) = self.take(info, resource)? {
                         return Ok(next);
                     }
@@ -442,8 +496,13 @@ impl Capture {
     }
 
     fn acquire(&mut self, timeout_ms: u32) -> Result<Acquired, CaptureError> {
+        #[cfg(test)]
+        if self.lose_next > 0 {
+            self.lose_next -= 1;
+            return Ok(Acquired::Lost(DXGI_ERROR_ACCESS_LOST));
+        }
         let Some(duplication) = &self.duplication else {
-            return Ok(Acquired::Lost);
+            return Ok(Acquired::Lost(DXGI_ERROR_ACCESS_LOST));
         };
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource = None;
@@ -459,9 +518,10 @@ impl Capture {
                     Ok(Acquired::Timeout)
                 }
             },
-            Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => Ok(Acquired::Timeout),
-            Err(err) if err.code() == DXGI_ERROR_ACCESS_LOST => Ok(Acquired::Lost),
-            Err(err) => Err(self.failed("read the next picture of", &err)),
+            Err(err) => match acquire_failed(err.code()) {
+                Some(acquired) => Ok(acquired),
+                None => Err(self.failed("read the next picture of", &err)),
+            },
         }
     }
 
@@ -516,9 +576,9 @@ impl Capture {
             .convert(&view, &self.layout, &self.targets[slot]);
         drop(view);
         drop(texture);
-        let released = held.release();
         // SAFETY: a call on the live immediate context.
         unsafe { self.context.Flush() };
+        let released = held.release();
         let converted = Instant::now();
         if let Err(err) = released {
             self.release_failed(err)?;
@@ -585,6 +645,23 @@ impl Capture {
     fn lose(&mut self) {
         self.duplication = None;
         self.drop_pending();
+    }
+
+    // Each duplication this call made was lost before a picture, the last
+    // one with `code`. Once that has gone on for LOST_CALLS calls, the share
+    // is told why, as if Windows had refused the desktop with it, since
+    // DuplicateOutput1 keeps saying yes.
+    fn lost_again(&mut self, code: HRESULT) -> Next {
+        self.lost_at_once += 1;
+        if self.lost_at_once != LOST_CALLS {
+            return Next::Idle;
+        }
+        let err = windows::core::Error::from(code);
+        let reason =
+            duplication_pause(&err).unwrap_or_else(|| PauseReason::Changing(meaning(&err)));
+        self.paused = Some(reason.clone());
+        self.region_pointer.paused();
+        Next::Paused(reason)
     }
 
     // Windows shows another desktop than this session's own, or cannot say
@@ -814,12 +891,15 @@ impl Capture {
             if let Some(reason) = &self.refuse {
                 return Ok(Some(reason.clone()));
             }
+            if self.lose_next > 0 {
+                return Ok(None);
+            }
         }
         let now = Instant::now();
         if !self.missing.due(now) {
             return Ok(Some(self.missing_reason()));
         }
-        let output = match find(&self.monitor.id) {
+        let output = match find(&self.monitor) {
             Ok((_, output)) => output,
             Err(err) if err.kind() == ErrorKind::MonitorGone => {
                 return match self.missing.missed(now) {
@@ -922,6 +1002,18 @@ enum Refused {
     Failed(CaptureError),
 }
 
+fn duplication_pause(err: &windows::core::Error) -> Option<PauseReason> {
+    Some(match err.code() {
+        E_ACCESSDENIED | DXGI_ERROR_ACCESS_DENIED => PauseReason::SecureDesktop,
+        DXGI_ERROR_NOT_CURRENTLY_AVAILABLE => PauseReason::Taken,
+        DXGI_ERROR_SESSION_DISCONNECTED => PauseReason::Disconnected,
+        DXGI_ERROR_ACCESS_LOST | DXGI_ERROR_MODE_CHANGE_IN_PROGRESS | DXGI_ERROR_UNSUPPORTED => {
+            PauseReason::Changing(meaning(err))
+        }
+        _ => return None,
+    })
+}
+
 // What the next duplicate() on this thread is refused for, before Windows is
 // asked: no test can make Windows refuse a monitor at open.
 #[cfg(test)]
@@ -958,16 +1050,11 @@ fn duplicate(
             if is_device_lost(code) {
                 return Refused::Failed(device::lost(device, &step, &err));
             }
-            let reason = match code {
-                E_ACCESSDENIED => PauseReason::SecureDesktop,
-                DXGI_ERROR_NOT_CURRENTLY_AVAILABLE => PauseReason::Taken,
-                DXGI_ERROR_SESSION_DISCONNECTED => PauseReason::Disconnected,
-                DXGI_ERROR_ACCESS_LOST | DXGI_ERROR_MODE_CHANGE_IN_PROGRESS => {
-                    PauseReason::Changing(meaning(&err))
-                }
+            let reason = match duplication_pause(&err) {
+                Some(reason) => reason,
                 // Measured: a second live duplication of one monitor in the
                 // same process gets this, from the same device or another.
-                E_INVALIDARG => {
+                None if code == E_INVALIDARG => {
                     return Refused::Failed(CaptureError::other(format!(
                         "could not {step}: this program is already duplicating it, and Windows allows one duplication of a monitor per program (E_INVALIDARG). Stop the other share first"
                     )));
@@ -1093,6 +1180,62 @@ mod tests {
         Some(Capture::open(monitor, Options::default()).unwrap())
     }
 
+    // A real device without a duplication, so no desktop access is needed.
+    fn lost_capture() -> Option<Capture> {
+        make_process_dpi_aware().unwrap();
+        let Some(monitor) = crate::monitors().unwrap().into_iter().next() else {
+            println!("skipped: no monitor is attached to the desktop");
+            return None;
+        };
+        let (adapter, _) = find(&monitor).unwrap();
+        let (device, context) = device::create(&adapter, &monitor.adapter.description).unwrap();
+        let converter = Converter::new(&device, &monitor.adapter.description).unwrap();
+        let options = Options::default();
+        let plan = Plan::new(
+            monitor.width,
+            monitor.height,
+            monitor.rotation,
+            options.max_width,
+            options.max_height,
+        );
+        let layout = converter.layout(plan).unwrap();
+        let targets = [
+            converter.target(plan.width, plan.height).unwrap(),
+            converter.target(plan.width, plan.height).unwrap(),
+        ];
+        Some(Capture {
+            monitor,
+            options,
+            device,
+            context,
+            converter,
+            duplication: None,
+            fresh: true,
+            rotation: plan.rotation,
+            layout,
+            targets,
+            last_out: 1,
+            copy: None,
+            cap: FpsCap::new(options.max_fps),
+            pending: None,
+            rested: false,
+            skipped: 0,
+            paused: None,
+            lost_at_once: 0,
+            missing: Missing::default(),
+            number: 0,
+            pointer: (0, 0, false),
+            hotspot: (0, 0),
+            region: None,
+            region_pointer: RegionPointer::default(),
+            qpc_frequency: 1,
+            refuse: None,
+            look: None,
+            reopens: 0,
+            lose_next: 0,
+        })
+    }
+
     fn times(present: Instant) -> Pending {
         Pending {
             present,
@@ -1100,6 +1243,66 @@ mod tests {
             converted: present,
             accumulated: 1,
             protected: false,
+        }
+    }
+
+    #[test]
+    fn an_unsupported_desktop_waits_for_a_mode_change() {
+        for code in [
+            DXGI_ERROR_ACCESS_LOST,
+            DXGI_ERROR_MODE_CHANGE_IN_PROGRESS,
+            DXGI_ERROR_UNSUPPORTED,
+        ] {
+            let err = windows::core::Error::from(code);
+            assert_eq!(
+                duplication_pause(&err),
+                Some(PauseReason::Changing(meaning(&err)))
+            );
+        }
+        for code in [
+            E_INVALIDARG,
+            windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED,
+            windows::Win32::Foundation::E_OUTOFMEMORY,
+        ] {
+            assert_eq!(duplication_pause(&windows::core::Error::from(code)), None);
+        }
+    }
+
+    #[test]
+    fn a_refused_desktop_waits_as_the_secure_desktop() {
+        for code in [E_ACCESSDENIED, DXGI_ERROR_ACCESS_DENIED] {
+            assert_eq!(
+                duplication_pause(&windows::core::Error::from(code)),
+                Some(PauseReason::SecureDesktop),
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_desktop_switch_while_reading_makes_a_new_duplication() {
+        assert!(matches!(
+            acquire_failed(DXGI_ERROR_WAIT_TIMEOUT),
+            Some(Acquired::Timeout)
+        ));
+        for code in [
+            DXGI_ERROR_ACCESS_LOST,
+            DXGI_ERROR_ACCESS_DENIED,
+            E_ACCESSDENIED,
+            DXGI_ERROR_SESSION_DISCONNECTED,
+            DXGI_ERROR_MODE_CHANGE_IN_PROGRESS,
+        ] {
+            assert!(
+                matches!(acquire_failed(code), Some(Acquired::Lost(lost)) if lost == code),
+                "{code:?}"
+            );
+        }
+        for code in [
+            E_INVALIDARG,
+            windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED,
+            windows::Win32::Graphics::Dxgi::DXGI_ERROR_INVALID_CALL,
+        ] {
+            assert!(acquire_failed(code).is_none(), "{code:?}");
         }
     }
 
@@ -1166,7 +1369,7 @@ mod tests {
                         assert_eq!((frame.width, frame.height), (plan.width, plan.height));
                         break;
                     }
-                    Next::Cursor(_) if calls < 10 => {}
+                    Next::Cursor(_) | Next::Idle if calls < LOST_CALLS => {}
                     Next::Cursor(_) | Next::Idle => {
                         panic!("round {round}: no picture after the duplication was made again")
                     }
@@ -1218,12 +1421,11 @@ mod tests {
                     assert!(frame.skipped >= 2, "{} skipped", frame.skipped);
                     return;
                 }
-                Next::Cursor(_) => {}
-                Next::Idle => panic!("no picture after the duplication was made again"),
+                Next::Cursor(_) | Next::Idle => {}
                 Next::Paused(reason) => panic!("paused: {reason}"),
             }
         }
-        panic!("only pointer updates after the duplication was made again");
+        panic!("no picture in 10 calls after the duplication was made again");
     }
 
     // The picture Windows hands over changed size, as in a mode change that
@@ -1598,6 +1800,97 @@ mod tests {
         );
         assert!(turned.is_ok(), "the same upright size, turned");
     }
+
+    // Windows taking back each new duplication before its first picture, as
+    // the desktop can for a while after a change: a call tries AGAIN apart
+    // for IDLE_WAIT and then answers, so the share can stop.
+    #[test]
+    fn repeated_losses_return_between_paced_retries() {
+        let Some(mut capture) = lost_capture() else {
+            return;
+        };
+        capture.lose_next = u32::MAX;
+        let most = 1 + (IDLE_WAIT.as_millis() / AGAIN.as_millis()) as u32;
+        let mut reopens = 0;
+        for call in 1..=3 {
+            let asked = Instant::now();
+            assert!(matches!(capture.next().unwrap(), Next::Idle), "call {call}");
+            let waited = asked.elapsed();
+            let made = capture.reopens - reopens;
+            reopens = capture.reopens;
+            assert!(waited >= IDLE_WAIT, "call {call} answered after {waited:?}");
+            assert!(made > 1 && made <= most, "call {call} made {made}");
+        }
+        capture.refuse = Some(PauseReason::SecureDesktop);
+        assert!(matches!(
+            capture.next().unwrap(),
+            Next::Paused(PauseReason::SecureDesktop)
+        ));
+        assert_eq!(capture.reopens, reopens + 1);
+        assert_eq!(capture.lost_at_once, 0);
+    }
+
+    // Each new duplication lost for longer than a mode change takes: the
+    // share is told why once, as Windows said it, and the tries then go
+    // LOST_CALLS calls apart.
+    #[test]
+    fn losses_that_go_on_say_why_and_slow_the_tries() {
+        let Some(mut capture) = lost_capture() else {
+            return;
+        };
+        capture.lose_next = u32::MAX;
+        let start = Instant::now();
+        for call in 1..LOST_CALLS {
+            assert!(matches!(capture.next().unwrap(), Next::Idle), "call {call}");
+        }
+        assert!(matches!(
+            capture.next().unwrap(),
+            Next::Paused(PauseReason::Changing(_))
+        ));
+        assert!(start.elapsed() >= IDLE_WAIT * LOST_CALLS);
+        let tried = capture.reopens;
+        for call in 1..LOST_CALLS {
+            let asked = Instant::now();
+            assert!(
+                matches!(capture.next().unwrap(), Next::Idle),
+                "call {call} after the pause"
+            );
+            assert!(asked.elapsed() >= RETRY, "call {call} after the pause");
+        }
+        assert_eq!(capture.reopens, tried);
+        assert!(matches!(capture.next().unwrap(), Next::Idle));
+        assert_eq!(capture.reopens, tried + 1);
+
+        capture.lost_at_once = LOST_CALLS - 1;
+        assert!(matches!(
+            capture.lost_again(E_ACCESSDENIED),
+            Next::Paused(PauseReason::SecureDesktop)
+        ));
+        assert_eq!(capture.paused, Some(PauseReason::SecureDesktop));
+    }
+
+    #[test]
+    fn a_reused_source_name_pauses_without_a_picture() {
+        let Some(mut capture) = lost_capture() else {
+            return;
+        };
+        if capture.monitor.device_paths.is_empty()
+            || capture.monitor.device_paths.iter().any(String::is_empty)
+        {
+            println!("skipped: DisplayConfig did not report every target path");
+            return;
+        }
+        capture.monitor.device_paths = vec![String::from("another monitor at the same source")];
+        capture.look = Some(PauseReason::Missing);
+        assert!(matches!(
+            capture.next().unwrap(),
+            Next::Paused(PauseReason::Missing)
+        ));
+        assert!(capture.duplication.is_none());
+        assert!(capture.pending.is_none());
+        assert_eq!(capture.number, 0);
+    }
+
     #[test]
     fn while_paused_each_call_waits_then_tries_once() {
         let _turn = desktop_turn();
@@ -1669,9 +1962,12 @@ mod tests {
         assert_eq!(capture.cap.held_until(), None);
 
         capture.refuse = None;
-        match capture.next().unwrap() {
-            Next::Frame(_) => {}
-            other => panic!("{other:?} once the desktop was back"),
+        for call in 1.. {
+            match capture.next().unwrap() {
+                Next::Frame(_) => break,
+                Next::Idle if call < LOST_CALLS => {}
+                other => panic!("{other:?} once the desktop was back"),
+            }
         }
         // Past the slot the picture that went out booked.
         thread::sleep(IDLE_WAIT);

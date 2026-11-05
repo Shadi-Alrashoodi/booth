@@ -205,6 +205,7 @@ pub(crate) mod tests {
                 device_name: device.to_owned(),
                 adapter_luid: 7,
             },
+            device_paths: Vec::new(),
             name: String::from("Generic PnP Monitor"),
             left,
             top: 0,
