@@ -163,6 +163,26 @@ fn the_panic_key_takes_its_key_under_more_modifiers() {
     assert_eq!(Action::Panic.name(), "panic key");
 }
 
+#[test]
+fn loose_keys_conflict_with_incomparable_modifiers() {
+    let mut bindings = Bindings::default();
+    bindings.set(Action::Panic, chord("Shift+K"));
+    assert_eq!(
+        bindings.conflict(Action::PushToTalk, chord("Ctrl+K")),
+        Some(Action::Panic)
+    );
+    bindings.set(Action::PushToTalk, chord("Ctrl+K"));
+    assert_eq!(
+        bindings.first_conflict(),
+        Some((Action::PushToTalk, Action::Panic))
+    );
+    assert_eq!(
+        bindings.conflict(Action::Panic, chord("Shift+K")),
+        Some(Action::PushToTalk)
+    );
+    assert_eq!(bindings.first_conflict_without(&[Action::Panic]), None);
+}
+
 // An action left out clashes with nothing, and what it hid is found.
 #[test]
 fn a_conflict_found_without_some_actions() {

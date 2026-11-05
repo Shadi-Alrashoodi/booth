@@ -349,22 +349,40 @@ impl Tracker {
         };
         // A modifier let go with no other key pressed: the modifier pressed
         // last is the key, the others its modifiers. That is how Right Ctrl
-        // alone is read.
+        // alone is read. While controlled, an injected modifier is nobody's,
+        // so if the one pressed last was injected, the physical one pressed
+        // last is the key.
         if let Some(gesture) = &mut self.capture
             && key.is_modifier()
             && !gesture.done
             && let Some(last) = gesture.last_modifier
         {
+            let last = if self.controlled
+                && !self
+                    .down
+                    .iter()
+                    .any(|(down, from)| *down == last && *from != INJECTED)
+            {
+                self.down
+                    .iter()
+                    .rev()
+                    .find(|(down, from)| down.is_modifier() && *from != INJECTED)
+                    .map_or(key, |(down, _)| *down)
+            } else {
+                last
+            };
             let others = self
                 .down
                 .iter()
-                .filter(|(down, _)| *down != last)
+                .filter(|(down, from)| *down != last && (!self.controlled || *from != INJECTED))
                 .fold(Modifiers::NONE, |all, (down, _)| all.with(down.modifier()));
             out.push(Event::Chord(Chord::new(others, last)));
             gesture.done = true;
         }
         self.down.remove(at);
-        if self.down.is_empty()
+        // An injected key held from before control began is nobody's, so it
+        // does not keep the next gesture from starting.
+        if !self.down.iter().any(|(_, from)| self.counts(*from))
             && let Some(gesture) = &mut self.capture
         {
             *gesture = Gesture::default();

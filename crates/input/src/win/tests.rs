@@ -1,20 +1,21 @@
 // The Windows part. The hidden window's thread is started and stopped for
 // real: a test build registers it without the background flag
 // (BACKGROUND), and the window is never in front, so nothing typed while
-// this runs ever reaches it. That is the only test in the binary that
-// registers for input, since a process has one keyboard registration and
-// two would take it from each other. The Windows keys hook's procedure is
-// driven with made-up events; no hook is installed.
+// this runs ever reaches it. The full-queue shutdown test runs in a separate
+// process, since a process has one keyboard registration and two would take
+// it from each other. The Windows keys hook's procedure is driven with
+// made-up events; no hook is installed.
 
 use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
+use windows_sys::Win32::Foundation::ERROR_NOT_ENOUGH_QUOTA;
 use windows_sys::Win32::System::Threading::{
     GR_USEROBJECTS, GetCurrentProcess, GetGuiResources, GetProcessHandleCount,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_UP,
+    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_UP, PostThreadMessageW,
 };
 
 use super::Hooked;
@@ -28,6 +29,23 @@ use crate::remote::Remote;
 const VIEWER: isize = 0x0004_0A12;
 const BROWSER: isize = 0x0003_0C44;
 const E: Key = Key::from_scan(0, 0x12);
+
+impl super::Thread {
+    pub(crate) fn fill_queue(&self) {
+        for _ in 0..100_000 {
+            // SAFETY: spawn returned only after this thread had a queue.
+            // The test keeps it blocked until the queue is full.
+            if unsafe { PostThreadMessageW(self.id, super::WM_COMMANDS, 0, 0) } == 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(ERROR_NOT_ENOUGH_QUOTA as i32)
+                );
+                return;
+            }
+        }
+        panic!("the hotkey message queue did not fill");
+    }
+}
 
 #[test]
 fn the_hotkey_thread_starts_and_stops_cleanly_many_times() {

@@ -15,7 +15,7 @@ use std::io;
 use std::ptr;
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_CLASS_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT,
@@ -178,11 +178,15 @@ impl Drop for Thread {
         };
         // A thread that already ended (it panicked) no longer owns its id,
         // which Windows may have given to another thread since.
-        if !join.is_finished() {
+        while !join.is_finished() {
             // SAFETY: posts WM_QUIT with no data to the hotkey thread, which
             // is still running and has a message queue since its window was
             // made before `spawn` returned.
-            unsafe { PostThreadMessageW(self.id, WM_QUIT, 0, 0) };
+            if unsafe { PostThreadMessageW(self.id, WM_QUIT, 0, 0) } != 0 {
+                break;
+            }
+            // A full queue refuses even WM_QUIT, so wait for room and retry.
+            thread::sleep(Duration::from_millis(1));
         }
         let _ = join.join();
     }

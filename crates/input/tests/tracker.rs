@@ -640,6 +640,57 @@ fn while_controlled_settings_reads_no_injected_key() {
     );
 }
 
+#[test]
+fn modifier_capture_ignores_old_injected_modifiers_while_controlled() {
+    for controlled in [false, true] {
+        let mut tracker = tracker();
+        tracker.raw(RawKey::press(Key::LEFT_SHIFT, INJECTED));
+        tracker.set_controlled(controlled);
+        tracker.capture(true);
+        assert_eq!(down(&mut tracker, Key::RIGHT_CTRL), []);
+        let modifiers = if controlled {
+            Modifiers::NONE
+        } else {
+            Modifiers::SHIFT
+        };
+        assert_eq!(
+            up(&mut tracker, Key::RIGHT_CTRL),
+            [Event::Chord(Chord::new(modifiers, Key::RIGHT_CTRL))]
+        );
+        assert_eq!(down(&mut tracker, Key::RIGHT_ALT), []);
+        let next = if controlled {
+            vec![Event::Chord(Chord::new(Modifiers::NONE, Key::RIGHT_ALT))]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(up(&mut tracker, Key::RIGHT_ALT), next);
+    }
+}
+
+#[test]
+fn modifier_capture_uses_a_physical_key_when_control_begins() {
+    let mut tracker = tracker();
+    tracker.capture(true);
+    assert_eq!(down(&mut tracker, Key::LEFT_CTRL), []);
+    assert_eq!(tracker.raw(RawKey::press(Key::LEFT_SHIFT, INJECTED)), []);
+    tracker.set_controlled(true);
+    assert_eq!(
+        up(&mut tracker, Key::LEFT_CTRL),
+        [Event::Chord(Chord::new(Modifiers::NONE, Key::LEFT_CTRL))]
+    );
+
+    let mut tracker = Tracker::new(Bindings::default());
+    tracker.capture(true);
+    assert_eq!(down(&mut tracker, Key::LEFT_CTRL), []);
+    assert_eq!(down(&mut tracker, Key::LEFT_ALT), []);
+    assert_eq!(tracker.raw(RawKey::press(Key::LEFT_SHIFT, INJECTED)), []);
+    tracker.set_controlled(true);
+    assert_eq!(
+        up(&mut tracker, Key::LEFT_CTRL),
+        [Event::Chord(Chord::new(Modifiers::CTRL, Key::LEFT_ALT))]
+    );
+}
+
 fn any_key() -> impl Strategy<Value = Key> {
     prop::sample::select(vec![
         Key::LEFT_CTRL,

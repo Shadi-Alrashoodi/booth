@@ -163,13 +163,16 @@ impl Bindings {
 
 // A press fires on exactly its modifiers, so Ctrl+Shift+M and Ctrl+M are
 // two keys. A loose action also runs with more modifiers down than its own,
-// so it takes every chord on its key that includes its modifiers.
+// so it takes every chord on its key that includes its modifiers. Two loose
+// actions on one key always clash, since holding both sets of modifiers sets
+// off both.
 fn clash(a: (Action, Chord), b: (Action, Chord)) -> bool {
     let ((a_action, a), (b_action, b)) = (a, b);
     if a.key != b.key {
         return false;
     }
     a.modifiers == b.modifiers
+        || (a_action.loose() && b_action.loose())
         || (a_action.loose() && b.modifiers.contains(a.modifiers))
         || (b_action.loose() && a.modifiers.contains(b.modifiers))
 }

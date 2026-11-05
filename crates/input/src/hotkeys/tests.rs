@@ -1,6 +1,8 @@
-// The hotkey thread's logic on made-up Raw Input events. Nothing here makes
-// a window, registers for input, installs a hook or sends a key.
+// The hotkey thread's logic on made-up Raw Input events. Except for the
+// full-queue shutdown subprocess, nothing here makes a window or registers
+// for input. Nothing installs a hook or sends a key.
 
+use std::process::{Command as Process, Stdio};
 use std::sync::atomic::{AtomicIsize, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -115,6 +117,73 @@ const DOWN: bool = true;
 const UP: bool = false;
 const W: Key = Key::from_scan(0, 0x11);
 const ALT_F4: [(Key, bool); 2] = [(Key::LEFT_ALT, DOWN), (Key::F4, DOWN)];
+
+#[test]
+fn dropping_the_thread_with_a_full_queue_finishes() {
+    const CHILD: &str = "BOOTH_HOTKEY_FULL_QUEUE";
+    if std::env::var_os(CHILD).is_none() {
+        let mut child = Process::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "hotkeys::tests::dropping_the_thread_with_a_full_queue_finishes",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("the hotkey shutdown subprocess did not finish within 10 seconds");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let mut rig = rig(true);
+    rig.keys(KEYBOARD, &[(Key::RIGHT_CTRL, DOWN)]);
+    let (blocked, waiting) = mpsc::channel();
+    let (release, resume) = mpsc::channel();
+    let mut block = Some((blocked, resume));
+    rig.run.handler = Box::new(move |_| {
+        if let Some((blocked, resume)) = block.take() {
+            blocked.send(()).unwrap();
+            resume.recv().unwrap();
+        }
+    });
+    let hotkeys = win::Thread::spawn(rig.run).unwrap();
+    rig.commands.send(Command::Capture(true)).unwrap();
+    hotkeys.wake();
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    hotkeys.fill_queue();
+
+    let (started, dropping) = mpsc::channel();
+    let (finished, dropped) = mpsc::channel();
+    let dropper = thread::spawn(move || {
+        started.send(()).unwrap();
+        drop(hotkeys);
+        finished.send(()).unwrap();
+    });
+    dropping.recv_timeout(Duration::from_secs(5)).unwrap();
+    thread::sleep(Duration::from_millis(100));
+    release.send(()).unwrap();
+    dropped
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the hotkey thread did not stop after its queue drained");
+    dropper.join().unwrap();
+}
 
 fn chord(key: Key) -> [(Key, bool); 6] {
     [

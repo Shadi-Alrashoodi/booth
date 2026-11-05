@@ -1593,6 +1593,46 @@ mod tests {
         }
     }
 
+    // 1.3.0 let push to talk and the panic key share a key when neither's
+    // modifiers held the other's. Holding Ctrl and Shift sets off both, and
+    // which was meant is anyone's guess, so both go back.
+    #[test]
+    fn an_upgrade_from_1_3_0_sends_push_to_talk_and_panic_on_one_key_back() {
+        let (mut settings, mut problems) =
+            parse(b"hotkey_push_to_talk = Ctrl+K\nhotkey_panic = Shift+K\n");
+        let gave_way = settle_hotkeys(&mut settings, &mut problems);
+        assert_eq!(settings.hotkeys(), Bindings::default());
+        assert_eq!(
+            problems,
+            [
+                "settings: push to talk and panic key are on one key, Ctrl+K; push to talk goes back to Right Ctrl and panic key goes back to Ctrl+Shift+End"
+            ]
+        );
+        let ctrl_k: Chord = "Ctrl+K".parse().unwrap();
+        let shift_k: Chord = "Shift+K".parse().unwrap();
+        assert_eq!(
+            gave_way,
+            [
+                GaveWay {
+                    action: Action::PushToTalk,
+                    was: ctrl_k,
+                    with: Action::Panic,
+                    with_was: shift_k,
+                    now: Action::PushToTalk.default_chord(),
+                    with_now: Action::Panic.default_chord(),
+                },
+                GaveWay {
+                    action: Action::Panic,
+                    was: shift_k,
+                    with: Action::PushToTalk,
+                    with_was: ctrl_k,
+                    now: Action::Panic.default_chord(),
+                    with_now: Action::PushToTalk.default_chord(),
+                },
+            ]
+        );
+    }
+
     // Two keys of the file on F9 go back first, as 1.2.0 had them go, and then
     // pausing's default is free and stays.
     #[test]

@@ -27,7 +27,8 @@ use crate::tracker::{INJECTED, RawKey};
 // those would put the hook ahead by every Win chord pressed. Injected keys
 // are some other program's, and Raw Input also reports what is not a key,
 // such as the made-up Shift around the arrows and the second half of Pause,
-// which the hook may not.
+// which the hook may not. Right Shift counts on neither side because the
+// hook cannot tell the made-up Right Shift from the real one.
 const AHEAD: u64 = 4;
 
 pub(crate) struct Grab {
@@ -91,7 +92,7 @@ impl Side {
     // A physical key; true when the hook takes it.
     fn event(&mut self, key: Key, down: bool, on: bool, bindings: &Bindings) -> bool {
         let take = self.decide(key, down, on, bindings);
-        if !take {
+        if !take && key != Key::RIGHT_SHIFT {
             self.passed += 1;
         }
         take
@@ -382,6 +383,46 @@ mod tests {
         assert!(!grab.lost());
         grab.raw(RawKey::press(L, KEYBOARD), ON);
         assert!(grab.lost());
+    }
+
+    #[test]
+    fn right_shift_does_not_make_a_live_hook_look_lost() {
+        for extended in [false, true] {
+            let mut grab = grab();
+            for _ in 0..10 {
+                for down in [DOWN, UP] {
+                    let key = Key::from_windows(0xA1, 0x36, extended);
+                    assert!(!grab.hook(key, down, false, ON));
+                    let raw = if down {
+                        RawKey::press(Key::RIGHT_SHIFT, KEYBOARD)
+                    } else {
+                        RawKey::release(Key::RIGHT_SHIFT, KEYBOARD)
+                    };
+                    assert!(!grab.raw(raw, ON));
+                    assert!(!grab.lost(), "extended {extended}");
+                }
+            }
+            for _ in 0..10 {
+                for down in [UP, DOWN] {
+                    let key = Key::from_windows(0xA1, 0x36, true);
+                    assert!(!grab.hook(key, down, false, ON));
+                    let mut raw = if down {
+                        RawKey::press(Key::RIGHT_SHIFT, KEYBOARD)
+                    } else {
+                        RawKey::release(Key::RIGHT_SHIFT, KEYBOARD)
+                    };
+                    raw.flags |= RI_KEY_E0;
+                    assert_eq!(raw.key(), None);
+                    assert!(!grab.raw(raw, ON));
+                    assert!(!grab.lost(), "extended {extended}");
+                }
+            }
+            for _ in 0..=AHEAD {
+                assert!(!grab.lost(), "extended {extended}");
+                grab.raw(RawKey::press(L, KEYBOARD), ON);
+            }
+            assert!(grab.lost(), "extended {extended}");
+        }
     }
 
     // However many keys the hook swallowed before, and whether or not Raw

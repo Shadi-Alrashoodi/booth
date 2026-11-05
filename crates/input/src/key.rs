@@ -20,6 +20,7 @@ const E1: u16 = 0xE100;
 
 const VK_PAUSE: u32 = 0x13;
 const VK_NUMLOCK: u32 = 0x90;
+const VK_RSHIFT: u32 = 0xA1;
 const VK_PACKET: u32 = 0xE7;
 
 impl Key {
@@ -53,11 +54,14 @@ impl Key {
     // A key as a window's key messages and the low-level hook give it: the
     // scan code without its prefix and a flag for E0, named the way Raw Input
     // names it. Both give Pause as 45 without the flag and Num Lock as 45
-    // with it, the other way round from what the keyboard sends.
+    // with it, the other way round from what the keyboard sends. The hook
+    // gives Right Shift as 36 with the flag, which would otherwise read as
+    // the made-up Shift around the arrows.
     pub fn from_windows(vk: u32, scan: u32, extended: bool) -> Option<Key> {
         match vk {
             VK_PAUSE => return Some(Key::PAUSE),
             VK_NUMLOCK => return Some(Key::from_scan(0, 0x45)),
+            VK_RSHIFT => return Some(Key::RIGHT_SHIFT),
             // Text a program typed through SendInput: the low-level hook gets
             // the character where the scan code would be.
             VK_PACKET => return None,
@@ -446,6 +450,8 @@ mod tests {
             ((0x5B, 0x5B, true), Some(Key::LEFT_WIN)),
             ((0xA3, 0x1D, true), Some(Key::RIGHT_CTRL)),
             ((0xA2, 0x1D, false), Some(Key::LEFT_CTRL)),
+            ((0xA1, 0x36, false), Some(Key::RIGHT_SHIFT)),
+            ((0xA1, 0x36, true), Some(Key::RIGHT_SHIFT)),
             ((0x09, 0x0F, false), Some(Key::TAB)),
             ((0x23, 0x4F, true), Some(Key::END)),
             // Ctrl+Pause.
