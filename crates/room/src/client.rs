@@ -54,6 +54,8 @@ const SUMMARY_EVERY: Duration = Duration::from_secs(5);
 // to NAME_FOR, in case its address changed.
 const NAME_EVERY: Duration = Duration::from_secs(2);
 const NAME_FOR: Duration = Duration::from_secs(60);
+// Four answers of eight targets leave room for replies to earlier tries.
+const NAME_SOURCES: usize = 32;
 
 // One for the whole program, not one per join. The host drops a stamp from
 // this key that is not newer than the last it took, so a rejoin after the
@@ -677,6 +679,7 @@ impl Client {
         self.last_heard = (self.last_heard + asleep).min(now);
         self.silent_since = self.silent_since.map(on);
         self.name_new_since = self.name_new_since.map(on);
+        self.name_until = self.name_until.map(|until| until + asleep);
         let rejoin = asleep + self.timers.reconnecting_after >= self.timers.lost_after
             && matches!(self.state, LinkState::Live | LinkState::Reconnecting);
         if !rejoin {
@@ -756,10 +759,13 @@ impl Client {
                 self.silence_began(now, socket);
                 changed = true;
             }
-            LinkState::Connecting | LinkState::Lost
-                if self.sessions.current.is_some()
+            LinkState::Connecting | LinkState::Lost | LinkState::Reconnecting
+                if self.sessions.previous.is_none()
                     && !self.heard_on_session
-                    && silent >= self.timers.reconnecting_after =>
+                    && self.sessions.current.as_ref().is_some_and(|current| {
+                        now.saturating_duration_since(current.created())
+                            >= self.timers.reconnecting_after
+                    }) =>
             {
                 // The host answered but never took the session: it may have
                 // dropped it, so start over rather than wait on it.
@@ -915,12 +921,20 @@ impl Client {
                 soonest.add(Some(self.last_heard + self.timers.lost_after));
             }
             LinkState::Reconnecting => soonest.add(Some(self.last_heard + self.timers.lost_after)),
-            LinkState::Connecting | LinkState::Lost
-                if self.sessions.current.is_some() && !self.heard_on_session =>
-            {
-                soonest.add(Some(self.last_heard + self.timers.reconnecting_after));
-            }
             _ => {}
+        }
+        if matches!(
+            self.state,
+            LinkState::Connecting | LinkState::Lost | LinkState::Reconnecting
+        ) && self.sessions.previous.is_none()
+            && !self.heard_on_session
+        {
+            soonest.add(
+                self.sessions
+                    .current
+                    .as_ref()
+                    .map(|current| current.created() + self.timers.reconnecting_after),
+            );
         }
         if self.state == LinkState::Connecting && self.notice.is_none() {
             soonest.add(self.still_trying_at);
@@ -1016,10 +1030,20 @@ impl Client {
             return true;
         }
         log!(self.log, "address name: trying {} too", list(&new));
-        for ip in ips {
-            if !self.punch_sources.contains(&ip) {
-                self.punch_sources.push(ip);
+        let fixed = self.candidates.len();
+        for ip in self.from_name.iter().map(SocketAddr::ip) {
+            if self.punch_sources[..fixed].contains(&ip) {
+                continue;
             }
+            if let Some(at) = self.punch_sources[fixed..]
+                .iter()
+                .position(|old| *old == ip)
+            {
+                self.punch_sources.remove(fixed + at);
+            } else if self.punch_sources.len() == fixed + NAME_SOURCES {
+                self.punch_sources.remove(fixed);
+            }
+            self.punch_sources.push(ip);
         }
         if self.silent_since.is_some() && self.name_new_since.is_none() {
             self.name_new_since = Some(now);
@@ -1779,6 +1803,10 @@ impl Client {
                 self.log,
                 "no reply code: stun says this pc's mapping is hard"
             ),
+            (None, ReplyState::HostNoAddress) => log!(
+                self.log,
+                "no reply code: the invite has no outside address or name for the host"
+            ),
             (None, _) => log!(
                 self.log,
                 "no reply code: stun gave this pc no outside address"
@@ -1916,9 +1944,6 @@ impl Client {
         self.sessions.current = Some(session);
         self.set_host_addr(from);
         self.media = Some(MediaPath::new(from));
-        self.reached_mapped = self
-            .mapped_addr
-            .is_some_and(|mapped| reply::same_address(mapped, from));
         self.connecting = true;
         self.traffic.earlier_retransmits += self.link.retransmissions();
         let old = std::mem::replace(&mut self.link, Link::new(now));
@@ -1927,7 +1952,10 @@ impl Client {
         self.told_periods = None;
         self.heard_on_session = false;
         self.host_hello = false;
-        self.last_heard = now;
+        // Answers alone must not keep a silent host in Reconnecting forever.
+        if self.state != LinkState::Reconnecting {
+            self.last_heard = now;
+        }
         self.link.queue(&Message::Hello {
             version: self.version,
             name: self.name.clone(),
@@ -2027,7 +2055,12 @@ impl Client {
         let mut changed = false;
         let quiet = matches!(self.state, LinkState::Reconnecting | LinkState::Lost)
             || now.saturating_duration_since(self.last_heard) >= self.timers.quiet_after();
-        if which == Which::Current && received.newest && Some(from) != self.host_addr {
+        // Until the host takes the rekey it still sends on the old session,
+        // so that is where a move can first be heard.
+        if (which == Which::Current || !self.heard_on_session)
+            && received.newest
+            && Some(from) != self.host_addr
+        {
             changed = true;
             if let Some(was_at) = self.host_addr {
                 log!(self.log, "the host moved from {was_at} to {from}");
@@ -2619,6 +2652,9 @@ impl Client {
     fn set_host_addr(&mut self, addr: SocketAddr) {
         self.host_addr = Some(addr);
         self.path = Some(numbers::path_word(net::addrs::path_of(addr)));
+        self.reached_mapped = self
+            .mapped_addr
+            .is_some_and(|mapped| reply::same_address(mapped, addr));
     }
 
     fn back_to_ladder(&mut self, now: Instant) {
@@ -2924,6 +2960,105 @@ mod tests {
     }
 
     #[test]
+    fn untaken_rejoin_after_wake_is_retried() {
+        let timers = Timers::default();
+        let start = Instant::now();
+        let (mut rig, _) = Rig::connected(timers, start);
+        rig.client.screen.watched = Some(4);
+        let asleep = Duration::from_secs(20);
+        let woke = start + asleep;
+        assert!(rig.client.slept(asleep, woke, &rig.socket));
+        rig.tick(woke);
+        let answered = woke + Duration::from_millis(500);
+        let (_, _, response) = rig.host.answer_all(answered).pop().expect("a try");
+        rig.deliver(&response, answered);
+        rig.tick(answered);
+        let again = answered + timers.reconnecting_after;
+        rig.tick(again - Duration::from_millis(1));
+        assert!(rig.host.answer_all(again).is_empty(), "retried too soon");
+        rig.tick(again);
+        let (kind, mut session, response) = rig.host.answer_all(again).pop().expect("a new try");
+        assert_eq!(kind, InitKind::Known);
+        assert_eq!(rig.client.state, LinkState::Reconnecting);
+        assert_eq!(rig.client.screen.watched, Some(4));
+        rig.deliver(&response, again);
+        assert!(rig.host.open_all(&mut session) > 0);
+        rig.deliver(&ping(&mut session, 0), again);
+        assert_eq!(rig.client.state, LinkState::Live);
+        assert_eq!(rig.client.screen.watched, Some(4));
+    }
+
+    #[test]
+    fn untaken_rejoin_keeps_the_loss_deadline() {
+        let timers = Timers {
+            voice_report_every: Duration::from_secs(60),
+            ..Timers::default()
+        };
+        let start = Instant::now();
+        let (mut rig, _) = Rig::connected(timers, start);
+        let asleep = Duration::from_secs(20);
+        let woke = start + asleep;
+        assert!(rig.client.slept(asleep, woke, &rig.socket));
+        rig.tick(woke);
+        let (_, _, response) = rig.host.answer_all(woke).pop().expect("a try");
+        rig.deliver(&response, woke);
+
+        // Other timers must not hide the deadline for this session.
+        rig.client.link = Link::new(woke);
+        rig.client.link.next_ping = woke + timers.lost_after;
+        rig.client
+            .stun
+            .set_settled(net::stun::Mapping::Easy, Some(OUTSIDE));
+        let again = woke + timers.reconnecting_after;
+        let next = rig.client.next_deadline().expect("a deadline");
+        assert_eq!(next, again, "no wake for the untaken session");
+
+        let mut now = woke;
+        while now < woke + timers.lost_after {
+            now += Duration::from_millis(500);
+            rig.tick(now);
+            if rig.client.state == LinkState::Reconnecting {
+                for (_, _, response) in rig.host.answer_all(now) {
+                    rig.deliver(&response, now);
+                }
+            }
+        }
+        assert_eq!(rig.client.state, LinkState::Lost);
+        assert_eq!(rig.client.notice, Some(Notice::LostHost));
+    }
+
+    #[test]
+    fn reconnecting_keeps_an_unconfirmed_rekey() {
+        let timers = Timers {
+            rekey_after: Duration::from_secs(10),
+            reject_after: Duration::from_secs(30),
+            ..Timers::default()
+        };
+        let start = Instant::now();
+        let (mut rig, mut first) = Rig::connected(timers, start);
+        let rekey_at = start + timers.rekey_after;
+        rig.deliver(&ping(&mut first, 1), rekey_at);
+        rig.tick(rekey_at);
+        rig.host.wire.packets();
+        let quiet = rekey_at + timers.reconnecting_after;
+        rig.tick(quiet);
+        assert_eq!(rig.client.state, LinkState::Reconnecting);
+        let (kind, _, response) = rig.host.answer_all(quiet).pop().expect("a rekey");
+        assert_eq!(kind, InitKind::Rekey);
+        rig.deliver(&response, quiet);
+        rig.tick(quiet + timers.reconnecting_after);
+        assert!(rig.client.sessions.previous.is_some());
+        assert_eq!(
+            rig.client.sessions.current.as_ref().unwrap().created(),
+            quiet
+        );
+        assert!(
+            rig.client.next_deadline().expect("a deadline") > quiet + timers.reconnecting_after,
+            "the timer thread would spin"
+        );
+    }
+
+    #[test]
     fn untaken_rekey_is_retried() {
         let timers = Timers {
             rekey_after: Duration::from_secs(10),
@@ -2973,6 +3108,80 @@ mod tests {
             rig.host.open_all(&mut second) > 0,
             "the client does not send on the new session"
         );
+    }
+
+    #[test]
+    fn host_move_during_unconfirmed_rekey() {
+        for response_moved in [false, true] {
+            let timers = Timers {
+                rekey_after: Duration::from_secs(10),
+                reject_after: Duration::from_secs(30),
+                ..Timers::default()
+            };
+            let start = Instant::now();
+            let (mut rig, mut first) = Rig::connected(timers, start);
+            let now = start + timers.rekey_after;
+            rig.deliver(&ping(&mut first, 1), now);
+            rig.tick(now);
+            let (kind, mut second, response) = rig.host.answer_all(now).pop().expect("a rekey");
+            assert_eq!(kind, InitKind::Rekey);
+            let moved = Wire::new();
+            let home = rig.host.wire.addr();
+            let from = if response_moved { moved.addr() } else { home };
+            rig.client.on_packet(&response, from, now, &rig.socket);
+            assert_eq!(rig.client.host_addr, Some(home));
+
+            let late = ping(&mut first, 2);
+            rig.client
+                .on_packet(&ping(&mut first, 3), moved.addr(), now, &rig.socket);
+            assert_eq!(rig.client.host_addr, Some(moved.addr()));
+            assert_eq!(rig.client.media.as_ref().unwrap().to(), home);
+            let mut plain = Vec::new();
+            assert!(
+                moved
+                    .packets()
+                    .iter()
+                    .any(|packet| second.decrypt(packet, &mut plain).is_ok()),
+                "confirmation did not reach the host"
+            );
+            rig.client.on_packet(&late, home, now, &rig.socket);
+            assert_eq!(
+                rig.client.host_addr,
+                Some(moved.addr()),
+                "a late packet moved it back"
+            );
+
+            rig.tick(now);
+            let mut probe = None;
+            for packet in moved.packets() {
+                if second.decrypt(&packet, &mut plain).is_ok()
+                    && let Some(Plain::Ping(PingMessage::Ping { seq, t1 })) =
+                        peer::read_plain(&plain)
+                {
+                    probe = Some((seq, t1));
+                }
+            }
+            let (seq, t1) = probe.expect("a probe at the new address");
+            let mut payload = Vec::new();
+            PingMessage::Pong {
+                seq,
+                t1,
+                t2: t1,
+                t3: t1,
+            }
+            .encode(&mut payload);
+            let pong = seal(&mut second, Channel::Ping, &payload);
+            rig.client.on_packet(&pong, moved.addr(), now, &rig.socket);
+            assert!(rig.client.heard_on_session);
+            assert_eq!(rig.client.media.as_ref().unwrap().to(), moved.addr());
+
+            rig.deliver(&ping(&mut first, 4), now);
+            assert_eq!(
+                rig.client.host_addr,
+                Some(moved.addr()),
+                "an old session moved it back"
+            );
+        }
     }
 
     #[test]
@@ -3924,6 +4133,30 @@ mod tests {
     }
 
     #[test]
+    fn no_host_address_is_logged_for_the_invite() {
+        let (log, captured) = Log::capture(64);
+        let start = Instant::now();
+        let mut rig = Rig::with_log(Timers::default(), start, log);
+        rig.client
+            .stun
+            .set_settled(net::stun::Mapping::Easy, Some(OUTSIDE));
+        rig.tick(start + DUE);
+        assert_eq!(
+            rig.client.reply.as_ref().unwrap().state,
+            ReplyState::HostNoAddress
+        );
+        let lines = captured.lines();
+        assert!(lines.iter().any(|line| {
+            line == "no reply code: the invite has no outside address or name for the host"
+        }));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("stun gave this pc no outside address"))
+        );
+    }
+
+    #[test]
     fn punches_only_from_host_unanswered() {
         let (log, captured) = Log::capture(64);
         let mut joining = Joining::new(easy(), |_| {});
@@ -4041,6 +4274,48 @@ mod tests {
         assert_eq!(rig.client.notice, Some(Notice::LostHost));
     }
 
+    #[test]
+    fn sleep_keeps_the_name_lookup_window() {
+        let timers = Timers::default();
+        for lost in [false, true] {
+            for asleep in [Duration::from_secs(90), Duration::from_secs(5)] {
+                let start = Instant::now();
+                let (mut rig, _) = named(timers, start);
+                let quiet = start + timers.reconnecting_after;
+                rig.tick(quiet);
+                assert!(rig.client.name_wanted().is_some());
+                let host_ip = rig.host.wire.addr().ip().to_string();
+                rig.client.name_found(name_gave(&[&host_ip]), quiet);
+                let before = if lost {
+                    let now = start + timers.lost_after;
+                    rig.tick(now);
+                    assert!(rig.client.name_wanted().is_some());
+                    rig.client.name_found(name_gave(&[&host_ip]), now);
+                    now
+                } else {
+                    quiet
+                };
+                let until = rig.client.name_until.unwrap();
+                let woke = before + asleep;
+                let rejoined = rig.client.slept(asleep, woke, &rig.socket);
+                assert_eq!(rejoined, !lost && asleep >= Duration::from_secs(12));
+                rig.tick(woke);
+                assert!(
+                    rig.client.name_wanted().is_some(),
+                    "no lookup at the wake, lost {lost}"
+                );
+                assert_eq!(rig.client.name_until, Some(until + asleep));
+                rig.client.name_found(name_gave(&["127.0.0.2"]), woke);
+                let moved = SocketAddr::from(([127, 0, 0, 2], rig.host.wire.addr().port()));
+                assert!(rig.client.everywhere().contains(&moved));
+                rig.tick(until + asleep);
+                assert_eq!(rig.client.next_name, None);
+                assert_eq!(rig.client.name_until, None);
+                assert!(rig.client.name_wanted().is_none());
+            }
+        }
+    }
+
     // The name gave a new address and nothing answered there within
     // lost_after of the first try.
     #[test]
@@ -4122,6 +4397,95 @@ mod tests {
                 "not tried again as if it were new"
             );
         }
+    }
+
+    #[test]
+    fn name_sources_stay_bounded() {
+        let start = Instant::now();
+        let (mut rig, _) = named(Timers::default(), start);
+        for n in 1..=200 {
+            let ip = format!("127.0.1.{n}");
+            rig.client.name_found(name_gave(&[&ip]), start);
+        }
+        let sources = &rig.client.punch_sources;
+        assert!(sources.len() <= rig.client.candidates.len() + NAME_SOURCES);
+        assert!(sources.contains(&"127.0.1.200".parse().unwrap()));
+        assert!(!sources.contains(&"127.0.1.1".parse().unwrap()));
+        assert!(
+            rig.client
+                .candidates
+                .iter()
+                .all(|addr| sources.contains(&addr.ip()))
+        );
+
+        // Seeing an old address again keeps it among the recent ones.
+        rig.client.name_found(name_gave(&["127.0.1.169"]), start);
+        rig.client.name_found(name_gave(&["127.0.1.201"]), start);
+        assert!(
+            rig.client
+                .punch_sources
+                .contains(&"127.0.1.169".parse().unwrap())
+        );
+        assert!(
+            !rig.client
+                .punch_sources
+                .contains(&"127.0.1.170".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn name_sources_only_keep_targets_tried() {
+        let start = Instant::now();
+        let (mut rig, _) = named(Timers::default(), start);
+        let ips: Vec<String> = (1..=200).map(|n| format!("127.0.1.{n}")).collect();
+        let refs: Vec<&str> = ips.iter().map(String::as_str).collect();
+        rig.client.name_found(name_gave(&refs), start);
+        assert_eq!(rig.client.from_name.len(), 8);
+        assert_eq!(
+            rig.client.punch_sources.len(),
+            rig.client.candidates.len() + 8
+        );
+        for addr in rig.client.from_name.iter().chain(&rig.client.candidates) {
+            assert!(rig.client.punch_sources.contains(&addr.ip()));
+        }
+        assert!(
+            !rig.client
+                .punch_sources
+                .contains(&"127.0.1.200".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn name_sources_keep_replies_to_open_tries() {
+        let start = Instant::now();
+        let mut rig = Rig::editing(Timers::default(), start, Log::off(), |invite| {
+            invite.hostname = Some(NAME.to_owned());
+        });
+        let ips: Vec<String> = (1..=24).map(|n| format!("127.0.1.{n}")).collect();
+        let refs: Vec<&str> = ips.iter().map(String::as_str).collect();
+        rig.client.name_found(name_gave(&refs[..8]), start);
+        let earlier = rig.client.from_name[0];
+        let tried = start + NAME_EVERY - Duration::from_millis(1);
+        rig.tick(tried);
+        let (_, _, response) = rig.host.answer_all(tried).pop().expect("a try");
+        let mut later = start;
+        for ips in refs[8..].chunks(8) {
+            later += NAME_EVERY;
+            rig.client.name_found(name_gave(ips), later);
+        }
+        rig.client.on_packet(&response, earlier, later, &rig.socket);
+        assert!(rig.client.sessions.current.is_some());
+        assert_eq!(rig.client.host_addr, Some(earlier));
+
+        for n in 1..=200 {
+            let ip = format!("127.0.2.{n}");
+            rig.client.name_found(name_gave(&[&ip]), later);
+        }
+        assert!(!rig.client.punch_sources.contains(&earlier.ip()));
+        let bad = rig.client.drops.bad;
+        let punch = session::punch_packet(&[7; session::PUNCH_RANDOM_LEN]);
+        rig.client.on_packet(&punch, earlier, later, &rig.socket);
+        assert_eq!(rig.client.drops.bad, bad, "the current host is still known");
     }
 
     // A STUN server on a wire, with the first round answered.
@@ -4415,6 +4779,39 @@ mod tests {
             assert!(view.numbers.address_change.is_some());
             assert_eq!(view.reply, None, "verified {verified}");
             assert!(rig.client.own_moved.is_some());
+        }
+    }
+
+    #[test]
+    fn code_in_room_after_leaving_mapped_address() {
+        for new_ip in [false, true] {
+            let start = Instant::now();
+            let rig = Rig::editing(Timers::default(), start, Log::off(), |invite| {
+                invite.candidates[0].kind = CandidateKind::Public;
+                invite.mapped = true;
+            });
+            let (mut rig, mut session) = Rig::joined(rig, start);
+            assert!(rig.client.reached_mapped);
+            let elsewhere = Wire::new();
+            let moved = if new_ip {
+                SocketAddr::from(([127, 0, 0, 2], rig.host.wire.addr().port()))
+            } else {
+                elsewhere.addr()
+            };
+            rig.client
+                .on_packet(&ping(&mut session, 1), moved, start, &rig.socket);
+            assert_eq!(rig.client.host_addr, Some(moved));
+            let quiet = moved_away(&mut rig, start);
+            let reply = rig.client.view(quiet, 0).reply.expect("the code");
+            assert_eq!(
+                reply.state,
+                ReplyState::Code {
+                    second_router: false
+                }
+            );
+            assert!(!rig.client.reached_mapped);
+            rig.deliver(&ping(&mut session, 2), quiet);
+            assert!(rig.client.reached_mapped, "back through the mapped address");
         }
     }
 
