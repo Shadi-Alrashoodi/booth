@@ -334,6 +334,8 @@ impl Session {
         drop(client);
         let first = Ask::first(engine, engine_bytes);
 
+        // Made before the clients so it outlives their release on errors too.
+        let signal = Signal::new().map_err(fail("make an event for"))?;
         // The small period first. It needs the engine's own format, so only
         // when that is already 48 kHz.
         let small = if first.convert {
@@ -341,7 +343,7 @@ impl Session {
         } else {
             activate_as::<IAudioClient3>(&device, talking)
                 .ok()
-                .and_then(|client3| init_small(&device, client3, &first.bytes, talking))
+                .and_then(|client3| init_small(&device, client3, &first.bytes, talking, &signal))
         };
         let (client, period_frames, small_period, ask, refused) = match small {
             Some((client3, frames)) => {
@@ -353,9 +355,12 @@ impl Session {
                     let client: IAudioClient = activate_as(&device, talking)?;
                     Ok(Format::parse(&mix_bytes(&client)?).ok())
                 };
-                let (client, ask, refused) =
-                    init_with(first, |ask| init_shared(&device, ask, talking), engine_now)
-                        .map_err(fail("open"))?;
+                let (client, ask, refused) = init_with(
+                    first,
+                    |ask| init_shared(&device, ask, talking, &signal),
+                    engine_now,
+                )
+                .map_err(fail("open"))?;
                 let mut default = 0i64;
                 // SAFETY: one local for the call to fill.
                 unsafe { client.GetDevicePeriod(Some(&mut default), None) }
@@ -364,10 +369,6 @@ impl Session {
             }
         };
 
-        let signal = Signal::new().map_err(fail("make an event for"))?;
-        // SAFETY: the event stays open for as long as the client lives:
-        // both are in the stream, and the stream drops the client first.
-        unsafe { client.SetEventHandle(signal.0) }.map_err(fail("open"))?;
         // SAFETY: getters on an initialized client.
         let buffer_frames = unsafe { client.GetBufferSize() }.map_err(fail("open"))?;
         // SAFETY: as above.
@@ -575,6 +576,7 @@ fn init_shared(
     device: &IMMDevice,
     ask: &Ask,
     talking: bool,
+    signal: &Signal,
 ) -> windows::core::Result<IAudioClient> {
     let client: IAudioClient = activate_as(device, talking)?;
     let mut flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
@@ -586,6 +588,9 @@ fn init_shared(
     // outlives the call. Zero buffer and period ask for the default in
     // shared mode.
     unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, wave, None) }?;
+    // SAFETY: the caller keeps the event open until the client is released.
+    // Set at once, since releasing a stream without one makes Windows wait.
+    unsafe { client.SetEventHandle(signal.0) }?;
     Ok(client)
 }
 
@@ -597,6 +602,7 @@ fn init_small(
     client: IAudioClient3,
     wave_bytes: &[u8],
     talking: bool,
+    signal: &Signal,
 ) -> Option<(IAudioClient3, u32)> {
     let periods = engine_periods(&client, wave_bytes).ok()?;
     let wave = wave_bytes.as_ptr().cast::<WAVEFORMATEX>();
@@ -629,6 +635,9 @@ fn init_small(
         }
         Err(_) => return None,
     };
+    // SAFETY: the caller keeps the event open until the client is released.
+    // Set before asking for the period, which can fail on an open stream.
+    unsafe { client.SetEventHandle(signal.0) }.ok()?;
     let period = current_period(&client)?;
     Some((client, period))
 }
