@@ -8,19 +8,25 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_NOT_SAME_DEVICE,
+    ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_NOT_SAME_DEVICE, GENERIC_READ, GENERIC_WRITE,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_HASH_HANDLE, BCRYPT_SHA256_ALG_HANDLE, BCryptCreateHash, BCryptDestroyHash,
     BCryptFinishHash, BCryptHashData,
 };
-use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+use windows_sys::Win32::Storage::FileSystem::{
+    DELETE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX, FILE_RENAME_INFO, FILE_SHARE_READ,
+    FileDispositionInfo, FileDispositionInfoEx, FileRenameInfo, SetFileInformationByHandle,
+};
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::UI::Shell::{FOLDERID_Downloads, KF_FLAG_CREATE, SHGetKnownFolderPath};
 
@@ -33,10 +39,85 @@ pub const MOST_ZIP_BYTES: u64 = 256 * 1024 * 1024;
 // A read that waits this long means the line has stalled.
 const READ_WAIT: Duration = Duration::from_secs(30);
 const PART: &str = "download.part";
-// Added to the zip's name while it is copied into Downloads on another
-// drive. No browser uses it, so only Booth ever makes a file of that name.
 const COPYING: &str = ".copying";
+// Staging names tried before the copy gives up with the last reason.
+const COPYING_NAMES: u64 = 16;
 const COPY_CHUNK: usize = 64 * 1024;
+
+struct Pending {
+    file: File,
+    published: bool,
+}
+
+impl Pending {
+    fn create(path: &Path, new: bool) -> io::Result<Pending> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+            .share_mode(FILE_SHARE_READ)
+            .create(!new)
+            .truncate(!new)
+            .create_new(new)
+            .open(path)?;
+        let pending = Pending {
+            file,
+            published: false,
+        };
+        if new {
+            pending.delete_on_close(true)?;
+        }
+        Ok(pending)
+    }
+
+    fn publish(&mut self, to: &Path) -> io::Result<()> {
+        self.delete_on_close(false)?;
+        rename_new(&self.file, to)?;
+        self.published = true;
+        Ok(())
+    }
+
+    fn delete_on_close(&self, delete: bool) -> io::Result<()> {
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: delete };
+        // SAFETY: a live handle with delete access and a correctly sized
+        // structure. Using the handle cannot delete a replacement file.
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                self.file.as_raw_handle(),
+                FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if !self.published {
+            let disposition = FILE_DISPOSITION_INFO_EX {
+                Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+            };
+            // SAFETY: a live handle with delete access and a correctly sized
+            // structure. Using the handle cannot delete a replacement file.
+            let ok = unsafe {
+                SetFileInformationByHandle(
+                    self.file.as_raw_handle(),
+                    FileDispositionInfoEx,
+                    (&disposition as *const FILE_DISPOSITION_INFO_EX).cast(),
+                    size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+                )
+            };
+            if ok == 0 {
+                let _ = self.delete_on_close(true);
+            }
+        }
+    }
+}
 
 // SHA-256 from Windows' own cryptography (CNG), so no hashing crate is
 // needed.
@@ -222,10 +303,8 @@ pub fn fetch(
         deadline: None,
         fresh: false,
     };
-    let digest = receive(manifest, &part, &rules, stop, progress).inspect_err(|_| {
-        let _ = fs::remove_file(&part);
-    })?;
-    keep(&part, digest, manifest, downloads)
+    let (file, digest) = receive(manifest, &part, &rules, stop, progress)?;
+    keep(&part, file, digest, manifest, downloads)
 }
 
 // None when the zip's place in Downloads is free. A file there that is not
@@ -244,7 +323,7 @@ fn receive(
     rules: &Rules,
     stop: &AtomicBool,
     progress: &mut dyn FnMut(u64, Option<u64>),
-) -> Result<[u8; 32], DownloadError> {
+) -> Result<(Pending, [u8; 32]), DownloadError> {
     let failed = |source| DownloadError::Part {
         path: part.to_path_buf(),
         source,
@@ -252,68 +331,72 @@ fn receive(
     if stop.load(Ordering::Acquire) {
         return Err(DownloadError::Fetch(FetchError::Stopped));
     }
-    let mut file = File::create(part).map_err(failed)?;
+    let mut file = Pending::create(part, false).map_err(failed)?;
     let mut hash = Sha256::new().map_err(failed)?;
     let mut body = http::open(&manifest.url, rules, stop).map_err(DownloadError::Fetch)?;
     let length = body.length();
     let mut got = 0u64;
     http::pour_body(&mut body, rules.most, stop, &mut |chunk| {
-        file.write_all(chunk)?;
+        file.file.write_all(chunk)?;
         hash.update(chunk)?;
         got += chunk.len() as u64;
         progress(got, length);
         Ok(())
     })
     .map_err(DownloadError::Fetch)?;
-    file.sync_all().map_err(failed)?;
-    hash.finish().map_err(failed)
+    file.file.sync_all().map_err(failed)?;
+    let digest = hash.finish().map_err(failed)?;
+    Ok((file, digest))
 }
 
-// Every way out but a keep leaves no part file behind.
-pub fn keep(
+// Removal of an unpublished part is best effort: Windows may refuse it.
+fn keep(
     part: &Path,
+    mut file: Pending,
     digest: [u8; 32],
     manifest: &Manifest,
     downloads: &Path,
 ) -> Result<Kept, DownloadError> {
-    let dropped = |err| {
-        let _ = fs::remove_file(part);
-        Err(err)
-    };
     if digest != manifest.sha256 {
-        return dropped(DownloadError::Mismatch);
+        return Err(DownloadError::Mismatch);
     }
     let to = downloads.join(&manifest.zip);
     match look(&to, &manifest.sha256) {
-        Ok(Some(kept)) => {
-            let _ = fs::remove_file(part);
-            return Ok(kept);
-        }
+        Ok(Some(kept)) => return Ok(kept),
         Ok(None) => {}
-        Err(err) => return dropped(err),
+        Err(err) => return Err(err),
     }
-    let placed = match rename_new(part, &to) {
+    match file.publish(&to) {
         Ok(()) => Ok(()),
         Err(err) if err.raw_os_error() == Some(ERROR_NOT_SAME_DEVICE as i32) => {
             copy_across(part, &to, &manifest.sha256)
         }
         Err(err) => Err(move_failed(&to, err)),
-    };
-    match placed {
-        Ok(()) => {
-            let _ = fs::remove_file(part);
-            Ok(Kept::Saved(to))
-        }
-        Err(err) => dropped(err),
-    }
+    }?;
+    Ok(Kept::Saved(to))
 }
 
 // A rename on one drive, which is whole or not at all, and never over a
 // file that appeared since the look before it.
-fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
-    let (from, target) = (wide(from), wide(to));
-    // SAFETY: both paths are zero terminated and outlive the call.
-    if unsafe { MoveFileExW(from.as_ptr(), target.as_ptr(), 0) } == 0 {
+fn rename_new(from: &File, to: &Path) -> io::Result<()> {
+    let target = wide(&std::path::absolute(to)?);
+    let size = size_of::<FILE_RENAME_INFO>() + size_of_val(target.as_slice());
+    let size = u32::try_from(size).map_err(|_| io::ErrorKind::InvalidInput)?;
+    let mut buffer =
+        vec![FILE_RENAME_INFO::default(); (size as usize).div_ceil(size_of::<FILE_RENAME_INFO>())];
+    let info = buffer.as_mut_ptr();
+    // SAFETY: the buffer is aligned for the structure and has room for the
+    // whole name. Zeroed flags forbid replacement; the source stays locked.
+    let ok = unsafe {
+        (*info).FileNameLength = ((target.len() - 1) * size_of::<u16>()) as u32;
+        ptr::copy_nonoverlapping(
+            target.as_ptr(),
+            ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            target.len(),
+        );
+        SetFileInformationByHandle(from.as_raw_handle(), FileRenameInfo, info.cast(), size)
+    };
+    if ok == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -338,22 +421,41 @@ fn move_failed(to: &Path, source: io::Error) -> DownloadError {
 // The bytes are hashed again on the way, so the file that gets that name
 // is the one that matched.
 fn copy_across(part: &Path, to: &Path, sha256: &[u8; 32]) -> Result<(), DownloadError> {
-    let mut copying = to.as_os_str().to_owned();
-    copying.push(COPYING);
-    let copying = PathBuf::from(copying);
-    // Left by a copy that was cut off.
-    let _ = fs::remove_file(&copying);
-    let copied = copy_checked(part, &copying, to, sha256)
-        .and_then(|()| rename_new(&copying, to).map_err(|err| move_failed(to, err)));
-    if copied.is_err() {
-        let _ = fs::remove_file(&copying);
-    }
-    copied
+    let mut number = 0u64;
+    let mut out = loop {
+        let mut copying = to.as_os_str().to_owned();
+        copying.push(COPYING);
+        if number != 0 {
+            copying.push(format!(".{number}"));
+        }
+        // Another copy's staging file is delete pending while it lives, and
+        // Windows answers access denied for that name, not already exists.
+        match Pending::create(Path::new(&copying), true) {
+            Ok(out) => break out,
+            Err(err)
+                if number + 1 < COPYING_NAMES
+                    && matches!(
+                        err.kind(),
+                        io::ErrorKind::AlreadyExists | io::ErrorKind::PermissionDenied
+                    ) =>
+            {
+                number += 1
+            }
+            Err(source) => {
+                return Err(DownloadError::Move {
+                    to: to.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    };
+    copy_checked(part, &mut out.file, to, sha256)?;
+    out.publish(to).map_err(|err| move_failed(to, err))
 }
 
 fn copy_checked(
     part: &Path,
-    copying: &Path,
+    out: &mut File,
     to: &Path,
     sha256: &[u8; 32],
 ) -> Result<(), DownloadError> {
@@ -366,11 +468,6 @@ fn copy_checked(
         source,
     };
     let mut from = File::open(part).map_err(unread)?;
-    let mut out = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(copying)
-        .map_err(unwritten)?;
     let mut hash = Sha256::new().map_err(unwritten)?;
     let mut buffer = vec![0u8; COPY_CHUNK];
     loop {
@@ -444,10 +541,11 @@ mod tests {
 
     // The part file as a fetch leaves it: the bytes, and their hash taken
     // on the way.
-    fn arrived(folder: &Folder, bytes: &[u8]) -> (PathBuf, [u8; 32]) {
+    fn arrived(folder: &Folder, bytes: &[u8]) -> (PathBuf, Pending, [u8; 32]) {
         let part = part_path(&folder.data());
-        fs::write(&part, bytes).unwrap();
-        (part, sha256(bytes))
+        let mut file = Pending::create(&part, false).unwrap();
+        file.file.write_all(bytes).unwrap();
+        (part, file, sha256(bytes))
     }
 
     fn newer() -> Manifest {
@@ -477,8 +575,8 @@ mod tests {
     #[test]
     fn matching_download_moved_to_downloads() {
         let folder = Folder::new("matches");
-        let (part, digest) = arrived(&folder, NEWER_ZIP);
-        let kept = keep(&part, digest, &newer(), &folder.downloads()).unwrap();
+        let (part, file, digest) = arrived(&folder, NEWER_ZIP);
+        let kept = keep(&part, file, digest, &newer(), &folder.downloads()).unwrap();
         let to = folder.downloads().join("booth-0.2.0-windows-x64.zip");
         assert_eq!(kept, Kept::Saved(to.clone()));
         assert_eq!(fs::read(&to).unwrap(), NEWER_ZIP);
@@ -491,14 +589,128 @@ mod tests {
     }
 
     #[test]
+    fn the_download_stays_locked_until_publication() {
+        let folder = Folder::new("locked");
+        let (part, file, digest) = arrived(&folder, NEWER_ZIP);
+        let replacement = folder.data().join("replacement");
+        fs::write(&replacement, b"a replacement file").unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                barrier.wait();
+                let changed = fs::write(&part, b"changed after it arrived");
+                let replaced = fs::rename(&replacement, &part);
+                let removed = fs::remove_file(&part);
+                (changed, replaced, removed)
+            });
+            barrier.wait();
+            let (changed, replaced, removed) = writer.join().unwrap();
+            assert!(changed.is_err(), "the received bytes could be changed");
+            assert!(replaced.is_err(), "the received file could be replaced");
+            assert!(removed.is_err(), "the received file could be removed");
+        });
+        let to = folder.downloads().join(&newer().zip);
+        assert_eq!(
+            keep(&part, file, digest, &newer(), &folder.downloads()).unwrap(),
+            Kept::Saved(to.clone())
+        );
+        assert_eq!(fs::read(to).unwrap(), NEWER_ZIP);
+    }
+
+    #[test]
+    fn a_stale_part_is_replaced() {
+        let folder = Folder::new("existing-part");
+        let part = part_path(&folder.data());
+        fs::write(&part, b"a download that was cut off before it could finish").unwrap();
+        let (part, file, digest) = arrived(&folder, NEWER_ZIP);
+        assert_eq!(fs::read(&part).unwrap(), NEWER_ZIP);
+        let to = folder.downloads().join(&newer().zip);
+        assert_eq!(
+            keep(&part, file, digest, &newer(), &folder.downloads()).unwrap(),
+            Kept::Saved(to.clone())
+        );
+        assert_eq!(fs::read(to).unwrap(), NEWER_ZIP);
+        assert!(!part.exists());
+    }
+
+    #[test]
+    fn an_unpublished_part_can_be_reused_while_it_is_read() {
+        let folder = Folder::new("part-reader");
+        let (part, file, _) = arrived(&folder, NEWER_ZIP);
+        let mut reader = File::open(&part).unwrap();
+        drop(file);
+        let mut next = Pending::create(&part, false).unwrap();
+        next.file.write_all(b"the next download").unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, NEWER_ZIP);
+        assert_eq!(fs::read(&part).unwrap(), b"the next download");
+    }
+
+    #[test]
+    fn a_process_closing_removes_its_unpublished_copy() {
+        let key = "BOOTH_TEST_COPYING";
+        if let Some(path) = std::env::var_os(key) {
+            let mut file = Pending::create(Path::new(&path), true).unwrap();
+            file.file
+                .write_all(b"a copy cut off before publication")
+                .unwrap();
+            std::process::exit(0);
+        }
+        let folder = Folder::new("copying-closed");
+        let copying = folder
+            .downloads()
+            .join("booth-0.2.0-windows-x64.zip.copying");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "update::download::tests::a_process_closing_removes_its_unpublished_copy",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(key, &copying)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("running 1 test"), "{stdout}");
+        assert!(!copying.exists());
+    }
+
+    #[test]
     fn a_download_that_does_not_match_is_deleted() {
         let folder = Folder::new("mismatch");
         let mut altered = NEWER_ZIP.to_vec();
         altered[0] ^= 1;
-        let (part, digest) = arrived(&folder, &altered);
-        let err = keep(&part, digest, &newer(), &folder.downloads()).unwrap_err();
+        let (part, file, digest) = arrived(&folder, &altered);
+        let err = keep(&part, file, digest, &newer(), &folder.downloads()).unwrap_err();
         assert!(matches!(err, DownloadError::Mismatch), "{err}");
         assert!(!part.exists());
+        assert_eq!(fs::read_dir(folder.downloads()).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[allow(clippy::permissions_set_readonly_false)]
+    fn a_mismatch_does_not_claim_that_cleanup_succeeded() {
+        let folder = Folder::new("mismatch-left");
+        let (part, file, _) = arrived(&folder, b"not the release");
+        let mut permissions = file.file.metadata().unwrap().permissions();
+        permissions.set_readonly(true);
+        file.file.set_permissions(permissions).unwrap();
+        let err = keep(&part, file, [0; 32], &newer(), &folder.downloads()).unwrap_err();
+        assert!(matches!(err, DownloadError::Mismatch), "{err}");
+        assert!(part.exists());
+        let mut permissions = fs::metadata(&part).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&part, permissions).unwrap();
+        assert_eq!(
+            super::super::download_failed(&newer(), &err),
+            "The download did not match the signed release. Press Download to try again."
+        );
         assert_eq!(fs::read_dir(folder.downloads()).unwrap().count(), 0);
     }
 
@@ -507,8 +719,8 @@ mod tests {
     #[test]
     fn hash_taken_on_the_way() {
         let folder = Folder::new("on-the-way");
-        let (part, _) = arrived(&folder, NEWER_ZIP);
-        let err = keep(&part, [0; 32], &newer(), &folder.downloads()).unwrap_err();
+        let (part, file, _) = arrived(&folder, NEWER_ZIP);
+        let err = keep(&part, file, [0; 32], &newer(), &folder.downloads()).unwrap_err();
         assert!(matches!(err, DownloadError::Mismatch), "{err}");
         assert!(!part.exists());
     }
@@ -518,8 +730,8 @@ mod tests {
         let folder = Folder::new("taken");
         let to = folder.downloads().join("booth-0.2.0-windows-x64.zip");
         fs::write(&to, b"someone else's file").unwrap();
-        let (part, digest) = arrived(&folder, NEWER_ZIP);
-        let err = keep(&part, digest, &newer(), &folder.downloads()).unwrap_err();
+        let (part, file, digest) = arrived(&folder, NEWER_ZIP);
+        let err = keep(&part, file, digest, &newer(), &folder.downloads()).unwrap_err();
         assert!(
             matches!(&err, DownloadError::Taken(path) if *path == to),
             "{err}"
@@ -533,8 +745,8 @@ mod tests {
         let folder = Folder::new("already");
         let to = folder.downloads().join("booth-0.2.0-windows-x64.zip");
         fs::write(&to, NEWER_ZIP).unwrap();
-        let (part, digest) = arrived(&folder, NEWER_ZIP);
-        let kept = keep(&part, digest, &newer(), &folder.downloads()).unwrap();
+        let (part, file, digest) = arrived(&folder, NEWER_ZIP);
+        let kept = keep(&part, file, digest, &newer(), &folder.downloads()).unwrap();
         assert_eq!(kept, Kept::AlreadyThere(to));
         assert!(!part.exists());
     }
@@ -577,17 +789,17 @@ mod tests {
     #[test]
     fn copy_to_another_drive() {
         let folder = Folder::new("across");
-        let (part, _) = arrived(&folder, NEWER_ZIP);
+        let (part, file, _) = arrived(&folder, NEWER_ZIP);
         let to = folder.downloads().join("booth-0.2.0-windows-x64.zip");
         let copying = folder
             .downloads()
             .join("booth-0.2.0-windows-x64.zip.copying");
         let sha256 = newer().sha256;
 
-        fs::write(&copying, b"left by a copy that was cut off").unwrap();
         copy_across(&part, &to, &sha256).unwrap();
         assert_eq!(fs::read(&to).unwrap(), NEWER_ZIP);
         assert!(!copying.exists());
+        assert!(part.exists());
 
         // A file that took the release's name meanwhile stays as it is.
         let err = copy_across(&part, &to, &sha256).unwrap_err();
@@ -597,6 +809,8 @@ mod tests {
         );
         assert_eq!(fs::read(&to).unwrap(), NEWER_ZIP);
         assert!(!copying.exists());
+        drop(file);
+        assert!(!part.exists());
 
         // The part changed on disk after it was hashed on the way.
         fs::remove_file(&to).unwrap();
@@ -608,11 +822,82 @@ mod tests {
     }
 
     #[test]
+    fn copying_files_are_left_alone() {
+        let folder = Folder::new("copying-taken");
+        let part = part_path(&folder.data());
+        fs::write(&part, NEWER_ZIP).unwrap();
+        let to = folder.downloads().join(&newer().zip);
+        let copying = to.with_extension("zip.copying");
+        let other = to.with_extension("zip.copying.1");
+        for path in [&copying, &other] {
+            fs::write(path, b"someone else's file").unwrap();
+        }
+        copy_across(&part, &to, &newer().sha256).unwrap();
+        assert_eq!(fs::read(&to).unwrap(), NEWER_ZIP);
+        for path in [&copying, &other] {
+            assert_eq!(fs::read(path).unwrap(), b"someone else's file");
+        }
+        assert_eq!(fs::read_dir(folder.downloads()).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn a_staging_name_another_copy_holds_is_numbered_past() {
+        let folder = Folder::new("copying-live");
+        let part = part_path(&folder.data());
+        fs::write(&part, NEWER_ZIP).unwrap();
+        let to = folder.downloads().join(&newer().zip);
+        let copying = to.with_extension("zip.copying");
+        let live = Pending::create(&copying, true).unwrap();
+        copy_across(&part, &to, &newer().sha256).unwrap();
+        assert_eq!(fs::read(&to).unwrap(), NEWER_ZIP);
+        drop(live);
+        assert!(!copying.exists());
+        assert_eq!(fs::read_dir(folder.downloads()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn staging_names_run_out() {
+        let folder = Folder::new("copying-full");
+        let part = part_path(&folder.data());
+        fs::write(&part, NEWER_ZIP).unwrap();
+        let to = folder.downloads().join(&newer().zip);
+        fs::write(to.with_extension("zip.copying"), b"someone else's file").unwrap();
+        for number in 1..COPYING_NAMES {
+            let name = format!("zip.copying.{number}");
+            fs::write(to.with_extension(name), b"someone else's file").unwrap();
+        }
+        let err = copy_across(&part, &to, &newer().sha256).unwrap_err();
+        assert!(
+            matches!(&err, DownloadError::Move { source, .. }
+                if source.kind() == io::ErrorKind::AlreadyExists),
+            "{err}"
+        );
+        assert!(!to.exists());
+        assert_eq!(
+            fs::read_dir(folder.downloads()).unwrap().count(),
+            COPYING_NAMES as usize
+        );
+    }
+
+    #[test]
+    fn a_missing_source_leaves_copying_files_alone() {
+        let folder = Folder::new("copying-no-source");
+        let to = folder.downloads().join(&newer().zip);
+        let copying = to.with_extension("zip.copying");
+        fs::write(&copying, b"someone else's file").unwrap();
+        let err = copy_across(&part_path(&folder.data()), &to, &newer().sha256).unwrap_err();
+        assert!(matches!(err, DownloadError::Part { .. }), "{err}");
+        assert_eq!(fs::read(&copying).unwrap(), b"someone else's file");
+        assert!(!to.exists());
+        assert_eq!(fs::read_dir(folder.downloads()).unwrap().count(), 1);
+    }
+
+    #[test]
     fn missing_downloads_folder() {
         let folder = Folder::new("no-folder");
-        let (part, digest) = arrived(&folder, NEWER_ZIP);
+        let (part, file, digest) = arrived(&folder, NEWER_ZIP);
         let missing = folder.0.join("no such folder");
-        let err = keep(&part, digest, &newer(), &missing).unwrap_err();
+        let err = keep(&part, file, digest, &newer(), &missing).unwrap_err();
         assert!(matches!(err, DownloadError::Move { .. }), "{err}");
         assert!(!part.exists());
     }

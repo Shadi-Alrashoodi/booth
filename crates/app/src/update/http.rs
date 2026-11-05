@@ -136,7 +136,7 @@ fn io_text(host: &str, err: &io::Error) -> String {
         }
         _ => format!(
             "{} while fetching from {host}",
-            err.to_string().trim_end_matches('.')
+            crate::messages::os_text(&err.to_string()).trim_end_matches('.')
         ),
     }
 }
@@ -871,11 +871,18 @@ mod tests {
             text(12999),
             "WinHTTP error 12999 while fetching from github.com"
         );
-        assert!(
-            text(5).ends_with(" while fetching from github.com"),
-            "{}",
-            text(5)
-        );
+        for code in [5, 8] {
+            let sentence = text(code);
+            assert!(
+                sentence.ends_with(" while fetching from github.com"),
+                "{sentence}"
+            );
+            assert!(
+                sentence.contains(&format!("(os error {code})")),
+                "{sentence}"
+            );
+            assert!(!sentence.contains(". (os error"), "{sentence}");
+        }
         let status = |code| {
             FetchError::Status {
                 host: String::from("github.com"),

@@ -391,10 +391,15 @@ impl Update {
         });
         match spawned {
             Ok(_) => self.worker = Some(Worker { events, stop }),
-            Err(err) => {
-                self.worker_failed(&format!("Windows would not start a thread for it ({err})"));
-            }
+            Err(err) => self.worker_start_failed(&err),
         }
+    }
+
+    fn worker_start_failed(&mut self, err: &io::Error) {
+        self.worker_failed(&format!(
+            "Windows would not start a thread for it ({})",
+            clause(err)
+        ));
     }
 
     fn worker_failed(&mut self, why: &str) {
@@ -631,11 +636,17 @@ fn download_failed(manifest: &Manifest, err: &DownloadError) -> String {
             "Could not download Booth {version}: it is larger than the {} MB Booth takes. Get it from {RELEASES_PAGE} instead.",
             most / MB
         ),
+        DownloadError::Part { source, .. } | DownloadError::Fetch(FetchError::Write(source)) => {
+            format!(
+                "Could not write the download: {}. Check that the disk has room, then press Download again.",
+                clause(source)
+            )
+        }
         DownloadError::Fetch(err) => {
             format!("Could not download Booth {version}: {err}. Press Download to try again.")
         }
         DownloadError::Mismatch => String::from(
-            "The download did not match the signed release, so Booth deleted it. Press Download to try again.",
+            "The download did not match the signed release. Press Download to try again.",
         ),
         DownloadError::Taken(_) => format!(
             "A different {} is already in Downloads. Move it away, then press Download again.",
@@ -644,10 +655,6 @@ fn download_failed(manifest: &Manifest, err: &DownloadError) -> String {
         DownloadError::NoDownloads(err) => format!(
             "Could not find the Downloads folder: {}. Press Download to try again.",
             clause(err)
-        ),
-        DownloadError::Part { source, .. } => format!(
-            "Could not write the download: {}. Check that the disk has room, then press Download again.",
-            clause(source)
         ),
         DownloadError::Move { source, .. } => format!(
             "Could not move {} into Downloads: {}. Press Download to try again.",
@@ -1002,7 +1009,7 @@ mod tests {
         let cases = [
             (
                 DownloadError::Mismatch,
-                "The download did not match the signed release, so Booth deleted it. Press Download to try again.",
+                "The download did not match the signed release. Press Download to try again.",
             ),
             (
                 DownloadError::Fetch(FetchError::Stopped),
@@ -1046,6 +1053,11 @@ mod tests {
         let part = PathBuf::from(r"C:\Users\Mara\AppData\Local\Booth\download.part");
         let ends = [
             (
+                DownloadError::Fetch(FetchError::Write(io::Error::from_raw_os_error(112))),
+                "Could not write the download: ",
+                ". Check that the disk has room, then press Download again.",
+            ),
+            (
                 DownloadError::Part {
                     path: part,
                     source: denied(),
@@ -1087,6 +1099,78 @@ mod tests {
         let mut update = update_in(State::Checking);
         update.apply(Event::Checked(Checked::Stopped));
         assert_eq!(update.shown(), None);
+    }
+
+    #[test]
+    fn fallback_fetch_errors_keep_the_reason_and_next_step() {
+        for code in [5, 8] {
+            let err = || FetchError::Io {
+                host: String::from("github.com"),
+                source: io::Error::from_raw_os_error(code),
+            };
+            let mut update = update_in(State::Checking);
+            update.apply(Event::Checked(err().into()));
+            let shown = update.shown().unwrap();
+            assert_eq!((shown.tone, shown.download), (Tone::Quiet, false));
+            assert!(
+                shown
+                    .text
+                    .starts_with("Could not check for a new version: ")
+            );
+            assert!(shown.text.ends_with(". Booth looks again after a day."));
+            assert!(shown.text.contains(&format!("(os error {code})")));
+            assert!(!shown.text.contains(". (os error"), "{}", shown.text);
+
+            let mut update = update_in(State::Downloading {
+                manifest: manifest(),
+                got: 0,
+                total: None,
+            });
+            update.apply(Event::Downloaded(Err(DownloadError::Fetch(err()))));
+            let shown = update.shown().unwrap();
+            assert_eq!((shown.tone, shown.download), (Tone::Problem, true));
+            assert!(shown.text.starts_with("Could not download Booth 0.2.0: "));
+            assert!(shown.text.ends_with(". Press Download to try again."));
+            assert!(shown.text.contains(&format!("(os error {code})")));
+            assert!(!shown.text.contains(". (os error"), "{}", shown.text);
+        }
+    }
+
+    #[test]
+    fn a_worker_start_failure_keeps_the_reason_and_next_step() {
+        let err = io::Error::from_raw_os_error(8);
+        for state in [
+            State::Checking,
+            State::Downloading {
+                manifest: manifest(),
+                got: 0,
+                total: None,
+            },
+        ] {
+            let downloading = matches!(state, State::Downloading { .. });
+            let mut update = update_in(state);
+            update.worker_start_failed(&err);
+            let shown = update.shown().unwrap();
+            let (start, end, tone) = if downloading {
+                (
+                    "Could not download Booth 0.2.0: ",
+                    ". Press Download to try again.",
+                    Tone::Problem,
+                )
+            } else {
+                ("Could not check for a new version: ", ".", Tone::Quiet)
+            };
+            assert_eq!((shown.tone, shown.download), (tone, downloading));
+            assert!(shown.text.starts_with(start), "{}", shown.text);
+            assert!(shown.text.ends_with(end), "{}", shown.text);
+            assert!(
+                shown
+                    .text
+                    .contains("Windows would not start a thread for it")
+            );
+            assert!(shown.text.contains("(os error 8)"));
+            assert!(!shown.text.contains(". (os error"), "{}", shown.text);
+        }
     }
 
     // A room opening sets the worker's stop once, and the worker's last
