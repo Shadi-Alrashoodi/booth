@@ -1341,17 +1341,42 @@ impl Drop for Raised {
 // Instant on Windows reads the same counter, so the capture time is now
 // less how long ago the counter stood there, with no second clock involved.
 fn qpc_instant(position: u64) -> Instant {
-    let now = Instant::now();
-    let mut counter = 0i64;
-    // SAFETY: writes one i64 into a local.
-    if unsafe { QueryPerformanceCounter(&mut counter) }.is_err() {
-        return now;
-    }
     let Some(frequency) = qpc_frequency() else {
-        return now;
+        return Instant::now();
     };
-    let now_hns =
-        (u128::from(counter as u64) * u128::from(HNS_PER_SEC) / u128::from(frequency)) as u64;
+    qpc_instant_from(position, frequency, Instant::now, || {
+        let mut counter = 0i64;
+        // SAFETY: writes one i64 into a local.
+        unsafe { QueryPerformanceCounter(&mut counter) }.ok()?;
+        u64::try_from(counter).ok()
+    })
+}
+
+fn qpc_instant_from(
+    position: u64,
+    frequency: u64,
+    mut read_now: impl FnMut() -> Instant,
+    mut read_counter: impl FnMut() -> Option<u64>,
+) -> Instant {
+    // Retry a descheduled read, keeping the narrowest bracket if all are wide.
+    // The later count keeps the estimate on the early side of the bracket.
+    let mut best = None;
+    for _ in 0..4 {
+        let before = read_counter();
+        let now = read_now();
+        let Some((before, after)) = before.zip(read_counter()) else {
+            return now;
+        };
+        let width = after.saturating_sub(before);
+        if best.is_none_or(|(narrowest, _, _)| width < narrowest) {
+            best = Some((width, now, after));
+        }
+        if u128::from(width) * 1_000_000 <= u128::from(frequency) * 20 {
+            break;
+        }
+    }
+    let (_, now, counter) = best.expect("at least one clock bracket");
+    let now_hns = (u128::from(counter) * u128::from(HNS_PER_SEC) / u128::from(frequency)) as u64;
     let age = Duration::from_nanos(now_hns.saturating_sub(position).saturating_mul(100));
     now.checked_sub(age).unwrap_or(now)
 }
@@ -1612,6 +1637,70 @@ mod tests {
         // taken as now rather than wrapped around.
         let ahead = qpc_instant(qpc_now() + HNS_PER_SEC);
         assert!(ahead - now < Duration::from_millis(100), "{ahead:?}");
+    }
+
+    #[test]
+    fn a_delayed_clock_read_does_not_move_capture_into_the_past() {
+        use std::cell::Cell;
+
+        let now = Instant::now();
+        let counter = Cell::new(HNS_PER_SEC);
+        let reads = Cell::new(0);
+        let delay = Cell::new(false);
+        let at = qpc_instant_from(
+            HNS_PER_SEC - 100_000,
+            HNS_PER_SEC,
+            || {
+                let at = now + Duration::from_nanos((counter.get() - HNS_PER_SEC) * 100);
+                delay.set(reads.get() == 0);
+                reads.set(reads.get() + 1);
+                at
+            },
+            || {
+                if delay.replace(false) {
+                    counter.set(counter.get() + 100_000);
+                }
+                Some(counter.get())
+            },
+        );
+        assert_eq!(at, now - Duration::from_millis(10));
+        assert_eq!(reads.get(), 2);
+    }
+
+    #[test]
+    fn a_short_clock_bracket_keeps_capture_on_the_early_side() {
+        let now = Instant::now();
+        let mut counters = [HNS_PER_SEC, HNS_PER_SEC + 100].into_iter();
+        let at = qpc_instant_from(
+            HNS_PER_SEC - 100_000,
+            HNS_PER_SEC,
+            || now + Duration::from_micros(7),
+            || counters.next(),
+        );
+        assert_eq!(
+            at,
+            now - Duration::from_millis(10) - Duration::from_micros(3)
+        );
+    }
+
+    #[test]
+    fn clock_reads_stop_after_four_wide_brackets() {
+        use std::cell::Cell;
+
+        let now = Instant::now();
+        let counter = Cell::new(HNS_PER_SEC);
+        let mut offsets = [0, 10_000, 10_000, 12_000, 12_000, 17_000, 17_000, 20_000].into_iter();
+        let at = qpc_instant_from(
+            HNS_PER_SEC - 100_000,
+            HNS_PER_SEC,
+            || now + Duration::from_nanos((counter.get() - HNS_PER_SEC) * 100),
+            || {
+                counter.set(HNS_PER_SEC + offsets.next().expect("at most four brackets"));
+                Some(counter.get())
+            },
+        );
+        assert_eq!(at, now - Duration::from_micros(10_200));
+        assert!(offsets.next().is_none());
     }
 
     #[test]

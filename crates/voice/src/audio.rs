@@ -8,7 +8,7 @@
 // turns an Instant into its wall-anchored microseconds, so a voice packet can
 // carry the same kind of timestamp as a ping. On Windows an Instant is the
 // performance counter, which is what WASAPI stamps packets with, so the
-// conversion is exact.
+// conversion introduces no clock drift.
 
 #![deny(unsafe_code)]
 
