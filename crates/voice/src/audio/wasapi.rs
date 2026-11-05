@@ -41,7 +41,7 @@ use windows::Win32::Media::KernelStreaming::{
     AUDIO_EFFECT_TYPE_ACOUSTIC_ECHO_CANCELLATION, AUDIO_EFFECT_TYPE_AUTOMATIC_GAIN_CONTROL,
     AUDIO_EFFECT_TYPE_DEEP_NOISE_SUPPRESSION, AUDIO_EFFECT_TYPE_NOISE_SUPPRESSION,
 };
-use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToStringAlloc};
+use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
     CoUninitialize, STGM_READ,
@@ -784,13 +784,11 @@ fn is_hands_free(device: &IMMDevice) -> bool {
 fn string_property(device: &IMMDevice, key: &PROPERTYKEY) -> Option<String> {
     // SAFETY: a getter on a live interface.
     let store = unsafe { device.OpenPropertyStore(STGM_READ) }.ok()?;
-    // SAFETY: the key outlives the call; the value is ours to clear.
-    let mut value = unsafe { store.GetValue(key) }.ok()?;
+    // SAFETY: the key outlives the call; the value clears itself on drop.
+    let value = unsafe { store.GetValue(key) }.ok()?;
     // SAFETY: `value` is the PROPVARIANT just filled in; the string that
     // comes back is ours to free.
     let text = unsafe { PropVariantToStringAlloc(&value) };
-    // SAFETY: cleared once, after the last read.
-    let _ = unsafe { PropVariantClear(&mut value) };
     take_string(text.ok()?)
 }
 
