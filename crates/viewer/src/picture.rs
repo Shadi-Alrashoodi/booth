@@ -305,6 +305,14 @@ impl Picture {
         self.views.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn kept_size(&self) -> Option<(u32, u32)> {
+        self.kept
+            .as_ref()
+            .filter(|kept| kept.filled)
+            .map(|kept| (kept.width, kept.height))
+    }
+
     // The views `video` is drawn with this present, made the first time its
     // slice is drawn. Called after tick.
     fn planes(&mut self, video: &Video) -> Result<&mut Planes, ViewerError> {

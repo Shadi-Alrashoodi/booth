@@ -7,6 +7,8 @@ mod control;
 mod cursor;
 mod device;
 mod error;
+#[cfg(any(test, feature = "fault"))]
+pub mod fault;
 #[cfg(test)]
 mod offscreen;
 mod palette;
@@ -425,7 +427,12 @@ impl Viewer {
         // for a moment's lack of memory; trying again is the way back.
         if size != self.swap.size || self.swap.target.is_none() {
             self.path.changed(self.swap.last_present());
-            self.swap.resize(&self.gpu, &self.scene, size)?;
+            if let Err(err) = self.swap.resize(&self.gpu, &self.scene, size) {
+                // As while minimized, so the present that tries again shows
+                // this picture and pointer, not the ones before them.
+                let _ = self.scene.hold(frame.video.as_ref(), frame.cursor);
+                return Err(err.resizing());
+            }
         }
         let look = Look {
             size,
@@ -435,7 +442,8 @@ impl Viewer {
             band: self.band,
         };
         let Some(target) = &self.swap.target else {
-            return Err(ViewerError::other(
+            return Err(ViewerError::new(
+                ErrorKind::Resize,
                 "could not draw the frame: the viewer has no buffer to draw into after a failed resize",
             ));
         };
@@ -468,6 +476,8 @@ impl Viewer {
         presented
             .ok()
             .map_err(|err| ViewerError::windows("show the frame", &err))?;
+        #[cfg(any(test, feature = "fault"))]
+        fault::shown(self.swap.size, self.scene.has_shape());
         if let Some(video) = &frame.video {
             self.scene.keep(video)?;
         }
@@ -666,6 +676,8 @@ impl Swap {
                 gpu.context.Flush();
             }
         }
+        #[cfg(any(test, feature = "fault"))]
+        fault::resize(size)?;
         // SAFETY: a live swap chain with no outstanding buffer references;
         // the flags are the ones it was made with.
         unsafe {
@@ -859,6 +871,83 @@ mod tests {
         assert!(presented.shown);
         assert!(viewer.swap.target.is_some());
         assert!(viewer.present(&still).is_ok());
+    }
+
+    fn video(frame: &capture::Frame) -> Video<'_> {
+        Video {
+            texture: &frame.texture,
+            index: 0,
+            width: frame.width,
+            height: frame.height,
+        }
+    }
+
+    // A picture and pointer shape whose present meets a failed resize are
+    // kept, as while minimized, so the present that tries again shows them
+    // and not the ones before. The error says it was the resize, which the
+    // caller can try again.
+    #[test]
+    fn a_failed_resize_keeps_its_picture_for_the_next_present() {
+        let _screen = one_at_a_time();
+        let Some(mut viewer) = hidden("Booth viewer resize test") else {
+            return;
+        };
+        let strip = Strip::default();
+        let wide = capture::Pattern::new(viewer.device(), 320, 180, 0)
+            .and_then(|mut pattern| pattern.next())
+            .unwrap();
+        let square = capture::Pattern::new(viewer.device(), 480, 480, 0)
+            .and_then(|mut pattern| pattern.next())
+            .unwrap();
+        let size = |frame: &capture::Frame| Some((frame.width, frame.height));
+        assert_ne!(size(&wide), size(&square));
+        let shaped = Cursor {
+            x: 0,
+            y: 0,
+            visible: true,
+            scale: 1.0,
+            shape: Some(CursorShape {
+                kind: CursorKind::Color,
+                width: 32,
+                height: 32,
+                pitch: 128,
+                hotspot_x: 0,
+                hotspot_y: 0,
+                bytes: vec![0xff; 32 * 32 * 4],
+            }),
+        };
+        viewer
+            .present(&Frame {
+                video: Some(video(&wide)),
+                cursor: None,
+                strip: &strip,
+            })
+            .unwrap();
+        assert_eq!(viewer.scene.kept_size(), size(&wide));
+        assert!(!viewer.scene.has_shape());
+
+        fault::fail_resizes(1);
+        viewer.swap.target = None;
+        let failed = viewer
+            .present(&Frame {
+                video: Some(video(&square)),
+                cursor: Some(&shaped),
+                strip: &strip,
+            })
+            .unwrap_err();
+        assert_eq!(failed.kind(), ErrorKind::Resize, "{failed}");
+        assert_eq!(viewer.scene.kept_size(), size(&square));
+        assert!(viewer.scene.has_shape());
+
+        let again = viewer
+            .present(&Frame {
+                video: None,
+                cursor: None,
+                strip: &strip,
+            })
+            .unwrap();
+        assert!(again.shown);
+        assert_eq!(viewer.scene.kept_size(), size(&square));
     }
 
     // New numbers in the strip of a still picture want a present of their

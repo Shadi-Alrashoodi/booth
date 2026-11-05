@@ -15,6 +15,9 @@ pub enum ErrorKind {
     DeviceLost,
     // The person closed the window. Nothing is wrong; watching has stopped.
     Closed,
+    // The buffers could not take the window's new size, maybe for a
+    // moment's lack of video memory. The next present tries again.
+    Resize,
     Other,
 }
 
@@ -56,6 +59,14 @@ impl ViewerError {
     // error, which the windows crate leaves to the caller.
     pub(crate) fn missing(step: impl fmt::Display, what: &str) -> ViewerError {
         ViewerError::other(format!("could not {step}: Windows returned no {what}"))
+    }
+
+    // A lost device stays lost whatever step met it.
+    pub(crate) fn resizing(self) -> ViewerError {
+        match self.kind {
+            ErrorKind::Other => ViewerError::new(ErrorKind::Resize, self.message),
+            _ => self,
+        }
     }
 
     pub fn kind(&self) -> ErrorKind {

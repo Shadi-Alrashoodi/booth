@@ -286,7 +286,7 @@ fn summary(numbers: &ViewerNumbers) -> String {
 
 // What the viewer did with the sharer's pointer: presents of it alone, and
 // pointers of pictures that waited for one, drawn with a picture or alone
-// once the wait ran out. Only with vsync on does any wait.
+// once the wait ran out. Only when presents cannot tear does any wait.
 fn pointer_words(numbers: &ViewerNumbers) -> String {
     format!(
         "pointer: {} drawn alone, {} with a picture, {} alone after {} ms",

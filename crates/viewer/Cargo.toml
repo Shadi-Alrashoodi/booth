@@ -27,6 +27,13 @@ windows = { workspace = true, features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[features]
+# Tests only (share's tests turn it on): src/fault.rs, which makes resizes
+# and pointer shapes fail as they do when video memory runs short, and keeps
+# what the last present that reached the screen had. A release build never
+# has it.
+fault = []
+
 [dev-dependencies]
 capture.workspace = true
 # The leak test counts the process's threads.

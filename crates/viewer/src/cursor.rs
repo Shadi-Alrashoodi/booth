@@ -333,6 +333,8 @@ impl Pointer {
     }
 
     fn upload(&self, images: &Images, hotspot: (i32, i32)) -> Result<Shape, ViewerError> {
+        #[cfg(any(test, feature = "fault"))]
+        crate::fault::shape()?;
         Ok(match images {
             Images::Alpha {
                 width,

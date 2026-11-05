@@ -223,4 +223,9 @@ impl Scene {
     pub(crate) fn cached_views(&self) -> usize {
         self.picture.cached_views()
     }
+
+    #[cfg(test)]
+    pub(crate) fn kept_size(&self) -> Option<(u32, u32)> {
+        self.picture.kept_size()
+    }
 }

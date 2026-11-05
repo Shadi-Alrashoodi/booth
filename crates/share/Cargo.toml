@@ -32,6 +32,8 @@ fault = []
 encode = { workspace = true, features = ["fault"] }
 # The tests in src/sharer.rs say what a look at the desktop finds.
 capture = { workspace = true, features = ["fault"] }
+# tests/viewer_resize.rs makes the viewer's resizes fail.
+viewer = { workspace = true, features = ["fault"] }
 # tests/window.rs makes the window it shares.
 windows = { workspace = true, features = [
     "Win32_Foundation",

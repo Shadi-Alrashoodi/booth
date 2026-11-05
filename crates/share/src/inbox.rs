@@ -117,7 +117,7 @@ impl Inbox {
     // A pointer update never waits behind video. One the viewer has not
     // taken yet is replaced, but its shape is kept if the new one has none,
     // since a shape is only sent when it changes. `with_picture`: it is the
-    // pointer of a picture on its way, which a viewer with vsync on draws
+    // pointer of a picture on its way, which a viewer without tearing draws
     // with that picture. The newest update's mark is the one taken.
     pub fn cursor(&self, update: CursorUpdate, with_picture: bool) {
         let mut waiting = self.lock();

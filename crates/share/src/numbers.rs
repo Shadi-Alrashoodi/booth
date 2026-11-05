@@ -125,13 +125,13 @@ pub struct ViewerNumbers {
     // screen sends nothing, so on a desktop not every one is a stall.
     pub stalls: u64,
     // Presents made for the sharer's pointer alone, with nothing else shown
-    // that wake: each one ahead of a picture can put it a refresh later with
-    // vsync on. With vsync off nothing waits, and every pointer drawn in a
-    // wake that shows no picture counts here.
+    // that wake: each one ahead of a picture can put it a refresh later when
+    // presents cannot tear. When presents can tear nothing waits, and every
+    // pointer drawn in a wake that shows no picture counts here.
     pub pointer_alone: u64,
-    // Pointers of pictures that waited for a picture with vsync on
-    // (screen::PointerHold): drawn with one, or alone once the wait ran out,
-    // which pointer_alone counts as well.
+    // Pointers of pictures that waited for a picture when presents cannot
+    // tear (screen::PointerHold): drawn with one, or alone once the wait
+    // ran out, which pointer_alone counts as well.
     pub pointer_waited: u64,
     pub pointer_ran_out: u64,
     // The codec of the last picture decoded, and how often a new codec's

@@ -32,7 +32,10 @@ const STRIP_EVERY: Duration = Duration::from_millis(250);
 const SECOND: Duration = Duration::from_secs(1);
 // A wait between two frames shown that anyone sees as the picture stopping.
 const STALL: Duration = Duration::from_millis(100);
-// How long the pointer of a picture waits for a picture with vsync on
+// A game can leave too little video memory for a resize for a moment. A
+// resize that keeps failing this long ends the watch instead.
+const PRESENT_RETRY: Duration = Duration::from_secs(2);
+// How long the pointer of a picture waits when presents cannot tear
 // wherever DWM steps aside, rather than a present of its own that puts that
 // picture a refresh later.
 // On a LAN it leads its picture by the encode, the decode and the present,
@@ -297,6 +300,8 @@ pub struct Screen {
     // The frames `waiting` let go, on their way to the numbers.
     settled: Vec<Settled>,
     numbers: ViewerNumbers,
+    decode_failures: u64,
+    present_failures: PresentFailures,
     shown_this_wake: bool,
     // When the last wake took a packet: a moving share whose pictures stop
     // showing still sends them. And when the strip's numbers were last
@@ -446,11 +451,11 @@ impl NewDecoders {
     }
 }
 
-// The pointer of a picture, held for a picture with vsync on (POINTER_HOLD),
+// The pointer of a picture, held when presents cannot tear (POINTER_HOLD),
 // kept apart from the loop so the rule can be tried with plain times. Drawn
 // alone just before its picture it would put that picture a refresh later
-// wherever DWM steps aside. With vsync off a present of the pointer alone
-// was measured to cost the picture nothing, so nothing is held then.
+// wherever DWM steps aside. With tearing a present of the pointer alone was
+// measured to cost the picture nothing, so nothing is held then.
 struct PointerHold {
     on: bool,
     // The update held, the newest, and when its wait runs out.
@@ -468,9 +473,9 @@ struct PointerHold {
 }
 
 impl PointerHold {
-    fn new(vsync: bool) -> PointerHold {
+    fn new(vsync: bool, tearing: bool) -> PointerHold {
         PointerHold {
-            on: vsync,
+            on: vsync || !tearing,
             held: None,
             stalled: false,
             composed: false,
@@ -566,6 +571,69 @@ impl PointerHold {
 
     fn held(&self) -> Option<&CursorUpdate> {
         self.held.as_ref().map(|(update, _)| update)
+    }
+}
+
+#[derive(Default)]
+struct PresentFailures {
+    since: Option<Instant>,
+}
+
+impl PresentFailures {
+    fn clear(&mut self) {
+        self.since = None;
+    }
+
+    fn retrying(&self) -> bool {
+        self.since.is_some()
+    }
+
+    fn failed(
+        &mut self,
+        kind: ErrorKind,
+        why: &str,
+        now: Instant,
+        report: &mut dyn FnMut(Report<'_>),
+    ) -> Result<(), String> {
+        match kind {
+            ErrorKind::Closed => Ok(()),
+            ErrorKind::Resize => {
+                let since = *self.since.get_or_insert_with(|| {
+                    report(Report::Line(Line::Log(format!("{why}; trying again"))));
+                    now
+                });
+                if now.saturating_duration_since(since) < PRESENT_RETRY {
+                    Ok(())
+                } else {
+                    Err(why.to_string())
+                }
+            }
+            ErrorKind::DeviceLost | ErrorKind::Other => Err(why.to_string()),
+        }
+    }
+}
+
+fn second_due(next: &mut Instant, now: Instant) -> bool {
+    if now < *next {
+        return false;
+    }
+    *next = crate::rate::next_reading(*next, now);
+    true
+}
+
+fn decode_failure(
+    failures: &mut u64,
+    numbers: &mut ViewerNumbers,
+    number: u32,
+    why: &str,
+) -> Option<Line> {
+    numbers.decode_failed += 1;
+    *failures += 1;
+    let line = format!("frame {number} did not decode: {why}");
+    match *failures {
+        1 => Some(Line::Say(line)),
+        2..=FAILURES_LOGGED => Some(Line::Log(line)),
+        _ => None,
     }
 }
 
@@ -689,6 +757,7 @@ impl Screen {
         if let Some(note) = timer.note() {
             say(Line::Say(note.to_string()));
         }
+        let hold = PointerHold::new(watch.vsync, viewer.tearing());
         let mut screen = Screen {
             decoder,
             viewer,
@@ -703,7 +772,7 @@ impl Screen {
             link_loss: false,
             one_way_ms: 0.0,
             pointer: None,
-            hold: PointerHold::new(watch.vsync),
+            hold,
             interval: Duration::from_secs(1) / watch.fps.max(1),
             clock: watch.clock,
             asks: Asks::default(),
@@ -712,6 +781,8 @@ impl Screen {
             waiting: Waiting::default(),
             settled: Vec::new(),
             numbers: ViewerNumbers::default(),
+            decode_failures: 0,
+            present_failures: PresentFailures::default(),
             shown_this_wake: false,
             packet_at: Instant::now(),
             ticked_at: Instant::now(),
@@ -835,19 +906,19 @@ impl Screen {
             };
             if ((moved || controlled) && !self.shown_this_wake)
                 || self.viewer.needs_redraw()
+                || self.present_failures.retrying()
                 || strip_alone()
             {
                 if moved && !self.shown_this_wake {
                     self.numbers.pointer_alone += 1;
                 }
-                self.redraw()?;
+                self.redraw(report)?;
             }
             if self.viewer.strip_clicked() {
                 report(Report::StripClicked);
             }
 
-            if now >= next_second {
-                next_second += SECOND;
+            if second_due(&mut next_second, now) {
                 self.gauge();
                 reassembler.gauge();
                 stats::gauge!("share.screen.batch", batch);
@@ -986,7 +1057,7 @@ impl Screen {
         }
         // The sentence is for the person. What was too many is for the log.
         if let Err(DecodeError::Packed { most, what }) = &result
-            && self.numbers.decode_failed < FAILURES_LOGGED
+            && self.decode_failures < FAILURES_LOGGED
         {
             report(Report::Line(Line::Log(format!(
                 "frame {number} carries more than {most} {what}"
@@ -1027,7 +1098,7 @@ impl Screen {
             width: decoded.width,
             height: decoded.height,
         };
-        let presented = self.present(Some(video))?;
+        let presented = self.present(Some(video), report)?;
         if let Some(returned) = presented {
             let gap = self
                 .numbers
@@ -1198,12 +1269,10 @@ impl Screen {
         refused: bool,
         report: &mut dyn FnMut(Report<'_>),
     ) -> Result<(), String> {
-        self.numbers.decode_failed += 1;
-        let line = format!("frame {number} did not decode: {why}");
-        match self.numbers.decode_failed {
-            1 => report(Report::Line(Line::Say(line))),
-            2..=FAILURES_LOGGED => report(Report::Line(Line::Log(line))),
-            _ => {}
+        if let Some(line) =
+            decode_failure(&mut self.decode_failures, &mut self.numbers, number, why)
+        {
+            report(Report::Line(line));
         }
         self.asks
             .failed(number, refused, Instant::now(), &mut self.back);
@@ -1215,13 +1284,17 @@ impl Screen {
     }
 
     // Draws the last picture again, with the pointer where it is now.
-    fn redraw(&mut self) -> Result<(), String> {
-        self.present(None).map(|_| ())
+    fn redraw(&mut self, report: &mut dyn FnMut(Report<'_>)) -> Result<(), String> {
+        self.present(None, report).map(|_| ())
     }
 
     // When the present returned, or None when nothing was shown: minimized,
-    // or the window closed just now, which the loop sees next.
-    fn present(&mut self, video: Option<Video<'_>>) -> Result<Option<Instant>, String> {
+    // a failed resize, or the window closed just now, which the loop sees next.
+    fn present(
+        &mut self,
+        video: Option<Video<'_>>,
+        report: &mut dyn FnMut(Report<'_>),
+    ) -> Result<Option<Instant>, String> {
         let picture = video.is_some();
         if let Some(update) = self.hold.present(picture) {
             #[cfg(feature = "fault")]
@@ -1237,13 +1310,14 @@ impl Screen {
         let returned = Instant::now();
         #[cfg(feature = "fault")]
         crate::fault::presented(picture, self.pointer.as_ref());
-        // The viewer keeps a shape once it has it; it comes again only when
-        // it changes.
-        if let Some(pointer) = &mut self.pointer {
-            pointer.shape = None;
-        }
         match presented {
             Ok(presented) => {
+                self.present_failures.clear();
+                // The viewer keeps a shape once it has it; a failed resize
+                // may not have reached it, so it stays until a present works.
+                if let Some(pointer) = &mut self.pointer {
+                    pointer.shape = None;
+                }
                 self.shown_this_wake = true;
                 // None after a resize or F11 until Windows reports on a
                 // present made since, and the log says so then rather than
@@ -1252,8 +1326,11 @@ impl Screen {
                 self.hold.path(presented.path);
                 Ok(presented.shown.then_some(returned))
             }
-            Err(err) if err.kind() == ErrorKind::Closed => Ok(None),
-            Err(err) => Err(err.to_string()),
+            Err(err) => {
+                self.present_failures
+                    .failed(err.kind(), &err.to_string(), returned, report)?;
+                Ok(None)
+            }
         }
     }
 
@@ -1484,6 +1561,166 @@ mod tests {
     use crate::PAYLOAD_INTERNET;
 
     #[test]
+    fn a_sleep_does_not_replay_seconds() {
+        let start = Instant::now();
+        let mut next = start + SECOND;
+        assert!(!second_due(&mut next, start));
+        assert!(second_due(
+            &mut next,
+            start + SECOND + Duration::from_millis(17)
+        ));
+        assert_eq!(next, start + SECOND * 2);
+
+        let woke = start + Duration::from_secs(8 * 60 * 60);
+        assert!(second_due(&mut next, woke));
+        assert_eq!(next, woke + SECOND);
+        for ms in [0, 1, 250, 999] {
+            assert!(!second_due(&mut next, woke + Duration::from_millis(ms)));
+        }
+        assert!(second_due(&mut next, woke + SECOND));
+        assert_eq!(next, woke + SECOND * 2);
+    }
+
+    #[test]
+    fn frames_that_never_reach_the_decoder_keep_the_failure_lines() {
+        let mut numbers = ViewerNumbers {
+            decode_failed: 120,
+            ..ViewerNumbers::default()
+        };
+        let mut failures = 0;
+        assert_eq!(
+            decode_failure(&mut failures, &mut numbers, 121, "invalid data"),
+            Some(Line::Say(
+                "frame 121 did not decode: invalid data".to_string()
+            ))
+        );
+        numbers.decode_failed += 120;
+        for number in 242..246 {
+            assert_eq!(
+                decode_failure(&mut failures, &mut numbers, number, "invalid data"),
+                Some(Line::Log(format!(
+                    "frame {number} did not decode: invalid data"
+                )))
+            );
+        }
+        assert_eq!(
+            decode_failure(&mut failures, &mut numbers, 246, "invalid data"),
+            None
+        );
+        assert_eq!(numbers.decode_failed, 246);
+    }
+
+    #[test]
+    fn a_short_resize_failure_keeps_the_watch() {
+        let start = Instant::now();
+        let why = "could not resize the viewer's buffers: out of memory";
+        let mut failures = PresentFailures::default();
+        let mut lines = Vec::new();
+        let mut report = |report: Report<'_>| {
+            if let Report::Line(line) = report {
+                lines.push(line);
+            }
+        };
+        assert!(
+            failures
+                .failed(ErrorKind::Resize, why, start, &mut report)
+                .is_ok()
+        );
+        assert!(failures.retrying(), "a still picture needs another present");
+        assert!(
+            failures
+                .failed(
+                    ErrorKind::Resize,
+                    why,
+                    start + Duration::from_millis(1999),
+                    &mut report
+                )
+                .is_ok()
+        );
+        failures.clear();
+        assert!(!failures.retrying());
+        assert!(
+            failures
+                .failed(ErrorKind::Resize, why, start + SECOND * 3, &mut report)
+                .is_ok()
+        );
+        failures.clear();
+        assert!(!failures.retrying());
+        assert_eq!(lines, vec![Line::Log(format!("{why}; trying again")); 2]);
+    }
+
+    #[test]
+    fn a_resize_failure_that_persists_ends_the_watch() {
+        let start = Instant::now();
+        let why =
+            "could not draw the frame: the viewer has no buffer to draw into after a failed resize";
+        for attempts in [1, 240] {
+            let mut failures = PresentFailures::default();
+            for attempt in 0..attempts {
+                let now = start + PRESENT_RETRY * attempt / attempts;
+                assert!(
+                    failures
+                        .failed(ErrorKind::Resize, why, now, &mut |_| {})
+                        .is_ok()
+                );
+            }
+            assert_eq!(
+                failures.failed(ErrorKind::Resize, why, start + PRESENT_RETRY, &mut |_| {}),
+                Err(why.to_string())
+            );
+        }
+    }
+
+    // Only a resize gets another try: a lost device, or the frame itself
+    // failing to draw, show or be kept, ends the watch as before.
+    #[test]
+    fn other_present_failures_end_the_watch_at_once() {
+        let mut failures = PresentFailures::default();
+        let now = Instant::now();
+        for (kind, why) in [
+            (ErrorKind::DeviceLost, "the graphics card was reset"),
+            (ErrorKind::Other, "could not show the frame"),
+        ] {
+            assert_eq!(
+                failures.failed(kind, why, now, &mut |_| {}),
+                Err(why.to_string()),
+                "{kind:?}"
+            );
+            assert!(!failures.retrying());
+        }
+        assert!(
+            failures
+                .failed(
+                    ErrorKind::Closed,
+                    "the viewer window was closed",
+                    now,
+                    &mut |_| {}
+                )
+                .is_ok()
+        );
+        assert!(!failures.retrying());
+    }
+
+    #[test]
+    fn a_pointer_waits_when_tearing_is_unavailable() {
+        let now = Instant::now();
+        for (vsync, tearing, waits) in [
+            (false, false, true),
+            (false, true, false),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            let mut hold = PointerHold::new(vsync, tearing);
+            let drawn = hold.came(at(1), true, now);
+            assert_eq!(drawn.is_none(), waits, "vsync {vsync}, tearing {tearing}");
+            assert_eq!(hold.deadline(), waits.then_some(now + POINTER_HOLD));
+            hold.present(true);
+            hold.path(Some(PresentPath::Composed));
+            assert_eq!(hold.came(at(2), true, now), Some(at(2)), "composed");
+        }
+    }
+
+    #[test]
     fn only_a_refusal_of_the_stream_counts_toward_stopping() {
         let oversized = DecodeError::Oversized {
             width: 8192,
@@ -1650,19 +1887,19 @@ mod tests {
             visible: false,
             ..shown.clone()
         };
-        let nothing = PointerHold::new(true);
+        let nothing = PointerHold::new(true, true);
         assert_eq!(mouse_mode(&nothing, None), MouseMode::Absolute);
         assert_eq!(mouse_mode(&nothing, Some(&shown)), MouseMode::Absolute);
         assert_eq!(mouse_mode(&nothing, Some(&hidden)), MouseMode::Relative);
         let now = Instant::now();
-        let mut hides = PointerHold::new(true);
+        let mut hides = PointerHold::new(true, true);
         let hide = CursorUpdate {
             visible: false,
             ..at(1)
         };
         assert_eq!(hides.came(hide, true, now), None);
         assert_eq!(mouse_mode(&hides, Some(&shown)), MouseMode::Relative);
-        let mut shows = PointerHold::new(true);
+        let mut shows = PointerHold::new(true, true);
         assert_eq!(shows.came(at(1), true, now), None);
         assert_eq!(mouse_mode(&shows, Some(&hidden)), MouseMode::Absolute);
     }
@@ -1692,11 +1929,11 @@ mod tests {
         }
     }
 
-    // With vsync on, the pointer of a picture waits for a picture, its own
+    // Without tearing, the pointer of a picture waits for a picture, its own
     // or not, or for POINTER_HOLD, and a later one takes its place and keeps
     // the deadline. After a wait that ran out the next ones are drawn at
     // once until a picture is presented. One that moved alone, and every one
-    // with vsync off, is drawn at once, and one that moved alone ends a
+    // with tearing, is drawn at once, and one that moved alone ends a
     // wait, keeping the shape of the one held.
     #[test]
     fn a_marked_pointer_waits_for_its_picture() {
@@ -1704,11 +1941,11 @@ mod tests {
         let ms = |ms: u64| start + Duration::from_millis(ms);
         let x = |update: Option<CursorUpdate>| update.map(|update| update.x);
 
-        let mut off = PointerHold::new(false);
+        let mut off = PointerHold::new(false, true);
         assert_eq!(x(off.came(at(1), true, ms(0))), Some(1), "vsync off");
         assert_eq!(off.deadline(), None);
 
-        let mut hold = PointerHold::new(true);
+        let mut hold = PointerHold::new(true, true);
         assert_eq!(x(hold.came(at(2), false, ms(0))), Some(2), "moved alone");
         assert_eq!(hold.came(at(3), true, ms(0)), None);
         assert_eq!(hold.came(at(4), true, ms(5)), None);
@@ -1761,7 +1998,7 @@ mod tests {
         let ms = |ms: u64| start + Duration::from_millis(ms);
         let x = |update: Option<CursorUpdate>| update.map(|update| update.x);
 
-        let mut hold = PointerHold::new(true);
+        let mut hold = PointerHold::new(true, true);
         assert_eq!(hold.take(at(1), true, false, ms(0)), None);
         assert_eq!(hold.present(false), None, "the still picture");
         assert_eq!(
@@ -1810,7 +2047,7 @@ mod tests {
         let (asks, new_decoders) = (Asks::default(), NewDecoders::default());
         let strip = ms(250);
         let wake = |hold: &PointerHold| next_wake(&reassembler, &asks, &new_decoders, hold, strip);
-        let mut hold = PointerHold::new(true);
+        let mut hold = PointerHold::new(true, true);
         assert_eq!(wake(&hold), strip, "nothing held");
         assert_eq!(hold.came(at(1), true, ms(0)), None);
         let woke = wake(&hold);
