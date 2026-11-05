@@ -1089,36 +1089,39 @@ enum RowPick {
 struct WindowPick {
     id: room::WindowId,
     title: String,
-    // The program's name and whether the window is minimized, quiet after
-    // the title.
-    quiet: String,
+    program: String,
+    minimized: bool,
     spoken: String,
+}
+
+impl From<room::TopWindow> for WindowPick {
+    fn from(window: room::TopWindow) -> Self {
+        let mut spoken = format!("Share the window {}", messages::isolated(&window.title));
+        if let Some(program) = &window.program {
+            spoken.push_str(&format!(", {}", messages::isolated(program)));
+        }
+        if window.minimized {
+            spoken.push_str(", minimized");
+        }
+        // Desktop titles keep their left-to-right order even when the first
+        // word is Arabic; spoken names use first-strong isolates instead.
+        let drawn = |text: &str| format!("\u{2066}{text}\u{2069}");
+        Self {
+            id: window.id,
+            title: drawn(&window.title),
+            program: window.program.as_deref().map(drawn).unwrap_or_default(),
+            minimized: window.minimized,
+            spoken,
+        }
+    }
 }
 
 // The windows as they are now; none when they cannot be listed.
 fn window_picks() -> Vec<WindowPick> {
-    let windows = room::top_windows().unwrap_or_default();
-    windows
+    room::top_windows()
+        .unwrap_or_default()
         .into_iter()
-        .map(|window| {
-            let quiet = match (&window.program, window.minimized) {
-                (Some(program), true) => format!("{program}, minimized"),
-                (Some(program), false) => program.clone(),
-                (None, true) => String::from("minimized"),
-                (None, false) => String::new(),
-            };
-            let spoken = format!(
-                "Share the window {}{}",
-                messages::isolated(&window.title),
-                if window.minimized { ", minimized" } else { "" }
-            );
-            WindowPick {
-                id: window.id,
-                title: window.title,
-                quiet,
-                spoken,
-            }
-        })
+        .map(WindowPick::from)
         .collect()
 }
 
@@ -1130,6 +1133,8 @@ fn window_picks() -> Vec<WindowPick> {
 fn share_list(ui: &mut Ui, picks: &[Pick], windows: &[WindowPick]) -> Option<RowPick> {
     let mut pressed = None;
     controls::region(ui, |ui| {
+        controls::text(ui, "Screen", theme::body(), ASH);
+        ui.add_space(STEP);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.y = STEP;
             for (i, pick) in picks.iter().enumerate() {
@@ -1149,12 +1154,21 @@ fn share_list(ui: &mut Ui, picks: &[Pick], windows: &[WindowPick]) -> Option<Row
         if windows.is_empty() {
             return;
         }
+        ui.add_space(FIELD_GAP);
+        controls::text(ui, "Windows", theme::body(), ASH);
+        ui.add_space(STEP);
         let most = (ui.available_height() / 2.0).max(2.0 * ROW_HEIGHT);
         let scroll = ScrollArea::vertical()
             .id_salt("windows")
             .max_height(most)
             .auto_shrink([false, true]);
         scroll.show(ui, |ui| {
+            // Room for the bar exactly when egui shows it, which it does once
+            // the rows pass the list's height rounded up.
+            if windows.len() as f32 * ROW_HEIGHT > most.ceil() {
+                let style = ui.spacing().scroll;
+                ui.set_width(ui.available_width() - style.bar_width - style.bar_outer_margin);
+            }
             for (i, window) in windows.iter().enumerate() {
                 if window_row(ui, window) {
                     pressed = Some(RowPick::Window(i));
@@ -1165,8 +1179,33 @@ fn share_list(ui: &mut Ui, picks: &[Pick], windows: &[WindowPick]) -> Option<Row
     pressed
 }
 
-// One window: its title cut on one line, its program and whether it is
-// minimized quiet at the right. The whole row is the button, as a known
+const NAME_WIDTH: f32 = 96.0;
+const MINIMIZED_WIDTH: f32 = 64.0;
+const LEAST_TITLE_WIDTH: f32 = 112.0;
+
+// At the narrowest panel with the bar, or under Ctrl+= zoom, a row can be
+// narrower than its columns and the title's least width together. The name gives way first, then the marker, so the
+// title stays readable and nothing reaches past the row into the gutter.
+fn window_parts(rect: Rect) -> [Rect; 3] {
+    let spare = (rect.width() - LEAST_TITLE_WIDTH).max(0.0);
+    let marker_room = spare.min(STEP + MINIMIZED_WIDTH);
+    let name_room = (spare - marker_room).min(STEP + NAME_WIDTH);
+    let minimized = Rect::from_x_y_ranges(
+        rect.right() - (marker_room - STEP).max(0.0)..=rect.right(),
+        rect.y_range(),
+    );
+    let name_right = rect.right() - marker_room;
+    let program = Rect::from_x_y_ranges(
+        name_right - (name_room - STEP).max(0.0)..=name_right,
+        rect.y_range(),
+    );
+    let title = Rect::from_x_y_ranges(rect.left()..=name_right - name_room, rect.y_range());
+    [title, program, minimized]
+}
+
+// The columns keep their room even when empty, so names line up and never
+// take room from a title. An empty one draws no label, which a screen reader
+// would stop on as blank text. The whole row is the button, as a known
 // host's is on the start screen.
 fn window_row(ui: &mut Ui, window: &WindowPick) -> bool {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::hover());
@@ -1176,19 +1215,37 @@ fn window_row(ui: &mut Ui, window: &WindowPick) -> bool {
         Sense::click(),
     );
     row.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &window.spoken));
-    let quiet = theme::caption();
-    let right = controls::text_width(ui, &window.quiet, quiet.clone());
-    controls::split_row(
-        ui,
-        rect,
-        right,
-        |ui| {
-            controls::one_line(ui, &window.title, theme::body(), CHALK);
-        },
-        |ui| {
-            controls::one_line(ui, &window.quiet, quiet, ASH);
-        },
-    );
+    let [title, program, minimized] = window_parts(rect);
+    for (part, text, font, color, layout) in [
+        (
+            title,
+            window.title.as_str(),
+            theme::body(),
+            CHALK,
+            Layout::left_to_right(Align::Center),
+        ),
+        (
+            program,
+            window.program.as_str(),
+            theme::caption(),
+            ASH,
+            Layout::right_to_left(Align::Center),
+        ),
+        (
+            minimized,
+            if window.minimized { "minimized" } else { "" },
+            theme::caption(),
+            ASH,
+            Layout::left_to_right(Align::Center),
+        ),
+    ] {
+        if text.is_empty() {
+            continue;
+        }
+        let mut column = ui.new_child(UiBuilder::new().max_rect(part).layout(layout));
+        column.set_clip_rect(part.intersect(ui.clip_rect()));
+        controls::one_line(&mut column, text, font, color);
+    }
     let focused = row.has_focus();
     if focused && controls::keyboard_focus(ui) {
         controls::ring(ui, rect);
@@ -3211,7 +3268,8 @@ pub(crate) mod tests {
         let window = |id| WindowPick {
             id,
             title: String::new(),
-            quiet: String::new(),
+            program: String::new(),
+            minimized: false,
             spoken: String::new(),
         };
         let shares = |on: bool| {
@@ -4210,12 +4268,404 @@ pub(crate) mod tests {
     }
 
     fn window(hwnd: isize, title: &str) -> WindowPick {
-        WindowPick {
+        room::TopWindow {
             id: room::WindowId { hwnd, process: 1 },
             title: title.to_string(),
-            quiet: String::from("notepad"),
-            spoken: format!("Share the window {title}"),
+            program: Some(String::from("Notepad")),
+            minimized: false,
         }
+        .into()
+    }
+
+    #[test]
+    fn a_window_spoken_label_keeps_its_whole_title_name_and_state() {
+        let title = format!("{} - Notes", "long title ".repeat(40));
+        for minimized in [false, true] {
+            for program in [None, Some("\u{639}\u{631}\u{628}\u{64a} Notepad")] {
+                let pick = WindowPick::from(room::TopWindow {
+                    id: room::WindowId {
+                        hwnd: 1,
+                        process: 1,
+                    },
+                    title: title.clone(),
+                    program: program.map(str::to_owned),
+                    minimized,
+                });
+                let mut expected = format!("Share the window \u{2068}{title}\u{2069}");
+                if let Some(program) = program {
+                    expected.push_str(&format!(", \u{2068}{program}\u{2069}"));
+                }
+                if minimized {
+                    expected.push_str(", minimized");
+                }
+                assert_eq!(pick.spoken, expected);
+                let ctx = accessible_panel();
+                let (_, output) =
+                    crate::controls::tests::frame(&ctx, Vec::new(), |ui| window_row(ui, &pick));
+                let nodes = output.accesskit_update.unwrap().nodes;
+                let button = nodes
+                    .iter()
+                    .find(|(_, node)| node.role() == eframe::egui::accesskit::Role::Button)
+                    .expect("the row is a button");
+                assert_eq!(button.1.label(), Some(expected.as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn empty_window_columns_leave_no_blank_text_for_a_screen_reader() {
+        for (program, minimized, shown) in [
+            (None, false, 1),
+            (Some("Notepad"), false, 2),
+            (None, true, 2),
+            (Some("Notepad"), true, 3),
+        ] {
+            let pick = WindowPick::from(room::TopWindow {
+                id: room::WindowId {
+                    hwnd: 1,
+                    process: 1,
+                },
+                title: String::from("Notes"),
+                program: program.map(str::to_owned),
+                minimized,
+            });
+            let ctx = accessible_panel();
+            let (_, output) =
+                crate::controls::tests::frame(&ctx, Vec::new(), |ui| window_row(ui, &pick));
+            let texts: Vec<String> = output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.role() == eframe::egui::accesskit::Role::Label)
+                .map(|(_, node)| node.value().unwrap_or_default().to_owned())
+                .collect();
+            assert_eq!(texts.len(), shown, "{program:?} {minimized} {texts:?}");
+            assert!(
+                texts.iter().all(|text| !text.is_empty()),
+                "{program:?} {minimized} {texts:?}"
+            );
+        }
+    }
+
+    fn painted_share_frame(
+        ctx: &Context,
+        screen: Vec2,
+        events: Vec<Event>,
+        run: impl FnMut(&mut Ui),
+    ) -> eframe::egui::FullOutput {
+        let mut output = ctx.run_ui(
+            eframe::egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), screen)),
+                events,
+                ..Default::default()
+            },
+            run,
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    fn painted_share_text<'a>(
+        output: &'a eframe::egui::FullOutput,
+        words: &str,
+    ) -> (Rect, &'a eframe::egui::epaint::TextShape) {
+        output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                eframe::egui::Shape::Text(text) if text.galley.text() == words => {
+                    Some((clipped.clip_rect, text))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no text called {words}"))
+    }
+
+    #[test]
+    fn share_groups_have_field_labels_and_only_needed_space() {
+        let ctx = accessible_panel();
+        let row = window(1, "Notes");
+        for windows in [&[][..], std::slice::from_ref(&row)] {
+            let mut bottom = 0.0;
+            let output = painted_share_frame(&ctx, vec2(360.0, 640.0), Vec::new(), |ui| {
+                share_list(ui, &[], windows);
+                bottom = ui.cursor().top();
+            });
+            let bounds = |label| {
+                output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| node.label() == Some(label))
+                    .and_then(|(_, node)| node.bounds())
+                    .unwrap()
+            };
+            let (_, screen) = painted_share_text(&output, "Screen");
+            assert_eq!(screen.galley.job.sections[0].format.font_id, theme::body());
+            assert_eq!(screen.galley.job.sections[0].format.color, ASH);
+            let region = bounds("Share a region of a monitor");
+            assert_eq!(
+                region.y0 as f32 - screen.pos.y - screen.galley.size().y,
+                STEP
+            );
+            if windows.is_empty() {
+                assert_eq!(bottom, region.y1 as f32 + SIDE);
+                assert!(!output.shapes.iter().any(|shape| matches!(
+                    &shape.shape,
+                    eframe::egui::Shape::Text(text) if text.galley.text() == "Windows"
+                )));
+            } else {
+                let (_, label) = painted_share_text(&output, "Windows");
+                assert_eq!(label.galley.job.sections[0].format.font_id, theme::body());
+                assert_eq!(label.galley.job.sections[0].format.color, ASH);
+                assert_eq!(label.pos.y - region.y1 as f32, FIELD_GAP);
+                let first = bounds(&row.spoken);
+                assert_eq!(first.y0 as f32 - label.pos.y - label.galley.size().y, STEP);
+            }
+            output.drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn window_columns_keep_their_widths_and_clip_each_line() {
+        // Three rows in a list half a point shorter than they are, which egui
+        // rounds up and shows without a bar.
+        let above = SIDE
+            + 2.0 * (controls::line_height(&theme::body()) + STEP)
+            + CONTROL_HEIGHT
+            + FIELD_GAP;
+        let just_short = above + SIDE + 2.0 * 3.0 * ROW_HEIGHT - 1.0;
+        for width in [360.0, 320.0, 320.0 / 1.5, 160.0] {
+            for (count, height, scrolls) in
+                [(2, 640.0, false), (3, just_short, false), (30, 640.0, true)]
+            {
+                let ctx = Context::default();
+                theme::apply(&ctx);
+                let windows: Vec<WindowPick> = (0..count)
+                    .map(|i| {
+                        room::TopWindow {
+                            id: room::WindowId {
+                                hwnd: i,
+                                process: 1,
+                            },
+                            title: format!("Window {i} {}", "long title ".repeat(10)),
+                            program: (i != 2)
+                                .then(|| format!("Program {i} {}", "name ".repeat(10))),
+                            minimized: i == 1,
+                        }
+                        .into()
+                    })
+                    .collect();
+                let mut bar = 0.0;
+                let mut bar_width = 0.0;
+                let mut draw = |ui: &mut Ui| {
+                    bar_width = ui.spacing().scroll.bar_width;
+                    bar = if scrolls {
+                        bar_width + ui.spacing().scroll.bar_outer_margin
+                    } else {
+                        0.0
+                    };
+                    share_list(ui, &[], &windows);
+                };
+                let screen = vec2(width, height);
+                let first_output = painted_share_frame(&ctx, screen, Vec::new(), &mut draw);
+                let output = painted_share_frame(&ctx, screen, Vec::new(), &mut draw);
+                let right = width - SIDE - bar;
+                let handle = output.shapes.iter().find_map(|shape| match &shape.shape {
+                    eframe::egui::Shape::Rect(rect)
+                        if rect.rect.width() == bar_width && rect.fill.a() != 0 =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                });
+                assert_eq!(handle.is_some(), scrolls, "{width} {count}");
+                // Under Ctrl+= zoom the row is narrower than the columns and
+                // the title's least width together.
+                if width < 320.0 {
+                    for window in windows.iter().take(2) {
+                        let (title, _) = painted_share_text(&output, &window.title);
+                        assert!(title.width() >= LEAST_TITLE_WIDTH, "{width} {title:?}");
+                    }
+                    let parts = [
+                        windows[0].title.as_str(),
+                        windows[0].program.as_str(),
+                        windows[1].title.as_str(),
+                        windows[1].program.as_str(),
+                        "minimized",
+                    ];
+                    let painted = output
+                        .shapes
+                        .iter()
+                        .filter_map(|clipped| match &clipped.shape {
+                            eframe::egui::Shape::Text(text)
+                                if parts.contains(&text.galley.text()) =>
+                            {
+                                Some(clipped.clip_rect)
+                            }
+                            _ => None,
+                        });
+                    for part in painted {
+                        assert!(
+                            part.left() >= SIDE && part.right() <= right,
+                            "{width} {count} {part:?}"
+                        );
+                    }
+                    continue;
+                }
+                // At 320 px the title is at its least, so a bar narrows the
+                // name instead.
+                let (title_width, name_width) = if width == 360.0 {
+                    (152.0 - bar, NAME_WIDTH)
+                } else {
+                    (LEAST_TITLE_WIDTH, NAME_WIDTH - bar)
+                };
+                if let Some(handle) = handle {
+                    let (marker, _) = painted_share_text(&output, "minimized");
+                    assert!(handle.left() >= marker.right(), "{handle:?} {marker:?}");
+                }
+                for (i, window) in windows.iter().take(2).enumerate() {
+                    let (title_rect, title) = painted_share_text(&output, &window.title);
+                    let (name_rect, name) = painted_share_text(&output, &window.program);
+                    for words in [window.title.as_str(), window.program.as_str(), "minimized"] {
+                        assert_eq!(
+                            painted_share_text(&first_output, words).0,
+                            painted_share_text(&output, words).0
+                        );
+                    }
+                    assert_eq!(title_rect.width(), title_width);
+                    assert_eq!(title_rect.height(), ROW_HEIGHT);
+                    assert_eq!(name_rect.width(), name_width);
+                    assert_eq!(name_rect.right(), right - MINIMIZED_WIDTH - STEP);
+                    assert_eq!(name_rect.left() - title_rect.right(), STEP);
+                    assert_eq!(name.pos.x, name_rect.right());
+                    assert_eq!(name.galley.job.halign, Align::RIGHT);
+                    for (text, font, color) in
+                        [(title, theme::body(), CHALK), (name, theme::caption(), ASH)]
+                    {
+                        assert_eq!(text.galley.rows.len(), 1);
+                        assert!(text.galley.elided);
+                        assert_eq!(text.galley.job.sections[0].format.font_id, font);
+                        assert_eq!(text.galley.job.sections[0].format.color, color);
+                        assert_eq!(text.galley.rows[0].glyphs.last().unwrap().chr, '\u{2026}');
+                    }
+                    if i == 1 {
+                        let (marker_rect, marker) = painted_share_text(&output, "minimized");
+                        assert_eq!(marker_rect.width(), MINIMIZED_WIDTH);
+                        assert_eq!(marker_rect.right(), right);
+                        assert_eq!(marker_rect.left() - name_rect.right(), STEP);
+                        assert_eq!(marker.pos.x, marker_rect.left());
+                        assert_eq!(marker.galley.job.halign, Align::LEFT);
+                        assert_eq!(marker.galley.rows.len(), 1);
+                        assert_eq!(marker_rect.top(), title_rect.top());
+                    }
+                }
+                let (first, _) = painted_share_text(&output, &windows[0].title);
+                let (second, _) = painted_share_text(&output, &windows[1].title);
+                assert_eq!(second.top(), first.bottom());
+                if count > 2 {
+                    let (unnamed, _) = painted_share_text(&output, &windows[2].title);
+                    assert_eq!(unnamed.width(), title_width);
+                    if count == 3 {
+                        assert_eq!(unnamed.height(), ROW_HEIGHT - 0.5);
+                    }
+                }
+                // The label stays where it is, whole, as the rows scroll
+                // under it.
+                if scrolls {
+                    let (_, label) = painted_share_text(&output, "Windows");
+                    let (top_row, top_title) = painted_share_text(&output, &windows[0].title);
+                    let wheel = vec![
+                        Event::PointerMoved(top_row.center()),
+                        Event::MouseWheel {
+                            unit: eframe::egui::MouseWheelUnit::Point,
+                            delta: vec2(0.0, -6.0),
+                            phase: TouchPhase::Move,
+                            modifiers: Modifiers::NONE,
+                        },
+                    ];
+                    let list = |ui: &mut Ui| {
+                        share_list(ui, &[], &windows);
+                    };
+                    let turned = painted_share_frame(&ctx, screen, wheel, list);
+                    let scrolled = painted_share_frame(&ctx, screen, Vec::new(), list);
+                    let (clip, moved) = painted_share_text(&scrolled, "Windows");
+                    assert_eq!(moved.pos.y, label.pos.y);
+                    assert!(
+                        clip.contains_rect(Rect::from_min_size(moved.pos, moved.galley.size()))
+                    );
+                    let (_, scrolled_title) = painted_share_text(&scrolled, &windows[0].title);
+                    assert!(
+                        scrolled_title.pos.y < top_title.pos.y,
+                        "{:?} {:?}",
+                        scrolled_title.pos,
+                        top_title.pos
+                    );
+                    turned.drop_without_applying_deltas();
+                    scrolled.drop_without_applying_deltas();
+                }
+                first_output.drop_without_applying_deltas();
+                output.drop_without_applying_deltas();
+            }
+        }
+    }
+
+    #[test]
+    fn arabic_first_window_text_keeps_desktop_order() {
+        let title = "*\u{639}\u{631}\u{628}\u{64a} - Notepad";
+        let program = "*\u{639}\u{631}\u{628}\u{64a} - App";
+        let pick = WindowPick::from(room::TopWindow {
+            id: room::WindowId {
+                hwnd: 1,
+                process: 1,
+            },
+            title: title.to_string(),
+            program: Some(program.to_string()),
+            minimized: false,
+        });
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        let output = painted_share_frame(&ctx, vec2(360.0, 640.0), Vec::new(), |ui| {
+            controls::region(ui, |ui| window_row(ui, &pick));
+        });
+        for (words, last) in [(&pick.title, 'N'), (&pick.program, 'A')] {
+            let (_, text) = painted_share_text(&output, words);
+            assert_eq!(text.galley.rows.len(), 1);
+            assert!(!text.galley.elided);
+            let row = &text.galley.rows[0];
+            let x = |chr| {
+                row.glyphs
+                    .iter()
+                    .find(|glyph| glyph.chr == chr)
+                    .unwrap()
+                    .pos
+                    .x
+            };
+            let arabic: Vec<_> = row
+                .glyphs
+                .iter()
+                .filter(|glyph| ('\u{600}'..='\u{6ff}').contains(&glyph.chr))
+                .collect();
+            assert!(arabic.iter().all(|glyph| glyph.is_rtl()));
+            let xs: Vec<_> = std::iter::once(x('*'))
+                .chain(
+                    arabic
+                        .iter()
+                        .rev()
+                        .filter(|glyph| glyph.advance_width > 0.0)
+                        .map(|glyph| glyph.pos.x),
+                )
+                .chain([x('-'), x(last)])
+                .collect();
+            assert!(xs.is_sorted(), "desktop order: {xs:?}");
+            assert!(words.starts_with('\u{2066}') && words.ends_with('\u{2069}'));
+            assert_eq!(row.text(), *words);
+        }
+        output.drop_without_applying_deltas();
     }
 
     // Region, after the monitors, opens the picker.
@@ -4226,16 +4676,17 @@ pub(crate) mod tests {
         let ctx = Context::default();
         theme::apply(&ctx);
         let picks = picks();
+        let row_top = SIDE + controls::line_height(&theme::body()) + STEP;
         let (second, _) = frame(&ctx, Vec::new(), |ui| {
             assert_eq!(share_list(ui, &picks, &[]), None);
             let first = Button::new(&picks[0].text).width(ui);
             let gap = ui.spacing().item_spacing.x;
-            pos2(SIDE + first + gap + 10.0, SIDE + CONTROL_HEIGHT / 2.0)
+            pos2(SIDE + first + gap + 10.0, row_top + CONTROL_HEIGHT / 2.0)
         });
         frame(&ctx, press(second), |ui| share_list(ui, &picks, &[]));
         let (pressed, _) = frame(&ctx, release(second), |ui| share_list(ui, &picks, &[]));
         assert_eq!(pressed, Some(RowPick::Monitor(1)));
-        let first = pos2(SIDE + 10.0, SIDE + CONTROL_HEIGHT / 2.0);
+        let first = pos2(SIDE + 10.0, row_top + CONTROL_HEIGHT / 2.0);
         frame(&ctx, press(first), |ui| share_list(ui, &picks, &[]));
         let (pressed, _) = frame(&ctx, release(first), |ui| share_list(ui, &picks, &[]));
         assert_eq!(pressed, Some(RowPick::Monitor(0)));
@@ -4255,7 +4706,10 @@ pub(crate) mod tests {
         let windows = [window(1, "Notes"), window(2, "Game")];
         let (second, _) = frame(&ctx, Vec::new(), |ui| {
             assert_eq!(share_list(ui, &[], &windows), None);
-            let below = SIDE + CONTROL_HEIGHT + ui.spacing().item_spacing.y;
+            let below = SIDE
+                + 2.0 * (controls::line_height(&theme::body()) + STEP)
+                + CONTROL_HEIGHT
+                + FIELD_GAP;
             pos2(SIDE + 10.0, below + ROW_HEIGHT * 1.5)
         });
         frame(&ctx, press(second), |ui| share_list(ui, &[], &windows));
@@ -4392,8 +4846,8 @@ pub(crate) mod tests {
     }
 
     // At 360 px with two monitors the invite's lifetime toggle lies under the
-    // second monitor's button, and under a window row once the share's block
-    // stands alone above it. After a pick, a second click at either place
+    // second monitor's button. Once the share's block stands alone above it,
+    // it lies beside Region. After a pick, a second click at either place
     // presses nothing until the room goes, and the toggle stays where the
     // list left it, then moves once, up to where the block alone puts it: on
     // a host, granted at once with the block 80 ms on, and on a client that
@@ -4492,24 +4946,15 @@ pub(crate) mod tests {
         let (_, output) = draw(listed, Vec::new(), &off, t);
         let second = place(&output, &picks[1].spoken);
         let under_list = place(&output, TOGGLE).top();
-        let rows: Vec<Rect> = windows
-            .iter()
-            .map(|window| place(&output, &window.spoken))
-            .collect();
         assert!(bare.intersects(second), "{bare:?} {second:?}");
-        // The block alone, in place: the toggle under a window row.
+        // The block alone puts the toggle beside Region, so no window row
+        // can be used to aim at it.
         let settled = &mut Panel::default();
         draw(settled, Vec::new(), &running, t);
         let (_, output) = draw(settled, Vec::new(), &running, at(500));
         let under_block = place(&output, TOGGLE);
-        let row = rows
-            .iter()
-            .find(|row| row.intersects(under_block))
-            .expect("the toggle under a window row");
-        let aims = [
-            bare.intersect(second).center(),
-            under_block.intersect(*row).center(),
-        ];
+        let aims = [bare.intersect(second).center(), under_block.center()];
+        assert!(place(&output, messages::SHARE_PC_SOUND).contains(aims[0]));
 
         // Each view from the time it starts, when the second clicks come, and
         // when the room goes.

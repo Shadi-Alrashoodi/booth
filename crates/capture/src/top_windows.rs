@@ -3,12 +3,17 @@
 // itself out of captures. A title is for the picker alone: it never goes
 // into a message, the log or the settings, so Debug leaves it out.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::mem;
 
 use windows::Graphics::Capture::GraphicsCaptureSession;
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, TRUE};
+use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
+use windows::Win32::Storage::FileSystem::{
+    GetFileVersionInfoSizeW, GetFileVersionInfoW, QueryDosDeviceW, VerQueryValueW,
+};
 use windows::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     QueryFullProcessImageNameW,
@@ -19,7 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WDA_EXCLUDEFROMCAPTURE, WDA_MONITOR, WS_CHILD, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW,
 };
-use windows::core::{BOOL, PWSTR};
+use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR, w};
 
 use crate::error::CaptureError;
 use crate::pointer::frame_bounds;
@@ -32,8 +37,9 @@ const LONGEST_TITLE: usize = 256;
 pub struct TopWindow {
     pub id: WindowId,
     pub title: String,
-    // The program's file name without ".exe", which tells two windows of
-    // the same title apart; None when Windows will not say.
+    // The program's display name, or its file name without ".exe", which
+    // tells two windows of the same title apart; None for a hosted app's
+    // frame or when Windows will not say.
     pub program: Option<String>,
     pub minimized: bool,
 }
@@ -68,9 +74,10 @@ pub fn top_windows() -> Result<Vec<TopWindow>, CaptureError> {
     .map_err(|err| CaptureError::windows("list the windows", &err))?;
     // SAFETY: plain queries.
     let (own, shell) = unsafe { (GetCurrentProcessId(), GetShellWindow()) };
+    let mut programs = HashMap::new();
     Ok(handles
         .into_iter()
-        .filter_map(|hwnd| listed(hwnd, own, shell))
+        .filter_map(|hwnd| listed(hwnd, own, shell, &mut programs))
         .collect())
 }
 
@@ -86,7 +93,12 @@ unsafe extern "system" fn collect(hwnd: HWND, list: LPARAM) -> BOOL {
 // first, before any text is read: reading the title of a window of this
 // process sends it a message, and a window whose thread is stuck would hold
 // the panel up.
-fn listed(hwnd: HWND, own: u32, shell: HWND) -> Option<TopWindow> {
+fn listed(
+    hwnd: HWND,
+    own: u32,
+    shell: HWND,
+    programs: &mut HashMap<String, Option<String>>,
+) -> Option<TopWindow> {
     // SAFETY: plain queries; a window gone since it was listed answers 0
     // or false, and is left out.
     unsafe {
@@ -127,7 +139,7 @@ fn listed(hwnd: HWND, own: u32, shell: HWND) -> Option<TopWindow> {
     Some(TopWindow {
         id,
         title,
-        program: program(id.process),
+        program: program(id.process, programs),
         minimized: id.minimized(),
     })
 }
@@ -189,8 +201,10 @@ fn clean_title(text: &str) -> String {
     kept.trim().chars().take(LONGEST_TITLE).collect()
 }
 
-// The file name of the program behind a window, without ".exe".
-fn program(process: u32) -> Option<String> {
+// A listing reads each file once, even when several windows belong to it
+// or its version resource cannot be read. The picker keeps these names
+// until it takes a new listing.
+fn program(process: u32, programs: &mut HashMap<String, Option<String>>) -> Option<String> {
     // SAFETY: a plain open for the least access there is; closed below.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process) }.ok()?;
     let mut path = [0u16; 1024];
@@ -208,12 +222,176 @@ fn program(process: u32) -> Option<String> {
     let _ = unsafe { CloseHandle(handle) };
     read.ok()?;
     let path = String::from_utf16_lossy(&path[..length as usize]);
+    programs
+        .entry(path)
+        .or_insert_with_key(|path| program_name(path))
+        .clone()
+}
+
+fn program_name(path: &str) -> Option<String> {
+    program_name_from(path, device_target, file_description)
+}
+
+fn program_name_from(
+    path: &str,
+    device: impl Fn(&str) -> Option<String>,
+    description: impl FnOnce(&str) -> Option<String>,
+) -> Option<String> {
     let name = path.rsplit(['\\', '/']).next()?;
+    if name.eq_ignore_ascii_case("ApplicationFrameHost.exe") {
+        return None;
+    }
+    if on_local_disk(path, device)
+        && let Some(description) = description(path)
+    {
+        return Some(description);
+    }
     let stem = name
         .strip_suffix(".exe")
         .or_else(|| name.strip_suffix(".EXE"))
         .unwrap_or(name);
-    (!stem.is_empty()).then(|| stem.to_string())
+    let stem = clean_title(stem);
+    (!stem.is_empty()).then_some(stem)
+}
+
+// Opening a file on a dropped share can hold up the picker, and network,
+// WebDAV and shared-folder drives each name a device of their own, so a
+// program's file is read only from a local disk volume. The device mapping
+// is read without opening the volume. A substituted drive names the folder
+// it stands for, and that folder's drive is asked about once more.
+fn on_local_disk(path: &str, device: impl Fn(&str) -> Option<String>) -> bool {
+    let target = |path: &str| {
+        path.get(..2)
+            .filter(|drive| drive.ends_with(':'))
+            .and_then(&device)
+    };
+    let disk = |target: &str| {
+        target
+            .to_ascii_lowercase()
+            .strip_prefix(r"\device\harddiskvolume")
+            .is_some_and(|number| {
+                !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    };
+    target(path).is_some_and(|first| {
+        disk(&first)
+            || first
+                .strip_prefix(r"\??\")
+                .and_then(&target)
+                .is_some_and(|second| disk(&second))
+    })
+}
+
+fn device_target(drive: &str) -> Option<String> {
+    let drive = HSTRING::from(drive);
+    let mut target = [0u16; 1024];
+    // SAFETY: a live, terminated drive name and a live output buffer.
+    let length = unsafe { QueryDosDeviceW(PCWSTR(drive.as_ptr()), Some(&mut target)) };
+    if length == 0 {
+        return None;
+    }
+    let target = target[..length as usize].split(|&unit| unit == 0).next()?;
+    Some(String::from_utf16_lossy(target))
+}
+
+fn version_words(info: &[u32], value: *const std::ffi::c_void, length: usize) -> &[u16] {
+    let Some(offset) = (value as usize).checked_sub(info.as_ptr() as usize) else {
+        return &[];
+    };
+    let bytes = mem::size_of_val(info);
+    if offset >= bytes || offset % mem::align_of::<u16>() != 0 {
+        return &[];
+    }
+    let length = length.min((bytes - offset) / mem::size_of::<u16>());
+    // SAFETY: info is aligned for u16 and fully initialized, and every u16
+    // value is valid. The returned slice is cut within that buffer.
+    let words = unsafe {
+        std::slice::from_raw_parts(info.as_ptr().cast::<u16>(), bytes / mem::size_of::<u16>())
+    };
+    &words[offset / mem::size_of::<u16>()..][..length]
+}
+
+fn version_description(
+    info: &[u32],
+    value: *const std::ffi::c_void,
+    length: usize,
+) -> Option<String> {
+    let text = version_words(info, value, length);
+    let end = text
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(text.len());
+    let description = clean_title(&String::from_utf16_lossy(&text[..end]));
+    (!description.is_empty()).then_some(description)
+}
+
+fn translation_order(translations: &[[u16; 2]], language: u16) -> impl Iterator<Item = [u16; 2]> {
+    translations
+        .iter()
+        .filter(move |entry| entry[0] == language)
+        .chain(
+            translations
+                .iter()
+                .filter(move |entry| entry[0] != language),
+        )
+        .copied()
+        .chain([[0x0409, 0x04B0], [0x0409, 0x04E4]])
+}
+
+fn file_description(path: &str) -> Option<String> {
+    let path = HSTRING::from(path);
+    // SAFETY: a live, terminated path; the unused handle is optional.
+    let size = unsafe { GetFileVersionInfoSizeW(PCWSTR(path.as_ptr()), None) };
+    if size == 0 {
+        return None;
+    }
+    // The translation pairs and strings returned below need word alignment.
+    let mut info = vec![0u32; (size as usize).div_ceil(mem::size_of::<u32>())];
+    // SAFETY: a live path and a buffer at least size bytes long.
+    unsafe { GetFileVersionInfoW(PCWSTR(path.as_ptr()), None, size, info.as_mut_ptr().cast()) }
+        .ok()?;
+    let mut value = std::ptr::null_mut();
+    let mut length = 0;
+    // SAFETY: the complete version block and live output pointers.
+    let translated = unsafe {
+        VerQueryValueW(
+            info.as_ptr().cast(),
+            w!("\\VarFileInfo\\Translation"),
+            &mut value,
+            &mut length,
+        )
+    };
+    let translations: Vec<[u16; 2]> = if translated.as_bool() {
+        version_words(&info, value, length as usize / mem::size_of::<u16>())
+            .as_chunks::<2>()
+            .0
+            .to_vec()
+    } else {
+        Vec::new()
+    };
+    // SAFETY: a plain query.
+    let language = unsafe { GetUserDefaultUILanguage() };
+    for [language, codepage] in translation_order(&translations, language) {
+        let key = HSTRING::from(format!(
+            "\\StringFileInfo\\{language:04X}{codepage:04X}\\FileDescription"
+        ));
+        // SAFETY: the complete version block, a live terminated key and
+        // live output pointers. String lengths are in UTF-16 code units.
+        let found = unsafe {
+            VerQueryValueW(
+                info.as_ptr().cast(),
+                PCWSTR(key.as_ptr()),
+                &mut value,
+                &mut length,
+            )
+        };
+        if found.as_bool()
+            && let Some(description) = version_description(&info, value, length as usize)
+        {
+            return Some(description);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -232,6 +410,227 @@ mod tests {
     use windows::core::{HSTRING, PCWSTR, w};
 
     use super::*;
+
+    #[test]
+    fn version_values_stay_within_the_block() {
+        let storage = [0x00420041u32, 0x00440043, 0x00460045];
+        let info = &storage[..2];
+        let start = info.as_ptr().cast::<u8>();
+        assert_eq!(
+            version_words(info, start.wrapping_add(2).cast(), 4),
+            [66, 67, 68]
+        );
+        assert_eq!(version_words(info, start.cast(), 1), [65]);
+        for value in [
+            std::ptr::null(),
+            start.wrapping_sub(2).cast(),
+            start.wrapping_add(1).cast(),
+            start.wrapping_add(mem::size_of_val(info)).cast(),
+            start.wrapping_add(mem::size_of_val(info) + 2).cast(),
+        ] {
+            assert!(version_words(info, value, 4).is_empty());
+        }
+        assert!(version_words(info, start.cast(), 0).is_empty());
+    }
+
+    #[test]
+    fn a_version_description_ends_at_its_first_nul() {
+        let info = [0x00420041u32, 0x00430000, 0x00450044];
+        assert_eq!(
+            version_description(&info, info.as_ptr().cast(), 6).as_deref(),
+            Some("AB")
+        );
+        assert_eq!(
+            version_description(&info, info.as_ptr().cast(), 1).as_deref(),
+            Some("A")
+        );
+        let empty = [0u32];
+        assert_eq!(version_description(&empty, empty.as_ptr().cast(), 2), None);
+    }
+
+    #[test]
+    fn translations_for_the_ui_language_come_first() {
+        let translations = [[0x0409, 0x04E4], [0x0401, 0x04B0], [0x0411, 0x03A4]];
+        assert_eq!(
+            translation_order(&translations, 0x0401).collect::<Vec<_>>(),
+            [
+                [0x0401, 0x04B0],
+                [0x0409, 0x04E4],
+                [0x0411, 0x03A4],
+                [0x0409, 0x04B0],
+                [0x0409, 0x04E4]
+            ]
+        );
+    }
+
+    #[test]
+    fn translations_keep_the_file_order_when_no_language_matches() {
+        let translations = [[0x0411, 0x03A4], [0x0401, 0x04B0]];
+        assert_eq!(
+            translation_order(&translations, 0x0419).collect::<Vec<_>>(),
+            [
+                [0x0411, 0x03A4],
+                [0x0401, 0x04B0],
+                [0x0409, 0x04B0],
+                [0x0409, 0x04E4]
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_translations_use_the_english_fallbacks() {
+        assert_eq!(
+            translation_order(&[], 0x0401).collect::<Vec<_>>(),
+            [[0x0409, 0x04B0], [0x0409, 0x04E4]]
+        );
+    }
+
+    #[test]
+    fn remote_programs_use_the_file_name_without_reading_the_file() {
+        for path in [
+            r"\\server\apps\Notes.exe",
+            r"\\?\UNC\server\apps\Notes.exe",
+            "//server/apps/Notes.exe",
+        ] {
+            assert_eq!(
+                program_name_from(
+                    path,
+                    |_| panic!("a UNC path needs no drive query"),
+                    |_| panic!("a remote file must not be opened")
+                )
+                .as_deref(),
+                Some("Notes")
+            );
+        }
+        for drives in [
+            &[("Z:", r"\Device\Mup")][..],
+            &[("Z:", r"\Device\Mup\server\apps")],
+            &[(
+                "Z:",
+                r"\Device\LanmanRedirector\;Z:000000000000\server\apps",
+            )],
+            &[("Z:", r"\device\lanmanredirector\server\apps")],
+            &[("Z:", r"\??\UNC\server\apps")],
+            &[(
+                "Z:",
+                r"\Device\WebDavRedirector\;Z:0000000000000000\server\DavWWWRoot",
+            )],
+            &[("Z:", r"\Device\VBoxMiniRdr\;Z:\VBoxSvr\apps")],
+            &[("Z:", r"\Device\HarddiskVolume")],
+            &[
+                ("Z:", r"\??\Y:\apps"),
+                ("Y:", r"\Device\LanmanRedirector\;Y:0\server\apps"),
+            ],
+            &[("Z:", r"\??\Y:\apps")],
+            &[],
+        ] {
+            assert_eq!(
+                program_name_from(
+                    r"Z:\Notes.exe",
+                    |drive| mapped(drives, drive),
+                    |_| panic!("a remote file must not be opened")
+                )
+                .as_deref(),
+                Some("Notes"),
+                "{drives:?}"
+            );
+        }
+    }
+
+    fn mapped(drives: &[(&str, &str)], drive: &str) -> Option<String> {
+        drives
+            .iter()
+            .find(|(name, _)| *name == drive)
+            .map(|(_, target)| target.to_string())
+    }
+
+    #[test]
+    fn local_programs_can_use_the_file_description() {
+        for drives in [
+            &[("C:", r"\Device\HarddiskVolume4")][..],
+            &[("C:", r"\device\harddiskvolume12")],
+            &[("C:", r"\??\D:\apps"), ("D:", r"\Device\HarddiskVolume2")],
+        ] {
+            assert_eq!(
+                program_name_from(
+                    r"C:\Notes.exe",
+                    |drive| mapped(drives, drive),
+                    |path| {
+                        assert_eq!(path, r"C:\Notes.exe");
+                        Some(String::from("Notes display name"))
+                    }
+                )
+                .as_deref(),
+                Some("Notes display name")
+            );
+        }
+    }
+
+    #[test]
+    fn file_name_fallbacks_drop_direction_controls_and_empty_names() {
+        for (stem, expected) in [
+            (" \u{2069}Notes\u{202E}\u{2066} \u{2069}", Some("Notes")),
+            ("\u{2066}\u{202E}\u{2069}", None),
+        ] {
+            let path = format!(r"C:\apps\{stem}.exe");
+            assert_eq!(
+                program_name_from(
+                    &path,
+                    |_| Some(String::from(r"\Device\HarddiskVolume4")),
+                    |_| None
+                )
+                .as_deref(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn notepad_uses_its_file_description() {
+        let path = r"C:\Windows\System32\notepad.exe";
+        let description = file_description(path).expect("Notepad has a version resource");
+        assert_ne!(description, "notepad");
+        assert_eq!(program_name(path), Some(description));
+    }
+
+    #[test]
+    fn a_program_without_a_version_resource_uses_its_file_name() {
+        let path = std::env::current_exe().unwrap();
+        let name = path.file_stem().unwrap().to_str().unwrap();
+        let path = path.to_str().unwrap();
+        assert_eq!(file_description(path), None);
+        assert_eq!(program_name(path).as_deref(), Some(name));
+    }
+
+    #[test]
+    fn a_hosted_apps_frame_has_no_program_name() {
+        for path in [
+            r"C:\Windows\System32\ApplicationFrameHost.exe",
+            r"C:\Windows\System32\APPLICATIONFRAMEHOST.EXE",
+        ] {
+            assert_eq!(program_name(path), None);
+        }
+    }
+
+    #[test]
+    fn program_names_are_kept_by_full_path_including_missing_names() {
+        // SAFETY: a plain query.
+        let process = unsafe { GetCurrentProcessId() };
+        let mut programs = HashMap::new();
+        let first = program(process, &mut programs).expect("this executable has a file name");
+        assert_eq!(programs.len(), 1);
+        let path = programs.keys().next().unwrap().clone();
+        assert!(std::path::Path::new(&path).is_absolute());
+        assert_eq!(programs[&path].as_deref(), Some(first.as_str()));
+        programs.insert(path.clone(), Some(String::from("kept name")));
+        assert_eq!(
+            program(process, &mut programs).as_deref(),
+            Some("kept name")
+        );
+        programs.insert(path, None);
+        assert_eq!(program(process, &mut programs), None);
+        assert_eq!(programs.len(), 1);
+    }
 
     // One kind of window the list is asked about.
     struct Kind {
@@ -400,10 +799,11 @@ mod tests {
         ]);
         // SAFETY: a plain query.
         let shell = unsafe { GetShellWindow() };
+        let mut programs = HashMap::new();
         let listed: Vec<(&str, Option<TopWindow>)> = made
             .0
             .iter()
-            .map(|(name, hwnd)| (*name, listed(*hwnd, 0, shell)))
+            .map(|(name, hwnd)| (*name, listed(*hwnd, 0, shell, &mut programs)))
             .collect();
         for (name, window) in &listed {
             println!("{name}: {window:?}");
