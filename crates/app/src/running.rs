@@ -13,11 +13,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use net::Holder;
+use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, FindWindowExW, GetWindowThreadProcessId, PostMessageW,
+    SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT, SendMessageTimeoutW, WM_COPYDATA,
 };
 
-use crate::tray;
+use crate::{links, tray};
 
 // Held open as long as the panel is, and let go by Windows when the
 // process ends, a crash included. Others may read it, not open it to write,
@@ -74,6 +77,77 @@ pub fn take(dir: &Path, wait: Duration) -> Lock {
     }
 }
 
+pub enum HandOver {
+    Held(File),
+    Unheld(io::Error),
+    Handed,
+    InRoom,
+    Older(u32),
+    NoAnswer,
+}
+
+pub fn hand_over(dir: &Path, wait: Duration, link: &str) -> HandOver {
+    let until = Instant::now() + wait;
+    let mut sent = false;
+    loop {
+        match hold(dir) {
+            Lock::Held(file) => return HandOver::Held(file),
+            Lock::Unheld(err) => return HandOver::Unheld(err),
+            Lock::Open => {}
+            Lock::BroughtForward => unreachable!(),
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return HandOver::NoAnswer;
+        }
+        if !sent
+            && let Some(pid) = holder(dir).filter(|pid| *pid != std::process::id())
+            && let Some(window) = tray_window(pid)
+        {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return HandOver::NoAnswer;
+            }
+            sent = true;
+            let data = COPYDATASTRUCT {
+                dwData: links::MESSAGE_TAG,
+                cbData: link.len() as u32,
+                lpData: link.as_ptr().cast_mut().cast(),
+            };
+            let mut answer = 0;
+            let timeout = left.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+            // A timeout does not cancel delivery, so this message is never
+            // sent again, even if the tray has not answered by the deadline.
+            // SAFETY: data and its bytes outlive the synchronous send; Windows
+            // copies them to the other process for the duration of its call.
+            let ok = unsafe {
+                AllowSetForegroundWindow(pid);
+                SendMessageTimeoutW(
+                    window,
+                    WM_COPYDATA,
+                    0,
+                    &raw const data as isize,
+                    SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+                    timeout,
+                    &mut answer,
+                )
+            };
+            if ok != 0 {
+                return match answer {
+                    1 => HandOver::Handed,
+                    2 => HandOver::InRoom,
+                    _ => HandOver::Older(pid),
+                };
+            }
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return HandOver::NoAnswer;
+        }
+        thread::sleep(POLL.min(left));
+    }
+}
+
 fn open(dir: &Path) -> io::Result<File> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -107,6 +181,18 @@ pub fn bring_forward(pid: u32) -> bool {
     if show == 0 {
         return false;
     }
+    let Some(window) = tray_window(pid) else {
+        return false;
+    };
+    // SAFETY: plain values; both fail harmlessly for a window or a
+    // process that has just gone.
+    unsafe {
+        AllowSetForegroundWindow(pid);
+        PostMessageW(window, show, 0, 0) != 0
+    }
+}
+
+fn tray_window(pid: u32) -> Option<HWND> {
     let class: Vec<u16> = tray::CLASS.encode_utf16().chain([0]).collect();
     let mut after = ptr::null_mut();
     loop {
@@ -114,19 +200,14 @@ pub fn bring_forward(pid: u32) -> bool {
         // `after` is null or a window this loop was just given.
         let window = unsafe { FindWindowExW(ptr::null_mut(), after, class.as_ptr(), ptr::null()) };
         if window.is_null() {
-            return false;
+            return None;
         }
         let mut owner = 0u32;
         // SAFETY: `owner` is a live u32; a window gone since it was found
         // leaves it 0.
         unsafe { GetWindowThreadProcessId(window, &mut owner) };
         if owner == pid {
-            // SAFETY: plain values; both fail harmlessly for a window or a
-            // process that has just gone.
-            return unsafe {
-                AllowSetForegroundWindow(pid);
-                PostMessageW(window, show, 0, 0) != 0
-            };
+            return Some(window);
         }
         after = window;
     }
@@ -242,6 +323,276 @@ mod tests {
     const FOLDER_VAR: &str = "BOOTH_TEST_OPEN_ON";
     const OPEN: &str = "open on the folder";
     const ASKED: &str = "the panel was asked for";
+    const LINK_MODE: &str = "BOOTH_TEST_LINK_MODE";
+    const LINK_TEXT: &str = "booth://join/booth1-test";
+    const LINK_SEEN: &str = "the invite link arrived";
+
+    fn with_link_holder(mode: &str, check: impl FnOnce(&Path, u32)) {
+        let dir = folder(&format!("link-{mode}"));
+        let mut first = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "running::tests::hold_for_an_invite_link",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(FOLDER_VAR, &dir)
+            .env(LINK_MODE, mode)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = BufReader::new(first.stdout.take().unwrap()).lines();
+        assert!(
+            lines
+                .by_ref()
+                .map_while(Result::ok)
+                .any(|line| line.contains(OPEN))
+        );
+        let checked =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&dir, first.id())));
+        drop(first.stdin.take());
+        let rest: Vec<_> = lines.map_while(Result::ok).collect();
+        let ended = first.wait().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        if let Err(payload) = checked {
+            std::panic::resume_unwind(payload);
+        }
+        assert!(ended.success());
+        if matches!(mode, "taken" | "room" | "older" | "hung") {
+            assert_eq!(
+                rest.iter().filter(|line| line.contains(LINK_SEEN)).count(),
+                1,
+                "{rest:?}"
+            );
+        }
+        if mode == "gone" {
+            assert!(
+                rest.iter().all(|line| !line.contains(LINK_SEEN)),
+                "{rest:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn link_hand_over_sends_the_bytes_once() {
+        with_link_holder("taken", |dir, _| {
+            let at = Instant::now();
+            assert!(matches!(
+                hand_over(dir, Duration::from_secs(2), LINK_TEXT),
+                HandOver::Handed
+            ));
+            let took = at.elapsed();
+            println!("invite link handed over in {took:?}");
+            assert!(took < Duration::from_secs(1), "{took:?}");
+        });
+    }
+
+    #[test]
+    fn link_hand_over_in_a_room() {
+        with_link_holder("room", |dir, _| {
+            assert!(matches!(
+                hand_over(dir, Duration::from_secs(1), LINK_TEXT),
+                HandOver::InRoom
+            ));
+        });
+    }
+
+    #[test]
+    fn link_hand_over_to_an_older_copy() {
+        with_link_holder("older", |dir, pid| {
+            assert!(
+                matches!(hand_over(dir, Duration::from_secs(1), LINK_TEXT), HandOver::Older(other) if other == pid)
+            );
+        });
+    }
+
+    #[test]
+    fn link_hand_over_without_a_tray_waits() {
+        with_link_holder("none", |dir, _| {
+            let at = Instant::now();
+            let wait = Duration::from_millis(200);
+            assert!(matches!(
+                hand_over(dir, wait, LINK_TEXT),
+                HandOver::NoAnswer
+            ));
+            assert!(at.elapsed() >= wait);
+            assert!(at.elapsed() < Duration::from_secs(1));
+        });
+    }
+
+    #[test]
+    fn link_hand_over_gives_up_on_a_hung_tray() {
+        with_link_holder("hung", |dir, _| {
+            let at = Instant::now();
+            let wait = Duration::from_millis(100);
+            assert!(matches!(
+                hand_over(dir, wait, LINK_TEXT),
+                HandOver::NoAnswer
+            ));
+            assert!(at.elapsed() >= wait);
+            assert!(at.elapsed() < Duration::from_secs(1));
+        });
+    }
+
+    // The first tray window goes while the message waits on it, and another
+    // comes well before the deadline: the failed send is not made again.
+    #[test]
+    fn link_hand_over_failed_send_is_not_sent_again() {
+        with_link_holder("gone", |dir, _| {
+            let at = Instant::now();
+            let wait = Duration::from_secs(1);
+            assert!(matches!(
+                hand_over(dir, wait, LINK_TEXT),
+                HandOver::NoAnswer
+            ));
+            assert!(at.elapsed() >= wait);
+        });
+    }
+
+    #[test]
+    fn link_hand_over_takes_a_closing_folder() {
+        with_link_holder("closing", |dir, _| {
+            let at = Instant::now();
+            let taken = hand_over(dir, Duration::from_secs(2), LINK_TEXT);
+            assert!(matches!(taken, HandOver::Held(_)));
+            assert!(at.elapsed() >= Duration::from_millis(250));
+            assert!(at.elapsed() < Duration::from_secs(1));
+        });
+    }
+
+    #[test]
+    #[ignore = "the holder in the invite link tests"]
+    fn hold_for_an_invite_link() {
+        use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetQueueStatus, MSG,
+            PostThreadMessageW, QS_SENDMESSAGE, RegisterClassW, WM_QUIT, WNDCLASSW,
+        };
+
+        unsafe extern "system" fn older(
+            hwnd: HWND,
+            message: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            if message == WM_COPYDATA {
+                println!("{LINK_SEEN}");
+            }
+            // SAFETY: these are the arguments Windows gave this window.
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
+
+        let Some(dir) = std::env::var_os(FOLDER_VAR) else {
+            return;
+        };
+        let mode = std::env::var(LINK_MODE).unwrap();
+        let Lock::Held(held) = hold(Path::new(&dir)) else {
+            panic!("the holder takes the folder");
+        };
+        if mode == "closing" {
+            let _tray = tray::Tray::start(
+                || {},
+                |bytes| {
+                    assert_eq!(bytes, LINK_TEXT.as_bytes());
+                    thread::sleep(Duration::from_millis(300));
+                    std::process::exit(0);
+                },
+            )
+            .unwrap();
+            println!("{OPEN}");
+            let _ = std::io::stdin().read(&mut [0; 1]);
+            return;
+        }
+        if mode == "older" || mode == "gone" {
+            let class: Vec<u16> = tray::CLASS.encode_utf16().chain([0]).collect();
+            // SAFETY: the class and its procedure outlive this thread's message loop.
+            unsafe {
+                let wc = WNDCLASSW {
+                    lpfnWndProc: Some(older),
+                    hInstance: GetModuleHandleW(ptr::null()),
+                    lpszClassName: class.as_ptr(),
+                    ..WNDCLASSW::default()
+                };
+                assert_ne!(RegisterClassW(&wc), 0);
+                let window = |class: *const u16| {
+                    CreateWindowExW(
+                        0,
+                        class,
+                        ptr::null(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        GetModuleHandleW(ptr::null()),
+                        ptr::null(),
+                    )
+                };
+                if mode == "gone" {
+                    // The first window is on a thread that never takes its
+                    // messages and goes with that thread once the link run's
+                    // message waits there, so that send fails at once.
+                    let (made, ready) = std::sync::mpsc::channel();
+                    let first_class = class.clone();
+                    let first = thread::spawn(move || {
+                        assert!(!window(first_class.as_ptr()).is_null());
+                        made.send(()).unwrap();
+                        let until = Instant::now() + Duration::from_secs(5);
+                        while (GetQueueStatus(QS_SENDMESSAGE) >> 16) & QS_SENDMESSAGE == 0
+                            && Instant::now() < until
+                        {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    });
+                    ready.recv().unwrap();
+                    println!("{OPEN}");
+                    first.join().unwrap();
+                }
+                assert!(!window(class.as_ptr()).is_null());
+                let tid = GetCurrentThreadId();
+                thread::spawn(move || {
+                    let _ = std::io::stdin().read(&mut [0; 1]);
+                    PostThreadMessageW(tid, WM_QUIT, 0, 0);
+                });
+                if mode == "older" {
+                    println!("{OPEN}");
+                }
+                let mut msg = MSG::default();
+                while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) > 0 {
+                    DispatchMessageW(&msg);
+                }
+            }
+            drop(held);
+            return;
+        }
+        let tray = if mode == "none" {
+            None
+        } else {
+            Some(
+                tray::Tray::start(
+                    || {},
+                    move |bytes| {
+                        assert_eq!(bytes, LINK_TEXT.as_bytes());
+                        if mode == "hung" {
+                            thread::sleep(Duration::from_millis(300));
+                        }
+                        println!("{LINK_SEEN}");
+                        if mode == "room" { 2 } else { 1 }
+                    },
+                )
+                .unwrap(),
+            )
+        };
+        println!("{OPEN}");
+        let _ = std::io::stdin().read(&mut [0; 1]);
+        drop(tray);
+        drop(held);
+    }
 
     // The first copy is a second process of this test program, with the
     // folder and a tray of its own, so the number in the lock file, the
@@ -304,7 +655,7 @@ mod tests {
         let Lock::Held(held) = hold(Path::new(&dir)) else {
             panic!("the first copy could not take the folder");
         };
-        let tray = tray::Tray::start(|| println!("{ASKED}")).expect("the tray starts");
+        let tray = tray::Tray::start(|| println!("{ASKED}"), |_| 0).expect("the tray starts");
         println!("{OPEN}");
         let _ = std::io::stdin().read(&mut [0u8; 1]);
         drop(tray);

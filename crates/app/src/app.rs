@@ -189,6 +189,7 @@ impl App {
         firewall: Firewall,
         mut backlog: Backlog,
         panel_keys: Rc<RefCell<PanelKeys>>,
+        link: Option<Zeroizing<String>>,
     ) -> App {
         theme::apply(&cc.egui_ctx);
         if let Ok(handle) = cc.window_handle()
@@ -216,7 +217,26 @@ impl App {
         let hotkeys = start_hotkeys(&setup, &target, &ctx, &flags, &mut backlog);
         let control_offered = room_injector(&hotkeys, &flags).is_some();
         let tray_clicked = Arc::new(AtomicBool::new(false));
-        let tray = start_tray(&setup, &tray_clicked, &ctx, &mut backlog);
+        let link_arrived = Arc::new(AtomicBool::new(link.is_some()));
+        let inbox = Arc::new(Mutex::new(
+            link.map(|text| Zeroizing::new(text.as_bytes().to_vec())),
+        ));
+        let in_room = Arc::new(AtomicBool::new(false));
+        let tray = start_tray(
+            &setup,
+            &tray_clicked,
+            &ctx,
+            link_receiver(
+                Arc::clone(&inbox),
+                Arc::clone(&link_arrived),
+                Arc::clone(&in_room),
+                Arc::new({
+                    let ctx = ctx.clone();
+                    move || ctx.request_repaint()
+                }),
+            ),
+            &mut backlog,
+        );
         let mut app = App {
             setup,
             screen: Screen::Checking,
@@ -238,9 +258,9 @@ impl App {
             viewer_strip: Arc::default(),
             tray,
             tray_clicked,
-            inbox: Arc::default(),
-            link_arrived: Arc::default(),
-            in_room: Arc::default(),
+            inbox,
+            link_arrived,
+            in_room,
             link: None,
             update: Update::off(),
             scale: None,
@@ -1203,6 +1223,7 @@ fn start_tray(
     setup: &Result<Setup, String>,
     clicked: &Arc<AtomicBool>,
     ctx: &Context,
+    link: impl Fn(&[u8]) -> isize + Send + 'static,
     backlog: &mut Backlog,
 ) -> Option<Tray> {
     if setup.is_err() {
@@ -1210,10 +1231,13 @@ fn start_tray(
     }
     let clicked = Arc::clone(clicked);
     let ctx = ctx.clone();
-    match Tray::start(move || {
-        clicked.store(true, Ordering::Release);
-        ctx.request_repaint();
-    }) {
+    match Tray::start(
+        move || {
+            clicked.store(true, Ordering::Release);
+            ctx.request_repaint();
+        },
+        link,
+    ) {
         Ok(tray) => {
             if !tray.on_taskbar() {
                 backlog.add(String::from(
@@ -1226,6 +1250,28 @@ fn start_tray(
             backlog.add(format!("tray: {err}; the panel goes on without its icon"));
             None
         }
+    }
+}
+
+pub(crate) fn link_receiver(
+    inbox: Arc<Mutex<Option<Zeroizing<Vec<u8>>>>>,
+    arrived: Arc<AtomicBool>,
+    in_room: Arc<AtomicBool>,
+    notify: Notify,
+) -> impl Fn(&[u8]) -> isize + Send + 'static {
+    move |bytes| {
+        if in_room.load(Ordering::Acquire) {
+            return 2;
+        }
+        let bytes = Zeroizing::new(bytes.to_vec());
+        let mut slot = inbox.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(bytes);
+        }
+        drop(slot);
+        arrived.store(true, Ordering::Release);
+        notify();
+        1
     }
 }
 
@@ -1658,8 +1704,11 @@ fn window(frame: &eframe::Frame) -> Option<isize> {
 pub enum NotStarted {
     // A panel that can open no room, with the message that says why.
     Blocked(String),
-    // No panel: the copy already open on this profile showed its own.
-    BroughtForward,
+    // No panel and nothing to say: the copy already open took the start or
+    // the link, links are off, or the run did not come from the window in use.
+    Quiet,
+    // No panel: a box says why the link was not opened.
+    Said(&'static str),
 }
 
 // What the start screen says for this run. A key that gave way is said until
@@ -1705,7 +1754,7 @@ pub fn load(args: &Args, backlog: &mut Backlog) -> Result<Setup, NotStarted> {
     };
     let held = match lock {
         Lock::Held(file) => Some(file),
-        Lock::BroughtForward => return Err(NotStarted::BroughtForward),
+        Lock::BroughtForward => return Err(NotStarted::Quiet),
         Lock::Open => return Err(NotStarted::Blocked(String::from(messages::ALREADY_OPEN))),
         Lock::Unheld(err) => {
             backlog.add(format!(
@@ -1719,6 +1768,58 @@ pub fn load(args: &Args, backlog: &mut Backlog) -> Result<Setup, NotStarted> {
     #[cfg(feature = "memstats")]
     crate::memstats::start(&data_dir);
     Ok(setup_from(args, data_dir, held, identity, backlog))
+}
+
+pub fn load_link(link: &str, backlog: &mut Backlog) -> Result<Setup, NotStarted> {
+    let shown = |err: keys::KeyError| NotStarted::Blocked(messages::sentence(&err.to_string()));
+    let data_dir = keys::data_dir(None).map_err(shown)?;
+    load_link_in(data_dir, link, backlog)
+}
+
+fn load_link_in(data_dir: PathBuf, link: &str, backlog: &mut Backlog) -> Result<Setup, NotStarted> {
+    let (settings, _, _) = Settings::load(&data_dir);
+    if settings.unread() || !settings.invite_links() || link.is_empty() {
+        return Err(NotStarted::Quiet);
+    }
+    let may = win::may_take_foreground();
+    let said = |line| {
+        if may {
+            NotStarted::Said(line)
+        } else {
+            NotStarted::Quiet
+        }
+    };
+    let held = match running::hand_over(&data_dir, running::WAIT, link) {
+        running::HandOver::Held(file) => Some(file),
+        running::HandOver::Unheld(err) => {
+            backlog.add(format!(
+                "could not hold {}: {err}; a second copy on this data folder would not be stopped",
+                data_dir.join(running::LOCK_FILE).display()
+            ));
+            None
+        }
+        running::HandOver::Handed => return Err(NotStarted::Quiet),
+        running::HandOver::InRoom => return Err(said(messages::LINK_IN_ROOM)),
+        running::HandOver::Older(pid) => {
+            if may {
+                running::bring_forward(pid);
+            }
+            return Err(said(messages::LINK_OLDER));
+        }
+        running::HandOver::NoAnswer => return Err(said(messages::LINK_NO_ANSWER)),
+    };
+    let identity = Identity::load_or_create(&data_dir)
+        .map_err(|err| NotStarted::Blocked(messages::sentence(&err.to_string())))?;
+    let args = Args {
+        profile: None,
+        port: None,
+        log: false,
+        loopback: None,
+        video_loss: None,
+    };
+    #[cfg(feature = "memstats")]
+    crate::memstats::start(&data_dir);
+    Ok(setup_from(&args, data_dir, held, identity, backlog))
 }
 
 // A settings line that could not be used goes to the log and costs nothing
@@ -1928,8 +2029,13 @@ mod tests {
     }
 
     fn arrive(app: &mut App, bytes: &[u8]) {
-        *app.inbox.lock().unwrap() = Some(Zeroizing::new(bytes.to_vec()));
-        app.link_arrived.store(true, Ordering::Release);
+        let receiver = link_receiver(
+            Arc::clone(&app.inbox),
+            Arc::clone(&app.link_arrived),
+            Arc::clone(&app.in_room),
+            Arc::clone(&app.notify),
+        );
+        assert_eq!(receiver(bytes), 1);
         app.follow_link(None);
         assert!(app.inbox.lock().unwrap().is_none());
     }
@@ -2084,8 +2190,16 @@ mod tests {
     #[test]
     fn opening_a_room_refuses_links_until_the_call_ends() {
         let in_room = Arc::new(AtomicBool::new(false));
+        let receiver = link_receiver(
+            Arc::default(),
+            Arc::default(),
+            Arc::clone(&in_room),
+            Arc::new(|| {}),
+        );
+        assert_eq!(receiver(&[1]), 1);
         let opened = opening(&in_room, || {
             assert!(in_room.load(Ordering::Acquire));
+            assert_eq!(receiver(&[2]), 2);
             Err(room::RoomError::OwnInvite)
         });
         assert!(opened.is_err());
@@ -2262,6 +2376,37 @@ mod tests {
         app.leave();
         assert!(start_of(&app).paste.is_empty());
         drop(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn link_cold_start_respects_settings_before_loading_a_key() {
+        let dir = fresh_dir("link-cold");
+        std::fs::write(dir.join(crate::settings::FILE), b"invite_links = off\r\n").unwrap();
+        assert!(matches!(
+            load_link_in(dir.clone(), "booth://join/test", &mut Backlog::default()),
+            Err(NotStarted::Quiet)
+        ));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_file(dir.join(crate::settings::FILE)).unwrap();
+        std::fs::create_dir(dir.join(crate::settings::FILE)).unwrap();
+        assert!(matches!(
+            load_link_in(dir.clone(), "booth://join/test", &mut Backlog::default()),
+            Err(NotStarted::Quiet)
+        ));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir(dir.join(crate::settings::FILE)).unwrap();
+        assert!(matches!(
+            load_link_in(dir.clone(), "", &mut Backlog::default()),
+            Err(NotStarted::Quiet)
+        ));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let setup = load_link_in(dir.clone(), "booth://join/test", &mut Backlog::default())
+            .ok()
+            .expect("a cold link opens the default panel");
+        assert!(setup._held.is_some());
+        assert!(setup.settings.invite_links());
+        drop(setup);
         let _ = std::fs::remove_dir_all(dir);
     }
 

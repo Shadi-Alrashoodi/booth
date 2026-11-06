@@ -7,6 +7,7 @@ mod controls;
 mod elevated;
 mod firewall;
 mod hotkeys;
+mod links;
 mod loopback;
 #[cfg(feature = "memstats")]
 mod memstats;
@@ -98,7 +99,8 @@ fn main() -> ExitCode {
     let args = memstats::take_flags(args);
     // Before any window, profile or key: this may be the process the
     // administrator prompt started.
-    if elevated::asked_for(&args) {
+    let kind = links::run_kind(&args);
+    if matches!(kind, links::RunKind::Helper) {
         if cfg!(feature = "store") {
             eprintln!(
                 "booth: the Store package brings its own firewall rule, so {} does nothing in this copy",
@@ -119,7 +121,23 @@ fn main() -> ExitCode {
         }
         return ExitCode::FAILURE;
     }
-    let args = match parse_args(args.into_iter()) {
+    let link = match kind {
+        links::RunKind::Refused => return ExitCode::from(2),
+        links::RunKind::Link(text) => Some(text),
+        links::RunKind::Panel => None,
+        links::RunKind::Helper => unreachable!(),
+    };
+    let args = match if link.is_some() {
+        Ok(Args {
+            profile: None,
+            port: None,
+            log: false,
+            loopback: None,
+            video_loss: None,
+        })
+    } else {
+        parse_args(args.into_iter())
+    } {
         Ok(args) => args,
         Err(problem) => {
             eprintln!("booth: {problem}");
@@ -145,10 +163,18 @@ fn main() -> ExitCode {
     let mut backlog = Backlog::default();
     // The port in settings is the one the rule is checked for, so they are
     // read first; it takes a few milliseconds.
-    let setup = match app::load(&args, &mut backlog) {
+    let loaded = match &link {
+        Some(link) => app::load_link(link, &mut backlog),
+        None => app::load(&args, &mut backlog),
+    };
+    let setup = match loaded {
         Ok(setup) => Ok(setup),
         Err(NotStarted::Blocked(why)) => Err(why),
-        Err(NotStarted::BroughtForward) => return ExitCode::SUCCESS,
+        Err(NotStarted::Quiet) => return ExitCode::SUCCESS,
+        Err(NotStarted::Said(line)) => {
+            win::error_box(line);
+            return ExitCode::SUCCESS;
+        }
     };
     let port = match &setup {
         Ok(setup) => setup.port(),
@@ -169,7 +195,7 @@ fn main() -> ExitCode {
                 native_options(Rc::clone(&panel_keys)),
                 Box::new(move |cc| {
                     Ok(Box::new(app::App::new(
-                        cc, setup, firewall, backlog, panel_keys,
+                        cc, setup, firewall, backlog, panel_keys, link,
                     )))
                 }),
             )

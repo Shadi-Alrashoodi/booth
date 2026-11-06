@@ -29,6 +29,10 @@ pub const LINK_OPEN_MIC: &str = "Open mic is on, so the room hears you as soon a
 pub const LINK_REFUSED: &str = "This link cannot be used";
 pub const LINK_NOT_BOOTH: &str =
     "This is not a Booth invite link. Ask your friend to send the invite again.";
+pub const LINK_IN_ROOM: &str = "Booth is in a room. Leave the room, then open the link again.";
+pub const LINK_OLDER: &str = "The Booth that is open is older than 1.4.0 and cannot open invite links. Close it, then open the link again.";
+pub const LINK_NO_ANSWER: &str =
+    "Booth is open but did not take the link. Close Booth, then open the link again.";
 
 pub fn link_from(known_room: Option<&str>) -> String {
     match known_room {
@@ -1597,7 +1601,14 @@ mod tests {
 
     #[test]
     fn invite_link_page_sentences() {
-        for text in [LINK_ABOUT, LINK_OPEN_MIC, LINK_NOT_BOOTH] {
+        for text in [
+            LINK_ABOUT,
+            LINK_OPEN_MIC,
+            LINK_NOT_BOOTH,
+            LINK_IN_ROOM,
+            LINK_OLDER,
+            LINK_NO_ANSWER,
+        ] {
             assert_sentences(text);
         }
         for room in [None, Some(""), Some("Tuesday night")] {

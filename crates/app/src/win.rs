@@ -22,7 +22,9 @@ use windows_sys::Win32::System::LibraryLoader::{
     GetModuleHandleW, LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemTime;
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentProcessId, OpenProcessToken,
+};
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows_sys::Win32::System::WindowsProgramming::GetUserNameW;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
@@ -31,12 +33,12 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_PROCESSKEY, VK_RBUTTON, VK_RMENU, VK_RWIN, VK_SHIFT, VK_XBUTTON1, VK_XBUTTON2,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DestroyIcon, DispatchMessageW, HWND_TOP, ICON_BIG, ICON_SMALL, IMAGE_ICON, IsIconic,
-    LR_DEFAULTCOLOR, LoadImageW, MB_ICONERROR, MB_OK, MB_TOPMOST, MSG, MessageBoxW,
-    PM_QS_POSTMESSAGE, PM_REMOVE, PeekMessageW, SM_CXICON, SM_CXSMICON, SPI_GETCLIENTAREAANIMATION,
-    SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetForegroundWindow,
-    SetWindowPos, ShowWindow, SystemParametersInfoW, WM_KEYDOWN, WM_KEYUP, WM_SETICON,
-    WM_SYSKEYDOWN, WM_SYSKEYUP,
+    AllowSetForegroundWindow, DestroyIcon, DispatchMessageW, HWND_TOP, ICON_BIG, ICON_SMALL,
+    IMAGE_ICON, IsIconic, LR_DEFAULTCOLOR, LoadImageW, MB_ICONERROR, MB_OK, MB_TOPMOST, MSG,
+    MessageBoxW, PM_QS_POSTMESSAGE, PM_REMOVE, PeekMessageW, SM_CXICON, SM_CXSMICON,
+    SPI_GETCLIENTAREAANIMATION, SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageW,
+    SetForegroundWindow, SetWindowPos, ShowWindow, SystemParametersInfoW, WM_KEYDOWN, WM_KEYUP,
+    WM_SETICON, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 use windows_sys::core::BOOL;
 
@@ -106,6 +108,12 @@ pub fn bring_forward(hwnd: isize) {
             );
         }
     }
+}
+
+pub fn may_take_foreground() -> bool {
+    // SAFETY: this process's own number tests the same foreground right it
+    // will pass on to the panel, without changing which window has focus.
+    unsafe { AllowSetForegroundWindow(GetCurrentProcessId()) != 0 }
 }
 
 pub fn take_foreground(hwnd: isize) -> bool {

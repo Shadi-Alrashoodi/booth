@@ -22,6 +22,7 @@ use std::{mem, ptr};
 use eframe::egui::Color32;
 use room::view::{Level, LinkState, Strip, View};
 use windows_sys::Win32::Foundation::{ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
@@ -31,11 +32,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateIconFromResourceEx, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow,
     DispatchMessageW, GetMessageW, GetSystemMetrics, HICON, LR_DEFAULTCOLOR, MSG, PostMessageW,
     PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SM_CXSMICON, WM_APP, WM_CLOSE,
-    WM_DESTROY, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    WM_COPYDATA, WM_DESTROY, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
-use crate::messages;
 use crate::theme::{AMBER, ASH, CHALK, INK, SAGE, WARN};
+use crate::{links, messages};
 
 // Windows' messages about the icon, and the panel's word that the look
 // changed.
@@ -191,7 +192,10 @@ pub struct Tray {
 impl Tray {
     // `click` runs on the tray's thread when the icon is clicked or chosen
     // with the keyboard, and must return at once.
-    pub fn start(click: impl Fn() + Send + 'static) -> io::Result<Tray> {
+    pub fn start(
+        click: impl Fn() + Send + 'static,
+        link: impl Fn(&[u8]) -> LRESULT + Send + 'static,
+    ) -> io::Result<Tray> {
         let wanted = Arc::new(Mutex::new(look(None, false)));
         let added = Arc::new(AtomicBool::new(false));
         let (ready, opened) = mpsc::channel();
@@ -199,6 +203,7 @@ impl Tray {
         let thread = thread::Builder::new()
             .name(String::from("booth tray"))
             .spawn(move || {
+                LINK.with(|slot| *slot.borrow_mut() = Some(Box::new(link)));
                 let here = Here {
                     wanted: thread_wanted,
                     added: thread_added,
@@ -209,6 +214,7 @@ impl Tray {
                     show_panel: 0,
                 };
                 run(here, &ready);
+                LINK.with(|slot| slot.borrow_mut().take());
             })
             .map_err(|err| context("could not start the tray thread", err))?;
         let window = match opened.recv() {
@@ -279,6 +285,29 @@ struct Here {
 
 thread_local! {
     static HERE: RefCell<Option<Here>> = const { RefCell::new(None) };
+    static LINK: RefCell<Option<Link>> = const { RefCell::new(None) };
+}
+
+type Link = Box<dyn Fn(&[u8]) -> LRESULT + Send>;
+
+unsafe fn link_bytes<'a>(lparam: LPARAM) -> Option<&'a [u8]> {
+    if lparam == 0 {
+        return None;
+    }
+    // SAFETY: WM_COPYDATA gives a struct that stays alive through this call.
+    let data = unsafe { &*(lparam as *const COPYDATASTRUCT) };
+    if data.dwData != links::MESSAGE_TAG
+        || data.cbData == 0
+        || data.cbData as usize > links::LINK_BYTES
+        || data.lpData.is_null()
+    {
+        return None;
+    }
+    // The sender's memory is valid only until this call returns.
+    // SAFETY: Windows made cbData bytes readable for WM_COPYDATA's handler.
+    let bytes =
+        unsafe { std::slice::from_raw_parts(data.lpData.cast::<u8>(), data.cbData as usize) };
+    Some(bytes)
 }
 
 fn run(mut here: Here, ready: &mpsc::Sender<io::Result<isize>>) {
@@ -500,6 +529,13 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if message == WM_COPYDATA {
+        // HERE can still be borrowed by a click that sent this message.
+        // SAFETY: the message's pointers live until this window procedure returns.
+        return unsafe { link_bytes(lparam) }.map_or(0, |bytes| {
+            LINK.with(|slot| slot.borrow().as_ref().map_or(0, |link| link(bytes)))
+        });
+    }
     let handled = HERE.with(|slot| {
         // A message sent while a call below is still running (DestroyWindow
         // sends WM_DESTROY) finds the state borrowed, and gets the default.
@@ -568,6 +604,148 @@ fn context(what: &str, err: io::Error) -> io::Error {
 mod tests {
     use super::*;
     use room::view::{ControlRequest, ControlView, Party, ShareView, Voice};
+    use zeroize::Zeroizing;
+
+    type Inbox = Arc<Mutex<Option<Zeroizing<Vec<u8>>>>>;
+    static TRAYS: Mutex<()> = Mutex::new(());
+
+    fn receiving() -> (Inbox, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let inbox = Arc::new(Mutex::new(None));
+        let arrived = Arc::new(AtomicBool::new(false));
+        let in_room = Arc::new(AtomicBool::new(false));
+        let receive = crate::app::link_receiver(
+            Arc::clone(&inbox),
+            Arc::clone(&arrived),
+            Arc::clone(&in_room),
+            Arc::new(|| {}),
+        );
+        LINK.with(|slot| *slot.borrow_mut() = Some(Box::new(receive)));
+        (inbox, arrived, in_room)
+    }
+
+    fn data(bytes: &mut [u8]) -> COPYDATASTRUCT {
+        COPYDATASTRUCT {
+            dwData: links::MESSAGE_TAG,
+            cbData: bytes.len() as u32,
+            lpData: bytes.as_mut_ptr().cast(),
+        }
+    }
+
+    fn deliver(lparam: LPARAM) -> LRESULT {
+        // SAFETY: each test keeps its struct and any bytes alive through the call.
+        unsafe { window_proc(ptr::null_mut(), WM_COPYDATA, 0, lparam) }
+    }
+
+    #[test]
+    fn link_message_rejects_bad_structs() {
+        let (inbox, arrived, _) = receiving();
+        assert_eq!(deliver(0), 0);
+        let mut bytes = vec![b'x'; 2049];
+        for invalid in [
+            COPYDATASTRUCT {
+                dwData: 0,
+                ..data(&mut bytes[..1])
+            },
+            COPYDATASTRUCT {
+                cbData: 0,
+                ..data(&mut bytes)
+            },
+            data(&mut bytes),
+            COPYDATASTRUCT {
+                lpData: ptr::null_mut(),
+                ..data(&mut bytes[..1])
+            },
+        ] {
+            assert_eq!(deliver(&raw const invalid as isize), 0);
+            assert!(inbox.lock().unwrap().is_none());
+            assert!(!arrived.load(Ordering::Acquire));
+        }
+        LINK.with(|slot| slot.borrow_mut().take());
+    }
+
+    #[test]
+    fn link_message_copies_and_keeps_the_first() {
+        let (inbox, arrived, _) = receiving();
+        let mut bytes = vec![b'x'; 2048];
+        let data = data(&mut bytes);
+        assert_eq!(deliver(&raw const data as isize), 1);
+        bytes.fill(b'y');
+        assert_eq!(deliver(&raw const data as isize), 1);
+        assert!(arrived.load(Ordering::Acquire));
+        assert_eq!(
+            inbox
+                .lock()
+                .unwrap()
+                .as_deref()
+                .map(|bytes| bytes.as_slice()),
+            Some(vec![b'x'; 2048].as_slice())
+        );
+        LINK.with(|slot| slot.borrow_mut().take());
+    }
+
+    #[test]
+    fn link_message_in_a_room_keeps_nothing() {
+        let (inbox, arrived, in_room) = receiving();
+        in_room.store(true, Ordering::Release);
+        let mut bytes = *b"x";
+        let data = data(&mut bytes);
+        assert_eq!(deliver(&raw const data as isize), 2);
+        assert!(inbox.lock().unwrap().is_none());
+        assert!(!arrived.load(Ordering::Acquire));
+        LINK.with(|slot| slot.borrow_mut().take());
+    }
+
+    #[test]
+    fn link_message_during_a_tray_click() {
+        let _tray = TRAYS.lock().unwrap_or_else(PoisonError::into_inner);
+        use std::sync::atomic::AtomicIsize;
+        use std::time::Duration;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+        let inbox: Inbox = Arc::default();
+        let receiver = crate::app::link_receiver(
+            Arc::clone(&inbox),
+            Arc::default(),
+            Arc::default(),
+            Arc::new(|| {}),
+        );
+        let window = Arc::new(AtomicIsize::new(0));
+        let target = Arc::clone(&window);
+        let (sent, answer) = mpsc::channel();
+        let tray = Tray::start(
+            move || {
+                let mut bytes = *b"x";
+                let data = data(&mut bytes);
+                // SAFETY: the click runs on this tray's thread, with HERE borrowed.
+                let taken = unsafe {
+                    SendMessageW(
+                        target.load(Ordering::Acquire) as HWND,
+                        WM_COPYDATA,
+                        0,
+                        &raw const data as isize,
+                    )
+                };
+                sent.send(taken).unwrap();
+            },
+            receiver,
+        )
+        .unwrap();
+        window.store(tray.window, Ordering::Release);
+        // SAFETY: the tray stays alive until its click answered.
+        assert_ne!(
+            unsafe { PostMessageW(tray.window as HWND, show_message(), 0, 0) },
+            0
+        );
+        assert_eq!(answer.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+        assert_eq!(
+            inbox
+                .lock()
+                .unwrap()
+                .as_deref()
+                .map(|bytes| bytes.as_slice()),
+            Some(b"x".as_slice())
+        );
+        drop(tray);
+    }
 
     // The control switch (screens/control.rs): on once the app has an
     // injector.
@@ -768,10 +946,14 @@ mod tests {
     // asks, and comes off when it is dropped.
     #[test]
     fn icon_on_and_off_the_taskbar() {
+        let _tray = TRAYS.lock().unwrap_or_else(PoisonError::into_inner);
         let (clicked, click) = mpsc::channel();
-        let mut tray = Tray::start(move || {
-            let _ = clicked.send(());
-        })
+        let mut tray = Tray::start(
+            move || {
+                let _ = clicked.send(());
+            },
+            |_| 0,
+        )
         .expect("the tray starts");
         assert!(tray.on_taskbar(), "Explorer took the icon");
         let asked = std::time::Instant::now();
