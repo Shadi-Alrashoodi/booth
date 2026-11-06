@@ -8,8 +8,8 @@ use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::ptr;
 use std::slice;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering, fence};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Devices::FunctionDiscovery::{
@@ -272,47 +272,36 @@ impl Session {
         })
     }
 
-    // A microphone asked for echo cancellation is opened as any other first.
-    // If Windows lists echo cancellation on for it there, it is the
-    // microphone's own and nothing changes. Otherwise it is opened again in
-    // the communications category, where Windows may cancel echo itself,
+    // A microphone asked for echo cancellation is opened as any other first,
+    // unless Windows' canceller was found for it before and can listen to
+    // the speakers Booth plays to, when the communications category is tried
+    // first. If Windows lists echo cancellation on for the plain open, it is
+    // the microphone's own and nothing changes. Otherwise it is opened again
+    // in the communications category, where Windows may cancel echo itself,
     // and kept that way only if it does, against speakers it can listen to;
-    // else it is opened as before. One found without is remembered in
-    // `missing`, so the next open of it is a single one.
+    // else it is opened as before. What that showed is kept in LEARNED for
+    // the run, since Mute ends the stream and every Unmute would otherwise
+    // pay for the same opens again while the first words wait.
     fn open(
         &self,
         direction: Direction,
         choice: &Choice,
         echo: Option<&Wish>,
-        missing: &mut Option<String>,
     ) -> Result<WasapiStream, AudioError> {
-        let mut stream = self.open_as(direction, choice, false)?;
         let Some(wish) = echo.filter(|_| direction == Direction::Input) else {
-            return Ok(stream);
+            return self.open_as(direction, choice, false);
         };
-        if stream.info.effects.echo_cancellation {
-            stream.info.echo = Echo::Device;
-            return Ok(stream);
-        }
-        if missing.as_deref() == Some(stream.info.id.as_str()) {
-            stream.info.echo = Echo::Missing;
-            return Ok(stream);
-        }
-        drop(stream);
-        if let Ok(mut talking) = self.open_as(direction, choice, true)
-            && talking.info.effects.echo_cancellation
-            && let Some(reference) = talking.point_echo(wish.reference.as_deref())
-        {
-            let ducking_off = talking.duck_nothing();
-            talking.info.echo = Echo::Windows {
-                reference,
-                ducking_off,
-            };
-            return Ok(talking);
-        }
-        let mut stream = self.open_as(direction, choice, false)?;
-        *missing = Some(stream.info.id.clone());
-        stream.info.echo = Echo::Missing;
+        let id = match choice {
+            Choice::Default => self.default_id(direction).ok().flatten(),
+            Choice::Device(id) => Some(id.clone()),
+        };
+        let (mut stream, echo) = open_cancelling(
+            id.as_deref(),
+            wish.reference.as_deref(),
+            &LEARNED,
+            |talking| self.open_as(direction, choice, talking),
+        )?;
+        stream.info.echo = echo;
         Ok(stream)
     }
 
@@ -382,7 +371,7 @@ impl Session {
         };
         let effects = match direction {
             Direction::Input => effects(&client),
-            Direction::Output => Effects::default(),
+            Direction::Output => None,
         };
         Ok(WasapiStream {
             frame_bytes: ask.format.frame_bytes(),
@@ -401,7 +390,7 @@ impl Session {
                 buffer_frames,
                 pro_audio: false,
                 refused,
-                effects,
+                effects: effects.unwrap_or_default(),
                 echo: Echo::NotAsked,
                 opened_in: Duration::ZERO,
             },
@@ -409,6 +398,7 @@ impl Session {
             client,
             signal,
             pc_sound: false,
+            listed: effects.is_some(),
         })
     }
 
@@ -431,6 +421,122 @@ impl Session {
             client,
         })
     }
+}
+
+// What the run has learned of each microphone asked for echo cancellation,
+// by endpoint id. It lasts until Booth closes, so a microphone that gains
+// Windows' canceller meanwhile is opened without it until then.
+static LEARNED: Learned = Learned(Mutex::new(Vec::new()));
+
+struct Learned(Mutex<Vec<(String, Canceller)>>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Canceller {
+    // Windows listed none for it in the communications category.
+    Missing,
+    // Windows' own, in the communications category, which listens to the
+    // speakers Windows picks unless `pointable`.
+    Windows { pointable: bool },
+}
+
+impl Canceller {
+    // Whether the communications category can give this microphone a
+    // canceller that listens to `reference`.
+    fn fits(self, reference: Option<&str>) -> bool {
+        match self {
+            Canceller::Missing => false,
+            Canceller::Windows { pointable } => reference_fits(pointable, reference),
+        }
+    }
+}
+
+impl Learned {
+    fn of(&self, id: &str) -> Option<Canceller> {
+        let known = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        known
+            .iter()
+            .find(|(known, _)| known == id)
+            .map(|&(_, canceller)| canceller)
+    }
+
+    fn learn(&self, id: &str, canceller: Canceller) {
+        let mut known = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        match known.iter_mut().find(|(known, _)| known == id) {
+            Some(entry) => entry.1 = canceller,
+            None => known.push((id.to_owned(), canceller)),
+        }
+    }
+}
+
+// What the choice between a plain open and the communications category
+// looks at in an opened microphone, so it can be tried without Windows.
+trait Cancelling {
+    fn id(&self) -> &str;
+    // Windows lists echo cancellation on for this stream, None when it
+    // could not be asked.
+    fn listed_echo(&self) -> Option<bool>;
+    // Windows' canceller on this stream can be told which speakers to
+    // listen to, None when Windows did not say.
+    fn pointable(&self) -> Option<bool>;
+    // Echo::Windows once Windows' canceller listens to `reference`, None
+    // when it cannot.
+    fn windows_echo(&self, reference: Option<&str>) -> Option<Echo>;
+}
+
+// Session::open's choice, with `open` making the stream plain or in the
+// communications category. A microphone known to have Windows' canceller
+// goes to the category first while that canceller can listen to
+// `reference`, and one Windows listed none for, or whose canceller cannot,
+// is opened once, plain.
+fn open_cancelling<S: Cancelling>(
+    id: Option<&str>,
+    reference: Option<&str>,
+    learned: &Learned,
+    mut open: impl FnMut(bool) -> Result<S, AudioError>,
+) -> Result<(S, Echo), AudioError> {
+    let fits = |id: &str| learned.of(id).map(|canceller| canceller.fits(reference));
+    let tried = id.and_then(fits) == Some(true);
+    if tried && let Some(kept) = keep_talking(open(true), reference, learned) {
+        return Ok(kept);
+    }
+    let stream = open(false)?;
+    if stream.listed_echo() == Some(true) {
+        return Ok((stream, Echo::Device));
+    }
+    if tried || fits(stream.id()) == Some(false) {
+        return Ok((stream, Echo::Missing));
+    }
+    drop(stream);
+    if let Some(kept) = keep_talking(open(true), reference, learned) {
+        return Ok(kept);
+    }
+    Ok((open(false)?, Echo::Missing))
+}
+
+// Only three things are remembered: Windows listing no canceller, Windows
+// saying its canceller cannot be pointed, and a canceller kept that Windows
+// says can be. A failed open or a question Windows did not answer may only
+// be passing, as a Bluetooth headset changing profile, and a reference
+// refused by a canceller that can be pointed goes with the output device
+// chosen in Settings.
+fn keep_talking<S: Cancelling>(
+    talking: Result<S, AudioError>,
+    reference: Option<&str>,
+    learned: &Learned,
+) -> Option<(S, Echo)> {
+    let talking = talking.ok()?;
+    if !talking.listed_echo()? {
+        learned.learn(talking.id(), Canceller::Missing);
+        return None;
+    }
+    let pointable = talking.pointable();
+    let echo = talking.windows_echo(reference);
+    if let Some(pointable) = pointable
+        && (echo.is_some() || !pointable)
+    {
+        learned.learn(talking.id(), Canceller::Windows { pointable });
+    }
+    Some((talking, echo?))
 }
 
 // What a device would give a stream, asked without opening one.
@@ -729,19 +835,18 @@ fn activate_as<T: Interface>(device: &IMMDevice, talking: bool) -> windows::core
     Ok(client)
 }
 
-// What Windows lists as on for an initialized capture stream. Windows 10
-// has no list, and lists nothing.
-fn effects(client: &IAudioClient) -> Effects {
+// What Windows lists as on for an initialized capture stream, None when it
+// could not be asked, as on Windows 10, which has no list.
+fn effects(client: &IAudioClient) -> Option<Effects> {
     // SAFETY: GetService on an initialized client.
-    let Ok(manager) = (unsafe { client.GetService::<IAudioEffectsManager>() }) else {
-        return Effects::default();
-    };
+    let manager = unsafe { client.GetService::<IAudioEffectsManager>() }.ok()?;
     let mut list: *mut AUDIO_EFFECT = ptr::null_mut();
     let mut count = 0u32;
     // SAFETY: two locals for the call to fill. The list is ours to free,
     // and is freed below once read.
-    if unsafe { manager.GetAudioEffects(&mut list, &mut count) }.is_err() || list.is_null() {
-        return Effects::default();
+    unsafe { manager.GetAudioEffects(&mut list, &mut count) }.ok()?;
+    if list.is_null() {
+        return Some(Effects::default());
     }
     // SAFETY: Windows handed out `count` whole effects at `list`.
     let listed = unsafe { slice::from_raw_parts(list, count as usize) };
@@ -761,7 +866,7 @@ fn effects(client: &IAudioClient) -> Effects {
     }));
     // SAFETY: allocated by COM for the caller; nothing reads it after this.
     unsafe { CoTaskMemFree(Some(list as *const c_void)) };
-    effects
+    Some(effects)
 }
 
 fn device_id(device: &IMMDevice) -> Option<String> {
@@ -912,6 +1017,9 @@ pub(crate) struct WasapiStream {
     // Process loopback's stream, whose errors are PC sound's, never a
     // device's.
     pc_sound: bool,
+    // Windows gave its list of effects, so `info.effects` is its answer and
+    // not what a failed ask leaves.
+    listed: bool,
 }
 
 impl WasapiStream {
@@ -947,7 +1055,9 @@ impl WasapiStream {
     // A stream in the communications category can make Windows lower
     // every other program's sound while it is open, and Mute closes it,
     // so every mute would fade the game out and back. True once Windows
-    // was told not to.
+    // was told not to. Microsoft describes the call for render streams and
+    // does not say what it does on a capture stream, so true means Windows
+    // took the call, not that nothing is lowered.
     fn duck_nothing(&self) -> bool {
         // SAFETY: GetService on an initialized client.
         let Ok(ducking) = (unsafe { self.client.GetService::<IAudioClientDuckingControl>() })
@@ -960,6 +1070,36 @@ impl WasapiStream {
                 .SetDuckingOptionsForCurrentStream(AUDIO_DUCKING_OPTIONS_DO_NOT_DUCK_OTHER_STREAMS)
         }
         .is_ok()
+    }
+}
+
+impl Cancelling for WasapiStream {
+    fn id(&self) -> &str {
+        &self.info.id
+    }
+
+    fn listed_echo(&self) -> Option<bool> {
+        self.listed.then_some(self.info.effects.echo_cancellation)
+    }
+
+    fn pointable(&self) -> Option<bool> {
+        // SAFETY: GetService on an initialized client.
+        match unsafe { self.client.GetService::<IAcousticEchoCancellationControl>() } {
+            Ok(_) => Some(true),
+            // Microsoft's answer for a canceller that cannot be pointed. Any
+            // other error says nothing of it.
+            Err(err) if err.code() == E_NOINTERFACE => Some(false),
+            Err(_) => None,
+        }
+    }
+
+    fn windows_echo(&self, reference: Option<&str>) -> Option<Echo> {
+        let reference = self.point_echo(reference)?;
+        let ducking_off = self.duck_nothing();
+        Some(Echo::Windows {
+            reference,
+            ducking_off,
+        })
     }
 }
 
@@ -1081,7 +1221,6 @@ pub(crate) struct Windows {
     session: Session,
     direction: Direction,
     echo: Option<Wish>,
-    missing: Option<String>,
 }
 
 // Echo cancellation asked of a capture stream, and the speakers Booth plays
@@ -1120,7 +1259,6 @@ pub(crate) fn device(direction: Direction, wake: Wake) -> Result<Windows, AudioE
         session,
         direction,
         echo: None,
-        missing: None,
     })
 }
 
@@ -1129,8 +1267,7 @@ impl Device for Windows {
 
     fn open(&mut self, choice: &Choice) -> Result<WasapiStream, AudioError> {
         let echo = self.echo.as_ref();
-        self.session
-            .open(self.direction, choice, echo, &mut self.missing)
+        self.session.open(self.direction, choice, echo)
     }
 }
 
@@ -1606,6 +1743,207 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!((tries, err.code()), (1, E_INVALIDARG));
+    }
+
+    const MICROPHONE: &str = "{0.0.1.00000000}.{microphone}";
+    const SPEAKERS: &str = "{0.0.0.00000000}.{speakers}";
+    // Speakers a canceller that can be pointed still refuses, as ones
+    // unplugged after Settings chose them.
+    const GONE: &str = "{0.0.0.00000000}.{gone}";
+
+    // A microphone as the choice of category sees one open of it, with None
+    // where Windows did not answer.
+    struct Opened {
+        echo: Option<bool>,
+        pointable: Option<bool>,
+    }
+
+    impl Cancelling for Opened {
+        fn id(&self) -> &str {
+            MICROPHONE
+        }
+
+        fn listed_echo(&self) -> Option<bool> {
+            self.echo
+        }
+
+        fn pointable(&self) -> Option<bool> {
+            self.pointable
+        }
+
+        fn windows_echo(&self, reference: Option<&str>) -> Option<Echo> {
+            let fits = reference_fits(self.pointable == Some(true), reference);
+            (fits && reference != Some(GONE)).then(|| Echo::Windows {
+                reference: reference.map(str::to_owned),
+                ducking_off: true,
+            })
+        }
+    }
+
+    // Whether Windows lists echo cancellation on a plain open and in the
+    // communications category, and whether that canceller can be pointed.
+    fn microphone(
+        plain: bool,
+        talking: bool,
+        pointable: bool,
+    ) -> impl FnMut(bool) -> Result<Opened, AudioError> {
+        move |in_category| {
+            Ok(Opened {
+                echo: Some(if in_category { talking } else { plain }),
+                pointable: Some(pointable),
+            })
+        }
+    }
+
+    // One Unmute, which makes a new stream thread: each open it took, true
+    // for the communications category, and what came of it.
+    fn unmute(
+        learned: &Learned,
+        reference: Option<&str>,
+        mut open: impl FnMut(bool) -> Result<Opened, AudioError>,
+    ) -> (Vec<bool>, Echo) {
+        let mut opens = Vec::new();
+        let (_, echo) = open_cancelling(Some(MICROPHONE), reference, learned, |talking| {
+            opens.push(talking);
+            open(talking)
+        })
+        .expect("opens");
+        (opens, echo)
+    }
+
+    fn windows_default() -> Echo {
+        Echo::Windows {
+            reference: None,
+            ducking_off: true,
+        }
+    }
+
+    #[test]
+    fn a_microphone_without_a_canceller_opens_once_from_the_second_unmute() {
+        let learned = Learned(Mutex::new(Vec::new()));
+        let none = || microphone(false, false, true);
+        assert_eq!(
+            unmute(&learned, None, none()),
+            (vec![false, true, false], Echo::Missing)
+        );
+        assert_eq!(unmute(&learned, None, none()), (vec![false], Echo::Missing));
+        assert_eq!(unmute(&learned, None, none()), (vec![false], Echo::Missing));
+    }
+
+    #[test]
+    fn windows_canceller_opens_once_from_the_second_unmute() {
+        let learned = Learned(Mutex::new(Vec::new()));
+        let windows = || microphone(false, true, false);
+        assert_eq!(
+            unmute(&learned, None, windows()),
+            (vec![false, true], windows_default())
+        );
+        assert_eq!(
+            unmute(&learned, None, windows()),
+            (vec![true], windows_default())
+        );
+        // Booth now plays to speakers chosen in Settings, which this
+        // canceller cannot be pointed at: one plain open, and back on
+        // Windows default it goes to the category first again.
+        assert_eq!(
+            unmute(&learned, Some(SPEAKERS), windows()),
+            (vec![false], Echo::Missing)
+        );
+        assert_eq!(
+            unmute(&learned, None, windows()),
+            (vec![true], windows_default())
+        );
+        // Windows no longer lists it.
+        let none = || microphone(false, false, false);
+        assert_eq!(
+            unmute(&learned, None, none()),
+            (vec![true, false], Echo::Missing)
+        );
+        assert_eq!(unmute(&learned, None, none()), (vec![false], Echo::Missing));
+    }
+
+    #[test]
+    fn the_microphones_own_canceller_takes_one_open() {
+        let learned = Learned(Mutex::new(Vec::new()));
+        for _ in 0..2 {
+            assert_eq!(
+                unmute(&learned, None, microphone(true, true, true)),
+                (vec![false], Echo::Device)
+            );
+        }
+        assert_eq!(learned.of(MICROPHONE), None);
+    }
+
+    #[test]
+    fn a_canceller_that_cannot_be_pointed_opens_once_for_other_speakers() {
+        let learned = Learned(Mutex::new(Vec::new()));
+        let fixed = || microphone(false, true, false);
+        assert_eq!(
+            unmute(&learned, Some(SPEAKERS), fixed()),
+            (vec![false, true, false], Echo::Missing)
+        );
+        assert_eq!(
+            unmute(&learned, Some(SPEAKERS), fixed()),
+            (vec![false], Echo::Missing)
+        );
+        assert_eq!(
+            unmute(&learned, None, fixed()),
+            (vec![true], windows_default())
+        );
+    }
+
+    // A Bluetooth headset changing profile can refuse an open or leave a
+    // question unanswered for a moment, and the speakers chosen in Settings
+    // can change: none of that is remembered.
+    #[test]
+    fn a_passing_failure_is_not_remembered() {
+        let learned = Learned(Mutex::new(Vec::new()));
+        let refusing = |talking| {
+            if talking {
+                Err(AudioError::Lost {
+                    direction: Direction::Input,
+                    name: String::from("Headset"),
+                })
+            } else {
+                Ok(Opened {
+                    echo: Some(false),
+                    pointable: Some(true),
+                })
+            }
+        };
+        assert_eq!(
+            unmute(&learned, None, refusing),
+            (vec![false, true, false], Echo::Missing)
+        );
+        let unlisted = |talking| {
+            Ok(Opened {
+                echo: if talking { None } else { Some(false) },
+                pointable: Some(true),
+            })
+        };
+        assert_eq!(
+            unmute(&learned, None, unlisted),
+            (vec![false, true, false], Echo::Missing)
+        );
+        let unsure = |talking| {
+            Ok(Opened {
+                echo: Some(talking),
+                pointable: None,
+            })
+        };
+        assert_eq!(
+            unmute(&learned, Some(SPEAKERS), unsure),
+            (vec![false, true, false], Echo::Missing)
+        );
+        assert_eq!(
+            unmute(&learned, Some(GONE), microphone(false, true, true)),
+            (vec![false, true, false], Echo::Missing)
+        );
+        assert_eq!(learned.of(MICROPHONE), None);
+        assert_eq!(
+            unmute(&learned, None, microphone(false, true, true)),
+            (vec![false, true], windows_default())
+        );
     }
 
     // The performance counter now, in the 100 ns units GetBuffer uses.

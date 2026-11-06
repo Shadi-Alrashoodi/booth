@@ -45,8 +45,9 @@ pub enum Echo {
     Device,
     // Windows cancels it, on a stream opened in the communications category,
     // listening to `reference`, or with None to the speakers Windows picks,
-    // which is its default output. `ducking_off` when Windows was told not to
-    // lower other programs' sound for it.
+    // which Microsoft calls the default render device without saying for
+    // which role. `ducking_off` when Windows was told not to lower other
+    // programs' sound for it.
     Windows {
         reference: Option<String>,
         ducking_off: bool,
@@ -63,7 +64,9 @@ impl Echo {
 
 // Whether a canceller Windows turned on can listen to the right speakers:
 // the reference can be pointed, or Booth plays to Windows default, which
-// is what the canceller listens to unless told otherwise.
+// Microsoft says the canceller listens to unless told otherwise. Booth's
+// default is the default device; where the default communications device
+// is another, which of the two the canceller takes is not documented.
 pub(crate) fn reference_fits(pointable: bool, reference: Option<&str>) -> bool {
     pointable || reference.is_none()
 }
@@ -79,12 +82,12 @@ impl fmt::Display for Echo {
                 ducking_off,
             } => write!(
                 f,
-                "on in Windows, listening to {}, other sound {}",
+                "on in Windows, listening to {}, {}",
                 reference.as_deref().unwrap_or("Windows default"),
                 if *ducking_off {
-                    "left alone"
+                    "asked Windows to leave other sound alone"
                 } else {
-                    "may be lowered"
+                    "other sound may be lowered"
                 }
             ),
             Echo::Missing => f.write_str("asked for, this microphone has none"),

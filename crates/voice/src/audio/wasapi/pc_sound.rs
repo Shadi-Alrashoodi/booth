@@ -149,6 +149,7 @@ fn open(stopping: &AtomicBool) -> Result<WasapiStream, AudioError> {
         client,
         signal,
         pc_sound: true,
+        listed: false,
     })
 }
 
