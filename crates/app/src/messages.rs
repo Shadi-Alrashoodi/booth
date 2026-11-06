@@ -193,13 +193,15 @@ fn host_version_step(host: Option<(Version, u16)>) -> String {
     }
 }
 
-pub fn copy_error(err: &arboard::Error) -> String {
+// `button` is the one pressed: Copy link must not send the person to Copy,
+// which copies the plain code.
+pub fn copy_error(err: &arboard::Error, button: &str) -> String {
     match err {
-        arboard::Error::ClipboardOccupied => String::from(
-            "Could not copy: another program is using the clipboard. Press Copy again.",
-        ),
+        arboard::Error::ClipboardOccupied => {
+            format!("Could not copy: another program is using the clipboard. Press {button} again.")
+        }
         other => format!(
-            "Could not copy: {}. Press Copy again.",
+            "Could not copy: {}. Press {button} again.",
             other.to_string().trim_end_matches('.')
         ),
     }

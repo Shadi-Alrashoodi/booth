@@ -609,13 +609,13 @@ impl InRoom {
                 Some("Copy") => {
                     self.copy_error = win::copy_private(&invite.code)
                         .err()
-                        .map(|err| messages::copy_error(&err));
+                        .map(|err| messages::copy_error(&err, "Copy"));
                 }
                 Some("Copy link") => {
                     let link = Zeroizing::new(invite::link(&invite.code));
                     self.copy_error = win::copy_private(&link)
                         .err()
-                        .map(|err| messages::copy_error(&err));
+                        .map(|err| messages::copy_error(&err, "Copy link"));
                 }
                 Some(_) => {
                     *step = Some(Step::NewInvite {
@@ -767,7 +767,7 @@ impl InRoom {
                     // home address, which history has no use for.
                     self.copy_error = win::copy_private(copied)
                         .err()
-                        .map(|err| messages::copy_error(&err));
+                        .map(|err| messages::copy_error(&err, "Copy"));
                 }
                 ui.add_space(HALF_STEP);
                 controls::prose(ui, messages::CODE_NOT_PASTED, theme::caption(), ASH);
@@ -1205,8 +1205,9 @@ const MINIMIZED_WIDTH: f32 = 64.0;
 const LEAST_TITLE_WIDTH: f32 = 112.0;
 
 // At the narrowest panel with the bar, or under Ctrl+= zoom, a row can be
-// narrower than its columns and the title's least width together. The name gives way first, then the marker, so the
-// title stays readable and nothing reaches past the row into the gutter.
+// narrower than its columns and the title's least width together. The name
+// gives way first, then the marker, so the title stays readable and nothing
+// reaches past the row into the gutter.
 fn window_parts(rect: Rect) -> [Rect; 3] {
     let spare = (rect.width() - LEAST_TITLE_WIDTH).max(0.0);
     let marker_room = spare.min(STEP + MINIMIZED_WIDTH);

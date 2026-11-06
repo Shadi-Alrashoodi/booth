@@ -480,7 +480,15 @@ impl App {
             Err(err) => {
                 let line = messages::room_error(&err);
                 match &mut self.link {
-                    Some(Waiting::Shown { error, .. }) => *error = Some(line),
+                    Some(Waiting::Shown { error, dead, .. }) => {
+                        // No later press gets past these, so the page has
+                        // nothing left to keep a newer link out for.
+                        *dead = matches!(
+                            err,
+                            room::RoomError::OwnInvite | room::RoomError::BadHostKey
+                        );
+                        *error = Some(line);
+                    }
                     _ => start.join_error = Some(line),
                 }
             }
@@ -996,8 +1004,17 @@ impl App {
             }
             return;
         }
-        if let Some(waiting) = &mut self.link {
-            waiting.restart();
+        // A newer link must not swap the invite under a click on Join, but a
+        // page that can no longer join anything gives way to it.
+        if let Some(Waiting::Shown {
+            invite,
+            wait,
+            dead: false,
+            ..
+        }) = &mut self.link
+            && !invite.is_expired(start::unix_now())
+        {
+            wait.restart();
         } else {
             let decoded = std::str::from_utf8(&bytes).ok().map(Invite::decode);
             let waiting = match decoded {
@@ -1005,6 +1022,7 @@ impl App {
                     invite,
                     wait: LinkWait::default(),
                     error: None,
+                    dead: false,
                 },
                 Some(Ok(_)) => Waiting::Refused(messages::code_error(&CodeError::Expired)),
                 None | Some(Err(CodeError::Empty | CodeError::NotACode)) => {
@@ -2106,8 +2124,18 @@ mod tests {
     fn a_second_link_keeps_the_first_and_restarts_it() {
         let dir = fresh_dir("link-second");
         let first = link_invite();
-        let mut app = test_app(Ok(setup_in(&dir)), Screen::Start(Start::default()));
+        // A Join refused over a port in use can work at the next press, so
+        // the page is still live.
+        let held = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut setup = setup_in(&dir);
+        setup.config.port = held.local_addr().unwrap().port();
+        let mut app = test_app(Ok(setup), Screen::Start(Start::default()));
         arrive(&mut app, invite::link(&first.encode()).as_bytes());
+        app.join_invite(first.clone(), &Context::default());
+        assert!(matches!(
+            &app.link,
+            Some(Waiting::Shown { error: Some(_), .. })
+        ));
         if let Some(Waiting::Shown { wait, .. }) = &mut app.link {
             // The page has already waited before another click on the link.
             wait.follow(
@@ -2117,20 +2145,79 @@ mod tests {
             );
         }
         arrive(&mut app, invite::link(&link_invite().encode()).as_bytes());
-        let Some(Waiting::Shown { invite, wait, .. }) = &mut app.link else {
+        let Some(Waiting::Shown {
+            invite,
+            wait,
+            error,
+            ..
+        }) = &mut app.link
+        else {
             panic!("the first page stays");
         };
         assert_eq!(invite, &first);
+        assert!(error.is_some());
         assert_eq!(
             wait.follow(true, Instant::now(), Duration::from_secs(1)),
             Some(Duration::from_secs(1))
         );
-        app.clear_link();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_newer_link_replaces_a_refusal() {
+        let dir = fresh_dir("link-after-refusal");
+        let newer = link_invite();
+        let mut app = test_app(Ok(setup_in(&dir)), Screen::Start(Start::default()));
         arrive(&mut app, b"not an invite");
-        arrive(&mut app, invite::link(&first.encode()).as_bytes());
+        assert!(matches!(&app.link, Some(Waiting::Refused(_))));
+        arrive(&mut app, invite::link(&newer.encode()).as_bytes());
+        let Some(Waiting::Shown { invite, error, .. }) = &app.link else {
+            panic!("the newer link is shown");
+        };
+        assert_eq!(invite, &newer);
+        assert!(error.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_newer_link_replaces_an_expired_invite() {
+        let dir = fresh_dir("link-after-expiry");
+        let newer = link_invite();
+        let mut app = test_app(Ok(setup_in(&dir)), Screen::Start(Start::default()));
+        arrive(&mut app, invite::link(&link_invite().encode()).as_bytes());
+        let Some(Waiting::Shown { invite, .. }) = &mut app.link else {
+            panic!("the first link is shown");
+        };
+        // The invite ran out while on show, which turns Join off and sets no
+        // error.
+        invite.expires_at = start::unix_now();
+        arrive(&mut app, invite::link(&newer.encode()).as_bytes());
+        let Some(Waiting::Shown { invite, error, .. }) = &app.link else {
+            panic!("the newer link is shown");
+        };
+        assert_eq!(invite, &newer);
+        assert!(error.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_newer_link_replaces_a_page_that_cannot_join() {
+        let dir = fresh_dir("link-after-own");
+        let newer = link_invite();
+        let mut app = test_app(Ok(setup_in(&dir)), Screen::Start(Start::default()));
+        let mut own = link_invite();
+        own.host_key = *app.setup.as_ref().unwrap().identity.public();
+        arrive(&mut app, invite::link(&own.encode()).as_bytes());
+        app.join_invite(own, &Context::default());
         assert!(
-            matches!(&app.link, Some(Waiting::Refused(reason)) if reason == messages::LINK_NOT_BOOTH)
+            matches!(&app.link, Some(Waiting::Shown { error: Some(error), .. }) if error == &messages::room_error(&room::RoomError::OwnInvite))
         );
+        arrive(&mut app, invite::link(&newer.encode()).as_bytes());
+        let Some(Waiting::Shown { invite, error, .. }) = &app.link else {
+            panic!("the newer link is shown");
+        };
+        assert_eq!(invite, &newer);
+        assert!(error.is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -95,6 +95,7 @@ pub enum Waiting {
         invite: Invite,
         wait: LinkWait,
         error: Option<String>,
+        dead: bool,
     },
     Refused(String),
 }
@@ -327,6 +328,7 @@ fn show_link(
         invite,
         wait,
         error,
+        ..
     } = page.waiting
     else {
         if let Waiting::Refused(reason) = page.waiting {
@@ -725,6 +727,7 @@ pub(crate) mod tests {
             .unwrap(),
             wait: LinkWait::default(),
             error: None,
+            dead: false,
         }
     }
 
