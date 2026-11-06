@@ -300,6 +300,7 @@ impl Speaker {
         while let Ok(order) = self.orders.try_recv() {
             match order {
                 ToSpeaker::Add(key, ear, gain) => {
+                    self.shared.ears_waiting.fetch_sub(1, Ordering::Relaxed);
                     let played = Played {
                         ear,
                         shared: Arc::clone(&self.shared),

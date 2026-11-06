@@ -80,6 +80,13 @@ pub(crate) const RETIRED_FOR: Duration = Duration::from_secs(2);
 // only a hostile host sends, would otherwise make thousands a second.
 const NEW_EARS_PER_SECOND: f64 = MAX_ROSTER as f64;
 const NEW_EAR_BURST: f64 = (2 * MAX_ROSTER) as f64;
+// Ears waiting in the speakers' orders past which a new talker gets none: a
+// whole burst of new talkers. The render thread takes them every period, so
+// only speakers that are away, as while they are unplugged, leave this many,
+// and an ear made then would wait in its order, decoder and all, long after
+// the room let go of it. Only ears count, since a volume holds nothing, and
+// only while any order waits: speakers whose thread ended let go of them all.
+const MOST_EARS_WAITING: usize = 2 * MAX_ROSTER;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TalkMode {
@@ -300,6 +307,8 @@ pub(crate) struct Shared {
     // and the control cue.
     cue: AtomicU64,
     control_cue: AtomicU64,
+    // Ears sent to the speakers that the render thread has not taken.
+    ears_waiting: AtomicUsize,
     changed: OnceLock<Box<dyn Fn() + Send + Sync>>,
     // Asks the devices thread to open or close the microphone to match.
     follow: OnceLock<Box<dyn Fn() + Send + Sync>>,
@@ -342,6 +351,7 @@ impl Shared {
             render_times: Timing::default(),
             cue: AtomicU64::new(0),
             control_cue: AtomicU64::new(0),
+            ears_waiting: AtomicUsize::new(0),
             changed: OnceLock::new(),
             follow: OnceLock::new(),
         })
@@ -630,7 +640,10 @@ impl Talk {
     ) -> bool {
         let at = match self.talkers.iter().position(|talker| talker.key == key) {
             Some(at) => at,
-            None if !self.new_ears.take(now, NEW_EARS_PER_SECOND, NEW_EAR_BURST) => {
+            None if (!self.speaker.is_empty()
+                && self.shared.ears_waiting.load(Ordering::Relaxed) >= MOST_EARS_WAITING)
+                || !self.new_ears.take(now, NEW_EARS_PER_SECOND, NEW_EAR_BURST) =>
+            {
                 self.dropped += 1;
                 return false;
             }
@@ -638,6 +651,9 @@ impl Talk {
                 Ok(ear) => {
                     let ear = Arc::new(Mutex::new(ear));
                     let gain = self.volumes.get(&key).copied().unwrap_or(1.0);
+                    // Counted before it is sent, so the speakers never take
+                    // one not counted yet.
+                    self.shared.ears_waiting.fetch_add(1, Ordering::Relaxed);
                     let _ = self
                         .speaker
                         .send(ToSpeaker::Add(key, Arc::clone(&ear), gain));
@@ -1021,6 +1037,80 @@ mod tests {
                 "voice: 10 ms frames with opus repair data, a listener lost 6.0 percent one or two frames at a time, 5 or more for 2 s",
             ]
         );
+    }
+
+    fn voice_frame(seq: u16) -> Frame<'static> {
+        Frame {
+            seq,
+            captured: 0,
+            mode: Mode::LowDelay,
+            redundancy: false,
+            last: false,
+            frame: &[0; 20],
+            previous: None,
+            pad: 0,
+        }
+    }
+
+    fn key(n: u32) -> [u8; 32] {
+        let mut key = [0u8; 32];
+        key[..4].copy_from_slice(&n.to_le_bytes());
+        key
+    }
+
+    // While the speakers take nothing from their orders, as while they are
+    // unplugged, a host naming someone new every 125 ms gets only a few ears
+    // made: each would wait in its order, decoder and all, after the room let
+    // go of it. Someone already heard goes on being heard, and the saved
+    // volumes sent at the start hold no place. Once the speakers take their
+    // orders, a new talker gets one again, even with an order waiting.
+    #[test]
+    fn speakers_away_hold_few_ears() {
+        let start = Instant::now();
+        let shared = Shared::new(&VoiceConfig::default(), None, false);
+        let (speaker, orders) = crossbeam_channel::unbounded();
+        let clock = Clock::new(start);
+        let mut speakers = Speaker::new(orders, Arc::clone(&shared), clock);
+        let mut talk = Talk::new(shared, speaker, clock, Timers::default(), Log::off(), start);
+        for n in 0..256 {
+            talk.set_volume(key(1000 + n), 50);
+        }
+        let held = key(10_000);
+        assert!(talk.hear(held, &voice_frame(0), None, false, start));
+        for n in 0..480 {
+            let now = start + Duration::from_millis(125) * n;
+            talk.hear(key(n), &voice_frame(0), None, false, now);
+            let dropped = talk.dropped;
+            talk.hear(held, &voice_frame(n as u16 + 1), None, false, now);
+            assert_eq!(talk.dropped, dropped, "a frame of someone heard dropped");
+            talk.keep_only(&[held], now);
+            talk.tick(now);
+        }
+        let made = 481 - talk.dropped;
+        assert!(made <= MOST_EARS_WAITING as u64, "{made} ears made");
+
+        speakers.fill(&mut [0.0; 480]);
+        let now = start + Duration::from_secs(61);
+        talk.set_volume(key(2000), 50);
+        assert!(talk.hear(key(480), &voice_frame(0), None, false, now));
+    }
+
+    // Speakers whose thread ended let go of every order, ears and all, so the
+    // ears they left waiting stop nobody.
+    #[test]
+    fn speakers_gone_hold_no_place() {
+        let start = Instant::now();
+        let shared = Shared::new(&VoiceConfig::default(), None, false);
+        let (speaker, orders) = crossbeam_channel::unbounded();
+        let clock = Clock::new(start);
+        let mut talk = Talk::new(shared, speaker, clock, Timers::default(), Log::off(), start);
+        for n in 0..MOST_EARS_WAITING as u32 {
+            assert!(talk.hear(key(n), &voice_frame(0), None, false, start));
+        }
+        let later = start + Duration::from_secs(1);
+        assert!(!talk.hear(key(100), &voice_frame(0), None, false, later));
+        drop(orders);
+        assert!(talk.hear(key(101), &voice_frame(0), None, false, later));
     }
 
     #[test]
