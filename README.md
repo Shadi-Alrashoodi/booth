@@ -21,6 +21,8 @@ Windows 10 version 2004 or later, or Windows 11, 64-bit, with a DirectX 12 graph
 
 Press Host, then Copy, and send the invite to a friend. They paste it under Join a room, and later rejoin from Known hosts. An invite lets in one friend within 10 minutes; for a group, press single use, 10 min so it reads anyone, 24 h, and copy the new invite. Either one carries your internet address, so never post it in public.
 
+Copy link gives a booth:// invite link. Links open the copy from the installer or the Store and show the invite before joining. Discord and many chat apps do not make them clickable; your friend can paste the link under Join a room instead, including with the zip. Friends need 1.4.0 for links; the plain invite works on any version.
+
 If a friend cannot get in, Booth gives them a code for the host to paste under the invite. Failing that, forward UDP 41000 to the host's PC, or use Tailscale or WireGuard.
 
 The first time, Booth asks for administrator rights to add its firewall rule. On Windows 11 22H2 or later Booth asks Windows to cancel echo, and Settings says under Echo cancellation whether your microphone has it. Where it has none, use a wired or USB headset.
@@ -29,10 +31,12 @@ Push to talk is on by default: hold Right Ctrl to talk. Hotkeys work while a gam
 
 ## Features
 
+- Invite links: Copy link gives a booth:// link that opens Booth and shows the invite; nothing joins until you press Join.
 - Voice in 5 ms Opus frames, with a jitter buffer that starts as small as it can, grows when over 1% of packets arrive late and shrinks after 5 s with none.
 - Screen sharing with Desktop Duplication and GPU encoding, H.264 or HEVC, up to 120 fps. On Intel graphics Booth encodes in software for now, H.264 up to 1080p at 60 fps.
 - 4K sharing in HEVC when the host, the sharer and everyone watching have 1.2.0 or later and every watcher's GPU decodes it; otherwise a share goes up to 1440p.
 - Share a whole monitor, a region of one picked by dragging, or one window, followed as it changes size; a minimized window pauses its share. Windows sends a window at up to 60 fps, or up to 120 on Windows 11 24H2 and later, about 3 ms capture to display at 1440p120 on my PC with host and viewer on one PC.
+- The Share list puts monitors under Screen and windows under Windows, with each window's program and whether it is minimized in columns of their own.
 - Pause a share with Ctrl+Shift+F9, and resume it with Resume or two presses: nothing of your screen is sent meanwhile, and everyone watching sees it paused.
 - PC sound with a share, from the switch under it: everything your PC plays except Booth, in stereo. Windows 11 only, heard by friends on 1.3.0 or later when the host has it too, and each friend has a volume for each sharer's PC sound.
 - Small on top, in a viewer window's system menu: the share at its least size above every other window, in a corner of the monitor.
