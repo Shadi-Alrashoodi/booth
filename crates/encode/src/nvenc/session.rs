@@ -203,6 +203,10 @@ pub(crate) struct Session {
     // here has done.
     #[cfg(test)]
     pub(crate) busy_answers: u32,
+    // Makes the next invalidation report a refusal, which no driver here
+    // has given.
+    #[cfg(test)]
+    pub(crate) fail_next_invalidate: bool,
     // Last, so the DLL outlives every call into it, Drop included.
     _library: Library,
 }
@@ -284,6 +288,8 @@ impl Session {
             fail_next_unlock: false,
             #[cfg(test)]
             busy_answers: 0,
+            #[cfg(test)]
+            fail_next_invalidate: false,
             _library: library,
         })
     }
@@ -418,6 +424,12 @@ impl Session {
     pub(crate) fn invalidate(&mut self, timestamp: u64) -> Result<(), EncodeError> {
         // SAFETY: the encoder is initialized; the timestamp is plain data.
         let status = unsafe { (self.fns.invalidate_ref_frames)(self.encoder, timestamp) };
+        #[cfg(test)]
+        let status = if std::mem::take(&mut self.fail_next_invalidate) {
+            NV_ENC_ERR_GENERIC
+        } else {
+            status
+        };
         if status != NV_ENC_SUCCESS {
             return Err(self.error("stop referencing a lost frame", status));
         }

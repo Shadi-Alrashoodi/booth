@@ -175,6 +175,10 @@ pub(crate) struct Nvenc {
     references: References,
     idr_next: bool,
     last_index: Option<u64>,
+    // The driver's first refusal of an invalidation, for the log. A refusal
+    // costs an IDR and a driver that refuses one is likely to refuse the
+    // next, so the first says it for all of them.
+    refusal: Option<String>,
     // Frames still to give back before the driver's release of the output
     // is reported as failed: crate::fault's, None outside a test.
     #[cfg(feature = "fault")]
@@ -250,6 +254,7 @@ impl Nvenc {
             caps,
             idr_next: true,
             last_index: None,
+            refusal: None,
             #[cfg(feature = "fault")]
             fail_in: crate::fault::take_nvenc_failure(),
         })
@@ -414,6 +419,10 @@ impl Encoder for Nvenc {
         self.codec
     }
 
+    fn notes(&self) -> &str {
+        self.refusal.as_deref().unwrap_or_default()
+    }
+
     fn gauge(&self) {
         self.session.gauge();
         self.references.gauge();
@@ -509,7 +518,12 @@ impl Encoder for Nvenc {
         }
         if let Plan::Invalidate(frames) = self.references.plan(lost_frame_index) {
             for &frame in &frames {
-                if self.session.invalidate(frame).is_err() {
+                if let Err(e) = self.session.invalidate(frame) {
+                    self.refusal.get_or_insert_with(|| {
+                        format!(
+                            "Answered the loss of frame {lost_frame_index} with an IDR because the driver refused to invalidate references, and will do the same for later refusals without noting them. {e}"
+                        )
+                    });
                     self.idr_next = true;
                     return Recovery::Idr;
                 }
@@ -704,6 +718,48 @@ mod tests {
             .encode(&frame(&texture, 8))
             .unwrap_or_else(|e| panic!("frame 8: {e}"));
         assert!(unit.idr, "frame 8 is not an IDR after the failed frame 7");
+    }
+
+    #[test]
+    fn invalidation_refusal_noted_once() {
+        let _turn = gpu::test_turn();
+        let Some(device) = nvidia_device() else {
+            println!("skipped: no NVIDIA GPU on this PC, so there is no NVENC to test");
+            return;
+        };
+        let texture = nv12(&device, 1280, 720);
+        let mut nvenc = opened(&device, &texture, 5);
+        if !nvenc.invalidates() {
+            println!("skipped: this GPU's NVENC cannot invalidate references");
+            return;
+        }
+        assert_eq!(nvenc.notes(), "");
+
+        nvenc.session.fail_next_invalidate = true;
+        assert_eq!(nvenc.recover(3), Recovery::Idr);
+        let note = nvenc.notes().to_string();
+        println!("{note}");
+        for part in [
+            "frame 3",
+            "stop referencing a lost frame",
+            "NV_ENC_ERR_GENERIC",
+        ] {
+            assert!(
+                note.contains(part),
+                "the note leaves out {part:?}: {note:?}"
+            );
+        }
+
+        let unit = nvenc
+            .encode(&frame(&texture, 5))
+            .unwrap_or_else(|e| panic!("frame 5: {e}"));
+        assert!(unit.idr, "frame 5 is not an IDR after the refusal");
+        nvenc
+            .encode(&frame(&texture, 6))
+            .unwrap_or_else(|e| panic!("frame 6: {e}"));
+        nvenc.session.fail_next_invalidate = true;
+        assert_eq!(nvenc.recover(6), Recovery::Idr);
+        assert_eq!(nvenc.notes(), note, "a second refusal was noted again");
     }
 
     // NVENC's level numbers, from nvEncodeAPI.h.

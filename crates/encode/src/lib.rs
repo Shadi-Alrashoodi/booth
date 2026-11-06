@@ -253,9 +253,10 @@ pub trait Encoder: Send {
     /// so every encoder says it and none can inherit a wrong one.
     fn codec(&self) -> Codec;
 
-    /// For the log: why a faster encoder was not used, and for the Media
+    /// For the log: why a faster encoder was not used, for the Media
     /// Foundation encoders which settings this one took and refused, since
-    /// each of them takes a different set. Empty when there is nothing to
+    /// each of them takes a different set, and what it ran into while
+    /// encoding, such as a driver's refusal. Empty when there is nothing to
     /// say.
     fn notes(&self) -> &str {
         ""

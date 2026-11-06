@@ -252,10 +252,10 @@ pub struct Sharer {
     // share's size and rate.
     switches: Switches,
     hevc_offer: Option<HevcOffer>,
-    // How much of the encoder's notes the log has: a Media Foundation
-    // encoder adds to them as it goes, about frames it held back or a new
-    // output format, which is what the log of a GPU that cannot be tried
-    // here should show.
+    // How much of the encoder's notes the log has: an encoder adds to them
+    // as it goes, about frames a Media Foundation one held back, a new
+    // output format or a driver's refusal, which is what the log of a GPU
+    // that cannot be tried here should show.
     notes_said: usize,
     // Set once the share runs on the software encoder until it ends: every
     // encoder from then on is that one, in H.264, at no more than it takes.
