@@ -4,7 +4,7 @@
 
 use std::ffi::{CStr, c_void};
 use std::ptr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{ERROR_MOD_NOT_FOUND, FreeLibrary, HMODULE};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
@@ -21,6 +21,13 @@ use crate::{Codec, EncodeError};
 // means the pool was rebuilt, and the oldest registrations are for textures
 // that will not come back.
 const MAX_REGISTRATIONS: usize = 6;
+
+// A busy encoder has not taken the frame, and the header asks for the same
+// call again after a few milliseconds. A frame at 120 fps is as long as it
+// waits: by then the next frame is due, and a driver still busy is handed
+// to the error path like any other failure.
+const BUSY_WAIT: Duration = Duration::from_millis(8);
+const BUSY_PAUSE: Duration = Duration::from_millis(1);
 
 struct Library(HMODULE);
 
@@ -189,9 +196,13 @@ pub(crate) struct Session {
     uses: u64,
     device: ID3D11Device,
     // Makes the next unlock report a failure after the frame was encoded
-    // and copied, the one driver failure a test cannot cause for real.
+    // and copied, which a test cannot cause for real.
     #[cfg(any(test, feature = "fault"))]
     pub(crate) fail_next_unlock: bool,
+    // Answers busy in the driver's place this many times, which no driver
+    // here has done.
+    #[cfg(test)]
+    pub(crate) busy_answers: u32,
     // Last, so the DLL outlives every call into it, Drop included.
     _library: Library,
 }
@@ -271,6 +282,8 @@ impl Session {
             device: device.clone(),
             #[cfg(any(test, feature = "fault"))]
             fail_next_unlock: false,
+            #[cfg(test)]
+            busy_answers: 0,
             _library: library,
         })
     }
@@ -458,12 +471,25 @@ impl Session {
         }
 
         let submitted = Instant::now();
-        // SAFETY: the input is mapped, the bitstream buffer belongs to this
-        // session and is not locked, and `pic` is valid for the call.
-        let status = unsafe { (self.fns.encode_picture)(self.encoder, &mut *pic) };
+        let status = loop {
+            let status = if self.busy_in_place_of_driver() {
+                NV_ENC_ERR_ENCODER_BUSY
+            } else {
+                // SAFETY: the input is mapped, the bitstream buffer belongs to
+                // this session and is not locked, and `pic` is valid for the
+                // call.
+                unsafe { (self.fns.encode_picture)(self.encoder, &mut *pic) }
+            };
+            if status != NV_ENC_ERR_ENCODER_BUSY || submitted.elapsed() >= BUSY_WAIT {
+                break status;
+            }
+            std::thread::sleep(BUSY_PAUSE);
+        };
         // Counted as submitted even when the call fails: nothing says how
         // far the driver got, and an unneeded IDR costs one big frame where
-        // a reference the viewer never had costs a broken picture.
+        // a reference the viewer never had costs a broken picture. A driver
+        // still busy has not taken the frame, but is counted the same way to
+        // keep one path for a failed call.
         if status != NV_ENC_SUCCESS {
             return Err(after_submit(self.error("encode a frame", status)));
         }
@@ -515,6 +541,18 @@ impl Session {
             submitted,
             ready,
         })
+    }
+
+    #[cfg(test)]
+    fn busy_in_place_of_driver(&mut self) -> bool {
+        let busy = self.busy_answers > 0;
+        self.busy_answers = self.busy_answers.saturating_sub(1);
+        busy
+    }
+
+    #[cfg(not(test))]
+    fn busy_in_place_of_driver(&mut self) -> bool {
+        false
     }
 
     fn registration(

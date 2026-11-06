@@ -645,6 +645,67 @@ mod tests {
         );
     }
 
+    fn opened(device: &ID3D11Device, texture: &ID3D11Texture2D, frames: u64) -> Nvenc {
+        let mut nvenc = Nvenc::open(
+            device,
+            &request(Codec::H264, 1280, 720, 60),
+            &Settings::default(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        for i in 0..frames {
+            nvenc
+                .encode(&frame(texture, i))
+                .unwrap_or_else(|e| panic!("frame {i}: {e}"));
+        }
+        nvenc
+    }
+
+    #[test]
+    fn busy_driver_tried_again() {
+        let _turn = gpu::test_turn();
+        let Some(device) = nvidia_device() else {
+            println!("skipped: no NVIDIA GPU on this PC, so there is no NVENC to test");
+            return;
+        };
+        let texture = nv12(&device, 1280, 720);
+        let mut nvenc = opened(&device, &texture, 5);
+
+        nvenc.session.busy_answers = 1;
+        nvenc
+            .encode(&frame(&texture, 5))
+            .unwrap_or_else(|e| panic!("a driver busy once failed frame 5: {e}"));
+        let unit = nvenc
+            .encode(&frame(&texture, 6))
+            .unwrap_or_else(|e| panic!("frame 6: {e}"));
+        assert!(
+            !unit.idr,
+            "an IDR after a frame the driver took on its second try"
+        );
+
+        // Busy past the wait: the frame fails like any failed submit, and the
+        // next frame is an IDR.
+        nvenc.session.busy_answers = u32::MAX;
+        let Err(error) = nvenc.encode(&frame(&texture, 7)) else {
+            panic!("a driver that stayed busy went unnoticed");
+        };
+        assert!(
+            error.to_string().contains("NV_ENC_ERR_ENCODER_BUSY"),
+            "{error}"
+        );
+        // Every try after the first follows a pause of at least 1 ms, so the
+        // 8 ms wait holds nine at most, and more means the wait grew.
+        let tries = u32::MAX - nvenc.session.busy_answers;
+        assert!(
+            tries <= 9,
+            "a driver that stayed busy was asked {tries} times for one frame"
+        );
+        nvenc.session.busy_answers = 0;
+        let unit = nvenc
+            .encode(&frame(&texture, 8))
+            .unwrap_or_else(|e| panic!("frame 8: {e}"));
+        assert!(unit.idr, "frame 8 is not an IDR after the failed frame 7");
+    }
+
     // NVENC's level numbers, from nvEncodeAPI.h.
     const HEVC_LEVELS: [u32; 13] = [
         NV_ENC_LEVEL_HEVC_1,
