@@ -169,11 +169,17 @@ impl Sink {
 
     // Never waits: the hotkey thread also answers push to talk, the panic
     // key and, while it is in, the hook every key on this PC waits for.
+    // Only that thread sends, so the number read here is still the next
+    // one when it is written back.
     pub(crate) fn send(&self, event: Captured, period: u32) {
-        let sequence = self.shared.next_sequence();
-        if self.sender.try_send((event, period, sequence)).is_err() {
+        let number = match self.shared.offered() {
+            (offered_in, count) if offered_in == period => count,
+            _ => 0,
+        };
+        if self.sender.try_send((event, period, number)).is_err() {
             self.shared.dropped(1);
         }
+        self.shared.set_offered(period, number.wrapping_add(1));
     }
 
     // A viewer that never said which window is its own has none in front.
@@ -206,9 +212,17 @@ impl Tap {
         self.sink.clone()
     }
 
-    // `fired` is what the hotkeys made of this event, and `hook_took` says
-    // the Windows keys hook sent it already.
-    pub(crate) fn key(&mut self, raw: RawKey, fired: &[Event], hook_took: bool) {
+    // `fired` is what the hotkeys made of this event, `hook_took` says the
+    // Windows keys hook sent it already, and `windows_acts` says Windows
+    // acts on this new press itself, which it does here when the hook did
+    // not take it.
+    pub(crate) fn key(
+        &mut self,
+        raw: RawKey,
+        fired: &[Event],
+        hook_took: bool,
+        windows_acts: bool,
+    ) {
         let Some(period) = self.follow() else {
             return;
         };
@@ -218,14 +232,23 @@ impl Tap {
         let Some(key) = raw.key() else {
             return;
         };
+        // The viewer's own key, whichever period its press was in.
+        if key == Key::F11 {
+            return;
+        }
         let down = raw.down();
+        // A release in another window still ends what this list holds, so
+        // the next press of that key is a press of its own.
         if let Some(at) = self.kept.iter().position(|kept| *kept == key) {
             if !down {
                 self.kept.remove(at);
             }
             return;
         }
-        let local = key == Key::F11
+        if !self.sink.viewer_in_front() {
+            return;
+        }
+        let local = (windows_acts && !hook_took)
             || fired
                 .iter()
                 .any(|event| matches!(event, Event::Pressed(action) if stays_local(*action)));
@@ -240,7 +263,7 @@ impl Tap {
     }
 
     pub(crate) fn mouse(&mut self, raw: RawMouse) {
-        let Some(period) = self.follow() else {
+        let Some(period) = self.follow().filter(|_| self.sink.viewer_in_front()) else {
             return;
         };
         if self.injected_by_its_controller(raw.device) {
@@ -252,14 +275,21 @@ impl Tap {
         }
     }
 
-    // The period to send in, starting clean each time one begins.
+    // The Windows keys hook is wanted: sending fullscreen, with the viewer
+    // in front.
+    pub(crate) fn windows_keys(&self) -> bool {
+        self.sink.windows_keys().is_some()
+    }
+
+    // The sending period, starting clean each time one begins. Nothing is
+    // sent unless the viewer is in front too.
     fn follow(&mut self) -> Option<u32> {
         let period = self.sink.shared.sending_period();
         if period != self.period {
             self.period = period;
             self.kept.clear();
         }
-        period.filter(|_| self.sink.viewer_in_front())
+        period
     }
 
     // While this PC is controlled itself, injected input is that
@@ -273,7 +303,7 @@ impl Tap {
 pub struct Feed {
     events: Receiver<Queued>,
     shared: Arc<Shared>,
-    // The period and number of the last event read.
+    // The period and number of the last event read, or counted lost.
     last: Option<(u32, u32)>,
     missed: u32,
     // Held back while Missed goes first, with its period.
@@ -307,34 +337,39 @@ impl Feed {
         }
         loop {
             if let Some((event, period)) = self.waiting.take() {
-                if self.shared.sending_period() == Some(period) {
-                    return Ok(event);
+                if self.shared.sending_period() != Some(period) {
+                    continue;
                 }
-                continue;
+                // Its number is counted already; only its age is left.
+                if late(&event) {
+                    self.missed = self.missed.saturating_add(1);
+                    self.shared.dropped(1);
+                    continue;
+                }
+                return Ok(event);
             }
-            let (event, period, number) = if self.missed > 0 {
-                match self.events.try_recv() {
-                    Ok(queued) => queued,
-                    Err(_) => return Ok(self.take_missed()),
+            // Read before the feed is: each event offered up to here was
+            // read already, is in the feed, or was lost.
+            let offered = self.shared.offered();
+            let (event, period, number) = match self.events.try_recv() {
+                Ok(queued) => queued,
+                Err(_) => {
+                    self.count_lost_after(offered);
+                    if self.missed > 0 {
+                        return Ok(self.take_missed());
+                    }
+                    let left = deadline.map_or(Duration::MAX, |deadline| {
+                        deadline.saturating_duration_since(Instant::now())
+                    });
+                    self.events.recv_timeout(left)?
                 }
-            } else {
-                let left = deadline.map_or(Duration::MAX, |deadline| {
-                    deadline.saturating_duration_since(Instant::now())
-                });
-                self.events.recv_timeout(left)?
             };
             if self.shared.sending_period() != Some(period) {
                 continue;
             }
-            match self.last {
-                Some((last_period, last)) if last_period == period => {
-                    let gap = number.wrapping_sub(last).wrapping_sub(1);
-                    self.missed = self.missed.saturating_add(gap);
-                }
-                _ => self.missed = 0,
-            }
+            self.count_lost(period, number);
             self.last = Some((period, number));
-            if event.at().is_some_and(|at| at.elapsed() > FEED_LATE) {
+            if late(&event) {
                 self.missed = self.missed.saturating_add(1);
                 self.shared.dropped(1);
                 continue;
@@ -347,9 +382,44 @@ impl Feed {
         }
     }
 
+    // The events of `period` numbered before `number` that never came.
+    fn count_lost(&mut self, period: u32, number: u32) {
+        match self.last {
+            Some((last_period, last)) if last_period == period => {
+                let gap = number.wrapping_sub(last).wrapping_sub(1);
+                self.missed = self.missed.saturating_add(gap);
+            }
+            // Each period numbers its events from 0, and what an earlier
+            // one lost was meant for a session that is over.
+            _ => self.missed = number,
+        }
+    }
+
+    // With the feed empty, the events offered that never came were dropped
+    // when it was full, the last of them maybe a release nothing follows.
+    fn count_lost_after(&mut self, (period, count): (u32, u32)) {
+        if count == 0 || self.shared.sending_period() != Some(period) {
+            return;
+        }
+        // Nothing offered after the last event read. That event can be one
+        // past the count, which is written just after its event goes in.
+        if let Some((last_period, last)) = self.last
+            && last_period == period
+            && (count.wrapping_sub(last) as i32) <= 1
+        {
+            return;
+        }
+        self.count_lost(period, count);
+        self.last = Some((period, count - 1));
+    }
+
     fn take_missed(&mut self) -> Captured {
         Captured::Missed(std::mem::take(&mut self.missed))
     }
+}
+
+fn late(event: &Captured) -> bool {
+    event.at().is_some_and(|at| at.elapsed() > FEED_LATE)
 }
 
 // The keys the viewer handles itself while controlling. F11 is the viewer's
@@ -504,6 +574,7 @@ mod tests {
         assert_eq!(rig.remote.numbers().feed_dropped, 3);
     }
 
+    // The last events lost may be releases, and nothing may follow them.
     #[test]
     fn a_full_feed_is_told_where_it_lost_events() {
         let mut rig = rig();
@@ -512,10 +583,98 @@ mod tests {
         for _ in 0..FEED_ROOM + 3 {
             rig.send(Key::M, now);
         }
-        assert_eq!(rig.read().len(), FEED_ROOM);
+        let read = rig.read();
+        assert_eq!(read.len(), FEED_ROOM + 1);
+        assert_eq!(
+            read[FEED_ROOM],
+            Captured::Missed(3),
+            "said with nothing after"
+        );
         rig.send(W, now);
-        assert_eq!(rig.read(), [Captured::Missed(3), key(W, now)]);
+        assert_eq!(rig.read(), [key(W, now)], "said once");
         assert_eq!(rig.remote.numbers().feed_dropped, 3);
+    }
+
+    // A full feed left by an earlier period loses the first events of the
+    // next one.
+    #[test]
+    fn a_new_period_is_told_what_it_lost_first() {
+        let mut rig = rig();
+        rig.remote.start_sending(VIEWER);
+        let now = Instant::now();
+        for _ in 0..FEED_ROOM {
+            rig.send(Key::M, now);
+        }
+        rig.remote.stop_sending();
+        rig.remote.start_sending(VIEWER);
+        rig.send(Key::D, now);
+        assert_eq!(rig.read(), [Captured::Missed(1)]);
+        rig.send(W, now);
+        assert_eq!(rig.read(), [key(W, now)]);
+
+        // The same when the period's next event is read before the feed
+        // runs empty.
+        for _ in 0..FEED_ROOM {
+            rig.send(Key::M, now);
+        }
+        rig.remote.stop_sending();
+        rig.remote.start_sending(VIEWER);
+        rig.send(Key::D, now);
+        rig.feed
+            .events
+            .try_recv()
+            .expect("the earlier period's events");
+        rig.send(W, now);
+        assert_eq!(rig.read(), [Captured::Missed(1), key(W, now)]);
+        assert_eq!(rig.remote.numbers().feed_dropped, 2);
+    }
+
+    // The count of events offered is written just after the event goes in,
+    // so the viewer can read an event the count does not hold yet.
+    #[test]
+    fn an_event_read_before_its_count_is_not_lost() {
+        let mut rig = rig();
+        rig.remote.start_sending(VIEWER);
+        let now = Instant::now();
+        rig.send(Key::M, now);
+        rig.send(W, now);
+        assert_eq!(rig.read(), [key(Key::M, now), key(W, now)]);
+        let period = rig.sink.open().expect("sending, viewer in front");
+        rig.remote.shared().set_offered(period, 1);
+        assert_eq!(
+            rig.feed.next(Duration::ZERO),
+            Err(RecvTimeoutError::Timeout)
+        );
+
+        // And once the count catches up, the next event is not taken for
+        // one after a loss.
+        let mut rig = self::rig();
+        rig.remote.start_sending(VIEWER);
+        rig.send(Key::M, now);
+        let period = rig.sink.open().expect("sending, viewer in front");
+        rig.sink
+            .sender
+            .try_send((key(W, now), period, 1))
+            .expect("room in the feed");
+        assert_eq!(rig.read(), [key(Key::M, now), key(W, now)]);
+        rig.remote.shared().set_offered(period, 2);
+        rig.send(Key::D, now);
+        assert_eq!(rig.read(), [key(Key::D, now)]);
+        assert_eq!(rig.remote.numbers().feed_dropped, 0);
+    }
+
+    // An event held back while Missed went first can grow late while the
+    // viewer is busy with that Missed.
+    #[test]
+    fn an_event_held_back_is_dropped_once_it_is_late() {
+        let mut rig = rig();
+        rig.remote.start_sending(VIEWER);
+        rig.send(Key::M, ago(FEED_LATE.as_millis() as u64 + 50));
+        rig.send(W, Instant::now());
+        assert_eq!(rig.feed.next(Duration::ZERO), Ok(Captured::Missed(1)));
+        std::thread::sleep(FEED_LATE + Duration::from_millis(20));
+        assert_eq!(rig.read(), [Captured::Missed(1)]);
+        assert_eq!(rig.remote.numbers().feed_dropped, 2);
     }
 
     #[test]

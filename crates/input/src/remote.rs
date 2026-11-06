@@ -4,7 +4,7 @@
 // thread has to ask Windows for (the mouse registration, the Windows keys
 // hook).
 
-use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -45,9 +45,13 @@ pub(crate) struct Shared {
     state: AtomicU32,
     // The viewer's window, which must be in front for anything to be sent.
     viewer: AtomicIsize,
-    // Every event offered to the feed takes the next number, sent or not,
-    // so the viewer can tell where some went missing.
-    sequence: AtomicU32,
+    // Every event offered to the feed takes the next number of its sending
+    // period, sent or not, so the viewer can tell where some went missing.
+    // The period in the high half and how many it has offered in the low,
+    // written after each event went into the feed or was dropped. Only the
+    // hotkey thread offers events, so the viewer reading this with the feed
+    // empty knows each one up to there has reached it or is lost.
+    offered: AtomicU64,
     // The last physical key or mouse event while controlled, as microseconds
     // after `epoch` plus one, so that zero is none.
     touched: AtomicU64,
@@ -72,7 +76,7 @@ impl Remote {
                 controlled: AtomicBool::new(false),
                 state: AtomicU32::new(0),
                 viewer: AtomicIsize::new(0),
-                sequence: AtomicU32::new(0),
+                offered: AtomicU64::new(0),
                 touched: AtomicU64::new(0),
                 epoch: Instant::now(),
                 paused: AtomicU8::new(0),
@@ -248,8 +252,15 @@ impl Shared {
         });
     }
 
-    pub(crate) fn next_sequence(&self) -> u32 {
-        self.sequence.fetch_add(1, Relaxed)
+    // The period and how many events it has offered the feed so far.
+    pub(crate) fn offered(&self) -> (u32, u32) {
+        let offered = self.offered.load(Acquire);
+        ((offered >> 32) as u32, offered as u32)
+    }
+
+    pub(crate) fn set_offered(&self, period: u32, count: u32) {
+        self.offered
+            .store(u64::from(period) << 32 | u64::from(count), Release);
     }
 
     pub(crate) fn touch(&self) {

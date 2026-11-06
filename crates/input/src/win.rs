@@ -379,7 +379,14 @@ impl Window {
                     dispatch = false;
                 }
                 WM_DEVICE_GONE if msg.hwnd == self.hwnd => {
-                    run.device_gone(msg.lParam as usize);
+                    let gone = run.device_gone(msg.lParam as usize);
+                    KEYS.with(|hooked| {
+                        if let Ok(mut hooked) = hooked.try_borrow_mut()
+                            && let Some(hooked) = hooked.as_mut()
+                        {
+                            hooked.grab.forget(&gone);
+                        }
+                    });
                     dispatch = false;
                 }
                 WM_COMMANDS => {
@@ -398,8 +405,9 @@ impl Window {
         self
     }
 
-    // A few atomic reads after every message; Windows is asked for
-    // something only when a switch changed.
+    // A few atomic reads after every message, and while the Windows keys
+    // are on, which window is in front. The mouse registration and the
+    // hook change only when one of those did.
     fn follow_switches(&mut self, run: &mut Loop) {
         let (mouse, keys) = run.wants();
         if !mouse {

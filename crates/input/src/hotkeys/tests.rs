@@ -722,9 +722,189 @@ fn a_key_the_windows_keys_hook_sent_is_not_sent_twice() {
     rig.keys(KEYBOARD, &ALT_F4);
     assert_eq!(
         rig.fed(),
-        [sent(Key::LEFT_ALT, DOWN), sent(Key::F4, DOWN)],
-        "sent by Raw Input when the hook did not take it"
+        [sent(Key::LEFT_ALT, DOWN)],
+        "Windows acts on F4 here when the hook did not take it"
     );
+}
+
+// The hook sent the press and went before the release: Windows never saw
+// the press, so the release goes where the press went.
+#[test]
+fn a_release_after_the_hook_went_follows_its_press() {
+    let mut rig = rig(false);
+    rig.remote.start_sending(VIEWER);
+    rig.run.raw(RawKey::press(Key::LEFT_WIN, KEYBOARD), 0, true);
+    rig.run
+        .raw(RawKey::release(Key::LEFT_WIN, KEYBOARD), 0, false);
+    assert_eq!(rig.fed(), [sent(Key::LEFT_WIN, UP)]);
+}
+
+// Windowed, there is no hook, and Windows acts here on its own shortcuts:
+// they stay here, so Alt+Tab gets you out and Alt+F4 closes only the viewer.
+// Alt, Ctrl and Shift alone still go, and a key goes one way from its press
+// to its release.
+#[test]
+fn windowed_the_windows_keys_stay_here() {
+    let mut rig = rig(false);
+    rig.remote.start_sending(VIEWER);
+    rig.keys(
+        KEYBOARD,
+        &[
+            (Key::LEFT_ALT, DOWN),
+            (Key::TAB, DOWN),
+            (Key::TAB, DOWN),
+            (Key::TAB, UP),
+            (Key::F4, DOWN),
+            (Key::LEFT_ALT, UP),
+            (Key::F4, UP),
+        ],
+    );
+    assert_eq!(
+        rig.fed(),
+        [sent(Key::LEFT_ALT, DOWN), sent(Key::LEFT_ALT, UP)]
+    );
+    rig.keys(
+        KEYBOARD,
+        &[
+            (Key::LEFT_WIN, DOWN),
+            (Key::LEFT_WIN, DOWN),
+            (W, DOWN),
+            (W, UP),
+            (Key::LEFT_WIN, UP),
+        ],
+    );
+    assert_eq!(rig.fed(), []);
+
+    // Tab went first, so its repeat with Alt held goes with it.
+    rig.keys(
+        KEYBOARD,
+        &[
+            (Key::TAB, DOWN),
+            (Key::LEFT_ALT, DOWN),
+            (Key::TAB, DOWN),
+            (Key::TAB, UP),
+            (Key::LEFT_ALT, UP),
+        ],
+    );
+    assert_eq!(
+        rig.fed(),
+        [
+            sent(Key::TAB, DOWN),
+            sent(Key::LEFT_ALT, DOWN),
+            sent(Key::TAB, DOWN),
+            sent(Key::TAB, UP),
+            sent(Key::LEFT_ALT, UP),
+        ]
+    );
+}
+
+// A remapper's Alt is as good as a real one to Windows, so Tab pressed with
+// it is Windows' own and stays here.
+#[test]
+fn an_injected_modifier_makes_a_windows_shortcut_too() {
+    let mut rig = rig(false);
+    rig.remote.start_sending(VIEWER);
+    rig.keys(INJECTED, &[(Key::LEFT_ALT, DOWN)]);
+    rig.keys(KEYBOARD, &[(Key::TAB, DOWN), (Key::TAB, UP)]);
+    assert_eq!(rig.fed(), [sent(Key::LEFT_ALT, DOWN)]);
+}
+
+// A remapper sends each repeat of a key it holds. Alt pressed after the
+// key does not make a repeat a new press, or its release would stay here.
+#[test]
+fn an_injectors_repeat_goes_where_its_press_went() {
+    let mut rig = rig(false);
+    rig.remote.start_sending(VIEWER);
+    rig.keys(INJECTED, &[(Key::TAB, DOWN)]);
+    rig.keys(KEYBOARD, &[(Key::LEFT_ALT, DOWN)]);
+    rig.keys(INJECTED, &[(Key::TAB, DOWN), (Key::TAB, UP)]);
+    assert_eq!(
+        rig.fed(),
+        [
+            sent(Key::TAB, DOWN),
+            sent(Key::LEFT_ALT, DOWN),
+            sent(Key::TAB, DOWN),
+            sent(Key::TAB, UP),
+        ]
+    );
+}
+
+// A key kept here and let go in another window, sending still on: the next
+// press of it in the viewer is a press of its own.
+#[test]
+fn a_local_key_let_go_elsewhere_is_sent_next_time() {
+    let mut rig = rig(false);
+    rig.remote.start_sending(VIEWER);
+    rig.keys(
+        KEYBOARD,
+        &[
+            (Key::LEFT_CTRL, DOWN),
+            (Key::LEFT_SHIFT, DOWN),
+            (Key::M, DOWN),
+        ],
+    );
+    rig.fed();
+    rig.front.store(BROWSER, Relaxed);
+    rig.keys(
+        KEYBOARD,
+        &[(Key::M, UP), (Key::LEFT_SHIFT, UP), (Key::LEFT_CTRL, UP)],
+    );
+    rig.front.store(VIEWER, Relaxed);
+    rig.keys(KEYBOARD, &[(Key::M, DOWN), (Key::M, UP)]);
+    assert_eq!(rig.fed(), [sent(Key::M, DOWN), sent(Key::M, UP)]);
+}
+
+// F11 is the viewer's own even when its press was in an earlier period, as
+// it is when F11 itself takes the viewer fullscreen and capture restarts.
+#[test]
+fn f11_never_goes_whatever_period_its_press_was_in() {
+    let mut rig = rig(false);
+    rig.remote.start_sending(VIEWER);
+    rig.keys(KEYBOARD, &[(Key::F11, DOWN)]);
+    rig.remote.stop_sending();
+    rig.remote.start_sending(VIEWER);
+    rig.keys(KEYBOARD, &[(Key::F11, UP)]);
+    assert_eq!(rig.fed(), []);
+}
+
+// A keyboard unplugged with keys down sends no breaks. What it held and the
+// feed sent is let go there; what stayed here stays, and a key another
+// keyboard still holds stays down.
+#[test]
+fn a_keyboard_that_goes_away_lets_go_of_what_it_sent() {
+    const SECOND: usize = 3;
+    let mut rig = rig(false);
+    rig.remote.start_sending(VIEWER);
+    rig.keys(KEYBOARD, &[(W, DOWN)]);
+    rig.keys(SECOND, &[(Key::D, DOWN)]);
+    rig.keys(KEYBOARD, &[(Key::D, DOWN)]);
+    rig.keys(
+        SECOND,
+        &[
+            (Key::LEFT_CTRL, DOWN),
+            (Key::LEFT_SHIFT, DOWN),
+            (Key::M, DOWN),
+        ],
+    );
+    rig.keys(KEYBOARD, &[(Key::LEFT_CTRL, DOWN), (Key::LEFT_SHIFT, DOWN)]);
+    rig.fed();
+    assert_eq!(rig.run.device_gone(KEYBOARD), [W]);
+    assert_eq!(rig.fed(), [sent(W, UP)]);
+    assert_eq!(
+        rig.run.device_gone(SECOND),
+        [Key::D, Key::LEFT_CTRL, Key::LEFT_SHIFT, Key::M],
+        "for the Windows keys hook to forget, the kept M too"
+    );
+    assert_eq!(
+        rig.fed(),
+        [
+            sent(Key::D, UP),
+            sent(Key::LEFT_CTRL, UP),
+            sent(Key::LEFT_SHIFT, UP),
+        ]
+    );
+    rig.keys(KEYBOARD, &[(Key::M, DOWN)]);
+    assert_eq!(rig.fed(), [sent(Key::M, DOWN)], "M is no longer kept");
 }
 
 // A PC can be controlled and control a third one at once. Its own
@@ -846,15 +1026,22 @@ fn a_reader_that_falls_behind_loses_events_and_is_told() {
         device: MOUSE,
         ..RawMouse::default()
     };
-    for _ in 0..FEED_ROOM + 5 {
+    rig.keys(KEYBOARD, &[(W, DOWN)]);
+    for _ in 0..FEED_ROOM - 1 {
         rig.run.mouse(moved);
     }
-    assert_eq!(rig.fed().len(), FEED_ROOM);
-    rig.keys(KEYBOARD, &[(W, DOWN)]);
-    assert_eq!(rig.fed(), [Fed::Missed(5), sent(W, DOWN)]);
-    assert_eq!(rig.remote.numbers().feed_dropped, 5);
     rig.keys(KEYBOARD, &[(W, UP)]);
-    assert_eq!(rig.fed(), [sent(W, UP)]);
+    let fed = rig.fed();
+    assert_eq!(fed.len(), FEED_ROOM + 1);
+    assert_eq!(fed[0], sent(W, DOWN));
+    assert_eq!(
+        fed[FEED_ROOM],
+        Fed::Missed(1),
+        "W's release was lost, and nothing follows it"
+    );
+    assert_eq!(rig.remote.numbers().feed_dropped, 1);
+    rig.keys(KEYBOARD, &[(W, DOWN), (W, UP)]);
+    assert_eq!(rig.fed(), [sent(W, DOWN), sent(W, UP)]);
 }
 
 #[test]
@@ -872,6 +1059,20 @@ fn what_the_window_asks_windows_for() {
     assert_eq!(rig.run.wants(), (true, false));
     rig.remote.set_controlled(false);
     assert_eq!(rig.run.wants(), (false, false));
+}
+
+// The hook exists only while the viewer is in front, so it goes when
+// another window comes forward, even if the viewer never hears of it.
+#[test]
+fn the_windows_keys_hook_is_wanted_only_with_the_viewer_in_front() {
+    let mut rig = rig(false);
+    rig.remote.start_sending(VIEWER);
+    rig.remote.set_windows_keys(true);
+    assert_eq!(rig.run.wants(), (true, true));
+    rig.front.store(BROWSER, Relaxed);
+    assert_eq!(rig.run.wants(), (true, false));
+    rig.front.store(VIEWER, Relaxed);
+    assert_eq!(rig.run.wants(), (true, true));
 }
 
 // The hook goes in with what physical keyboards hold then, and with the

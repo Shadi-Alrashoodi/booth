@@ -151,6 +151,26 @@ fn hook_takes_keys_only_for_a_viewer_in_front() {
     assert_eq!(fed(&mut feed), [(Key::LEFT_WIN, true), (E, true)]);
 }
 
+// F11 takes the viewer out of fullscreen, so the hook leaves it to the
+// viewer's window even with a taken Win held.
+#[test]
+fn hook_leaves_f11_to_the_viewer() {
+    let remote = Remote::new();
+    let (sender, events) = mpsc::sync_channel(FEED_ROOM);
+    let sink = Sink::new(sender, remote.shared(), Arc::new(|| VIEWER));
+    let mut feed = Feed::new(events, remote.shared());
+    let mut hooked = Hooked {
+        grab: Grab::new(Bindings::default(), std::iter::empty()),
+        sink,
+    };
+    remote.start_sending(VIEWER);
+    remote.set_windows_keys(true);
+    assert!(hooked.event(&made_up(0x5B, 0x5B, LLKHF_EXTENDED, true)));
+    assert!(!hooked.event(&made_up(0x7A, 0x57, 0, true)));
+    assert!(!hooked.event(&made_up(0x7A, 0x57, 0, false)));
+    assert_eq!(fed(&mut feed), [(Key::LEFT_WIN, true)]);
+}
+
 fn made_up(vk: u32, scan: u32, flags: u32, down: bool) -> KBDLLHOOKSTRUCT {
     KBDLLHOOKSTRUCT {
         vkCode: vk,

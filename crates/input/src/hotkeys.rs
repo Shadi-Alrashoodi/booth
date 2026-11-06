@@ -4,7 +4,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::bindings::{Action, Bindings};
 use crate::feed::{FEED_ROOM, Feed, RawMouse, Sink, Tap};
-use crate::grab::Grab;
+use crate::grab::{Grab, windows_acts};
+use crate::key::{Key, Modifiers};
 use crate::remote::{Remote, Shared};
 use crate::tracker::{Elevation, Event, INJECTED, RawKey, Tracker};
 use crate::win;
@@ -163,6 +164,7 @@ impl Loop {
             events.extend(self.tracker.pause(None));
             self.hand(events);
         }
+        let windows_acts = self.windows_acts_on(raw);
         let events = self.tracker.raw(raw);
         if events.contains(&Event::Pressed(Action::Panic)) {
             (self.panic)();
@@ -171,8 +173,27 @@ impl Loop {
             // keep this PC's keys, the Windows keys least of all.
             self.shared.release();
         }
-        self.tap.key(raw, &events, hook_took);
+        self.tap.key(raw, &events, hook_took, windows_acts);
         self.hand(events);
+    }
+
+    // A new press Windows acts on itself, the Win keys, the switchers and
+    // Alt+F4 and the like, with the modifiers held now, an injector's too,
+    // since Windows counts those as well. Asked before the tracker counts
+    // the press: a repeat goes where its press went. An injector pressing a
+    // key it holds is repeating it; a keyboard pressing that key is not.
+    fn windows_acts_on(&self, raw: RawKey) -> bool {
+        let Some(key) = raw.key().filter(|_| raw.down()) else {
+            return false;
+        };
+        let mut held = Modifiers::NONE;
+        for (down, device) in self.tracker.held() {
+            if down == key && (device != INJECTED || raw.device == INJECTED) {
+                return false;
+            }
+            held = held.with(down.modifier());
+        }
+        windows_acts(key, held)
     }
 
     // Registered only while controlled or sending. On the controlled PC a
@@ -224,9 +245,24 @@ impl Loop {
         self.hand(events);
     }
 
-    pub(crate) fn device_gone(&mut self, device: usize) {
+    // The keys it held never send their breaks, so the feed gets them here,
+    // unless another keyboard still holds the same key. The keys let go of
+    // come back for the Windows keys hook to forget as well.
+    pub(crate) fn device_gone(&mut self, device: usize) -> Vec<Key> {
+        let mut gone: Vec<Key> = self
+            .tracker
+            .held()
+            .filter(|(_, from)| *from == device)
+            .map(|(key, _)| key)
+            .collect();
         let events = self.tracker.device_gone(device);
+        gone.retain(|key| !self.tracker.held().any(|(down, _)| down == *key));
+        for key in &gone {
+            self.tap
+                .key(RawKey::release(*key, device), &[], false, false);
+        }
         self.hand(events);
+        gone
     }
 
     pub(crate) fn commands(&mut self) {
@@ -245,12 +281,13 @@ impl Loop {
 
     // What the window part has to ask Windows for: the mouse while
     // controlled or sending, and the Windows keys hook while sending
-    // fullscreen.
+    // fullscreen with the viewer in front. Another window coming to the
+    // front takes the hook out from this thread, whatever the viewer does.
     pub(crate) fn wants(&mut self) -> (bool, bool) {
         self.follow_controlled();
         (
             self.shared.controlled() || self.shared.sending_period().is_some(),
-            self.shared.windows_keys(),
+            self.tap.windows_keys(),
         )
     }
 

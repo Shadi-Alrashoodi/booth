@@ -86,6 +86,15 @@ impl Grab {
     pub(crate) fn lost(&self) -> bool {
         self.raw.passed > self.hook.passed + AHEAD
     }
+
+    // Keys of a keyboard that went away. Nothing says the hook hears their
+    // breaks either, and a Win left here would make every later key a Win
+    // chord.
+    pub(crate) fn forget(&mut self, keys: &[Key]) {
+        for side in [&mut self.hook, &mut self.raw] {
+            side.down.retain(|(held, _)| !keys.contains(held));
+        }
+    }
 }
 
 impl Side {
@@ -115,8 +124,12 @@ impl Side {
             .iter()
             .fold(Modifiers::NONE, |all, (held, _)| all.with(held.modifier()));
         // Booth's own keys stay with Booth. Settings refuses these chords,
-        // but a hand-written settings file can hold one.
-        let take = on && windows_acts(key, held) && !bindings.any_fires(Chord::new(held, key));
+        // but a hand-written settings file can hold one. F11 is the
+        // viewer's way out of fullscreen, Win held or not.
+        let take = on
+            && key != Key::F11
+            && windows_acts(key, held)
+            && !bindings.any_fires(Chord::new(held, key));
         self.down.push((key, take));
         take
     }
@@ -327,6 +340,22 @@ mod tests {
         assert!(grab.hook(Some(Key::TAB), DOWN, false, ON), "Alt still held");
         assert!(!grab.hook(Some(Key::LEFT_ALT), UP, false, ON));
         assert!(!grab.hook(Some(E), UP, false, ON), "never seen going down");
+    }
+
+    // A keyboard that went away with Win and Alt down: once its keys are
+    // forgotten, what another keyboard presses is no Windows shortcut.
+    #[test]
+    fn keys_of_a_keyboard_that_went_away_hold_nothing() {
+        let mut grab = grab();
+        assert!(grab.hook(Some(Key::LEFT_WIN), DOWN, false, ON));
+        assert!(grab.raw(RawKey::press(Key::LEFT_WIN, KEYBOARD), ON));
+        assert!(!grab.hook(Some(Key::LEFT_ALT), DOWN, false, ON));
+        assert!(!grab.raw(RawKey::press(Key::LEFT_ALT, KEYBOARD), ON));
+        grab.forget(&[Key::LEFT_WIN, Key::LEFT_ALT]);
+        for key in [E, Key::TAB] {
+            assert!(!grab.hook(Some(key), DOWN, false, ON), "{key}");
+            assert!(!grab.raw(RawKey::press(key, KEYBOARD), ON), "{key}");
+        }
     }
 
     #[test]
