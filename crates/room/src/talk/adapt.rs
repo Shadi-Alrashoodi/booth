@@ -30,10 +30,11 @@ pub(crate) struct Adapt {
     // What Opus is told to expect, from the last report.
     expected_loss: u8,
     // Since when each report has been zero, at 5 percent or more, and under
-    // 1 percent.
+    // 1 percent, moved on by any gap of two or more missed reports.
     clean_since: Option<Instant>,
     high_since: Option<Instant>,
     low_since: Option<Instant>,
+    last_report: Option<Instant>,
 }
 
 impl Adapt {
@@ -45,6 +46,7 @@ impl Adapt {
             clean_since: None,
             high_since: None,
             low_since: None,
+            last_report: None,
         }
     }
 
@@ -70,6 +72,27 @@ impl Adapt {
         };
         self.expected_loss = loss.ceil() as u8;
         let mut switches = Vec::new();
+
+        // Reports come every voice_report_every, a little late by the tick
+        // and the network, and stop while nobody hears this PC. One missed
+        // is still time at the level. Two or more missed say nothing about
+        // the path, so the gap counts as no time at any level, and what was
+        // counted before it stays.
+        if let Some(last) = self.last_report.replace(now) {
+            let gap = now.saturating_duration_since(last);
+            if gap > 2 * timers.voice_report_every + timers.voice_report_every / 2 {
+                for since in [
+                    &mut self.clean_since,
+                    &mut self.high_since,
+                    &mut self.low_since,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    *since += gap;
+                }
+            }
+        }
 
         if loss > 0.0 {
             self.clean_since = None;
@@ -206,6 +229,91 @@ mod tests {
             ]
         );
         assert_eq!((adapt.mode(), adapt.redundancy()), (Mode::LowDelay, false));
+    }
+
+    // Nobody heard this PC for 40 s between two spells: the 10 ms mode and
+    // redundancy end on 30 s of reports under 1 percent and at zero, the 9 s
+    // before the gap counted and the gap not.
+    #[test]
+    fn a_gap_in_reports_is_no_time_clean() {
+        let start = Instant::now();
+        let mut adapt = Adapt::new();
+        feed(&mut adapt, start, 0, &[6.0, 6.0, 6.0]);
+        assert_eq!((adapt.mode(), adapt.redundancy()), (Mode::Repair, true));
+        assert!(feed(&mut adapt, start, 3, &[0.0; 10]).is_empty());
+        assert!(feed(&mut adapt, start, 52, &[0.0; 21]).is_empty());
+        assert_eq!((adapt.mode(), adapt.redundancy()), (Mode::Repair, true));
+        let got = feed(&mut adapt, start, 73, &[0.0]);
+        assert_eq!(
+            got,
+            [
+                (
+                    73,
+                    Switch::RedundancyOff {
+                        clean_for: 30 * SECOND
+                    }
+                ),
+                (
+                    73,
+                    Switch::RepairOff {
+                        loss: 0.0,
+                        under_for: 30 * SECOND
+                    }
+                ),
+            ]
+        );
+    }
+
+    // Two spells a minute apart, each starting at 6 percent, are not 2 s of
+    // it until the second has lasted 2 s.
+    #[test]
+    fn a_gap_in_reports_is_no_time_lossy() {
+        let start = Instant::now();
+        let mut adapt = Adapt::new();
+        feed(&mut adapt, start, 0, &[6.0]);
+        assert!(feed(&mut adapt, start, 60, &[6.0, 6.0]).is_empty());
+        assert_eq!(adapt.mode(), Mode::LowDelay);
+        let got = feed(&mut adapt, start, 62, &[6.0]);
+        assert_eq!(
+            got,
+            [(
+                62,
+                Switch::RepairOn {
+                    loss: 6.0,
+                    for_at_least: 2 * SECOND
+                }
+            )]
+        );
+    }
+
+    // One report missed, or late, is still time at the level, and the 30 s
+    // end where they would have with none missed. Two missed are a gap and
+    // count as no time, so they end that much later. The tick runs a little
+    // past each second, so the reports after a miss come late.
+    #[test]
+    fn a_gap_is_more_than_one_missed_report() {
+        let late = Duration::from_millis(20);
+        for (gap, off_at, held) in [(2, 33, 30 * SECOND + late), (3, 36, 30 * SECOND)] {
+            let start = Instant::now();
+            let mut adapt = Adapt::new();
+            feed(&mut adapt, start, 0, &[6.0, 6.0, 6.0]);
+            assert!(feed(&mut adapt, start, 3, &[0.0; 10]).is_empty());
+            let got = feed(&mut adapt, start + late, 12 + gap, &[0.0; 30]);
+            assert_eq!(
+                got,
+                [
+                    (off_at, Switch::RedundancyOff { clean_for: held }),
+                    (
+                        off_at,
+                        Switch::RepairOff {
+                            loss: 0.0,
+                            under_for: held
+                        }
+                    ),
+                ],
+                "{gap} s between two reports"
+            );
+        }
     }
 
     #[test]
