@@ -24,6 +24,7 @@ use room::{
 use voice::audio::Direction;
 use zeroize::Zeroize;
 
+use crate::adapter::{self, CardWatch};
 use crate::backlog::Backlog;
 use crate::firewall::Firewall;
 use crate::hotkeys::{self, Hotkeys, ShareKey, ShareStep, Target};
@@ -104,6 +105,8 @@ pub struct App {
     // Shared with the message hook (main.rs), which runs between passes on
     // this thread.
     panel_keys: Rc<RefCell<PanelKeys>>,
+    // Only while the panel draws on the CPU. On a card nothing is looked at.
+    card_watch: Option<CardWatch>,
 }
 
 pub struct Setup {
@@ -187,6 +190,16 @@ impl App {
             win::set_window_icons(handle.hwnd.get());
         }
         let ctx = cc.egui_ctx.clone();
+        let drawn_on = cc
+            .wgpu_render_state
+            .as_ref()
+            .map(|state| state.adapter.get_info());
+        if let Some(info) = &drawn_on {
+            backlog.add(adapter::start_line(info));
+        }
+        let card_watch = drawn_on
+            .filter(adapter::on_cpu)
+            .map(|_| CardWatch::start(Instant::now()));
         // Here and not in main: the window toolkit registers for keyboard
         // Raw Input when its event loop starts, and the last registration in
         // a process is the one that counts.
@@ -203,7 +216,7 @@ impl App {
             backlog,
             stats_open: false,
             sweep: Sweep::default(),
-            scrolling: win::animations_on(),
+            scrolling: adapter::scrolls(win::animations_on(), card_watch.is_some()),
             notify: Arc::new(move || ctx.request_repaint()),
             not_now: None,
             damaged: Vec::new(),
@@ -221,6 +234,7 @@ impl App {
             scale: None,
             focused: None,
             panel_keys,
+            card_watch,
         };
         // The start screen reads the known hosts each time it opens. The
         // devices are read only in settings and when a room opens, so a list
@@ -1240,6 +1254,20 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         controls::note_focus_source(ui.ctx());
         self.follow_firewall(ui.ctx());
+        if let Some(watch) = &mut self.card_watch {
+            let now = Instant::now();
+            if let Some(line) = watch.look(now) {
+                self.backlog.add(line);
+            }
+            if let Some(left) = watch.next_look(now) {
+                ui.request_repaint_after(left);
+            }
+        }
+        let on_cpu = self
+            .card_watch
+            .as_ref()
+            .filter(|watch| watch.card_came())
+            .map(|_| messages::PANEL_ON_CPU);
         let view = match &self.screen {
             Screen::Room(in_room) => Some(in_room.room.view()),
             Screen::Checking | Screen::Firewall(_) | Screen::Start(_) | Screen::Settings { .. } => {
@@ -1250,7 +1278,7 @@ impl eframe::App for App {
             // Read again every frame, which in a room is at least once a
             // second, so turning Windows animations off takes effect while
             // the trace is running. It is one short call into Windows.
-            self.scrolling = win::animations_on();
+            self.scrolling = adapter::scrolls(win::animations_on(), self.card_watch.is_some());
             self.sweep.update(&view.strip.trace);
             ui.request_repaint_after(IDLE_REPAINT);
             // The global stats key hears this press too while it can, and
@@ -1295,7 +1323,7 @@ impl eframe::App for App {
                         (Screen::Room(in_room), Some(view)) => {
                             let keys = self.hotkeys.state();
                             let offered = self.control_offered;
-                            step = in_room.show(ui, view, self.stats_open, keys, offered);
+                            step = in_room.show(ui, view, self.stats_open, keys, offered, on_cpu);
                         }
                         (Screen::Start(start), _) => {
                             let blocked = self.setup.as_ref().err().map(String::as_str);
@@ -1306,7 +1334,8 @@ impl eframe::App for App {
                             let lines =
                                 start_lines(hint, &self.setup, &self.damaged, &self.unusable);
                             let update = self.update.shown();
-                            choice = start::show(ui, start, blocked, &lines, update.as_ref());
+                            choice =
+                                start::show(ui, start, blocked, on_cpu, &lines, update.as_ref());
                         }
                         (Screen::Firewall(ask), _) => {
                             answer = firewall_screen::show(ui, ask, self.firewall.waiting());
@@ -1710,6 +1739,7 @@ mod tests {
             scale: None,
             focused: None,
             panel_keys: Rc::default(),
+            card_watch: None,
         }
     }
 
@@ -1875,7 +1905,9 @@ mod tests {
         theme::apply(&ctx);
         ctx.enable_accesskit();
         let draw = |start: &mut Start, events| {
-            frame(&ctx, events, |ui| start::show(ui, start, None, &[], None))
+            frame(&ctx, events, |ui| {
+                start::show(ui, start, None, None, &[], None)
+            })
         };
         draw(&mut start, Vec::new());
         let (_, output) = draw(&mut start, Vec::new());
@@ -1896,6 +1928,113 @@ mod tests {
         let (choice, _) = draw(start, release(forget));
         // These frames are real time, and a slow PC may take them past the wait.
         assert!(choice.is_none() || closed.elapsed() >= Duration::from_millis(500));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn no_card() -> Result<Vec<capture::Adapter>, capture::CaptureError> {
+        Ok(Vec::new())
+    }
+
+    fn a_card() -> Result<Vec<capture::Adapter>, capture::CaptureError> {
+        Ok(vec![capture::Adapter {
+            description: String::from("NVIDIA GeForce RTX 4070 Ti SUPER"),
+            vendor_id: 0x10de,
+            device_id: 0x2705,
+            luid: 9,
+        }])
+    }
+
+    // Whether a frame of the whole panel shows the CPU line, and how long it
+    // asks to wait before the next.
+    fn cpu_frame(app: &mut App, ctx: &Context) -> (bool, Duration) {
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut output = ctx.run_ui(with_window(false), |ui| {
+            eframe::App::ui(app, ui, &mut frame);
+        });
+        let delay = output.viewport_output[&ViewportId::ROOT].repaint_delay;
+        let update = std::mem::take(&mut output.platform_output)
+            .accesskit_update
+            .expect("accesskit is on");
+        output.drop_without_applying_deltas();
+        let shown = update
+            .nodes
+            .iter()
+            .any(|(_, node)| [node.label(), node.value()].contains(&Some(messages::PANEL_ON_CPU)));
+        (shown, delay)
+    }
+
+    fn listed_line(app: &App) -> bool {
+        app.backlog
+            .texts()
+            .iter()
+            .any(|text| text.starts_with("panel: NVIDIA GeForce RTX 4070 Ti SUPER is listed now"))
+    }
+
+    // On a card the start screen says nothing and asks for no frames. On the
+    // CPU it says so from the frame whose look finds a card, a card listed
+    // already at the first look included, and until then it asks for a frame
+    // by the next look, since nothing else wakes the start screen.
+    #[test]
+    fn the_start_screen_says_when_a_card_came_for_a_panel_on_the_cpu() {
+        let dir = fresh_dir("on-cpu");
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let mut app = test_app(Ok(setup_in(&dir)), Screen::Start(Start::default()));
+        // The first frames of a context ask for more by themselves.
+        cpu_frame(&mut app, &ctx);
+        cpu_frame(&mut app, &ctx);
+        assert_eq!(
+            cpu_frame(&mut app, &ctx),
+            (false, Duration::MAX),
+            "on a card"
+        );
+
+        app.card_watch = Some(CardWatch::listing(no_card, Instant::now()));
+        let (shown, delay) = cpu_frame(&mut app, &ctx);
+        assert!(!shown, "before a card came");
+        assert!(
+            delay > Duration::ZERO && delay <= adapter::LOOK_EVERY,
+            "{delay:?}"
+        );
+        assert!(!listed_line(&app));
+
+        app.card_watch = Some(CardWatch::listing(a_card, Instant::now()));
+        assert_eq!(
+            cpu_frame(&mut app, &ctx),
+            (true, Duration::MAX),
+            "after a card came"
+        );
+        assert!(listed_line(&app), "{:?}", app.backlog.texts());
+        assert_eq!(
+            cpu_frame(&mut app, &ctx),
+            (true, Duration::MAX),
+            "on the next frame"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // In a room the line goes under your row once a card came, and on the CPU
+    // the trace stands still whatever Windows animations are.
+    #[test]
+    fn the_room_says_when_a_card_came_for_a_panel_on_the_cpu() {
+        let dir = fresh_dir("on-cpu-room");
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let mut app = app_in_room(&dir);
+        assert!(!cpu_frame(&mut app, &ctx).0, "on a card");
+        assert_eq!(app.scrolling, win::animations_on());
+
+        app.card_watch = Some(CardWatch::listing(no_card, Instant::now()));
+        assert!(!cpu_frame(&mut app, &ctx).0, "before a card came");
+        assert!(!app.scrolling);
+
+        app.card_watch = Some(CardWatch::listing(a_card, Instant::now()));
+        assert!(cpu_frame(&mut app, &ctx).0, "after a card came");
+        assert!(listed_line(&app), "{:?}", app.backlog.texts());
+        assert!(!app.scrolling);
+        close_room(app);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -10,7 +10,7 @@ use crate::controls::{self, Button, Lead};
 use crate::messages;
 use crate::theme::{
     self, ASH, BAD, CHALK, CONTROL_HEIGHT, FIELD_GAP, HALF_STEP, PANEL, PRIMARY_WIDTH, Role,
-    SECTION_GAP, SIDE, STEP,
+    SECTION_GAP, SIDE, STEP, WARN,
 };
 use crate::update::{Shown, Tone};
 
@@ -119,13 +119,14 @@ impl Start {
 
 // `blocked` is why this PC cannot host or join at all (the identity key could
 // not be loaded); then there is nothing to offer but the reason, not even
-// Settings, which would only apply to a room that cannot start. `lines` stay
-// for the whole run, unlike the note. `update` is the update check's line,
-// when it has one.
+// Settings, which would only apply to a room that cannot start. `on_cpu` and
+// `lines` stay for the whole run, unlike the note. `update` is the update
+// check's line, when it has one.
 pub fn show(
     ui: &mut Ui,
     start: &mut Start,
     blocked: Option<&str>,
+    on_cpu: Option<&str>,
     lines: &[String],
     update: Option<&Shown>,
 ) -> Option<Choice> {
@@ -147,7 +148,7 @@ pub fn show(
                     return None;
                 }
                 let mut choice = None;
-                if notes(ui, start.note.as_ref(), lines, update) {
+                if notes(ui, start.note.as_ref(), on_cpu, lines, update) {
                     choice = Some(Choice::Download);
                 }
 
@@ -209,7 +210,13 @@ pub fn show(
 // What came of the firewall prompt, the lines that last for this run and the
 // update check's line, as one block 8 px apart above the two sections. True
 // when Download was pressed.
-fn notes(ui: &mut Ui, note: Option<&Note>, lines: &[String], update: Option<&Shown>) -> bool {
+fn notes(
+    ui: &mut Ui,
+    note: Option<&Note>,
+    on_cpu: Option<&str>,
+    lines: &[String],
+    update: Option<&Shown>,
+) -> bool {
     let mut said = false;
     let mut gap = |ui: &mut Ui| {
         if std::mem::replace(&mut said, true) {
@@ -220,6 +227,10 @@ fn notes(ui: &mut Ui, note: Option<&Note>, lines: &[String], update: Option<&Sho
         gap(ui);
         let color = if note.failed { BAD } else { ASH };
         controls::prose(ui, note.text.as_str(), theme::body(), color);
+    }
+    if let Some(line) = on_cpu {
+        gap(ui);
+        controls::prose(ui, line, theme::body(), WARN);
     }
     for line in lines {
         gap(ui);
@@ -507,7 +518,7 @@ pub(crate) mod tests {
             ..RawInput::default()
         };
         let mut output = ctx.run_ui(input, |ui| {
-            let choice = show(ui, &mut Start::default(), None, &[], update);
+            let choice = show(ui, &mut Start::default(), None, None, &[], update);
             assert!(choice.is_none());
         });
         let nodes = std::mem::take(&mut output.platform_output)

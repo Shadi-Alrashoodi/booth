@@ -428,6 +428,9 @@ pub fn panel_stopped(details: &str) -> String {
     )
 }
 
+// While the panel draws on the CPU, once a graphics card is listed.
+pub const PANEL_ON_CPU: &str = "Booth started before the graphics card was ready, so it draws on the CPU. Start Booth again to use the card.";
+
 pub const RUNNING_ELEVATED: &str = "Booth was started as administrator. Start it again the usual way, not with Run as administrator. The firewall step asks for administrator by itself when it needs it.";
 
 pub const ADDRESS_NAME_ABOUT: &str = "If you run dynamic DNS, put the name here so friends can find you again after your address changes. Booth does not update it; your dynamic DNS client does.";

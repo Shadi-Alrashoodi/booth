@@ -63,6 +63,8 @@ pub struct InRoom {
     target: Target,
     // The hotkeys as they are this frame.
     keys: hotkeys::State,
+    // The line about the panel drawing on the CPU, as this frame has it.
+    on_cpu: Option<&'static str>,
     // Whether the panel offers remote control at all (control.rs).
     control_offered: bool,
     // The monitors Share offered, while the list under the title row is
@@ -196,6 +198,7 @@ impl InRoom {
             hold: Hold::default(),
             target,
             keys: hotkeys::State::default(),
+            on_cpu: None,
             control_offered: false,
             monitors: None,
             region_pick: None,
@@ -302,9 +305,11 @@ impl InRoom {
         stats_open: bool,
         keys: hotkeys::State,
         control_offered: bool,
+        on_cpu: Option<&'static str>,
     ) -> Option<Step> {
         self.keys = keys;
         self.control_offered = control_offered;
+        self.on_cpu = on_cpu;
         self.hold.frame_begins();
         let step = self.body(ui, view, stats_open);
         if let Some(held) = self.hold.frame_ends() {
@@ -1609,9 +1614,10 @@ impl InRoom {
     // On a client the list is the host's word, so it goes to ash with the
     // link: the numbers while the host is quiet, everything once it is lost.
     // Your own row holds the voice buttons, and under it goes why the
-    // microphone or the speakers are not running. The list is in the
-    // window's tone, 32 px a row, with nothing between rows but their own
-    // height. True when it ended on a row, with 8 px under it.
+    // microphone or the speakers are not running, and that the panel draws
+    // on the CPU. The list is in the window's tone, 32 px a row, with nothing
+    // between rows but their own height. True when it ended on a row, with
+    // 8 px under it.
     fn people(&mut self, ui: &mut Ui, view: &View) -> bool {
         let client_link = (view.role == Role::Client).then_some(view.strip.state);
         let gone = matches!(client_link, Some(LinkState::Lost | LinkState::Closed));
@@ -1649,7 +1655,7 @@ impl InRoom {
                 self.your_row(ui, &view.voice, person, word, dim, ends_here(view));
                 let paused = paused_line(self.keys);
                 let problem = voice_problem(&view.voice);
-                if paused.is_some() || problem.is_some() {
+                if paused.is_some() || problem.is_some() || self.on_cpu.is_some() {
                     row_last = false;
                     controls::gutter(ui, 0.0, STEP, |ui| {
                         if let Some(paused) = paused {
@@ -1657,6 +1663,9 @@ impl InRoom {
                         }
                         if let Some(problem) = problem {
                             controls::prose(ui, problem, theme::caption(), BAD);
+                        }
+                        if let Some(on_cpu) = self.on_cpu {
+                            controls::prose(ui, on_cpu, theme::caption(), WARN);
                         }
                     });
                 }
@@ -3205,7 +3214,7 @@ pub(crate) mod tests {
 
     fn line_shown(in_room: &mut InRoom, ctx: &Context, view: &View, line: &str) -> bool {
         let (_, output) = crate::controls::tests::frame(ctx, Vec::new(), |ui| {
-            in_room.show(ui, view, false, hotkeys::State::default(), false)
+            in_room.show(ui, view, false, hotkeys::State::default(), false, None)
         });
         let update = output.accesskit_update.expect("accesskit is on");
         update
@@ -3946,6 +3955,39 @@ pub(crate) mod tests {
             ..waiting
         };
         assert_eq!(voice_problem(&both), Some(line));
+    }
+
+    // The panel on the CPU with a card listed now says so under your row, as
+    // long as the app hands the line over, and the frames that leave it out
+    // show nothing.
+    #[test]
+    fn the_cpu_line_shows_under_your_row() {
+        let data_dir = std::env::temp_dir().join(format!("booth-app-cpu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let room = Arc::new(test_room(&data_dir));
+        let target = Target::default();
+        target.enter(Arc::clone(&room));
+        let mut panel = test_in_room(&room, &target);
+        let ctx = accessible_panel();
+        let view = in_room();
+        let shown = |panel: &mut InRoom, on_cpu| {
+            let (_, output) = crate::controls::tests::frame(&ctx, Vec::new(), |ui| {
+                panel.show(ui, &view, false, hotkeys::State::default(), false, on_cpu)
+            });
+            let update = output.accesskit_update.expect("accesskit is on");
+            update.nodes.iter().any(|(_, node)| {
+                [node.label(), node.value()].contains(&Some(messages::PANEL_ON_CPU))
+            })
+        };
+        assert!(!shown(&mut panel, None));
+        assert!(shown(&mut panel, Some(messages::PANEL_ON_CPU)));
+        assert!(!shown(&mut panel, None));
+
+        drop(panel);
+        target.leave();
+        hotkeys::leave(room);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     // Mara shares, as the view has it on everyone's panel.
