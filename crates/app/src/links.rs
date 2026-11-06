@@ -97,6 +97,7 @@ mod tests {
     fn the_registrations_agree() {
         let (scheme, _) = invite::LINK_PREFIX.split_once("://").unwrap();
         let installer = include_str!("../../../tools/booth.iss");
+        let manifest = include_str!("../../../tools/store/AppxManifest.xml");
         let key = format!("Root: HKA; Subkey: \"Software\\Classes\\{scheme}");
         for wanted in [
             format!(
@@ -110,6 +111,9 @@ mod tests {
         }
         assert!(installer.contains(&format!(
             "Name: \"links\"; Description: \"Open {scheme}:// invite links with Booth\""
+        )));
+        assert!(manifest.contains(&format!(
+            "<uap3:Protocol Name=\"{scheme}\" Parameters=\"{FLAG} &quot;%1&quot;\" />"
         )));
     }
 }
