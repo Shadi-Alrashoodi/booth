@@ -92,4 +92,24 @@ mod tests {
             ExitCode::from(2)
         );
     }
+
+    #[test]
+    fn the_registrations_agree() {
+        let (scheme, _) = invite::LINK_PREFIX.split_once("://").unwrap();
+        let installer = include_str!("../../../tools/booth.iss");
+        let key = format!("Root: HKA; Subkey: \"Software\\Classes\\{scheme}");
+        for wanted in [
+            format!(
+                "{key}\"; ValueType: string; ValueName: \"URL Protocol\"; ValueData: \"\"; Tasks: links"
+            ),
+            format!(
+                "{key}\\shell\\open\\command\"; ValueType: string; ValueName: \"\"; ValueData: \"\"\"{{app}}\\booth.exe\"\" {FLAG} \"\"%1\"\"\"; Tasks: links"
+            ),
+        ] {
+            assert!(installer.lines().any(|line| line == wanted), "{wanted}");
+        }
+        assert!(installer.contains(&format!(
+            "Name: \"links\"; Description: \"Open {scheme}:// invite links with Booth\""
+        )));
+    }
 }

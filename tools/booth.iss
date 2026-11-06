@@ -1,7 +1,7 @@
 ; The optional installer. The zip stays the main way to get Booth. This puts
 ; the same files in the user's own programs folder, adds a Start menu entry,
-; a desktop shortcut unless its box is cleared, and an uninstaller, and never
-; asks for administrator rights.
+; a desktop shortcut and the booth:// link handler unless their boxes are
+; cleared, and an uninstaller, and never asks for administrator rights.
 ; tools\release.ps1 compiles it with Inno Setup 6.7.3 and passes the version
 ; and the folders:
 ;   ISCC /DAppVersion=0.1.0 /DSourceDir=<the unzipped release> /DOutputDir=<dist\0.1.0> tools\booth.iss
@@ -90,7 +90,17 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
 [Tasks]
 ; Ticked, and a silent install makes the shortcut too. A package manager
 ; that wants none passes /MERGETASKS="!desktopicon".
+; A silent install registers booth:// links too; /MERGETASKS="!links" leaves
+; them unregistered.
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"
+Name: "links"; Description: "Open booth:// invite links with Booth"
+
+[Registry]
+Root: HKA; Subkey: "Software\Classes\booth"; ValueType: string; ValueName: ""; ValueData: "URL:Booth invite link"; Flags: uninsdeletekey; Tasks: links
+Root: HKA; Subkey: "Software\Classes\booth"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""; Tasks: links
+Root: HKA; Subkey: "Software\Classes\booth\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\booth.exe,0"; Tasks: links
+Root: HKA; Subkey: "Software\Classes\booth\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\booth.exe"" --link ""%1"""; Tasks: links
+Root: HKA; Subkey: "Software\Classes\booth"; ValueType: none; Flags: deletekey; Tasks: not links
 
 [Icons]
 Name: "{autoprograms}\Booth"; Filename: "{app}\booth.exe"
