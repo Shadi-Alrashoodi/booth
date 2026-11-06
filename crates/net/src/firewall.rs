@@ -13,16 +13,17 @@ use std::ptr;
 
 use windows::Win32::Foundation::{E_ACCESSDENIED, VARIANT_TRUE};
 use windows::Win32::NetworkManagement::WindowsFirewall::{
-    INetFwPolicy2, INetFwRule, INetFwRules, NET_FW_ACTION_ALLOW, NET_FW_IP_PROTOCOL_ANY,
-    NET_FW_IP_PROTOCOL_UDP, NET_FW_MODIFY_STATE_GP_OVERRIDE, NET_FW_MODIFY_STATE_INBOUND_BLOCKED,
-    NET_FW_PROFILE_TYPE2, NET_FW_PROFILE2_ALL, NET_FW_RULE_DIR_IN, NetFwPolicy2, NetFwRule,
+    INetFwPolicy2, INetFwRule, INetFwRule3, INetFwRules, NET_FW_ACTION_ALLOW,
+    NET_FW_AUTHENTICATE_NONE, NET_FW_IP_PROTOCOL_ANY, NET_FW_IP_PROTOCOL_UDP,
+    NET_FW_MODIFY_STATE_GP_OVERRIDE, NET_FW_MODIFY_STATE_INBOUND_BLOCKED, NET_FW_PROFILE_TYPE2,
+    NET_FW_PROFILE2_ALL, NET_FW_RULE_DIR_IN, NetFwPolicy2, NetFwRule,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
     CoUninitialize, IDispatch,
 };
 use windows::Win32::System::Ole::IEnumVARIANT;
-use windows::Win32::System::Variant::{VARIANT, VT_DISPATCH, VariantClear};
+use windows::Win32::System::Variant::{VARIANT, VT_ARRAY, VT_DISPATCH, VariantClear};
 use windows::core::{BSTR, Interface};
 use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
 use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsForUserW;
@@ -148,7 +149,9 @@ impl fmt::Display for FirewallState {
             FirewallState::Blocked(needed) => {
                 write!(f, "blocked by a rule for this exe; {needed}")
             }
-            FirewallState::Missing(needed) => write!(f, "no rule for this exe; {needed}"),
+            FirewallState::Missing(needed) => {
+                write!(f, "no rule for this exe lets friends in; {needed}")
+            }
             FirewallState::BlockingAll(shut) => write!(
                 f,
                 "windows blocks all incoming connections on {shut}, whatever the rules say"
@@ -471,11 +474,16 @@ fn facts(rule: &INetFwRule) -> windows::core::Result<RuleFacts> {
     // drop.
     unsafe {
         let protocol = rule.Protocol()?;
+        // A rule for any protocol has no port list at all, which is any port.
         let any_scope = rule.RemoteAddresses()? == "*"
+            && matches!(rule.RemotePorts()?.to_string().trim(), "" | "*")
+            && rule.LocalAddresses()? == "*"
             && rule
                 .InterfaceTypes()?
                 .to_string()
                 .eq_ignore_ascii_case("all")
+            && every_adapter(rule)?
+            && plain_traffic(rule)?
             && rule.ServiceName()?.is_empty();
         Ok(RuleFacts {
             inbound: rule.Direction()? == NET_FW_RULE_DIR_IN,
@@ -486,6 +494,37 @@ fn facts(rule: &INetFwRule) -> windows::core::Result<RuleFacts> {
             local_ports: rule.LocalPorts()?.to_string(),
             any_scope,
         })
+    }
+}
+
+// A rule limited to some adapters holds their names in an array.
+#[allow(unsafe_code)]
+fn every_adapter(rule: &INetFwRule) -> windows::core::Result<bool> {
+    // SAFETY: a getter on a live interface. The type is read before
+    // VariantClear releases what the VARIANT holds, once.
+    unsafe {
+        let mut adapters = rule.Interfaces()?;
+        let kind = adapters.Anonymous.Anonymous.vt;
+        let _ = VariantClear(&mut adapters);
+        Ok(kind.0 & VT_ARRAY.0 == 0)
+    }
+}
+
+// A rule set to allow only secure connections, or only some remote computers
+// or users, takes nothing but IPsec traffic, and friends send plain UDP. One
+// limited to some local users may leave out the one Booth runs as. A rule
+// object without these settings has none of them on.
+#[allow(unsafe_code)]
+fn plain_traffic(rule: &INetFwRule) -> windows::core::Result<bool> {
+    let Ok(rule) = rule.cast::<INetFwRule3>() else {
+        return Ok(true);
+    };
+    // SAFETY: as in facts.
+    unsafe {
+        Ok(rule.SecureFlags()? == NET_FW_AUTHENTICATE_NONE.0
+            && rule.RemoteMachineAuthorizedList()?.is_empty()
+            && rule.RemoteUserAuthorizedList()?.is_empty()
+            && rule.LocalUserAuthorizedList()?.is_empty())
     }
 }
 
@@ -541,8 +580,9 @@ struct RuleFacts {
     udp: bool,
     profiles: Profiles,
     local_ports: String,
-    // From any remote address, on every kind of network, for the program
-    // itself rather than one of the services it hosts.
+    // From any remote address and port, to any local address, on every kind
+    // of network and every adapter, secured or not, for every local user and
+    // for the program itself rather than one of the services it hosts.
     any_scope: bool,
 }
 
@@ -555,8 +595,11 @@ impl RuleFacts {
         self.inbound && !self.allow
     }
 
-    // A rule that lets in only the LAN, or only other ports, leaves friends
-    // on the internet outside.
+    // A rule that lets in only the LAN, only some remote ports, only some
+    // local addresses or adapters, only secure connections, or only other
+    // ports, can leave friends outside: those on the internet, from another
+    // port, arriving on another address or adapter, or all of them. It
+    // counts as no rule, which at worst asks for one that was not needed.
     fn lets_in(&self, port: u16) -> bool {
         self.allow && self.any_scope && ports_cover(&self.local_ports, port)
     }
@@ -702,6 +745,10 @@ fn expand_system(text: &[u16]) -> Option<Vec<u16>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::ManuallyDrop;
+    use windows::Win32::NetworkManagement::WindowsFirewall::NET_FW_AUTHENTICATE_WITH_INTEGRITY;
+    use windows::Win32::System::Ole::{SafeArrayCreateVector, SafeArrayPutElement};
+    use windows::Win32::System::Variant::{VARENUM, VT_BSTR, VT_VARIANT};
 
     const EXE: &str = r"D:\Code\target\release\booth.exe";
 
@@ -999,6 +1046,107 @@ mod tests {
         assert_eq!(state, FirewallState::Allowed(needed));
         let state = judge(&[rule(true, ALL), rule(false, PRIVATE)], &settings, PORT);
         assert_eq!(state, FirewallState::Blocked(needed));
+    }
+
+    // Made the way add makes Booth's own rule, but never added, so no
+    // administrator is needed and nothing on the PC changes.
+    #[allow(unsafe_code)]
+    fn loose_rule(protocol: i32) -> INetFwRule {
+        // SAFETY: the caller holds a Com, so the rule object can be made; the
+        // setters take plain values.
+        unsafe {
+            let rule: INetFwRule =
+                CoCreateInstance(&NetFwRule, None, CLSCTX_INPROC_SERVER).unwrap();
+            rule.SetProtocol(protocol).unwrap();
+            rule.SetDirection(NET_FW_RULE_DIR_IN).unwrap();
+            rule.SetAction(NET_FW_ACTION_ALLOW).unwrap();
+            rule.SetProfiles(NET_FW_PROFILE2_ALL.0).unwrap();
+            rule.SetEnabled(VARIANT_TRUE).unwrap();
+            rule
+        }
+    }
+
+    // The firewall takes adapters only as an array of names, and only names
+    // this PC has.
+    #[allow(unsafe_code)]
+    fn limit_to_adapter(rule: &INetFwRule, name: &str) -> windows::core::Result<()> {
+        // SAFETY: the array is made here and handed to the VARIANT that owns
+        // it. SafeArrayPutElement copies the item, so each VARIANT releases
+        // what it holds once, in VariantClear, after the last call that reads
+        // it.
+        unsafe {
+            let names = SafeArrayCreateVector(VT_VARIANT, 0, 1);
+            let mut item = VARIANT::default();
+            (*item.Anonymous.Anonymous).vt = VT_BSTR;
+            (*item.Anonymous.Anonymous).Anonymous.bstrVal = ManuallyDrop::new(BSTR::from(name));
+            let put = SafeArrayPutElement(names, &0, (&raw const item).cast());
+            let _ = VariantClear(&mut item);
+            let mut list = VARIANT::default();
+            (*list.Anonymous.Anonymous).vt = VARENUM(VT_ARRAY.0 | VT_VARIANT.0);
+            (*list.Anonymous.Anonymous).Anonymous.parray = names;
+            let set = put.and_then(|()| rule.SetInterfaces(&list));
+            let _ = VariantClear(&mut list);
+            set
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn allow_rules_limited_in_any_way_do_not_count() {
+        let _com = Com::start().unwrap();
+        let state = |rule: &INetFwRule| judged(&[facts(rule).unwrap()], PUBLIC);
+        for protocol in [NET_FW_IP_PROTOCOL_UDP.0, NET_FW_IP_PROTOCOL_ANY.0] {
+            let open = loose_rule(protocol);
+            assert_eq!(
+                state(&open),
+                FirewallState::Allowed(PUBLIC.into()),
+                "{protocol}"
+            );
+        }
+        let remote_port = loose_rule(NET_FW_IP_PROTOCOL_UDP.0);
+        // SAFETY: a setter on a live interface, with a BSTR that outlives it.
+        unsafe { remote_port.SetRemotePorts(&BSTR::from("53")) }.unwrap();
+        assert_eq!(state(&remote_port), FirewallState::Missing(PUBLIC.into()));
+        let local_address = loose_rule(NET_FW_IP_PROTOCOL_UDP.0);
+        // SAFETY: as above.
+        unsafe { local_address.SetLocalAddresses(&BSTR::from("192.168.1.5")) }.unwrap();
+        assert_eq!(state(&local_address), FirewallState::Missing(PUBLIC.into()));
+        let one_adapter = loose_rule(NET_FW_IP_PROTOCOL_UDP.0);
+        let adapters = crate::adapters::list().unwrap();
+        let limited = adapters
+            .iter()
+            .any(|adapter| limit_to_adapter(&one_adapter, &adapter.name).is_ok());
+        let names: Vec<_> = adapters.iter().map(|adapter| &adapter.name).collect();
+        assert!(limited, "the firewall took none of {names:?}");
+        assert_eq!(state(&one_adapter), FirewallState::Missing(PUBLIC.into()));
+        let secured = loose_rule(NET_FW_IP_PROTOCOL_UDP.0);
+        let ipsec = secured.cast::<INetFwRule3>().unwrap();
+        // SAFETY: a setter on a live interface that takes a plain value.
+        unsafe { ipsec.SetSecureFlags(NET_FW_AUTHENTICATE_WITH_INTEGRITY.0) }.unwrap();
+        assert_eq!(state(&secured), FirewallState::Missing(PUBLIC.into()));
+        // One account, written the way the firewall keeps who may connect.
+        let account = BSTR::from("D:(A;;CC;;;S-1-5-21-1-2-3-1001)");
+        let some_computers = loose_rule(NET_FW_IP_PROTOCOL_UDP.0);
+        let ipsec = some_computers.cast::<INetFwRule3>().unwrap();
+        // SAFETY: a setter on a live interface, with a BSTR that outlives it.
+        unsafe { ipsec.SetRemoteMachineAuthorizedList(&account) }.unwrap();
+        assert_eq!(
+            state(&some_computers),
+            FirewallState::Missing(PUBLIC.into())
+        );
+        let some_users = loose_rule(NET_FW_IP_PROTOCOL_UDP.0);
+        let ipsec = some_users.cast::<INetFwRule3>().unwrap();
+        // SAFETY: as above.
+        unsafe { ipsec.SetRemoteUserAuthorizedList(&account) }.unwrap();
+        assert_eq!(state(&some_users), FirewallState::Missing(PUBLIC.into()));
+        let some_local_users = loose_rule(NET_FW_IP_PROTOCOL_UDP.0);
+        let principals = some_local_users.cast::<INetFwRule3>().unwrap();
+        // SAFETY: as above.
+        unsafe { principals.SetLocalUserAuthorizedList(&account) }.unwrap();
+        assert_eq!(
+            state(&some_local_users),
+            FirewallState::Missing(PUBLIC.into())
+        );
     }
 
     #[test]
