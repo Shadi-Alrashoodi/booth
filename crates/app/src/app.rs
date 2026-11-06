@@ -559,6 +559,9 @@ impl App {
             self.target.clone(),
             panic,
             [volumes, sound_volumes],
+            self.setup
+                .as_ref()
+                .is_ok_and(|setup| setup.settings.invite_links()),
         )));
         self.sweep = Sweep::default();
     }

@@ -15,6 +15,7 @@ use room::view::{
 };
 use room::{MOST_VOLUME, Monitor, Room};
 use voice::audio::{AudioError, Choice};
+use zeroize::Zeroizing;
 
 use crate::controls::{self, Button, Lead};
 use crate::hotkeys::{self, Target};
@@ -47,6 +48,7 @@ pub struct InRoom {
     pub typed_room_name: String,
     // Why the last Copy did not reach the clipboard, until the next one does.
     copy_error: Option<String>,
+    invite_links: bool,
     log_file: Option<PathBuf>,
     // The stats word; settled before any room can start.
     firewall: &'static str,
@@ -183,11 +185,13 @@ impl InRoom {
         target: Target,
         panic: PanicKey,
         [volumes, sound_volumes]: [Volumes; 2],
+        invite_links: bool,
     ) -> InRoom {
         InRoom {
             room,
             typed_room_name,
             copy_error: None,
+            invite_links,
             log_file,
             firewall,
             paste: String::new(),
@@ -599,17 +603,17 @@ impl InRoom {
             // instead of Copy. Copy keeps its name after a press: buttons say
             // what they do, and a longer label would move the code over under
             // the mouse.
-            let buttons: &[&str] = if dead {
-                &["New invite"]
-            } else if outdated.is_some() {
-                &["Copy", "New invite"]
-            } else {
-                &["Copy"]
-            };
+            let buttons = invite_buttons(dead, outdated.is_some(), self.invite_links);
             let (text, mono, color) = invite_text(invite, share);
             match code_row(ui, text, mono, color, buttons).map(|i| buttons[i]) {
                 Some("Copy") => {
                     self.copy_error = win::copy_private(&invite.code)
+                        .err()
+                        .map(|err| messages::copy_error(&err));
+                }
+                Some("Copy link") => {
+                    let link = Zeroizing::new(invite::link(&invite.code));
+                    self.copy_error = win::copy_private(&link)
                         .err()
                         .map(|err| messages::copy_error(&err));
                 }
@@ -791,6 +795,18 @@ impl InRoom {
             controls::prose(ui, error.as_str(), theme::caption(), BAD);
         }
         new_code
+    }
+}
+
+fn invite_buttons(dead: bool, outdated: bool, links: bool) -> &'static [&'static str] {
+    if dead {
+        &["New invite"]
+    } else if outdated {
+        &["Copy", "New invite"]
+    } else if links {
+        &["Copy", "Copy link"]
+    } else {
+        &["Copy"]
     }
 }
 
@@ -3197,7 +3213,25 @@ pub(crate) mod tests {
                 flags: Default::default(),
             },
             Default::default(),
+            true,
         )
+    }
+
+    #[test]
+    fn invite_link_buttons() {
+        for dead in [false, true] {
+            for outdated in [false, true] {
+                for links in [false, true] {
+                    let expected: &[&str] = match (dead, outdated, links) {
+                        (true, _, _) => &["New invite"],
+                        (false, true, _) => &["Copy", "New invite"],
+                        (false, false, true) => &["Copy", "Copy link"],
+                        (false, false, false) => &["Copy"],
+                    };
+                    assert_eq!(invite_buttons(dead, outdated, links), expected);
+                }
+            }
+        }
     }
 
     // As if the region picker were open, its answer still to come over the
