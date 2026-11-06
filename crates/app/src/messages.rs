@@ -22,6 +22,26 @@ pub const INVITE_LINKS_ABOUT: &str =
 pub const INVITE_LINKS_INSTALLER: &str =
     "Links open the copy from the installer. With the zip, paste a link under Join a room.";
 pub const INVITE_LINK_WAIT_ABOUT: &str = "Join stays off this long after a link shows, so a click meant for something else cannot press it.";
+pub const LINK_HEAD: &str = "Join this room?";
+pub const LINK_ABOUT: &str =
+    "Join only if you know who sent it. Once you join, the host sees your name and your address.";
+pub const LINK_OPEN_MIC: &str = "Open mic is on, so the room hears you as soon as you join.";
+pub const LINK_REFUSED: &str = "This link cannot be used";
+pub const LINK_NOT_BOOTH: &str =
+    "This is not a Booth invite link. Ask your friend to send the invite again.";
+
+pub fn link_from(known_room: Option<&str>) -> String {
+    match known_room {
+        None => String::from("This invite came from a link. You have not joined this host before."),
+        Some("") => {
+            String::from("This invite came from a link. It is for a host you joined before.")
+        }
+        Some(room) => format!(
+            "This invite came from a link. It is for the host of {}, a room you joined before.",
+            isolated(room)
+        ),
+    }
+}
 
 // The lower crates write errors the way a log line reads: lower case, parts
 // joined with a semicolon. The panel shows sentences.
@@ -1573,6 +1593,34 @@ mod tests {
         ] {
             assert_sentences(text);
         }
+    }
+
+    #[test]
+    fn invite_link_page_sentences() {
+        for text in [LINK_ABOUT, LINK_OPEN_MIC, LINK_NOT_BOOTH] {
+            assert_sentences(text);
+        }
+        for room in [None, Some(""), Some("Tuesday night")] {
+            assert_sentences(&link_from(room));
+        }
+        assert_eq!(
+            link_from(None),
+            "This invite came from a link. You have not joined this host before."
+        );
+        assert_eq!(
+            link_from(Some("")),
+            "This invite came from a link. It is for a host you joined before."
+        );
+        assert_eq!(
+            link_from(Some("Tuesday night")),
+            "This invite came from a link. It is for the host of \u{2068}Tuesday night\u{2069}, a room you joined before."
+        );
+        assert!(
+            link_from(Some("\u{644}\u{64a}\u{644}"))
+                .contains("\u{2068}\u{644}\u{64a}\u{644}\u{2069}")
+        );
+        assert_eq!(LINK_HEAD, "Join this room?");
+        assert_eq!(LINK_REFUSED, "This link cannot be used");
     }
 
     #[test]

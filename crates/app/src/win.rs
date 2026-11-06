@@ -31,11 +31,12 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_PROCESSKEY, VK_RBUTTON, VK_RMENU, VK_RWIN, VK_SHIFT, VK_XBUTTON1, VK_XBUTTON2,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DestroyIcon, DispatchMessageW, HWND_TOP, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR,
-    LoadImageW, MB_ICONERROR, MB_OK, MB_TOPMOST, MSG, MessageBoxW, PM_QS_POSTMESSAGE, PM_REMOVE,
-    PeekMessageW, SM_CXICON, SM_CXSMICON, SPI_GETCLIENTAREAANIMATION, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SendMessageW, SetForegroundWindow, SetWindowPos, SystemParametersInfoW, WM_KEYDOWN,
-    WM_KEYUP, WM_SETICON, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    DestroyIcon, DispatchMessageW, HWND_TOP, ICON_BIG, ICON_SMALL, IMAGE_ICON, IsIconic,
+    LR_DEFAULTCOLOR, LoadImageW, MB_ICONERROR, MB_OK, MB_TOPMOST, MSG, MessageBoxW,
+    PM_QS_POSTMESSAGE, PM_REMOVE, PeekMessageW, SM_CXICON, SM_CXSMICON, SPI_GETCLIENTAREAANIMATION,
+    SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetForegroundWindow,
+    SetWindowPos, ShowWindow, SystemParametersInfoW, WM_KEYDOWN, WM_KEYUP, WM_SETICON,
+    WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 use windows_sys::core::BOOL;
 
@@ -105,6 +106,22 @@ pub fn bring_forward(hwnd: isize) {
             );
         }
     }
+}
+
+pub fn take_foreground(hwnd: isize) -> bool {
+    let hwnd = hwnd as HWND;
+    // A link may come from a background program; without focus, placing the
+    // panel above a game would put Join under a click meant for that game.
+    // SAFETY: the panel's own window; a window that closed makes the calls fail.
+    unsafe {
+        if SetForegroundWindow(hwnd) == 0 {
+            return false;
+        }
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+    }
+    true
 }
 
 // For winit's message hook, which sees each message the panel's thread takes

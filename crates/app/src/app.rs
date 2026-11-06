@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use std::fs::File;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use eframe::egui::text_edit::TextEditState;
@@ -12,7 +12,7 @@ use eframe::egui::{
 };
 use eframe::wgpu::rwh::{HasWindowHandle, RawWindowHandle};
 use input::{Action, Chord, Event, PanelKeys};
-use invite::Invite;
+use invite::{CodeError, Invite};
 use keys::Identity;
 use net::firewall::FirewallState;
 use room::view::{Role, ShareState};
@@ -22,7 +22,7 @@ use room::{
     VoiceConfig,
 };
 use voice::audio::Direction;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::adapter::{self, CardWatch};
 use crate::backlog::Backlog;
@@ -34,7 +34,7 @@ use crate::screens::control::PanicKey;
 use crate::screens::firewall::{self as firewall_screen, Answer, Ask};
 use crate::screens::room::{InRoom, Step, own_share_on, share_offered};
 use crate::screens::settings::{self as settings_screen, Draft, Press, Refused};
-use crate::screens::start::{self, Choice, Start};
+use crate::screens::start::{self, Choice, LinkPage, LinkWait, Start, Waiting};
 use crate::screens::stats;
 use crate::settings::{DEFAULT_PORT, GaveWay, Settings};
 use crate::sound::SettingsAudio;
@@ -95,6 +95,14 @@ pub struct App {
     tray: Option<Tray>,
     // Set on the tray's thread when the icon was clicked.
     tray_clicked: Arc<AtomicBool>,
+    // A link for the panel, from the tray's thread or from this start's own
+    // command line, and whether one came since the panel last looked.
+    inbox: Arc<Mutex<Option<Zeroizing<Vec<u8>>>>>,
+    link_arrived: Arc<AtomicBool>,
+    // Set from just before a room is asked for until it is left, so the
+    // tray turns away a link that comes then instead of keeping it.
+    in_room: Arc<AtomicBool>,
+    link: Option<Waiting>,
     // The update check and its download, if the setting is on.
     update: Update,
     // The window's scale the icons were last loaded for, and whether it had
@@ -230,6 +238,10 @@ impl App {
             viewer_strip: Arc::default(),
             tray,
             tray_clicked,
+            inbox: Arc::default(),
+            link_arrived: Arc::default(),
+            in_room: Arc::default(),
+            link: None,
             update: Update::off(),
             scale: None,
             focused: None,
@@ -376,6 +388,7 @@ impl App {
     }
 
     fn host(&mut self) {
+        self.clear_link();
         let injector = self.injector();
         let (Ok(setup), Screen::Start(start)) = (&self.setup, &mut self.screen) else {
             return;
@@ -388,20 +401,22 @@ impl App {
             address_name: setup.settings.address_name().map(str::to_owned),
             ..room_config(&setup.config, injector)
         };
-        match Room::host(
-            config,
-            Arc::clone(&setup.identity),
-            room_name,
-            Arc::clone(&self.notify),
-        ) {
+        let opened = opening(&self.in_room, || {
+            Room::host(
+                config,
+                Arc::clone(&setup.identity),
+                room_name,
+                Arc::clone(&self.notify),
+            )
+        });
+        match opened {
             Ok(room) => self.enter(room),
             Err(err) => start.host_error = Some(messages::room_error(&err)),
         }
     }
 
     fn join(&mut self, ctx: &Context) {
-        let injector = self.injector();
-        let (Ok(setup), Screen::Start(start)) = (&self.setup, &mut self.screen) else {
+        let Screen::Start(start) = &mut self.screen else {
             return;
         };
         let invite = match Invite::decode(start.paste.trim()) {
@@ -411,15 +426,26 @@ impl App {
                 return;
             }
         };
+        self.join_invite(invite, ctx);
+    }
+
+    fn join_invite(&mut self, invite: Invite, ctx: &Context) {
+        let injector = self.injector();
+        let (Ok(setup), Screen::Start(start)) = (&self.setup, &mut self.screen) else {
+            return;
+        };
         if let Some(log) = &setup.config.log {
             self.backlog.write_log(log, "client");
         }
-        match Room::join(
-            room_config(&setup.config, injector),
-            Arc::clone(&setup.identity),
-            invite,
-            Arc::clone(&self.notify),
-        ) {
+        let opened = opening(&self.in_room, || {
+            Room::join(
+                room_config(&setup.config, injector),
+                Arc::clone(&setup.identity),
+                invite,
+                Arc::clone(&self.notify),
+            )
+        });
+        match opened {
             Ok(room) => {
                 // The invite's secret has done its job; it should not sit in
                 // the field, or in the field's undo history where Ctrl+Z
@@ -431,11 +457,19 @@ impl App {
                 }
                 self.enter(room);
             }
-            Err(err) => start.join_error = Some(messages::room_error(&err)),
+            Err(err) => {
+                let line = messages::room_error(&err);
+                match &mut self.link {
+                    Some(Waiting::Shown { error, .. }) => *error = Some(line),
+                    _ => start.join_error = Some(line),
+                }
+            }
         }
     }
 
     fn enter(&mut self, room: Room) {
+        self.in_room.store(true, Ordering::Release);
+        self.clear_link();
         if let Some(line) = self.update.room_opened() {
             self.backlog.add(line);
         }
@@ -524,6 +558,7 @@ impl App {
             hotkeys::leave(in_room.room);
         }
         self.share_key = ShareKey::default();
+        self.in_room.store(false, Ordering::Release);
         self.screen = self.start(start);
         self.stats_open = false;
         self.sweep = Sweep::default();
@@ -531,6 +566,7 @@ impl App {
 
     // A known host joined again with the secret it gave, and no invite.
     fn rejoin(&mut self, key: [u8; 32]) {
+        self.clear_link();
         let injector = self.injector();
         let (Ok(setup), Screen::Start(start)) = (&self.setup, &mut self.screen) else {
             return;
@@ -541,12 +577,15 @@ impl App {
         if let Some(log) = &setup.config.log {
             self.backlog.write_log(log, "client");
         }
-        match Room::rejoin(
-            room_config(&setup.config, injector),
-            Arc::clone(&setup.identity),
-            known.clone(),
-            Arc::clone(&self.notify),
-        ) {
+        let opened = opening(&self.in_room, || {
+            Room::rejoin(
+                room_config(&setup.config, injector),
+                Arc::clone(&setup.identity),
+                known.clone(),
+                Arc::clone(&self.notify),
+            )
+        });
+        match opened {
             Ok(room) => self.enter(room),
             Err(err) => start.known_error = Some(messages::room_error(&err)),
         }
@@ -668,6 +707,13 @@ impl App {
         let saved = save_draft(setup, draft, &mut self.backlog, self.flags.controlled());
         if setup.settings != before {
             start.settings_changed();
+        }
+        if !setup.settings.invite_links() {
+            self.link = None;
+            self.inbox
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
         }
         let after = setup.settings.hotkeys();
         if after != before.hotkeys() && self.hotkeys.set_bindings(after) {
@@ -893,6 +939,72 @@ impl App {
             .is_ok_and(|setup| setup.config.log.is_some())
     }
 
+    fn clear_link(&mut self) {
+        self.link = None;
+        // Before the take: a link the tray stores after it keeps the flag on.
+        self.link_arrived.store(false, Ordering::Release);
+        self.inbox
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+    }
+
+    fn follow_link(&mut self, hwnd: Option<isize>) {
+        if !self.link_arrived.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let bytes = self
+            .inbox
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let Some(bytes) = bytes else {
+            return;
+        };
+        let refused = match &self.setup {
+            Err(_) => Some("the panel cannot open a room"),
+            Ok(setup) if !setup.settings.invite_links() => Some("invite links are off"),
+            Ok(_) if matches!(self.screen, Screen::Room(_)) => Some("a room is open"),
+            Ok(_) => None,
+        };
+        if let Some(reason) = refused {
+            if self.logging() {
+                self.backlog.add(format!("invite link: dropped, {reason}"));
+            }
+            return;
+        }
+        if let Some(waiting) = &mut self.link {
+            waiting.restart();
+        } else {
+            let decoded = std::str::from_utf8(&bytes).ok().map(Invite::decode);
+            let waiting = match decoded {
+                Some(Ok(invite)) if !invite.is_expired(start::unix_now()) => Waiting::Shown {
+                    invite,
+                    wait: LinkWait::default(),
+                    error: None,
+                },
+                Some(Ok(_)) => Waiting::Refused(messages::code_error(&CodeError::Expired)),
+                None | Some(Err(CodeError::Empty | CodeError::NotACode)) => {
+                    Waiting::Refused(String::from(messages::LINK_NOT_BOOTH))
+                }
+                Some(Err(err)) => Waiting::Refused(messages::code_error(&err)),
+            };
+            if self.logging() {
+                self.backlog.add(match &waiting {
+                    Waiting::Shown { invite, .. } => format!(
+                        "invite link: on show, host {}",
+                        keys::fingerprint(&invite.host_key)
+                    ),
+                    Waiting::Refused(reason) => format!("invite link: refused, {reason}"),
+                });
+            }
+            self.link = Some(waiting);
+        }
+        if let Some(hwnd) = hwnd {
+            win::take_foreground(hwnd);
+        }
+    }
+
     // The title goes to ash while another window has the focus, as the
     // caption buttons dim, and the icons are loaded again at the sizes a
     // new DPI asks for. The scale App::new loaded them at is not known yet
@@ -957,6 +1069,27 @@ impl App {
         };
         self.backlog.write_log(log, role);
     }
+}
+
+// What in_room was as the last room on this thread was asked for, so the
+// tests see each way into a room come through opening.
+#[cfg(test)]
+thread_local! {
+    static ASKED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+fn opening(
+    in_room: &AtomicBool,
+    open: impl FnOnce() -> Result<Room, room::RoomError>,
+) -> Result<Room, room::RoomError> {
+    in_room.store(true, Ordering::Release);
+    #[cfg(test)]
+    ASKED.with(|asked| asked.set(Some(in_room.load(Ordering::Acquire))));
+    let opened = open();
+    if opened.is_err() {
+        in_room.store(false, Ordering::Release);
+    }
+    opened
 }
 
 // A blocked panel can open no room, so there is nothing for the hotkeys to
@@ -1217,6 +1350,12 @@ impl eframe::App for App {
         if self.tray_clicked.swap(false, Ordering::AcqRel) {
             self.show_panel(ctx);
         }
+        self.follow_link(window(frame));
+        if (!matches!(self.screen, Screen::Start(_)) || !start::link_focused(ctx))
+            && let Some(waiting) = &mut self.link
+        {
+            waiting.restart();
+        }
         self.follow_window(ctx, frame);
         self.follow_update();
         self.follow_hotkeys(ctx);
@@ -1336,8 +1475,26 @@ impl eframe::App for App {
                             let lines =
                                 start_lines(hint, &self.setup, &self.damaged, &self.unusable);
                             let update = self.update.shown();
-                            choice =
-                                start::show(ui, start, blocked, on_cpu, &lines, update.as_ref());
+                            let page = self.link.as_mut().map(|waiting| LinkPage {
+                                waiting,
+                                delay: Duration::from_secs(
+                                    self.setup.as_ref().map_or(1, |setup| {
+                                        u64::from(setup.settings.invite_link_wait_secs())
+                                    }),
+                                ),
+                                open_mic: self.setup.as_ref().is_ok_and(|setup| {
+                                    setup.settings.talk_mode() == TalkMode::OpenMic
+                                }),
+                            });
+                            choice = start::show(
+                                ui,
+                                start,
+                                blocked,
+                                on_cpu,
+                                &lines,
+                                update.as_ref(),
+                                page,
+                            );
                         }
                         (Screen::Firewall(ask), _) => {
                             answer = firewall_screen::show(ui, ask, self.firewall.waiting());
@@ -1393,6 +1550,12 @@ impl eframe::App for App {
         match choice {
             Some(Choice::Host) => self.host(),
             Some(Choice::Join) => self.join(ui.ctx()),
+            Some(Choice::JoinLink) => {
+                if let Some(Waiting::Shown { invite, .. }) = &self.link {
+                    self.join_invite(invite.clone(), ui.ctx());
+                }
+            }
+            Some(Choice::DismissLink) => self.clear_link(),
             Some(Choice::Rejoin(key)) => self.rejoin(key),
             Some(Choice::SaveAddress(key)) => {
                 self.save_address(key);
@@ -1737,12 +1900,369 @@ mod tests {
             viewer_strip: Arc::default(),
             tray: None,
             tray_clicked: Arc::default(),
+            inbox: Arc::default(),
+            link_arrived: Arc::default(),
+            in_room: Arc::default(),
+            link: None,
             update: Update::off(),
             scale: None,
             focused: None,
             panel_keys: Rc::default(),
             card_watch: None,
         }
+    }
+
+    fn link_invite() -> Invite {
+        Invite::new(
+            *Identity::generate().public(),
+            Vec::new(),
+            invite::Mapping::Easy,
+            false,
+            false,
+            false,
+            None,
+            false,
+            start::unix_now(),
+        )
+        .unwrap()
+    }
+
+    fn arrive(app: &mut App, bytes: &[u8]) {
+        *app.inbox.lock().unwrap() = Some(Zeroizing::new(bytes.to_vec()));
+        app.link_arrived.store(true, Ordering::Release);
+        app.follow_link(None);
+        assert!(app.inbox.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn links_wait_on_the_screens_before_start() {
+        let dir = fresh_dir("link-screens");
+        let code = Zeroizing::new(invite::link(&link_invite().encode()));
+        for screen in [
+            Screen::Start(Start::default()),
+            Screen::Checking,
+            Screen::Firewall(Ask {
+                blocked: false,
+                standard_user: false,
+                blocking_all: true,
+            }),
+        ] {
+            let mut app = test_app(Ok(setup_in(&dir)), screen);
+            arrive(&mut app, code.as_bytes());
+            assert!(matches!(app.link, Some(Waiting::Shown { .. })));
+            app.screen = Screen::Start(Start::default());
+            assert!(matches!(app.link, Some(Waiting::Shown { .. })));
+        }
+        let mut app = app_in_settings(&dir, Start::default(), |_| {});
+        arrive(&mut app, code.as_bytes());
+        app.close_settings();
+        assert!(matches!(app.screen, Screen::Start(_)));
+        assert!(matches!(app.link, Some(Waiting::Shown { .. })));
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn links_are_dropped_when_the_panel_cannot_take_them() {
+        let dir = fresh_dir("link-dropped");
+        let code = Zeroizing::new(invite::link(&link_invite().encode()));
+        let mut blocked = test_app(
+            Err(String::from("The key could not be read.")),
+            Screen::Start(Start::default()),
+        );
+        arrive(&mut blocked, code.as_bytes());
+        assert!(blocked.link.is_none());
+        let mut setup = setup_in(&dir);
+        setup.settings.set_invite_links(false);
+        let mut off = test_app(Ok(setup), Screen::Start(Start::default()));
+        arrive(&mut off, code.as_bytes());
+        assert!(off.link.is_none());
+        let mut room = app_in_room(&dir);
+        assert!(room.in_room.load(Ordering::Acquire));
+        // An arrival taken just before the room opened is dropped by the panel too.
+        *room.inbox.lock().unwrap() = Some(Zeroizing::new(code.as_bytes().to_vec()));
+        room.link_arrived.store(true, Ordering::Release);
+        room.follow_link(None);
+        assert!(room.link.is_none());
+        assert!(room.inbox.lock().unwrap().is_none());
+        for app in [&blocked, &off, &room] {
+            assert!(app.backlog.is_empty());
+        }
+        room.leave();
+        assert!(!room.in_room.load(Ordering::Acquire));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_second_link_keeps_the_first_and_restarts_it() {
+        let dir = fresh_dir("link-second");
+        let first = link_invite();
+        let mut app = test_app(Ok(setup_in(&dir)), Screen::Start(Start::default()));
+        arrive(&mut app, invite::link(&first.encode()).as_bytes());
+        if let Some(Waiting::Shown { wait, .. }) = &mut app.link {
+            // The page has already waited before another click on the link.
+            wait.follow(
+                true,
+                Instant::now() - Duration::from_secs(2),
+                Duration::from_secs(1),
+            );
+        }
+        arrive(&mut app, invite::link(&link_invite().encode()).as_bytes());
+        let Some(Waiting::Shown { invite, wait, .. }) = &mut app.link else {
+            panic!("the first page stays");
+        };
+        assert_eq!(invite, &first);
+        assert_eq!(
+            wait.follow(true, Instant::now(), Duration::from_secs(1)),
+            Some(Duration::from_secs(1))
+        );
+        app.clear_link();
+        arrive(&mut app, b"not an invite");
+        arrive(&mut app, invite::link(&first.encode()).as_bytes());
+        assert!(
+            matches!(&app.link, Some(Waiting::Refused(reason)) if reason == messages::LINK_NOT_BOOTH)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broken_links_are_refused_without_logging_their_text() {
+        let dir = fresh_dir("link-refused");
+        let mut setup = setup_in(&dir);
+        setup.config.log = Some(dir.join("booth.log"));
+        let mut app = test_app(Ok(setup), Screen::Start(Start::default()));
+        for (bytes, expected) in [
+            (vec![0xff], String::from(messages::LINK_NOT_BOOTH)),
+            (Vec::new(), String::from(messages::LINK_NOT_BOOTH)),
+            (
+                b"booth1-abc".to_vec(),
+                messages::code_error(&CodeError::Damaged),
+            ),
+        ] {
+            app.clear_link();
+            arrive(&mut app, &bytes);
+            assert!(matches!(&app.link, Some(Waiting::Refused(reason)) if reason == &expected));
+        }
+        app.clear_link();
+        let mut expired = link_invite();
+        expired.expires_at = start::unix_now();
+        arrive(&mut app, invite::link(&expired.encode()).as_bytes());
+        assert!(
+            matches!(&app.link, Some(Waiting::Refused(reason)) if reason == &messages::code_error(&CodeError::Expired))
+        );
+        app.clear_link();
+        arrive(&mut app, invite::link(&link_invite().encode()).as_bytes());
+        assert!(
+            app.backlog
+                .texts()
+                .iter()
+                .any(|line| line.starts_with("invite link: on show, host "))
+        );
+        assert!(
+            app.backlog
+                .texts()
+                .iter()
+                .all(|line| !line.contains("booth1-"))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn saving_links_off_drops_the_waiting_invite() {
+        let dir = fresh_dir("link-save-off");
+        let mut app = app_in_settings(&dir, Start::default(), |draft| draft.invite_links = false);
+        arrive(&mut app, invite::link(&link_invite().encode()).as_bytes());
+        assert!(app.link.is_some());
+        app.save_settings();
+        assert!(app.link.is_none());
+        assert!(app.inbox.lock().unwrap().is_none());
+        assert!(!app.setup.as_ref().unwrap().settings.invite_links());
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn opening_a_room_refuses_links_until_the_call_ends() {
+        let in_room = Arc::new(AtomicBool::new(false));
+        let opened = opening(&in_room, || {
+            assert!(in_room.load(Ordering::Acquire));
+            Err(room::RoomError::OwnInvite)
+        });
+        assert!(opened.is_err());
+        assert!(!in_room.load(Ordering::Acquire));
+        let dir = fresh_dir("link-opening");
+        let room = opening(&in_room, || {
+            assert!(in_room.load(Ordering::Acquire));
+            Ok(room_tests::test_room(&dir))
+        })
+        .unwrap();
+        assert!(in_room.load(Ordering::Acquire));
+        room.leave();
+        let held = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut setup = setup_in(&dir);
+        setup.config.port = held.local_addr().unwrap().port();
+        let mut app = test_app(Ok(setup), Screen::Start(Start::default()));
+        app.host();
+        assert!(!app.in_room.load(Ordering::Acquire));
+        assert!(start_of(&app).host_error.is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // Host, Join on a link's page and Join on a known host each ask for
+    // their room with links already refused, and take them again when it
+    // fails: here the port is held.
+    #[test]
+    fn every_way_into_a_room_refuses_links_first() {
+        let dir = fresh_dir("link-asked");
+        let host_dir = dir.join("host");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let host = room_tests::test_room(&host_dir);
+        room_tests::test_friend(&host, &dir).leave();
+        host.leave();
+        let known = Room::known_hosts(&dir).unwrap();
+        let key = *known[0].host_key();
+        let held = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut setup = setup_in(&dir);
+        setup.config.port = held.local_addr().unwrap().port();
+        let mut app = test_app(
+            Ok(setup),
+            Screen::Start(Start {
+                known,
+                ..Start::default()
+            }),
+        );
+        let mut asked = Vec::new();
+        app.host();
+        asked.push(ASKED.take());
+        app.join_invite(link_invite(), &Context::default());
+        asked.push(ASKED.take());
+        app.rejoin(key);
+        asked.push(ASKED.take());
+        assert_eq!(asked, [Some(true); 3]);
+        assert!(!app.in_room.load(Ordering::Acquire));
+        let start = start_of(&app);
+        assert!(start.host_error.is_some());
+        assert!(start.join_error.is_some());
+        assert!(start.known_error.is_some());
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // The flag goes off before the inbox is emptied. The other way round, a
+    // link the tray stored between the two would wait there unflagged, and
+    // the next link would show it in its own place.
+    #[test]
+    fn clearing_a_link_turns_the_flag_off_before_the_take() {
+        let mut app = test_app(Err(String::new()), Screen::Checking);
+        app.link_arrived.store(true, Ordering::Release);
+        let inbox = Arc::clone(&app.inbox);
+        let arrived = Arc::clone(&app.link_arrived);
+        let (locked, held) = std::sync::mpsc::channel();
+        let tray = thread::spawn(move || {
+            let slot = inbox.lock().unwrap();
+            locked.send(()).unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            while arrived.load(Ordering::Acquire) && Instant::now() < until {
+                thread::yield_now();
+            }
+            let off = !arrived.load(Ordering::Acquire);
+            drop(slot);
+            off
+        });
+        held.recv().unwrap();
+        app.clear_link();
+        assert!(
+            tray.join().unwrap(),
+            "the flag was still on while the inbox was taken"
+        );
+    }
+
+    #[test]
+    fn link_wait_restarts_when_the_page_cannot_be_seen() {
+        let dir = fresh_dir("link-unseen");
+        for (start, focus, minimized) in [
+            (false, Some(true), false),
+            (true, None, false),
+            (true, Some(false), false),
+            (true, Some(true), true),
+        ] {
+            let screen = if start {
+                Screen::Start(Start::default())
+            } else {
+                Screen::Checking
+            };
+            let mut app = test_app(Ok(setup_in(&dir)), screen);
+            arrive(&mut app, invite::link(&link_invite().encode()).as_bytes());
+            let at = Instant::now();
+            if let Some(Waiting::Shown { wait, .. }) = &mut app.link {
+                wait.follow(true, at - Duration::from_secs(2), Duration::from_secs(1));
+                assert!(wait.follow(true, at, Duration::from_secs(1)).is_none());
+            }
+            let ctx = Context::default();
+            let mut input = with_window(minimized);
+            input.viewports.get_mut(&ViewportId::ROOT).unwrap().focused = focus;
+            let _ = ctx.run_logic(&input, |ctx| {
+                eframe::App::logic(&mut app, ctx, &mut eframe::Frame::_new_kittest())
+            });
+            let Some(Waiting::Shown { wait, .. }) = &mut app.link else {
+                panic!("the page waits");
+            };
+            assert_eq!(
+                wait.follow(true, at + Duration::from_secs(2), Duration::from_secs(1)),
+                Some(Duration::from_secs(1))
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn link_join_failure_keeps_the_page_and_success_wipes_the_paste() {
+        let dir = fresh_dir("link-join");
+        let mut setup = setup_in(&dir);
+        setup.config.port = 0;
+        setup.config.candidates = Candidates::Fixed(Vec::new());
+        setup.config.video.source = room::VideoSource::Hooks;
+        let fake = Fake::new(FakeSetup::default(), &[("a", "Test sound")], Some("a"));
+        setup.config.voice.devices = Devices::Fake {
+            microphone: fake.clone(),
+            speakers: fake.clone(),
+            pc_sound: fake,
+        };
+        let id = eframe::egui::Id::new("link join paste");
+        let ctx = Context::default();
+        TextEditState::default().store(&ctx, id);
+        let mut app = test_app(
+            Ok(setup),
+            Screen::Start(Start {
+                paste: String::from("booth1-private"),
+                paste_id: Some(id),
+                ..Start::default()
+            }),
+        );
+        let invite = link_invite();
+        arrive(&mut app, invite::link(&invite.encode()).as_bytes());
+        let mut own = invite.clone();
+        own.host_key = *app.setup.as_ref().unwrap().identity.public();
+        app.join_invite(own, &ctx);
+        assert!(!app.in_room.load(Ordering::Acquire));
+        assert!(
+            matches!(&app.link, Some(Waiting::Shown { error: Some(error), .. }) if error == &messages::room_error(&room::RoomError::OwnInvite))
+        );
+        assert_eq!(start_of(&app).paste, "booth1-private");
+        let mut expired = invite.clone();
+        expired.expires_at = start::unix_now();
+        app.join_invite(expired, &ctx);
+        assert!(
+            matches!(&app.link, Some(Waiting::Shown { error: Some(error), .. }) if error == &messages::room_error(&room::RoomError::InviteExpired))
+        );
+        app.join_invite(invite, &ctx);
+        assert!(matches!(app.screen, Screen::Room(_)));
+        assert!(app.link.is_none());
+        assert!(TextEditState::load(&ctx, id).is_none());
+        app.leave();
+        assert!(start_of(&app).paste.is_empty());
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn fresh_dir(name: &str) -> std::path::PathBuf {
@@ -1908,7 +2428,7 @@ mod tests {
         ctx.enable_accesskit();
         let draw = |start: &mut Start, events| {
             frame(&ctx, events, |ui| {
-                start::show(ui, start, None, None, &[], None)
+                start::show(ui, start, None, None, &[], None, None)
             })
         };
         draw(&mut start, Vec::new());

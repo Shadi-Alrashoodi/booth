@@ -1,9 +1,10 @@
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{
-    Align, Color32, CursorIcon, Id, Key, Layout, Rect, Response, ScrollArea, Sense, Shape, Ui,
-    UiBuilder, WidgetInfo, WidgetType, pos2, vec2,
+    Align, Color32, Context, CursorIcon, Event, Id, Key, Layout, Modifiers, PointerButton, Rect,
+    Response, ScrollArea, Sense, Shape, Ui, UiBuilder, WidgetInfo, WidgetType, pos2, vec2,
 };
+use invite::{CodeError, Invite};
 use room::KnownHost;
 
 use crate::controls::{self, Button, Lead};
@@ -85,6 +86,95 @@ pub enum Choice {
     Rejoin([u8; 32]),
     SaveAddress([u8; 32]),
     Forget([u8; 32]),
+    JoinLink,
+    DismissLink,
+}
+
+pub enum Waiting {
+    Shown {
+        invite: Invite,
+        wait: LinkWait,
+        error: Option<String>,
+    },
+    Refused(String),
+}
+
+impl Waiting {
+    pub fn restart(&mut self) {
+        if let Waiting::Shown { wait, .. } = self {
+            wait.restart();
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct LinkWait {
+    since: Option<Instant>,
+    pointer_left: bool,
+}
+
+impl LinkWait {
+    pub fn restart(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn follow(&mut self, active: bool, now: Instant, delay: Duration) -> Option<Duration> {
+        if !active {
+            self.restart();
+            return Some(delay);
+        }
+        let since = *self.since.get_or_insert(now);
+        let left = delay
+            .checked_sub(now.saturating_duration_since(since))
+            .filter(|left| !left.is_zero());
+        if left.is_some() {
+            self.pointer_left = false;
+        }
+        left
+    }
+
+    // Only an earlier frame counts: a release and a move off Join can come in
+    // one frame, and the click was made before the move.
+    fn pointer_ready(&mut self, ui: &Ui, rect: Rect) -> bool {
+        let ready = self.pointer_left;
+        // egui hands a press to the nearest widget within interact_radius, so
+        // a pointer that close is still on Join.
+        let reach = rect.expand(ui.style().interaction.interact_radius);
+        if ui.input(|input| {
+            input
+                .pointer
+                .hover_pos()
+                .is_none_or(|pos| !reach.contains(pos))
+        }) {
+            self.pointer_left = true;
+        }
+        ready
+    }
+}
+
+pub struct LinkPage<'a> {
+    pub waiting: &'a mut Waiting,
+    pub delay: Duration,
+    pub open_mic: bool,
+}
+
+pub fn link_focused(ctx: &Context) -> bool {
+    ctx.input(|input| {
+        let view = input.viewport();
+        view.focused == Some(true)
+            && view.minimized != Some(true)
+            && !input
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::WindowFocused(false)))
+    })
+}
+
+pub fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 impl Start {
@@ -129,6 +219,7 @@ pub fn show(
     on_cpu: Option<&str>,
     lines: &[String],
     update: Option<&Shown>,
+    link: Option<LinkPage<'_>>,
 ) -> Option<Choice> {
     let settings: Vec<Button> = blocked
         .is_none()
@@ -146,6 +237,9 @@ pub fn show(
                 if let Some(reason) = blocked {
                     controls::prose(ui, reason, theme::body(), BAD);
                     return None;
+                }
+                if let Some(page) = link {
+                    return show_link(ui, &start.known, page, Instant::now(), unix_now());
                 }
                 let mut choice = None;
                 if notes(ui, start.note.as_ref(), on_cpu, lines, update) {
@@ -205,6 +299,114 @@ pub fn show(
     } else {
         choice
     }
+}
+
+fn show_link(
+    ui: &mut Ui,
+    known: &[KnownHost],
+    page: LinkPage<'_>,
+    now: Instant,
+    unix: u64,
+) -> Option<Choice> {
+    // Enter may still be held from the program that opened the link.
+    ui.input_mut(|input| {
+        input.events.retain(|event| {
+            !matches!(
+                event,
+                Event::Key {
+                    key: Key::Enter,
+                    ..
+                }
+            )
+        })
+    });
+    if ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)) {
+        return Some(Choice::DismissLink);
+    }
+    let Waiting::Shown {
+        invite,
+        wait,
+        error,
+    } = page.waiting
+    else {
+        if let Waiting::Refused(reason) = page.waiting {
+            controls::text(ui, messages::LINK_REFUSED, theme::section(), CHALK);
+            ui.add_space(STEP);
+            controls::prose(ui, reason.as_str(), theme::body(), CHALK);
+            ui.add_space(STEP);
+            if controls::buttons(ui, &[Button::new("Back")], CONTROL_HEIGHT).is_some() {
+                return Some(Choice::DismissLink);
+            }
+        }
+        return None;
+    };
+    let active = link_focused(ui.ctx());
+    let left = wait.follow(active, now, page.delay);
+    let expired = invite.is_expired(unix);
+    if let Some(left) = left {
+        ui.ctx().request_repaint_after(left);
+    }
+    if !expired {
+        let expiry = UNIX_EPOCH + Duration::from_secs(invite.expires_at);
+        ui.ctx()
+            .request_repaint_after(expiry.duration_since(SystemTime::now()).unwrap_or_default());
+    }
+    controls::text(ui, messages::LINK_HEAD, theme::section(), CHALK);
+    ui.add_space(STEP);
+    let room = known
+        .iter()
+        .find(|host| host.host_key() == &invite.host_key)
+        .map(KnownHost::room_name);
+    controls::prose(ui, messages::link_from(room), theme::body(), CHALK);
+    ui.add_space(STEP);
+    controls::text(
+        ui,
+        keys::fingerprint(&invite.host_key),
+        theme::mono_caption(),
+        ASH,
+    );
+    ui.add_space(SIDE);
+    controls::prose(ui, messages::LINK_ABOUT, theme::caption(), ASH);
+    ui.add_space(STEP);
+    // Talk mode must not move Join under a pointer when Settings closes.
+    ui.scope(|ui| {
+        ui.set_min_height(controls::prose_height(
+            ui,
+            messages::LINK_OPEN_MIC,
+            theme::caption(),
+        ));
+        if page.open_mic {
+            controls::prose(ui, messages::LINK_OPEN_MIC, theme::caption(), WARN);
+        }
+    });
+    ui.add_space(STEP);
+    let enabled = left.is_none() && !expired;
+    let mut choice = None;
+    ui.horizontal(|ui| {
+        let join = ui
+            .push_id("link join", |ui| {
+                Button::new("Join")
+                    .label("Join this room")
+                    .enabled(enabled)
+                    .show(ui)
+            })
+            .inner;
+        let pointer_ready = enabled && wait.pointer_ready(ui, join.rect);
+        if controls::button_pressed(ui, &join, enabled)
+            && (!join.clicked_by(PointerButton::Primary) || pointer_ready)
+        {
+            choice = Some(Choice::JoinLink);
+        }
+        if controls::buttons(ui, &[Button::new("Not now")], CONTROL_HEIGHT).is_some() {
+            choice = Some(Choice::DismissLink);
+        }
+    });
+    if expired {
+        under_field(ui, &messages::code_error(&CodeError::Expired), ASH);
+    } else if let Some(error) = error {
+        under_field(ui, error, BAD);
+    }
+    choice
 }
 
 // What came of the firewall prompt, the lines that last for this run and the
@@ -507,6 +709,376 @@ pub(crate) mod tests {
     use crate::controls::tests::{frame, press, release};
     use crate::screens::room::tests::{test_friend, test_room};
 
+    fn waiting() -> Waiting {
+        Waiting::Shown {
+            invite: Invite::new(
+                [7; 32],
+                Vec::new(),
+                invite::Mapping::Easy,
+                false,
+                false,
+                false,
+                None,
+                false,
+                unix_now(),
+            )
+            .unwrap(),
+            wait: LinkWait::default(),
+            error: None,
+        }
+    }
+
+    struct LinkDraw {
+        ctx: Context,
+        at: Instant,
+        focus: Option<bool>,
+        minimized: bool,
+        mic: bool,
+        unix: u64,
+    }
+
+    impl LinkDraw {
+        fn new() -> Self {
+            let ctx = Context::default();
+            theme::apply(&ctx);
+            ctx.enable_accesskit();
+            Self {
+                ctx,
+                at: Instant::now(),
+                focus: Some(true),
+                minimized: false,
+                mic: false,
+                unix: unix_now(),
+            }
+        }
+
+        fn draw(
+            &self,
+            waiting: &mut Waiting,
+            ms: u64,
+            events: Vec<Event>,
+        ) -> (Option<Choice>, PlatformOutput) {
+            let mut input = RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(360.0, 640.0))),
+                events,
+                focused: self.focus == Some(true),
+                ..RawInput::default()
+            };
+            let viewport = input
+                .viewports
+                .get_mut(&eframe::egui::ViewportId::ROOT)
+                .unwrap();
+            viewport.focused = self.focus;
+            viewport.minimized = Some(self.minimized);
+            let mut choice = None;
+            let mut output = self.ctx.run_ui(input, |ui| {
+                choice = controls::page(ui, |ui| {
+                    show_link(
+                        ui,
+                        &[],
+                        LinkPage {
+                            waiting,
+                            delay: Duration::from_secs(1),
+                            open_mic: self.mic,
+                        },
+                        self.at + Duration::from_millis(ms),
+                        self.unix,
+                    )
+                });
+            });
+            let platform = std::mem::take(&mut output.platform_output);
+            output.drop_without_applying_deltas();
+            (choice, platform)
+        }
+    }
+
+    fn join_off(output: &PlatformOutput) -> bool {
+        output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Join this room"))
+            .expect("Join stays in the tree")
+            .1
+            .is_disabled()
+    }
+
+    fn key_event(key: Key) -> Vec<Event> {
+        vec![Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }]
+    }
+
+    #[test]
+    fn link_page_replaces_the_start() {
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let mut start = Start {
+            known: two_known_hosts("link-start"),
+            paste: String::from("booth1-private"),
+            ..Start::default()
+        };
+        let mut link = waiting();
+        let (choice, output) = frame(&ctx, Vec::new(), |ui| {
+            show(
+                ui,
+                &mut start,
+                None,
+                None,
+                &[String::from("a note")],
+                None,
+                Some(LinkPage {
+                    waiting: &mut link,
+                    delay: Duration::from_secs(1),
+                    open_mic: false,
+                }),
+            )
+        });
+        assert!(choice.is_none());
+        let nodes = output.accesskit_update.unwrap().nodes;
+        assert!(
+            nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some("Join this room"))
+        );
+        for words in [
+            "Host",
+            "Known hosts",
+            "Paste invite",
+            "booth1-private",
+            "a note",
+            "first",
+            "second",
+        ] {
+            assert!(
+                !nodes
+                    .iter()
+                    .any(|(_, node)| node.label() == Some(words) || node.value() == Some(words)),
+                "{words}"
+            );
+        }
+        assert!(!nodes.iter().any(|(_, node)| node.role() == Role::TextInput));
+    }
+
+    #[test]
+    fn link_join_waits_for_focus() {
+        let mut draw = LinkDraw::new();
+        let mut link = waiting();
+        assert!(join_off(&draw.draw(&mut link, 0, Vec::new()).1));
+        assert!(join_off(&draw.draw(&mut link, 999, Vec::new()).1));
+        assert!(!join_off(&draw.draw(&mut link, 1000, Vec::new()).1));
+        for (focus, minimized) in [(None, false), (Some(false), false), (Some(true), true)] {
+            draw.focus = focus;
+            draw.minimized = minimized;
+            assert!(join_off(&draw.draw(&mut link, 2000, Vec::new()).1));
+            draw.focus = Some(true);
+            draw.minimized = false;
+            assert!(join_off(&draw.draw(&mut link, 3000, Vec::new()).1));
+            assert!(!join_off(&draw.draw(&mut link, 4000, Vec::new()).1));
+        }
+        link.restart();
+        assert!(join_off(&draw.draw(&mut link, 5000, Vec::new()).1));
+        assert!(join_off(&draw.draw(&mut link, 5999, Vec::new()).1));
+        assert!(!join_off(&draw.draw(&mut link, 6000, Vec::new()).1));
+        assert!(join_off(
+            &draw
+                .draw(
+                    &mut link,
+                    7000,
+                    vec![Event::WindowFocused(false), Event::WindowFocused(true)]
+                )
+                .1
+        ));
+        assert!(join_off(&draw.draw(&mut link, 7010, Vec::new()).1));
+        assert!(join_off(&draw.draw(&mut link, 8009, Vec::new()).1));
+        assert!(!join_off(&draw.draw(&mut link, 8010, Vec::new()).1));
+    }
+
+    #[test]
+    fn link_join_requires_the_pointer_to_leave() {
+        let draw = LinkDraw::new();
+        let mut link = waiting();
+        let (_, output) = draw.draw(&mut link, 0, Vec::new());
+        let at = places(&output, "Join this room")[0].center();
+        draw.draw(&mut link, 10, vec![Event::PointerMoved(at)]);
+        draw.draw(&mut link, 990, press(at));
+        assert!(draw.draw(&mut link, 1010, release(at)).0.is_none());
+        for ms in [1100, 1500, 2000] {
+            draw.draw(&mut link, ms, press(at));
+            assert!(draw.draw(&mut link, ms + 16, release(at)).0.is_none());
+        }
+        draw.draw(&mut link, 2100, vec![Event::PointerMoved(pos2(1.0, 1.0))]);
+        draw.draw(&mut link, 2200, press(at));
+        assert!(matches!(
+            draw.draw(&mut link, 2216, release(at)).0,
+            Some(Choice::JoinLink)
+        ));
+    }
+
+    #[test]
+    fn link_join_refuses_a_click_that_leaves_in_its_own_frame() {
+        let draw = LinkDraw::new();
+        let mut link = waiting();
+        let (_, output) = draw.draw(&mut link, 0, Vec::new());
+        let at = places(&output, "Join this room")[0].center();
+        draw.draw(&mut link, 10, vec![Event::PointerMoved(at)]);
+        draw.draw(&mut link, 1000, Vec::new());
+        draw.draw(&mut link, 1100, press(at));
+        let mut away = release(at);
+        away.push(Event::PointerMoved(pos2(1.0, 1.0)));
+        assert!(draw.draw(&mut link, 1116, away).0.is_none());
+        draw.draw(&mut link, 1200, press(at));
+        assert!(matches!(
+            draw.draw(&mut link, 1216, release(at)).0,
+            Some(Choice::JoinLink)
+        ));
+    }
+
+    #[test]
+    fn link_join_refuses_a_press_begun_while_off() {
+        let draw = LinkDraw::new();
+        let mut link = waiting();
+        let (_, output) = draw.draw(&mut link, 0, Vec::new());
+        let rect = places(&output, "Join this room")[0];
+        // Off Join's 5-point reach and back, within the 6 points that keep
+        // the release a click.
+        let at = pos2(rect.left() + 0.25, rect.center().y);
+        draw.draw(&mut link, 900, press(at));
+        draw.draw(
+            &mut link,
+            1000,
+            vec![Event::PointerMoved(pos2(rect.left() - 5.25, at.y))],
+        );
+        draw.draw(&mut link, 1005, vec![Event::PointerMoved(at)]);
+        assert!(draw.draw(&mut link, 1010, release(at)).0.is_none());
+        draw.draw(&mut link, 1100, press(at));
+        assert!(matches!(
+            draw.draw(&mut link, 1116, release(at)).0,
+            Some(Choice::JoinLink)
+        ));
+    }
+
+    // egui gives a press a few points beside Join to Join, so resting there
+    // through the wait is resting on it.
+    #[test]
+    fn link_join_counts_the_pointer_beside_it_as_on_it() {
+        let draw = LinkDraw::new();
+        let mut link = waiting();
+        let (_, output) = draw.draw(&mut link, 0, Vec::new());
+        let rect = places(&output, "Join this room")[0];
+        let at = pos2(rect.right() + 3.0, rect.center().y);
+        draw.draw(&mut link, 10, vec![Event::PointerMoved(at)]);
+        for ms in [1000, 1500, 2000] {
+            draw.draw(&mut link, ms, press(at));
+            assert!(draw.draw(&mut link, ms + 16, release(at)).0.is_none());
+        }
+    }
+
+    #[test]
+    fn link_page_keys_and_reader() {
+        let draw = LinkDraw::new();
+        let mut link = waiting();
+        draw.draw(&mut link, 0, Vec::new());
+        draw.draw(&mut link, 1000, key_event(Key::Tab));
+        assert!(
+            draw.draw(&mut link, 1010, key_event(Key::Enter))
+                .0
+                .is_none()
+        );
+        assert!(matches!(
+            draw.draw(&mut link, 1020, key_event(Key::Space)).0,
+            Some(Choice::JoinLink)
+        ));
+        assert!(matches!(
+            draw.draw(&mut link, 1030, key_event(Key::Escape)).0,
+            Some(Choice::DismissLink)
+        ));
+        let (_, output) = draw.draw(&mut link, 1040, Vec::new());
+        let tree = output.accesskit_update.unwrap();
+        let id = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Join this room"))
+            .unwrap()
+            .0;
+        let click = Event::AccessKitActionRequest(eframe::egui::accesskit::ActionRequest {
+            action: eframe::egui::accesskit::Action::Click,
+            target_tree: eframe::egui::accesskit::TreeId::ROOT,
+            target_node: id,
+            data: None,
+        });
+        assert!(matches!(
+            draw.draw(&mut link, 1050, vec![click]).0,
+            Some(Choice::JoinLink)
+        ));
+    }
+
+    #[test]
+    fn link_page_join_stays_put_and_expires() {
+        let mut draw = LinkDraw::new();
+        let mut link = waiting();
+        let (_, output) = draw.draw(&mut link, 0, Vec::new());
+        let rect = places(&output, "Join this room")[0];
+        draw.mic = true;
+        if let Waiting::Shown { error, .. } = &mut link {
+            *error = Some(String::from("Could not join. Try again."));
+        }
+        let (_, output) = draw.draw(&mut link, 1000, Vec::new());
+        assert_eq!(places(&output, "Join this room")[0], rect);
+        assert!(!join_off(&output));
+        draw.unix += invite::SINGLE_USE_SECS;
+        let (_, output) = draw.draw(&mut link, 2000, Vec::new());
+        assert_eq!(places(&output, "Join this room")[0], rect);
+        assert!(join_off(&output));
+    }
+
+    // On push to talk the open mic line only holds its room: a screen reader
+    // must not be told the room hears everything.
+    #[test]
+    fn link_page_says_open_mic_only_when_on() {
+        let mut draw = LinkDraw::new();
+        let mut link = waiting();
+        let said = |output: PlatformOutput| {
+            output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(_, node)| node.label().or(node.value()) == Some(messages::LINK_OPEN_MIC))
+        };
+        assert!(!said(draw.draw(&mut link, 0, Vec::new()).1));
+        draw.mic = true;
+        assert!(said(draw.draw(&mut link, 10, Vec::new()).1));
+    }
+
+    #[test]
+    fn refused_link_page_has_only_back() {
+        let draw = LinkDraw::new();
+        let mut link = Waiting::Refused(String::from(messages::LINK_NOT_BOOTH));
+        let (_, output) = draw.draw(&mut link, 0, Vec::new());
+        let nodes = output.accesskit_update.as_ref().unwrap();
+        let buttons: Vec<_> = nodes
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.role() == Role::Button)
+            .filter_map(|(_, node)| node.label())
+            .collect();
+        assert_eq!(buttons, ["Back"]);
+        let at = places(&output, "Back")[0].center();
+        draw.draw(&mut link, 10, press(at));
+        assert!(matches!(
+            draw.draw(&mut link, 26, release(at)).0,
+            Some(Choice::DismissLink)
+        ));
+    }
+
     // What a screen reader is given for the start screen: each node's role
     // and its words.
     fn spoken(update: Option<&Shown>) -> Vec<(Role, String)> {
@@ -518,7 +1090,7 @@ pub(crate) mod tests {
             ..RawInput::default()
         };
         let mut output = ctx.run_ui(input, |ui| {
-            let choice = show(ui, &mut Start::default(), None, None, &[], update);
+            let choice = show(ui, &mut Start::default(), None, None, &[], update, None);
             assert!(choice.is_none());
         });
         let nodes = std::mem::take(&mut output.platform_output)
@@ -571,8 +1143,8 @@ pub(crate) mod tests {
     }
 
     // Two hosts joined over loopback and read back from the file.
-    fn two_known_hosts() -> Vec<KnownHost> {
-        let dir = std::env::temp_dir().join(format!("booth-app-start-{}", std::process::id()));
+    fn two_known_hosts(name: &str) -> Vec<KnownHost> {
+        let dir = std::env::temp_dir().join(format!("booth-app-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let friend_dir = dir.join("friend");
         std::fs::create_dir_all(&friend_dir).unwrap();
@@ -617,7 +1189,7 @@ pub(crate) mod tests {
         let ctx = Context::default();
         theme::apply(&ctx);
         ctx.enable_accesskit();
-        let known = two_known_hosts();
+        let known = two_known_hosts("start");
         let (above, clicked) = (*known[0].host_key(), *known[1].host_key());
         let mut start = Start {
             known,

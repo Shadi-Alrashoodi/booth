@@ -91,20 +91,23 @@ pub fn buttons(ui: &mut Ui, buttons: &[Button], height: f32) -> Option<usize> {
     ui.allocate_ui_with_layout(vec2(width, height), layout, |ui| {
         for (i, button) in buttons.iter().enumerate() {
             let response = ui.push_id(button.text, |ui| button.show(ui)).inner;
-            let drawn = Drawn {
-                off_limits: !button.enabled,
-                checked: false,
-            };
-            // Resume and Allow are disabled while they wait, and egui would
-            // still hand them the click of a press made then.
-            let began_off = aimed(ui, &response, drawn).off_limits;
-            let pointer = response.clicked_by(PointerButton::Primary);
-            if fresh_click(ui, &response) && button.enabled && !(pointer && began_off) {
+            if button_pressed(ui, &response, button.enabled) {
                 pressed = Some(i);
             }
         }
     });
     pressed
+}
+
+pub fn button_pressed(ui: &Ui, response: &Response, enabled: bool) -> bool {
+    let drawn = Drawn {
+        off_limits: !enabled,
+        checked: false,
+    };
+    // A release after the wait must not finish a press made while disabled.
+    let began_off = aimed(ui, response, drawn).off_limits;
+    let pointer = response.clicked_by(PointerButton::Primary);
+    fresh_click(ui, response) && enabled && !(pointer && began_off)
 }
 
 // egui takes each repeat of Space or Enter for a click too, so a key held down
