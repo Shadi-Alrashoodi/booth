@@ -61,6 +61,65 @@ fn fixed_reply() -> ReplyCode {
 }
 
 #[test]
+fn link_keeps_the_invite_text() {
+    // Kept from 1.3.0, so changing both sides of the codec cannot hide a change.
+    // Not compared with encode, whose preamble names the version that runs.
+    const CODE: &str = "booth1-aiaacaabaabqaaasa4dqobyha4dqobyha4dqobyha4dqobyha4dqobyha4dqobyha4dqcaqdaqcqmbyivov2xk5lvov2xk5lvov2xk5lvnvlcpoyavambkfsc6qcqqlemvtgpibiiefaqaacuaugekqcqbyrencwacgtygrlhrgv435afbb4wadrfwqcrpplfn3a";
+    assert_eq!(invite::LINK_PREFIX, "booth://join/");
+    assert_eq!(invite::link(CODE), format!("booth://join/{CODE}"));
+    assert_eq!(Invite::decode(&invite::link(CODE)), Ok(fixed_invite()));
+}
+
+#[test]
+fn pasted_links_read_as_the_plain_invite() {
+    let code = fixed_invite().encode();
+    let link = invite::link(&code);
+    for text in [
+        link.to_uppercase(),
+        format!("BOOTH://Join/{code}"),
+        format!("<{link}>"),
+        format!("{link}."),
+        format!("booth://join/{}\r\n{}", &code[..40], &code[40..]),
+    ] {
+        assert_eq!(Invite::decode(&text), Ok(fixed_invite()));
+    }
+}
+
+#[test]
+fn only_join_links_carry_an_invite() {
+    let code = fixed_invite().encode();
+    for text in [
+        String::from("booth:"),
+        String::from("booth://join/"),
+        format!("booth:join/{code}"),
+        format!("booth:/join/{code}"),
+        format!("booth:///join/{code}"),
+        format!("booth://join//{code}"),
+        format!("booth://other/{code}"),
+        format!("booth://{code}"),
+        invite::link(&invite::link(&code)),
+        format!("booth%3A//join/{code}"),
+        invite::link(&fixed_reply().encode()),
+        String::from("https://example.com/booth1-abc"),
+    ] {
+        assert_eq!(Invite::decode(&text), Err(CodeError::NotACode));
+        assert_eq!(ReplyCode::decode(&text), Err(CodeError::NotACode));
+    }
+}
+
+#[test]
+fn link_suffixes_are_damage() {
+    let code = invite::link(&fixed_invite().encode());
+    for suffix in ["?a=1", "#x", "/", "%20"] {
+        assert_eq!(
+            Invite::decode(&format!("{code}{suffix}")),
+            Err(CodeError::Damaged)
+        );
+    }
+    assert_eq!(ReplyCode::decode(&code), Err(CodeError::IsInvite));
+}
+
+#[test]
 fn typical_invite_round_trips() {
     let invite = Invite::new(
         [7; 32],

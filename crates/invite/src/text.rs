@@ -110,7 +110,11 @@ pub(crate) fn open<T>(
     if compact.is_empty() {
         return Err(CodeError::Empty);
     }
-    let (kind, data) = split_prefix(&compact)?;
+    let linked = strip_prefix_ignore_case(&compact, crate::LINK_PREFIX.as_bytes());
+    let (kind, data) = split_prefix(linked.unwrap_or(&compact))?;
+    if linked.is_some() && kind == Kind::Reply {
+        return Err(CodeError::NotACode);
+    }
     if kind != expected {
         return Err(match expected {
             Kind::Invite => CodeError::IsReplyCode,
@@ -444,6 +448,12 @@ mod tests {
                 _ => Err(CodeError::NewerVersion),
             };
             prop_assert_eq!(got, expected);
+        }
+
+        #[test]
+        fn linked_sealed_bodies_read_as_plain(fields in proptest::collection::vec(any::<u8>(), 0..700)) {
+            let text = seal(Kind::Invite, &fields);
+            prop_assert_eq!(open_invite(&crate::link(&text)), open_invite(&text));
         }
     }
 }

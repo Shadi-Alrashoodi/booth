@@ -16,6 +16,15 @@ pub use reply::{Answers, REPLY_SECS, ReplyCode};
 pub use version::{PROTOCOL, RELEASES_PAGE, VERSION, Version, two_versions};
 pub use wire::{check_addr, check_hostname};
 
+pub const LINK_PREFIX: &str = "booth://join/";
+
+pub fn link(code: &str) -> String {
+    let mut text = String::with_capacity(LINK_PREFIX.len() + code.len());
+    text.push_str(LINK_PREFIX);
+    text.push_str(code);
+    text
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Mapping {
     Easy,
