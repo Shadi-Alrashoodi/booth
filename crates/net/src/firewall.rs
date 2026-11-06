@@ -65,6 +65,10 @@ impl Profiles {
     fn overlaps(self, other: Profiles) -> bool {
         self.0 & other.0 != 0
     }
+
+    fn without(self, other: Profiles) -> Profiles {
+        Profiles(self.0 & !other.0)
+    }
 }
 
 impl BitOr for Profiles {
@@ -90,16 +94,46 @@ impl fmt::Display for Profiles {
     }
 }
 
-// The profiles in the first three are the ones the rule has to cover: active
-// now, with the firewall on.
+// The profiles active now, with the firewall on. The rule has to cover all
+// of them but the shut ones, where Windows drops everything unsolicited
+// whatever the rules say; those are kept for the log.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Needed {
+    pub profiles: Profiles,
+    pub shut: Profiles,
+}
+
+impl From<Profiles> for Needed {
+    fn from(profiles: Profiles) -> Needed {
+        Needed {
+            profiles,
+            shut: Profiles::default(),
+        }
+    }
+}
+
+impl fmt::Display for Needed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "active profiles with the firewall on: {}", self.profiles)?;
+        if self.shut.is_empty() {
+            return Ok(());
+        }
+        write!(
+            f,
+            "; windows blocks all incoming connections on {}, whatever the rules say",
+            self.shut
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FirewallState {
-    Allowed(Profiles),
-    Blocked(Profiles),
-    Missing(Profiles),
-    // Windows drops everything unsolicited on these profiles whatever the
-    // rules say: the "block all incoming connections" switch. No rule, and
-    // so no administrator prompt, can help.
+    Allowed(Needed),
+    Blocked(Needed),
+    Missing(Needed),
+    // Windows drops everything unsolicited on every needed profile whatever
+    // the rules say: the "block all incoming connections" switch. No rule,
+    // and so no administrator prompt, can help.
     BlockingAll(Profiles),
     // The firewall could not be read, it is off, or group policy decides
     // which rules count, so there is nothing to ask for. The text says
@@ -110,17 +144,11 @@ pub enum FirewallState {
 impl fmt::Display for FirewallState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            FirewallState::Allowed(needed) => {
-                write!(f, "allowed; active profiles with the firewall on: {needed}")
+            FirewallState::Allowed(needed) => write!(f, "allowed; {needed}"),
+            FirewallState::Blocked(needed) => {
+                write!(f, "blocked by a rule for this exe; {needed}")
             }
-            FirewallState::Blocked(needed) => write!(
-                f,
-                "blocked by a rule for this exe; active profiles with the firewall on: {needed}"
-            ),
-            FirewallState::Missing(needed) => write!(
-                f,
-                "no rule for this exe; active profiles with the firewall on: {needed}"
-            ),
+            FirewallState::Missing(needed) => write!(f, "no rule for this exe; {needed}"),
             FirewallState::BlockingAll(shut) => write!(
                 f,
                 "windows blocks all incoming connections on {shut}, whatever the rules say"
@@ -264,7 +292,8 @@ fn rule_list(policy: &INetFwPolicy2) -> windows::core::Result<INetFwRules> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Settings {
     active: Profiles,
-    // Active, with the firewall on: the profiles a rule has to cover.
+    // Active, with the firewall on. A rule has to cover all of them but the
+    // shut ones.
     needed: Profiles,
     // Needed profiles that let in anything no rule blocks.
     open: Profiles,
@@ -293,7 +322,10 @@ impl Settings {
                 "group policy decides which firewall rules apply on this pc, and its rules cannot be read",
             )));
         }
-        (!self.shut.is_empty()).then_some(FirewallState::BlockingAll(self.shut))
+        // A rule still helps on any needed profile that is not shut.
+        self.shut
+            .contains(self.needed)
+            .then_some(FirewallState::BlockingAll(self.shut))
     }
 }
 
@@ -515,8 +547,8 @@ struct RuleFacts {
 }
 
 impl RuleFacts {
-    fn applies(&self, needed: Profiles) -> bool {
-        self.inbound && self.enabled && self.udp && self.profiles.overlaps(needed)
+    fn applies(&self, cover: Profiles) -> bool {
+        self.inbound && self.enabled && self.udp && self.profiles.overlaps(cover)
     }
 
     fn blocks(&self) -> bool {
@@ -531,17 +563,22 @@ impl RuleFacts {
 }
 
 // Block wins over allow in Windows, whatever order the rules came in. A
-// block of any scope counts, since Allow removes it anyway.
+// block of any scope counts, since Allow removes it anyway. No rule matters
+// on a shut profile, so only the others are judged.
 fn judge(rules: &[RuleFacts], settings: &Settings, port: u16) -> FirewallState {
-    let needed = settings.needed;
-    let applying = || rules.iter().filter(|rule| rule.applies(needed));
+    let needed = Needed {
+        profiles: settings.needed,
+        shut: settings.shut,
+    };
+    let cover = settings.needed.without(settings.shut);
+    let applying = || rules.iter().filter(|rule| rule.applies(cover));
     if applying().any(|rule| !rule.allow) {
         return FirewallState::Blocked(needed);
     }
     let covered = applying()
         .filter(|rule| rule.lets_in(port))
         .fold(settings.open, |covered, rule| covered | rule.profiles);
-    if covered.contains(needed) {
+    if covered.contains(cover) {
         FirewallState::Allowed(needed)
     } else {
         FirewallState::Missing(needed)
@@ -795,27 +832,27 @@ mod tests {
     fn allowed_needs_every_active_profile() {
         let both = PRIVATE | PUBLIC;
         let state = judged(&[rule(true, PRIVATE)], PUBLIC);
-        assert_eq!(state, FirewallState::Missing(PUBLIC));
+        assert_eq!(state, FirewallState::Missing(PUBLIC.into()));
         let state = judged(&[rule(true, PRIVATE)], both);
-        assert_eq!(state, FirewallState::Missing(both));
+        assert_eq!(state, FirewallState::Missing(both.into()));
         let state = judged(&[rule(true, PRIVATE), rule(true, PUBLIC)], both);
-        assert_eq!(state, FirewallState::Allowed(both));
+        assert_eq!(state, FirewallState::Allowed(both.into()));
         let state = judged(&[rule(true, both)], PUBLIC);
-        assert_eq!(state, FirewallState::Allowed(PUBLIC));
+        assert_eq!(state, FirewallState::Allowed(PUBLIC.into()));
         let state = judged(&[rule(true, ALL)], both);
-        assert_eq!(state, FirewallState::Allowed(both));
-        assert_eq!(judged(&[], PUBLIC), FirewallState::Missing(PUBLIC));
+        assert_eq!(state, FirewallState::Allowed(both.into()));
+        assert_eq!(judged(&[], PUBLIC), FirewallState::Missing(PUBLIC.into()));
     }
 
     #[test]
     fn block_wins_on_an_active_profile_only() {
         let allow = rule(true, ALL);
         let state = judged(&[allow.clone(), rule(false, PUBLIC)], PUBLIC);
-        assert_eq!(state, FirewallState::Blocked(PUBLIC));
+        assert_eq!(state, FirewallState::Blocked(PUBLIC.into()));
         let state = judged(&[rule(false, PUBLIC), allow.clone()], PUBLIC);
-        assert_eq!(state, FirewallState::Blocked(PUBLIC));
+        assert_eq!(state, FirewallState::Blocked(PUBLIC.into()));
         let state = judged(&[allow, rule(false, Profiles::DOMAIN)], PUBLIC);
-        assert_eq!(state, FirewallState::Allowed(PUBLIC));
+        assert_eq!(state, FirewallState::Allowed(PUBLIC.into()));
         let narrow_block = RuleFacts {
             local_ports: String::from("5000"),
             any_scope: false,
@@ -823,7 +860,7 @@ mod tests {
         };
         assert_eq!(
             judged(&[narrow_block], PUBLIC),
-            FirewallState::Blocked(PUBLIC)
+            FirewallState::Blocked(PUBLIC.into())
         );
     }
 
@@ -842,7 +879,10 @@ mod tests {
             ..rule(true, ALL)
         };
         for other in [disabled, outbound, tcp] {
-            assert_eq!(judged(&[other], PUBLIC), FirewallState::Missing(PUBLIC));
+            assert_eq!(
+                judged(&[other], PUBLIC),
+                FirewallState::Missing(PUBLIC.into())
+            );
         }
         let quiet_blocks = [
             RuleFacts {
@@ -856,7 +896,7 @@ mod tests {
         ];
         for block in quiet_blocks {
             let state = judged(&[block, rule(true, ALL)], PUBLIC);
-            assert_eq!(state, FirewallState::Allowed(PUBLIC));
+            assert_eq!(state, FirewallState::Allowed(PUBLIC.into()));
         }
     }
 
@@ -866,7 +906,10 @@ mod tests {
             any_scope: false,
             ..rule(true, ALL)
         };
-        assert_eq!(judged(&[lan_only], PUBLIC), FirewallState::Missing(PUBLIC));
+        assert_eq!(
+            judged(&[lan_only], PUBLIC),
+            FirewallState::Missing(PUBLIC.into())
+        );
         for ports in ["41000", "40000-42000", "137, 41000", ""] {
             let allow = RuleFacts {
                 local_ports: String::from(ports),
@@ -874,7 +917,7 @@ mod tests {
             };
             assert_eq!(
                 judged(&[allow], PUBLIC),
-                FirewallState::Allowed(PUBLIC),
+                FirewallState::Allowed(PUBLIC.into()),
                 "{ports}"
             );
         }
@@ -884,7 +927,7 @@ mod tests {
         };
         assert_eq!(
             judged(&[other_port], PUBLIC),
-            FirewallState::Missing(PUBLIC)
+            FirewallState::Missing(PUBLIC.into())
         );
     }
 
@@ -920,10 +963,42 @@ mod tests {
         };
         assert!(matches!(managed.decide(), Some(FirewallState::Unknown(_))));
         let shut = Settings {
+            shut: both,
+            ..needing(both)
+        };
+        assert_eq!(shut.decide(), Some(FirewallState::BlockingAll(both)));
+        let partly = Settings {
             shut: PUBLIC,
             ..needing(both)
         };
-        assert_eq!(shut.decide(), Some(FirewallState::BlockingAll(PUBLIC)));
+        assert_eq!(partly.decide(), None);
+    }
+
+    // Ethernet on a private network next to an adapter on a public one that
+    // blocks all incoming connections: friends still reach Booth over the
+    // Ethernet, given a rule for the private profile.
+    #[test]
+    fn a_shut_profile_leaves_the_others_to_the_rules() {
+        let both = PRIVATE | PUBLIC;
+        let settings = Settings {
+            shut: PUBLIC,
+            ..needing(both)
+        };
+        let needed = Needed {
+            profiles: both,
+            shut: PUBLIC,
+        };
+        let state = judge(&[rule(true, PRIVATE)], &settings, PORT);
+        assert_eq!(state, FirewallState::Allowed(needed));
+        assert_eq!(
+            state.to_string(),
+            "allowed; active profiles with the firewall on: private, public; windows blocks all incoming connections on public, whatever the rules say"
+        );
+        assert_eq!(judge(&[], &settings, PORT), FirewallState::Missing(needed));
+        let state = judge(&[rule(true, ALL), rule(false, PUBLIC)], &settings, PORT);
+        assert_eq!(state, FirewallState::Allowed(needed));
+        let state = judge(&[rule(true, ALL), rule(false, PRIVATE)], &settings, PORT);
+        assert_eq!(state, FirewallState::Blocked(needed));
     }
 
     #[test]
@@ -934,13 +1009,13 @@ mod tests {
             ..needing(both)
         };
         let state = judge(&[rule(true, PUBLIC)], &open_private, PORT);
-        assert_eq!(state, FirewallState::Allowed(both));
+        assert_eq!(state, FirewallState::Allowed(both.into()));
         assert_eq!(
             judge(&[], &open_private, PORT),
-            FirewallState::Missing(both)
+            FirewallState::Missing(both.into())
         );
         let state = judge(&[rule(false, PUBLIC)], &open_private, PORT);
-        assert_eq!(state, FirewallState::Blocked(both));
+        assert_eq!(state, FirewallState::Blocked(both.into()));
     }
 
     #[test]

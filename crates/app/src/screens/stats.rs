@@ -1974,11 +1974,20 @@ mod tests {
     #[test]
     fn firewall_states_read_as_one_word_each() {
         let public = Profiles::PUBLIC;
-        assert_eq!(firewall(Some(&FirewallState::Allowed(public))), "allowed");
-        assert_eq!(firewall(Some(&FirewallState::Blocked(public))), "blocked");
+        assert_eq!(
+            firewall(Some(&FirewallState::Allowed(public.into()))),
+            "allowed"
+        );
+        assert_eq!(
+            firewall(Some(&FirewallState::Blocked(public.into()))),
+            "blocked"
+        );
         let shut = FirewallState::BlockingAll(public);
         assert_eq!(firewall(Some(&shut)), "blocked");
-        assert_eq!(firewall(Some(&FirewallState::Missing(public))), "no rule");
+        assert_eq!(
+            firewall(Some(&FirewallState::Missing(public.into()))),
+            "no rule"
+        );
         let off = FirewallState::Unknown(String::from("off"));
         assert_eq!(firewall(Some(&off)), "not known");
         assert_eq!(firewall(None), "not known");

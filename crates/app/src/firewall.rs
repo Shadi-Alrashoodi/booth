@@ -249,7 +249,7 @@ pub(crate) mod tests {
         let (release, hang) = mpsc::channel::<()>();
         let thread = thread::spawn(move || {
             let _ = hang.recv();
-            (FirewallState::Missing(PUBLIC), Duration::ZERO)
+            (FirewallState::Missing(PUBLIC.into()), Duration::ZERO)
         });
         let mut firewall = checking(thread, CHECK_LIMIT);
         let mut backlog = Backlog::default();
@@ -270,7 +270,7 @@ pub(crate) mod tests {
         let (release, hang) = mpsc::channel::<()>();
         let thread = thread::spawn(move || {
             let _ = hang.recv();
-            (FirewallState::Missing(PUBLIC), Duration::ZERO)
+            (FirewallState::Missing(PUBLIC.into()), Duration::ZERO)
         });
         let mut firewall = checking(thread, Duration::ZERO);
         let mut backlog = Backlog::default();
@@ -280,7 +280,10 @@ pub(crate) mod tests {
         while firewall.checked(&mut backlog).is_none() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(firewall.state(), Some(&FirewallState::Missing(PUBLIC)));
+        assert_eq!(
+            firewall.state(),
+            Some(&FirewallState::Missing(PUBLIC.into()))
+        );
     }
 
     fn prompted(ran: Elevated, after: Option<FirewallState>) -> Option<Option<Note>> {
@@ -303,7 +306,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_prompt_ends_in_one_sentence_or_none() {
-        let allowed = Some(FirewallState::Allowed(PUBLIC));
+        let allowed = Some(FirewallState::Allowed(PUBLIC.into()));
         assert_eq!(said(prompted(Elevated::Exited(0), allowed)), None);
         let cancelled = said(prompted(Elevated::Cancelled, None));
         assert_eq!(cancelled.as_deref(), Some(messages::FIREWALL_CANCELLED));
