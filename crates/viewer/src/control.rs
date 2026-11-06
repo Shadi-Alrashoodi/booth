@@ -114,12 +114,12 @@ pub(crate) fn escape_leaves_fullscreen(mode: Option<MouseMode>) -> bool {
     mode.is_none()
 }
 
-// Alt or F10 alone would give the next key to the window's menu. While this
-// PC controls, those keys are the sharer's. Alt+Space, which opens the
-// window menu and comes with its character, stays here in a window, as the
-// Windows keys do.
+// Alt or F10 alone would give the next key to the window's menu, and Alt
+// with a letter looks for that letter in it, finds none and beeps. While
+// this PC controls, those keys are the sharer's. Alt+Space, which opens the
+// window menu, stays here in a window, as the Windows keys do.
 pub(crate) fn menu_key_is_the_sharers(mode: Option<MouseMode>, character: isize) -> bool {
-    mode.is_some() && character == 0
+    mode.is_some() && character != isize::from(b' ')
 }
 
 // Where a pixel of the window's client area falls on the picture. None off
@@ -224,6 +224,26 @@ impl Hand {
         self.down != 0
     }
 
+    // The window lost the mouse with buttons down: each gets its up now,
+    // where the pointer was last sent.
+    pub(crate) fn let_go(&mut self, send: &mut dyn FnMut(Pointing)) {
+        for button in [
+            MouseButton::Left,
+            MouseButton::Right,
+            MouseButton::Middle,
+            MouseButton::Back,
+            MouseButton::Forward,
+        ] {
+            if self.down & button.bit() != 0 {
+                send(Pointing::Button {
+                    button,
+                    down: false,
+                });
+            }
+        }
+        self.down = 0;
+    }
+
     // Capture stopped, or the mouse went relative: the room let go of
     // everything this sent, and nothing is owed an up.
     pub(crate) fn forget(&mut self) {
@@ -323,6 +343,7 @@ mod tests {
     fn alt_goes_to_the_sharer_alt_space_stays() {
         let on = Some(MouseMode::Absolute);
         assert!(menu_key_is_the_sharers(on, 0));
+        assert!(menu_key_is_the_sharers(on, isize::from(b'f')));
         assert!(!menu_key_is_the_sharers(on, isize::from(b' ')));
         assert!(!menu_key_is_the_sharers(None, 0));
     }

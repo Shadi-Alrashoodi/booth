@@ -40,15 +40,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostQuitMessage, RegisterClassExW, SC_KEYMENU, SIZE_MINIMIZED, SM_CXICON, SM_CXSMICON,
     SPI_GETCLIENTAREAANIMATION, SW_HIDE, SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE,
     SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
-    SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetCursor,
+    SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SendNotifyMessageW, SetCursor,
     SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, ShowWindow,
     SystemParametersInfoW, TranslateMessage, WA_INACTIVE, WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WINDOWPLACEMENT, WM_ACTIVATE, WM_ACTIVATEAPP, WM_APP, WM_CLOSE, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE,
-    WM_SYSCOMMAND, WM_WINDOWPOSCHANGED, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW,
-    WS_EX_NOACTIVATE, WS_MAXIMIZE, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WINDOW_STYLE, WINDOWPLACEMENT, WM_ACTIVATE, WM_ACTIVATEAPP, WM_APP, WM_CAPTURECHANGED,
+    WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
+    WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_WINDOWPOSCHANGED, WM_XBUTTONDOWN,
+    WM_XBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_MAXIMIZE, WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 use windows::core::{BOOL, HSTRING, PCWSTR, w};
 
@@ -495,10 +495,18 @@ impl Window {
 
 impl Drop for Window {
     fn drop(&mut self) {
+        let hwnd = self.hwnd();
         // SAFETY: the window lives until its thread handles this message.
-        // If the post fails the thread would never end, so it is not joined.
-        let posted = unsafe { PostMessageW(Some(self.hwnd()), WM_TEAR_DOWN, WPARAM(0), LPARAM(0)) };
-        if posted.is_ok()
+        // A post fails with the window's queue full. A sent message does not
+        // go through that queue, and SendNotifyMessageW does not wait for the
+        // window's thread to handle it. If neither goes, the window is gone
+        // already and its thread is ending, or Windows is short of memory and
+        // a join could wait forever, so it is not joined.
+        let asked = unsafe {
+            PostMessageW(Some(hwnd), WM_TEAR_DOWN, WPARAM(0), LPARAM(0))
+                .or_else(|_| SendNotifyMessageW(hwnd, WM_TEAR_DOWN, WPARAM(0), LPARAM(0)))
+        };
+        if asked.is_ok()
             && let Some(thread) = self.thread.take()
         {
             let _ = thread.join();
@@ -1479,6 +1487,11 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             remote::mouse_left(&shared);
             LRESULT(0)
         }
+        // The mouse went to another window or to none, not back to this one.
+        WM_CAPTURECHANGED if lparam.0 != hwnd.0 as isize => {
+            remote::mouse_lost(&shared);
+            LRESULT(0)
+        }
         // While control has this PC's pointer, it is hidden: in relative
         // mode all the time, in absolute mode over the picture, where the
         // viewer draws the sharer's pointer in its place.
@@ -1584,11 +1597,14 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Condvar;
+
+    use windows::Win32::Foundation::ERROR_NOT_ENOUGH_QUOTA;
     use windows::Win32::Graphics::Gdi::EnumDisplayMonitors;
     use windows::Win32::UI::WindowsAndMessaging::{
         GUITHREADINFO, GetGUIThreadInfo, GetSystemMetrics, GetWindowThreadProcessId, HTTOP,
-        SC_RESTORE, SM_CMONITORS, SW_MAXIMIZE, WM_NCLBUTTONDBLCLK, WPF_RESTORETOMAXIMIZED,
-        WS_MINIMIZE,
+        IsWindow, SC_RESTORE, SM_CMONITORS, SW_MAXIMIZE, WM_NCLBUTTONDBLCLK, WM_NULL,
+        WPF_RESTORETOMAXIMIZED, WS_MINIMIZE,
     };
 
     use super::*;
@@ -2034,6 +2050,99 @@ mod tests {
         // SAFETY: a plain lookup.
         let monitor = unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONULL) };
         assert!(!monitor.is_invalid(), "{rect:?} is on no monitor");
+    }
+
+    // The window's queue full when the Viewer is dropped, as with its thread
+    // stuck for a while: the window still goes, and the drop waits for its
+    // thread. The thread is held in a wake while the queue fills. Never
+    // shown.
+    #[test]
+    fn a_full_queue_still_ends_the_window() {
+        #[derive(Default)]
+        struct Latch {
+            armed: bool,
+            parked: bool,
+            open: bool,
+        }
+        struct Free<'a>(&'a (Mutex<Latch>, Condvar));
+        impl Drop for Free<'_> {
+            fn drop(&mut self) {
+                let (state, changed) = self.0;
+                state.lock().unwrap_or_else(PoisonError::into_inner).open = true;
+                changed.notify_all();
+            }
+        }
+        let _screen = crate::tests::one_at_a_time();
+        let latch = Arc::new((Mutex::new(Latch::default()), Condvar::new()));
+        let theirs = Arc::clone(&latch);
+        let wake: Wake = Arc::new(move || {
+            let (state, changed) = &*theirs;
+            let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+            if !state.armed || state.open {
+                return;
+            }
+            state.parked = true;
+            changed.notify_all();
+            while !state.open {
+                state = changed.wait(state).unwrap_or_else(PoisonError::into_inner);
+            }
+        });
+        // SAFETY: a constant context; the previous one is not needed.
+        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let window = Window::open(
+            "Booth viewer queue test",
+            (1280, 720),
+            Show::Hidden,
+            Some(wake),
+            None,
+        )
+        .unwrap();
+        // After the window, so a check failing while the thread is held opens
+        // the latch before the window's drop waits for the thread.
+        let free = Free(&latch);
+        let hwnd = window.hwnd();
+        let (state, changed) = &*latch;
+        state.lock().unwrap().armed = true;
+        // SAFETY: posting to this test's live window.
+        unsafe { PostMessageW(Some(hwnd), WM_DISPLAYCHANGE, WPARAM(32), LPARAM(0)) }.unwrap();
+        let (parked, _) = changed
+            .wait_timeout_while(state.lock().unwrap(), Duration::from_secs(5), |state| {
+                !state.parked
+            })
+            .unwrap();
+        assert!(parked.parked, "the window's thread never woke");
+        drop(parked);
+
+        let mut refused = None;
+        for _ in 0..100_000 {
+            // SAFETY: posting to this test's live window.
+            if let Err(err) = unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) } {
+                refused = Some(err.code());
+                break;
+            }
+        }
+        assert_eq!(refused, Some(ERROR_NOT_ENOUGH_QUOTA.to_hresult()));
+        let dropping = std::thread::spawn(move || drop(window));
+        // Asked to go, the window's thread is still held, so the drop waits.
+        // Not asked, the drop is over at once.
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(
+            !dropping.is_finished(),
+            "the drop did not wait for the window's thread"
+        );
+        drop(free);
+
+        let until = Instant::now() + Duration::from_secs(5);
+        // SAFETY: a plain query, which a window gone answers too.
+        while unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+            assert!(Instant::now() < until, "the window outlived the Viewer");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        while !dropping.is_finished() {
+            assert!(Instant::now() < until, "the drop never came back");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        dropping.join().unwrap();
     }
 
     // A picture far taller than any monitor: small on top stays inside the

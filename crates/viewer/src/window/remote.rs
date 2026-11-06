@@ -48,6 +48,24 @@ pub(super) fn mouse_left(shared: &Shared) {
     shared.set_local(None);
 }
 
+// The window lost the mouse it held for a press, to Windows or another
+// window, so the ups of what went down will not come here: they go now.
+// When the window let go itself, nothing is held by then.
+pub(super) fn mouse_lost(shared: &Shared) {
+    let Some(out) = shared.out.as_deref() else {
+        return;
+    };
+    let now = Instant::now();
+    CONTROL.with(|cell| {
+        let Ok(mut here) = cell.try_borrow_mut() else {
+            return;
+        };
+        if std::mem::take(&mut here.holding) {
+            here.hand.let_go(&mut |pointing| out.point(pointing, now));
+        }
+    });
+}
+
 // The window thread's side of remote control.
 #[derive(Debug, Default)]
 struct Here {
@@ -63,6 +81,8 @@ struct Here {
     holding: bool,
     // Windows says when the pointer leaves the window.
     tracking: bool,
+    // Closed or torn down: capture never runs again, whatever comes after.
+    left: bool,
     #[cfg(test)]
     pretend_front: Option<bool>,
 }
@@ -202,11 +222,12 @@ pub(super) fn follow_control(hwnd: HWND, shared: &Shared, leaving: bool) {
         let Ok(mut here) = cell.try_borrow_mut() else {
             return;
         };
+        here.left |= leaving;
         let want = control::capturing(
             shared.mode(),
             in_front(hwnd, &here),
             shared.minimized(),
-            shared.closed() || leaving,
+            shared.closed() || here.left,
             shared.fullscreen(),
         );
         let window = hwnd.0 as isize;
@@ -371,9 +392,10 @@ pub(super) fn button_of(msg: u32, wparam: WPARAM) -> Option<(MouseButton, bool)>
     })
 }
 
-// Made-up window messages to a window that is never shown, and a
-// ControlOut that records: nothing here reads a real key or moves, clips or
-// hides the real pointer, and the pointer calls are the recorder's.
+// Made-up window messages to a window that is never shown, but for a moment
+// in one test, and a ControlOut that records: nothing here reads a real key
+// or moves, clips or hides the real pointer, and the pointer calls are the
+// recorder's.
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex, PoisonError};
@@ -386,7 +408,8 @@ mod tests {
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
     use windows::Win32::UI::WindowsAndMessaging::{
-        SendMessageW, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+        SendMessageW, WM_CAPTURECHANGED, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+        WM_MOUSEWHEEL, WM_RBUTTONDOWN,
     };
 
     use super::pointer::{self, Effect};
@@ -602,5 +625,108 @@ mod tests {
         drop(window);
         assert_eq!(out.take(), [Heard::Capture(None)]);
         assert_eq!(pointer::take(), []);
+    }
+
+    // Windows took the mouse the window held for a press: what went down
+    // comes up at once, and the next press holds the mouse again.
+    #[test]
+    fn a_hold_taken_away_lets_go_of_the_press() {
+        let _screen = crate::tests::one_at_a_time();
+        // SAFETY: a constant context; the previous one is not needed.
+        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let out = Arc::new(Recorder::default());
+        let window = Window::open(
+            "Booth viewer control test",
+            (640, 360),
+            Show::Hidden,
+            None,
+            Some(Arc::clone(&out) as Arc<dyn ControlOut>),
+        )
+        .unwrap();
+        let hwnd = window.hwnd();
+        let send = |msg: u32, wparam: usize, lparam: LPARAM| {
+            // SAFETY: this test's live window; SendMessageW returns once the
+            // window's thread has handled the message.
+            unsafe { SendMessageW(hwnd, msg, Some(WPARAM(wparam)), Some(lparam)) };
+        };
+        let shared = window.shared();
+        shared.set_mode(Some(MouseMode::Absolute));
+        send(WM_CONTROL, 0, LPARAM(0));
+        send(WM_PRETEND_FRONT, 1, LPARAM(0));
+        shared.set_placed(Some(Placement {
+            left: 0,
+            top: 0,
+            width: 640,
+            height: 360,
+            source: (1280, 720),
+        }));
+        out.take();
+        pointer::take();
+
+        send(WM_MOUSEMOVE, 0, at(320, 180));
+        send(WM_LBUTTONDOWN, 1, at(320, 180));
+        send(WM_RBUTTONDOWN, 3, at(320, 180));
+        assert_eq!(pointer::take(), [Effect::TrackLeave, Effect::Hold(true)]);
+        out.take();
+        send(WM_CAPTURECHANGED, 0, LPARAM(hwnd.0 as isize));
+        assert_eq!(out.take(), [], "the window took the mouse again itself");
+        send(WM_CAPTURECHANGED, 0, LPARAM(0));
+        assert_eq!(
+            out.take(),
+            [
+                click(MouseButton::Left, false),
+                click(MouseButton::Right, false)
+            ]
+        );
+        assert_eq!(pointer::take(), [], "let go of a hold it no longer had");
+        send(WM_LBUTTONUP, 0, at(320, 180));
+        assert_eq!(out.take(), [], "a second up");
+
+        // The window letting go itself loses nothing.
+        send(WM_LBUTTONDOWN, 1, at(320, 180));
+        assert_eq!(pointer::take(), [Effect::Hold(true)]);
+        send(WM_LBUTTONUP, 0, at(320, 180));
+        assert_eq!(pointer::take(), [Effect::Hold(false)]);
+        out.take();
+        send(WM_CAPTURECHANGED, 0, LPARAM(0));
+        assert_eq!(out.take(), []);
+    }
+
+    // Dropped while capturing, a shown window is hidden on its way out, which
+    // comes to it as WM_WINDOWPOSCHANGED: capture stops once and does not
+    // start again. On screen for a moment, without the focus.
+    #[test]
+    fn a_shown_viewer_dropped_stops_capture_once() {
+        let _screen = crate::tests::one_at_a_time();
+        // SAFETY: a constant context; the previous one is not needed.
+        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let out = Arc::new(Recorder::default());
+        let window = Window::open(
+            "Booth viewer control test",
+            (640, 360),
+            Show::NoActivate,
+            None,
+            Some(Arc::clone(&out) as Arc<dyn ControlOut>),
+        )
+        .unwrap();
+        let hwnd = window.hwnd();
+        let send = |msg: u32, wparam: usize| {
+            // SAFETY: this test's live window; SendMessageW returns once the
+            // window's thread has handled the message.
+            unsafe { SendMessageW(hwnd, msg, Some(WPARAM(wparam)), Some(LPARAM(0))) };
+        };
+        window.shared().set_mode(Some(MouseMode::Absolute));
+        send(WM_CONTROL, 0);
+        send(WM_PRETEND_FRONT, 1);
+        assert_eq!(
+            out.take(),
+            [Heard::Capture(Some(Capturing {
+                windows_keys: false,
+                relative: false,
+            }))]
+        );
+        drop(window);
+        assert_eq!(out.take(), [Heard::Capture(None)]);
+        pointer::take();
     }
 }
