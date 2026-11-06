@@ -17,6 +17,12 @@ use crate::update::RELEASES_PAGE;
 use crate::volumes::Problem;
 use crate::win;
 
+pub const INVITE_LINKS_ABOUT: &str =
+    "A booth:// link opens Booth and shows the invite. Nothing joins until you press Join.";
+pub const INVITE_LINKS_INSTALLER: &str =
+    "Links open the copy from the installer. With the zip, paste a link under Join a room.";
+pub const INVITE_LINK_WAIT_ABOUT: &str = "Join stays off this long after a link shows, so a click meant for something else cannot press it.";
+
 // The lower crates write errors the way a log line reads: lower case, parts
 // joined with a semicolon. The panel shows sentences.
 pub fn sentence(text: &str) -> String {
@@ -1555,6 +1561,17 @@ mod tests {
                 start.starts_with(|c: char| c.is_ascii_uppercase()),
                 "no capital: {text}"
             );
+        }
+    }
+
+    #[test]
+    fn invite_link_settings_sentences() {
+        for text in [
+            INVITE_LINKS_ABOUT,
+            INVITE_LINKS_INSTALLER,
+            INVITE_LINK_WAIT_ABOUT,
+        ] {
+            assert_sentences(text);
         }
     }
 

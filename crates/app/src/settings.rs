@@ -50,8 +50,10 @@ const SHARE_KEY_OPENS_LIST: &str = "share_key_opens_list";
 // Off unless the user turns it on, since a check shows GitHub this PC's
 // address. Only on is saved.
 const CHECK_FOR_NEW_VERSIONS: &str = "check_for_new_versions";
+const INVITE_LINKS: &str = "invite_links";
+const INVITE_LINK_WAIT_SECS: &str = "invite_link_wait_secs";
 // Every key this version knows, in the order a save adds the missing ones.
-const KEYS: [&str; 26] = [
+const KEYS: [&str; 28] = [
     NAME,
     PORT,
     STUN_SERVERS,
@@ -78,6 +80,8 @@ const KEYS: [&str; 26] = [
     SHARE_MONITOR,
     SHARE_KEY_OPENS_LIST,
     CHECK_FOR_NEW_VERSIONS,
+    INVITE_LINKS,
+    INVITE_LINK_WAIT_SECS,
 ];
 const PUSH_TO_TALK: &str = "push_to_talk";
 const OPEN_MIC: &str = "open_mic";
@@ -134,6 +138,8 @@ pub struct Settings {
     // share_monitor is.
     share_key_opens_list: bool,
     check_for_new_versions: bool,
+    no_invite_links: bool,
+    invite_link_wait_secs: Option<u32>,
     // The file could not be read as Booth started, so a default here says
     // nothing about what the file holds, and a save keeps that key's lines.
     // Stays for the run: nothing reads the file into this again.
@@ -408,6 +414,23 @@ impl Settings {
         self.check_for_new_versions = on;
     }
 
+    pub fn invite_links(&self) -> bool {
+        !self.no_invite_links
+    }
+
+    pub fn set_invite_links(&mut self, on: bool) {
+        self.no_invite_links = !on;
+    }
+
+    pub fn invite_link_wait_secs(&self) -> u32 {
+        self.invite_link_wait_secs.unwrap_or(1)
+    }
+
+    pub fn set_invite_link_wait_secs(&mut self, seconds: u32) {
+        let seconds = seconds.clamp(1, 5);
+        self.invite_link_wait_secs = (seconds != 1).then_some(seconds);
+    }
+
     // The file is read again first, so a line added by hand while Booth was
     // open is kept too.
     pub fn save(&mut self, dir: &Path) -> Result<(), SaveError> {
@@ -501,6 +524,10 @@ impl Settings {
             SHARE_MONITOR => self.share_monitor.clone(),
             SHARE_KEY_OPENS_LIST => self.share_key_opens_list.then(|| String::from("on")),
             CHECK_FOR_NEW_VERSIONS => self.check_for_new_versions.then(|| String::from("on")),
+            INVITE_LINKS => self.no_invite_links.then(|| String::from("off")),
+            INVITE_LINK_WAIT_SECS => self
+                .invite_link_wait_secs
+                .map(|seconds| seconds.to_string()),
             key => hotkey_action(key).and_then(|action| {
                 let chord = self.hotkeys.chord(action);
                 (chord != action.default_chord()).then(|| chord.to_string())
@@ -597,6 +624,16 @@ impl Settings {
                     })?;
                 self.set_upload_mbits(mbits);
             }
+            INVITE_LINK_WAIT_SECS => {
+                let seconds = value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit())
+                    .then(|| value.parse::<u32>().ok())
+                    .flatten()
+                    .filter(|seconds| (1..=5).contains(seconds))
+                    .ok_or_else(|| format!("{INVITE_LINK_WAIT_SECS} is a number of seconds from 1 to 5; set it again in settings"))?;
+                self.set_invite_link_wait_secs(seconds);
+            }
             AUTOMATIC_VOLUME => {
                 self.fixed_volume = match value {
                     "on" => false,
@@ -611,6 +648,7 @@ impl Settings {
             VSYNC_IN_VIEWER
             | HIDE_STRIP_IN_FULLSCREEN
             | CHECK_FOR_NEW_VERSIONS
+            | INVITE_LINKS
             | NOISE_SUPPRESSION
             | ECHO_CANCELLATION => {
                 let on = match value {
@@ -623,6 +661,7 @@ impl Settings {
                     HIDE_STRIP_IN_FULLSCREEN => self.hide_strip = on,
                     NOISE_SUPPRESSION => self.noise_suppression = on,
                     ECHO_CANCELLATION => self.no_echo_cancellation = !on,
+                    INVITE_LINKS => self.no_invite_links = !on,
                     _ => self.check_for_new_versions = on,
                 }
             }
@@ -2420,6 +2459,55 @@ mod tests {
             [
                 "settings: line 1 skipped: check_for_new_versions is on or off; set it again in settings"
             ]
+        );
+    }
+
+    #[test]
+    fn invite_link_settings_round_trip() {
+        let mut settings = Settings::default();
+        assert!(settings.invite_links());
+        assert_eq!(settings.invite_link_wait_secs(), 1);
+        assert!(settings.merge(b"").is_empty());
+        assert_eq!(KEYS.len(), 28);
+        settings.set_invite_links(false);
+        settings.set_invite_link_wait_secs(3);
+        let text = settings.merge(b"future_link_key = kept\r\n");
+        assert_eq!(
+            text,
+            b"future_link_key = kept\r\ninvite_links = off\r\ninvite_link_wait_secs = 3\r\n"
+        );
+        let (loaded, problems) = parse(&text);
+        assert_eq!(
+            problems,
+            [
+                "settings: line 1: future_link_key is not a setting this version knows; kept as it is"
+            ]
+        );
+        assert_eq!(loaded, settings);
+        let (loaded, problems) = parse(b"invite_links = on\ninvite_link_wait_secs = 1\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(loaded, Settings::default());
+        assert!(loaded.merge(b"").is_empty());
+    }
+
+    #[test]
+    fn invalid_invite_link_settings_keep_defaults() {
+        for value in ["0", "6", "1e3", "maybe"] {
+            let text = format!("invite_link_wait_secs = {value}\n");
+            let (loaded, problems) = parse(text.as_bytes());
+            assert_eq!(loaded, Settings::default());
+            assert_eq!(
+                problems,
+                [
+                    "settings: line 1 skipped: invite_link_wait_secs is a number of seconds from 1 to 5; set it again in settings"
+                ]
+            );
+        }
+        let (loaded, problems) = parse(b"invite_links = maybe\n");
+        assert_eq!(loaded, Settings::default());
+        assert_eq!(
+            problems,
+            ["settings: line 1 skipped: invite_links is on or off; set it again in settings"]
         );
     }
 

@@ -1185,8 +1185,10 @@ fn saved_line(settings: &Settings) -> String {
     let vsync = on_off(settings.vsync());
     let hide = on_off(settings.hide_strip());
     let versions = on_off(settings.check_for_new_versions());
+    let links = on_off(settings.invite_links());
+    let link_wait = settings.invite_link_wait_secs();
     format!(
-        "settings: saved, name {name}, port {port}, {stun} stun servers, address name {address}, input {input}, output {output}, {talk}, constant-rate voice {rate}, video upload {upload} mbit/s, vsync in the viewer {vsync}, strip hidden in fullscreen {hide}, check for new versions {versions}"
+        "settings: saved, name {name}, port {port}, {stun} stun servers, address name {address}, input {input}, output {output}, {talk}, constant-rate voice {rate}, video upload {upload} mbit/s, vsync in the viewer {vsync}, strip hidden in fullscreen {hide}, check for new versions {versions}, invite links {links}, join waits after a link {link_wait} s"
     )
 }
 

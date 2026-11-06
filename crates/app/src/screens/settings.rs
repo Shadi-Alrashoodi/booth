@@ -53,6 +53,8 @@ pub struct Draft {
     pub vsync: bool,
     pub hide_strip: bool,
     pub check_for_new_versions: bool,
+    pub invite_links: bool,
+    pub invite_link_wait_secs: u32,
     pub hotkeys: Bindings,
     // The row waiting for its new key, and the last key refused for it with
     // the action that already has it.
@@ -134,6 +136,8 @@ impl Draft {
             vsync: saved.vsync(),
             hide_strip: saved.hide_strip(),
             check_for_new_versions: saved.check_for_new_versions(),
+            invite_links: saved.invite_links(),
+            invite_link_wait_secs: saved.invite_link_wait_secs(),
             hotkeys: saved.hotkeys(),
             waiting: None,
             key_refused: None,
@@ -171,6 +175,8 @@ impl Draft {
         next.set_vsync(self.vsync);
         next.set_hide_strip(self.hide_strip);
         next.set_check_for_new_versions(self.check_for_new_versions);
+        next.set_invite_links(self.invite_links);
+        next.set_invite_link_wait_secs(self.invite_link_wait_secs);
         next.set_hotkeys(self.hotkeys);
         let refused = Refused {
             port: next.set_port(&self.port).is_err(),
@@ -403,6 +409,37 @@ fn network(ui: &mut Ui, draft: &mut Draft) -> [Response; 2] {
         if draft.check_for_new_versions {
             line(ui, update::CHECK_ABOUT, ASH);
         }
+    }
+    ui.add_space(FIELD_GAP);
+    let on = draft.invite_links;
+    if controls::choice_row(
+        ui,
+        ui.id().with("invite links"),
+        on,
+        "Invite links",
+        None,
+        WidgetType::Checkbox,
+    )
+    .clicked()
+    {
+        draft.invite_links = !on;
+    }
+    if draft.invite_links {
+        line(ui, messages::INVITE_LINKS_ABOUT, ASH);
+        if !cfg!(feature = "store") {
+            line(ui, messages::INVITE_LINKS_INSTALLER, ASH);
+        }
+        ui.add_space(FIELD_GAP);
+        label(ui, "Join waits after a link");
+        controls::slider(
+            ui,
+            ui.id().with("link wait"),
+            &mut draft.invite_link_wait_secs,
+            1..=5,
+            "s",
+            "Join waits after a link",
+        );
+        line(ui, messages::INVITE_LINK_WAIT_ABOUT, ASH);
     }
     if let Some(error) = &draft.error {
         let said = line(ui, error.as_str(), BAD);
@@ -1625,6 +1662,47 @@ mod tests {
         assert!(next.check_for_new_versions());
         let again = Draft::new(&next, KnownDevices::default(), String::new());
         assert!(again.check_for_new_versions);
+    }
+
+    #[test]
+    fn invite_link_settings_saved() {
+        let mut draft = typed("");
+        assert!(draft.invite_links);
+        assert_eq!(draft.invite_link_wait_secs, 1);
+        draft.invite_links = false;
+        draft.invite_link_wait_secs = 3;
+        let saved = draft.settings(&Settings::default()).unwrap();
+        assert!(!saved.invite_links());
+        assert_eq!(saved.invite_link_wait_secs(), 3);
+        let again = Draft::new(&saved, KnownDevices::default(), String::new());
+        assert!(!again.invite_links);
+        assert_eq!(again.invite_link_wait_secs, 3);
+    }
+
+    #[test]
+    fn invite_link_settings_rows() {
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let mut draft = typed("");
+        for on in [true, false] {
+            draft.invite_links = on;
+            let (_, output) =
+                crate::controls::tests::frame(&ctx, Vec::new(), |ui| network(ui, &mut draft));
+            let nodes = output.accesskit_update.unwrap().nodes;
+            assert!(
+                nodes
+                    .iter()
+                    .any(|(_, node)| node.label() == Some("Invite links"))
+            );
+            assert_eq!(
+                nodes.iter().any(
+                    |(_, node)| node.role() == eframe::egui::accesskit::Role::Slider
+                        && node.label() == Some("Join waits after a link")
+                ),
+                on
+            );
+        }
     }
 
     // Where the line is drawn: None when no such line was drawn at all.
