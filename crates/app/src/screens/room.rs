@@ -31,7 +31,7 @@ use crate::sound::PeriodsAsk;
 use crate::strip;
 use crate::theme::{
     self, AMBER, ASH, BAD, CHALK, CONTROL_HEIGHT, FIELD_GAP, HALF_STEP, PANEL, QUIET_DOT,
-    ROW_HEIGHT, SIDE, STEP, TALKING, WARN,
+    ROW_HEIGHT, SIDE, STEP, TALKING, TEXT_PAD, WARN,
 };
 use crate::volumes::Volumes;
 use crate::win;
@@ -1206,9 +1206,12 @@ const LEAST_TITLE_WIDTH: f32 = 112.0;
 
 // At the narrowest panel with the bar, or under Ctrl+= zoom, a row can be
 // narrower than its columns and the title's least width together. The name
-// gives way first, then the marker, so the title stays readable and nothing
-// reaches past the row into the gutter.
+// gives way first, then the marker, then the 12 px a button keeps either side
+// of its words, so the title stays readable and nothing reaches past the row
+// into the gutter.
 fn window_parts(rect: Rect) -> [Rect; 3] {
+    let pad = ((rect.width() - LEAST_TITLE_WIDTH) / 2.0).clamp(0.0, TEXT_PAD);
+    let rect = rect.shrink2(vec2(pad, 0.0));
     let spare = (rect.width() - LEAST_TITLE_WIDTH).max(0.0);
     let marker_room = spare.min(STEP + MINIMIZED_WIDTH);
     let name_room = (spare - marker_room).min(STEP + NAME_WIDTH);
@@ -1227,8 +1230,10 @@ fn window_parts(rect: Rect) -> [Rect; 3] {
 
 // The columns keep their room even when empty, so names line up and never
 // take room from a title. An empty one draws no label, which a screen reader
-// would stop on as blank text. The whole row is the button, as a known
-// host's is on the start screen.
+// would stop on as blank text. The whole row is one button, drawn as the
+// monitor buttons above it are, so it reads as one to press. egui also
+// gives focus to a row the list has scrolled out of view, so one that Tab or
+// a screen reader reaches is scrolled in, or its ring would be clipped away.
 fn window_row(ui: &mut Ui, window: &WindowPick) -> bool {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::hover());
     let row = ui.interact(
@@ -1237,12 +1242,16 @@ fn window_row(ui: &mut Ui, window: &WindowPick) -> bool {
         Sense::click(),
     );
     row.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &window.spoken));
+    if row.gained_focus() && controls::keyboard_focus(ui) {
+        row.scroll_to_me(None);
+    }
+    controls::row_fill(ui, rect, &row);
     let [title, program, minimized] = window_parts(rect);
     for (part, text, font, color, layout) in [
         (
             title,
             window.title.as_str(),
-            theme::body(),
+            theme::medium(),
             CHALK,
             Layout::left_to_right(Align::Center),
         ),
@@ -4594,12 +4603,12 @@ pub(crate) mod tests {
                     }
                     continue;
                 }
-                // At 320 px the title is at its least, so a bar narrows the
-                // name instead.
+                // At 320 px the title is at its least, so the button's sides
+                // and a bar narrow the name instead.
                 let (title_width, name_width) = if width == 360.0 {
-                    (152.0 - bar, NAME_WIDTH)
+                    (152.0 - 2.0 * TEXT_PAD - bar, NAME_WIDTH)
                 } else {
-                    (LEAST_TITLE_WIDTH, NAME_WIDTH - bar)
+                    (LEAST_TITLE_WIDTH, NAME_WIDTH - 2.0 * TEXT_PAD - bar)
                 };
                 if let Some(handle) = handle {
                     let (marker, _) = painted_share_text(&output, "minimized");
@@ -4614,16 +4623,18 @@ pub(crate) mod tests {
                             painted_share_text(&output, words).0
                         );
                     }
+                    assert_eq!(title_rect.left(), SIDE + TEXT_PAD);
                     assert_eq!(title_rect.width(), title_width);
                     assert_eq!(title_rect.height(), ROW_HEIGHT);
                     assert_eq!(name_rect.width(), name_width);
-                    assert_eq!(name_rect.right(), right - MINIMIZED_WIDTH - STEP);
+                    assert_eq!(name_rect.right(), right - TEXT_PAD - MINIMIZED_WIDTH - STEP);
                     assert_eq!(name_rect.left() - title_rect.right(), STEP);
                     assert_eq!(name.pos.x, name_rect.right());
                     assert_eq!(name.galley.job.halign, Align::RIGHT);
-                    for (text, font, color) in
-                        [(title, theme::body(), CHALK), (name, theme::caption(), ASH)]
-                    {
+                    for (text, font, color) in [
+                        (title, theme::medium(), CHALK),
+                        (name, theme::caption(), ASH),
+                    ] {
                         assert_eq!(text.galley.rows.len(), 1);
                         assert!(text.galley.elided);
                         assert_eq!(text.galley.job.sections[0].format.font_id, font);
@@ -4633,7 +4644,7 @@ pub(crate) mod tests {
                     if i == 1 {
                         let (marker_rect, marker) = painted_share_text(&output, "minimized");
                         assert_eq!(marker_rect.width(), MINIMIZED_WIDTH);
-                        assert_eq!(marker_rect.right(), right);
+                        assert_eq!(marker_rect.right(), right - TEXT_PAD);
                         assert_eq!(marker_rect.left() - name_rect.right(), STEP);
                         assert_eq!(marker.pos.x, marker_rect.left());
                         assert_eq!(marker.galley.job.halign, Align::LEFT);
@@ -4792,6 +4803,198 @@ pub(crate) mod tests {
         frame(&ctx, press(second), |ui| share_list(ui, &[], &windows));
         let (pressed, _) = frame(&ctx, release(second), |ui| share_list(ui, &[], &windows));
         assert_eq!(pressed, Some(RowPick::Window(1)));
+    }
+
+    // Where a screen reader is told the control with this name lies.
+    fn spoken_rect(output: &PlatformOutput, label: &str) -> Rect {
+        let bounds = output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit is on")
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some(label))
+            .and_then(|(_, node)| node.bounds())
+            .unwrap_or_else(|| panic!("nothing called {label}"));
+        Rect::from_min_max(
+            pos2(bounds.x0 as f32, bounds.y0 as f32),
+            pos2(bounds.x1 as f32, bounds.y1 as f32),
+        )
+    }
+
+    // A window's row shows what a monitor button shows: a button's words 12
+    // px in from its edge, no fill at rest, the control fill and the pointing
+    // hand under the mouse, and the raised fill while pressed.
+    #[test]
+    fn a_window_row_looks_as_a_monitor_button_does() {
+        use crate::controls::tests::{press, release};
+        use eframe::egui::{CornerRadius, FullOutput, Shape};
+        let ctx = accessible_panel();
+        let picks = picks();
+        let windows = [window(1, "Notes"), window(2, "Game")];
+        let draw = |events| {
+            painted_share_frame(&ctx, vec2(360.0, 640.0), events, |ui| {
+                share_list(ui, &picks, &windows);
+            })
+        };
+        let fills = |output: &FullOutput, rect: Rect| {
+            output
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    Shape::Rect(shape)
+                        if shape.rect == rect && shape.fill != Color32::TRANSPARENT =>
+                    {
+                        Some((shape.fill, shape.corner_radius))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let output = draw(Vec::new());
+        let monitor = spoken_rect(&output.platform_output, &picks[0].spoken);
+        let row = spoken_rect(&output.platform_output, &windows[1].spoken);
+        let (_, word) = painted_share_text(&output, &picks[0].text);
+        let (_, title) = painted_share_text(&output, &windows[1].title);
+        for (text, rect) in [(word, monitor), (title, row)] {
+            assert_eq!(text.galley.job.sections[0].format.font_id, theme::medium());
+            assert_eq!(text.galley.job.sections[0].format.color, CHALK);
+            assert_eq!(text.pos.x - rect.left(), TEXT_PAD, "{rect:?}");
+        }
+        let corner = CornerRadius::same(theme::CONTROL_RADIUS);
+        for rect in [monitor, row] {
+            let at = rect.center();
+            let rest = draw(vec![Event::PointerMoved(pos2(1.0, 1.0))]);
+            assert_eq!(fills(&rest, rect), [], "{rect:?} at rest");
+            let hovered = draw(vec![Event::PointerMoved(at)]);
+            assert_eq!(
+                fills(&hovered, rect),
+                [(theme::CONTROL, corner)],
+                "{rect:?}"
+            );
+            assert_eq!(
+                hovered.platform_output.cursor_icon,
+                CursorIcon::PointingHand,
+                "{rect:?}"
+            );
+            let pressed = draw(press(at));
+            assert_eq!(fills(&pressed, rect), [(theme::RAISED, corner)], "{rect:?}");
+            draw(release(at));
+        }
+    }
+
+    // Every row of the list is a button a screen reader can focus and press,
+    // named for what it shares. Tab goes from the monitors through Region and
+    // each window in turn, with the ring on the row it reached, and Shift+Tab
+    // goes back the same way. Twenty windows pass half the panel, so the list
+    // scrolls, and a row Tab reaches below or above the view is scrolled in.
+    #[test]
+    fn tab_goes_down_the_whole_share_list() {
+        use eframe::egui::accesskit::{Action, Role as Spoken};
+        use eframe::egui::{FullOutput, Shape};
+        let picks = picks();
+        let tab = |modifiers| {
+            vec![Event::Key {
+                key: Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }]
+        };
+        let reached = |output: &FullOutput, name: &str| {
+            let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+            let label = tree
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == tree.focus)
+                .and_then(|(_, node)| node.label());
+            assert_eq!(label, Some(name));
+            let (ring, view) = output
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    Shape::Rect(shape)
+                        if shape.stroke.color == theme::FOCUS_RING
+                            && shape.fill == Color32::TRANSPARENT =>
+                    {
+                        Some((shape.rect, clipped.clip_rect))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no ring on {name}"));
+            let rect = spoken_rect(&output.platform_output, name);
+            assert!(view.contains_rect(rect), "{name} out of view");
+            assert!(ring.contains_rect(rect.shrink2(vec2(0.0, 1.0))), "{name}");
+        };
+        let few = vec![window(1, "Notes"), window(2, "Game"), window(3, "Mail")];
+        let many = (1..=20)
+            .map(|i| window(i, &format!("Window {i}")))
+            .collect();
+        for windows in [few, many] {
+            let ctx = accessible_panel();
+            let draw = |events| {
+                painted_share_frame(&ctx, vec2(360.0, 640.0), events, |ui| {
+                    controls::note_focus_source(ui.ctx());
+                    share_list(ui, &picks, &windows);
+                })
+            };
+            let order: Vec<&str> = picks
+                .iter()
+                .map(|pick| pick.spoken.as_str())
+                .chain(["Share a region of a monitor"])
+                .chain(windows.iter().map(|window| window.spoken.as_str()))
+                .collect();
+
+            let output = draw(Vec::new());
+            let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+            for window in &windows {
+                let (_, node) = tree
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| node.label() == Some(window.spoken.as_str()))
+                    .expect("each window has its row");
+                assert_eq!(node.role(), Spoken::Button);
+                assert!(node.supports_action(Action::Focus));
+                assert!(node.supports_action(Action::Click));
+            }
+            // egui moves focus back on the frame after Shift+Tab, and a row
+            // scrolled in shows two frames after it took focus, in the two
+            // repaints egui runs for one request.
+            for name in &order {
+                draw(tab(Modifiers::NONE));
+                draw(Vec::new());
+                reached(&draw(Vec::new()), name);
+            }
+            for name in order.iter().rev().skip(1) {
+                draw(tab(Modifiers::SHIFT));
+                draw(Vec::new());
+                draw(Vec::new());
+                reached(&draw(Vec::new()), name);
+            }
+        }
+    }
+
+    // Enter or Space on a window's row that Tab reached picks that window,
+    // as a click does.
+    #[test]
+    fn enter_or_space_on_a_window_row_picks_that_window() {
+        use crate::controls::tests::frame;
+        let picks = picks();
+        let windows = [window(1, "Notes"), window(2, "Game"), window(3, "Mail")];
+        for chosen in [Key::Enter, Key::Space] {
+            let ctx = Context::default();
+            theme::apply(&ctx);
+            let draw = |events| frame(&ctx, events, |ui| share_list(ui, &picks, &windows)).0;
+            assert_eq!(draw(Vec::new()), None);
+            // Two monitors, Region, then the first two windows.
+            for _ in 0..5 {
+                let tab = vec![key_event(Key::Tab, true), key_event(Key::Tab, false)];
+                assert_eq!(draw(tab), None);
+            }
+            let picked = draw(vec![key_event(chosen, true)]);
+            assert_eq!(picked, Some(RowPick::Window(1)), "{chosen:?}");
+        }
     }
 
     // The list's room stays from the frame the list goes, however it went,

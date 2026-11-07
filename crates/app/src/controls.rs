@@ -499,12 +499,8 @@ impl<'a> Button<'a> {
                     fill: Color32::TRANSPARENT,
                     label: ASH,
                 }
-            } else if response.is_pointer_button_down_on() {
-                look.press
-            } else if lit {
-                look.hover
             } else {
-                look.rest
+                paint_now(look, &response, lit)
             };
             let label_color = match self.color {
                 Some(color) if self.enabled && self.role == Role::Secondary => color,
@@ -536,6 +532,26 @@ impl<'a> Button<'a> {
         } else {
             response
         }
+    }
+}
+
+fn paint_now(look: theme::ButtonLook, response: &Response, lit: bool) -> theme::Paint {
+    if response.is_pointer_button_down_on() {
+        look.press
+    } else if lit {
+        look.hover
+    } else {
+        look.rest
+    }
+}
+
+// A whole row that is one secondary button with words of its own laid out in
+// it, as a window is in the share list, takes the fill a Button takes under
+// the mouse and while pressed. Painted before the words.
+pub fn row_fill(ui: &Ui, rect: Rect, response: &Response) {
+    let paint = paint_now(Role::Secondary.look(), response, response.hovered());
+    if paint.fill != Color32::TRANSPARENT && ui.is_rect_visible(rect) {
+        ui.painter().rect_filled(rect, CONTROL_RADIUS, paint.fill);
     }
 }
 
