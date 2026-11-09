@@ -29,6 +29,7 @@ use net::watch::AddressWatch;
 use crate::chat::{self, ChatRefused};
 use crate::client::Client;
 use crate::config::{VideoConfig, VideoSource};
+use crate::cues::{Cues, SoundCues};
 use crate::host::{Host, Listing};
 use crate::known::{Save, Turn};
 use crate::log::{Log, Tally, Writer, list, log};
@@ -75,6 +76,13 @@ pub(crate) enum Side {
 }
 
 impl Side {
+    fn roster_epoch(&self) -> u32 {
+        match self {
+            Side::Host(_) => 0,
+            Side::Client(client) => client.roster_epoch(),
+        }
+    }
+
     fn on_packet(
         &mut self,
         packet: &[u8],
@@ -413,6 +421,7 @@ impl Commands {
 
 struct State {
     side: Side,
+    cues: Cues,
     // What the timer thread is waiting for, so the receive thread knows when
     // a new deadline needs it woken.
     planned: Option<Instant>,
@@ -424,6 +433,8 @@ struct State {
 
 struct Shared {
     state: Mutex<State>,
+    voice: Arc<talk::Shared>,
+    clock: Clock,
     view: Mutex<View>,
     stop: AtomicBool,
     socket: Arc<Socket>,
@@ -466,8 +477,16 @@ impl AddressHook {
 // Called with the state lock held, so a view built earlier on one thread can
 // never replace a view built later on the other. The lock order is state,
 // then view, everywhere; Room::view takes only the view lock.
-fn store_view(shared: &Shared, state: &State, now: Instant) {
+fn store_view(shared: &Shared, state: &mut State, now: Instant) {
     let mut view = state.side.view(now, &shared.socket);
+    let (room, own) = state.cues.follow(&view, state.side.roster_epoch(), now);
+    let at = shared.clock.micros(now);
+    if let Some(chime) = room {
+        shared.voice.room_chime(chime, at);
+    }
+    if let Some(chime) = own {
+        shared.voice.own_chime(chime, at);
+    }
     view.numbers.timer_late = shared.late.spread();
     shared.watching.link(now, || screen::link_numbers(&view));
     shared.watching.control(screen::control_for(&view));
@@ -567,6 +586,12 @@ impl Threads {
             turn,
         } = outlets;
         let view = side.view(Instant::now(), &socket);
+        let cues = Cues::new(
+            &view,
+            side.roster_epoch(),
+            voice.config.cues,
+            Instant::now(),
+        );
         let port = socket.local_port();
         let saver = Saver::start(turn, log.clone())?;
         let stun_servers = first_stun_servers(stun_servers, &log);
@@ -599,10 +624,13 @@ impl Threads {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 side,
+                cues,
                 planned: None,
                 view_built: None,
                 view_owed: false,
             }),
+            voice: Arc::clone(&voice.shared),
+            clock: voice.clock,
             view: Mutex::new(view),
             stop: AtomicBool::new(false),
             socket,
@@ -811,6 +839,12 @@ impl Threads {
         self.voice_changed(what, microphone);
     }
 
+    pub(crate) fn set_cues(&self, cues: SoundCues) {
+        let mut state = lock(&self.shared.state);
+        state.cues.set(cues);
+        self.voice.set_chime_volume(cues.volume);
+    }
+
     pub(crate) fn set_volume(&self, key: [u8; 32], percent: u8) {
         self.with_side(|side, _, _| side.set_volume(key, percent));
     }
@@ -884,7 +918,7 @@ impl Threads {
             if wake {
                 state.planned = next;
             }
-            store_view(&self.shared, &state, now);
+            store_view(&self.shared, &mut state, now);
             (result, wake)
         };
         if wake || self.shared.gate.pending() {
@@ -1043,7 +1077,7 @@ fn receive(shared: &Shared) {
                 {
                     let mut state = lock(&shared.state);
                     state.side.socket_failed();
-                    store_view(shared, &state, now);
+                    store_view(shared, &mut state, now);
                 }
                 shared.gate.run();
                 (shared.notify)();
@@ -1064,7 +1098,7 @@ fn receive(shared: &Shared) {
                 state.planned = next;
             }
             if changed {
-                store_view(shared, &state, now);
+                store_view(shared, &mut state, now);
             }
             (changed, wake)
         };
@@ -1217,7 +1251,7 @@ fn timers(shared: &Arc<Shared>, inbox: &Receiver<Command>, timer: Timer) {
             let planned = next_deadline(&state);
             state.planned = planned;
             if changed {
-                store_view(shared, &state, now);
+                store_view(shared, &mut state, now);
             }
             (changed, planned, name)
         };

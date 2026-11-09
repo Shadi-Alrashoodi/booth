@@ -13,6 +13,7 @@ use voice::codec::{CodecError, SAMPLE_RATE};
 use voice::jitter::{JitterBuffer, JitterStats, Source, VoicePacket};
 use voice::mix::{FrameSource, Mixer};
 
+use super::chime::Player;
 use super::cue::{self, Tone};
 use super::{Frame, RenderNow, Shared, lock};
 use crate::peer::Clock;
@@ -228,18 +229,21 @@ pub(crate) enum ToSpeaker {
     StreamVolume([u8; 32], f32),
 }
 
-// What the mixer plays: every talker, the PC sound of the share watched, and
-// the share cue, which goes through deafen and the limiter as they do.
+// What the mixer plays: every talker, the PC sound of the share watched, the
+// share cue and the room's chimes, which go through deafen and the limiter as
+// they do.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Key {
     Talker([u8; 32]),
     Sharer([u8; 32]),
     Cue,
+    Chime,
 }
 
 enum Sound {
     Talker(Played),
     Cue(Tone),
+    Chime(Player),
 }
 
 impl FrameSource for Sound {
@@ -247,6 +251,7 @@ impl FrameSource for Sound {
         match self {
             Sound::Talker(played) => played.next_frame(out),
             Sound::Cue(tone) => tone.next_frame(out),
+            Sound::Chime(player) => player.next_frame(out),
         }
     }
 
@@ -254,6 +259,7 @@ impl FrameSource for Sound {
         match self {
             Sound::Talker(played) => played.pause(),
             Sound::Cue(tone) => tone.pause(),
+            Sound::Chime(player) => player.pause(),
         }
     }
 
@@ -270,6 +276,7 @@ pub(crate) struct Speaker {
     mixer: Mixer<Key, Sound, sound::Stream>,
     // The control cue, which plays past the mixer (cue.rs).
     control: Tone,
+    own: Player,
     orders: Receiver<ToSpeaker>,
     shared: Arc<Shared>,
     clock: Clock,
@@ -280,13 +287,15 @@ pub(crate) struct Speaker {
 
 impl Speaker {
     pub(crate) fn new(orders: Receiver<ToSpeaker>, shared: Arc<Shared>, clock: Clock) -> Speaker {
-        // The cue stays in the mixer, idle between cues, so starting one
+        // The cues stay in the mixer, idle between cues, so starting one
         // never adds to the mixer's list on the render thread.
         let mut mixer = Mixer::with_streams();
         mixer.add(Key::Cue, Sound::Cue(Tone::idle()));
+        mixer.add(Key::Chime, Sound::Chime(Player::idle()));
         Speaker {
             mixer,
             control: Tone::control(),
+            own: Player::idle(),
             orders,
             shared,
             clock,
@@ -345,6 +354,11 @@ impl Speaker {
         {
             tone.start(cue);
         }
+        if let Some(chime) = self.shared.take_room_chime(began_us)
+            && let Some(Sound::Chime(player)) = self.mixer.source_mut(&Key::Chime)
+        {
+            player.start(chime, self.shared.chime_level());
+        }
         let now = &self.shared.render_now;
         let period = now.period.load(Ordering::Relaxed) as usize;
         if period != self.period {
@@ -359,6 +373,10 @@ impl Speaker {
             self.control.start(cue);
         }
         cue::mix_over(&mut self.control, out);
+        if let Some(chime) = self.shared.take_own_chime(began_us) {
+            self.own.start(chime, self.shared.chime_level());
+        }
+        cue::mix_over(&mut self.own, out);
         self.rendered += (out.len() / 2) as u64;
         self.shared.render_times.record(began.elapsed());
     }
@@ -369,8 +387,9 @@ impl Speaker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::talk::{Cue, Shared, VoiceConfig};
+    use crate::talk::{Chime, Cue, Shared, VoiceConfig};
     use std::f32::consts::TAU;
+    use std::time::Duration;
     use voice::codec::{Encoder, Mode};
     use voice::stereo::{FRAME, MAX_PACKET};
 
@@ -406,6 +425,35 @@ mod tests {
     // codec's 2.5 ms lookahead, which the capture time is moved back by.
     #[test]
     fn mouth_to_ear_timing() {
+        check_mouth_to_ear(false);
+    }
+
+    // A room chime under a talker only adds to what is heard: each sample is
+    // the voice alone plus the chime alone, so the chime neither moves nor
+    // bends the voice.
+    #[test]
+    fn room_chime_leaves_voice_alone() {
+        let talker = check_mouth_to_ear(false);
+        let both = check_mouth_to_ear(true);
+        let (mut speaker, shared, clock) = chime_speaker();
+        let mut chime: Vec<f32> = Vec::new();
+        let mut out = [0.0f32; 480];
+        for seq in 0..20 {
+            if seq == 2 {
+                shared.room_chime(Chime::FriendJoins, clock.micros(Instant::now()));
+            }
+            speaker.fill(&mut out);
+            chime.extend(out.iter().step_by(2));
+        }
+        assert!(chime.iter().any(|sample| sample.abs() > 0.09));
+        assert!(both.iter().all(|sample| sample.abs() < voice::mix::KNEE));
+        assert_eq!(both.len(), chime.len());
+        for ((talker, chime), both) in talker.iter().zip(&chime).zip(&both) {
+            assert!((talker + chime - both).abs() < 1e-6);
+        }
+    }
+
+    fn check_mouth_to_ear(chime: bool) -> Vec<f32> {
         let shared = Shared::new(&VoiceConfig::default(), None, false);
         let clock = Clock::new(Instant::now());
         let (orders_in, orders) = crossbeam_channel::unbounded();
@@ -418,13 +466,18 @@ mod tests {
         // 240 frames of stereo.
         let mut out = [0.0f32; 480];
         let mut heard_any = false;
+        let mut played = Vec::new();
         for (seq, bytes) in frames(20).iter().enumerate() {
+            if chime && seq == 2 {
+                shared.room_chime(Chime::FriendJoins, clock.micros(Instant::now()));
+            }
             let captured = clock.micros(Instant::now()) - 10_000;
             assert!(lock(&ear).push(&frame(seq as u16, bytes), Some(captured), false));
             speaker.fill(&mut out);
             heard_any |= out.iter().any(|&s| s != 0.0);
             for [left, right] in out.as_chunks::<2>().0 {
                 assert_eq!(left.to_bits(), right.to_bits());
+                played.push(*left);
             }
         }
         let mut recent = Vec::new();
@@ -442,6 +495,7 @@ mod tests {
         }
         assert!(!heard.about);
         assert_eq!(lock(&ear).stats().depth_frames, 1);
+        played
     }
 
     // 10 ms stereo frames as a sharer's encoder makes them: 500 Hz at 0.4
@@ -680,6 +734,150 @@ mod tests {
         assert_eq!(loudest(&mut speaker), 0.0);
         shared.cue(Cue::Falling, clock.micros(Instant::now()));
         assert!(loudest(&mut speaker) > 0.1);
+    }
+
+    fn chime_speaker() -> (Speaker, Arc<Shared>, Clock) {
+        let shared = Shared::new(&VoiceConfig::default(), None, false);
+        let clock = Clock::new(Instant::now());
+        let (_, orders) = crossbeam_channel::unbounded();
+        (
+            Speaker::new(orders, Arc::clone(&shared), clock),
+            shared,
+            clock,
+        )
+    }
+
+    fn render_cues(speaker: &mut Speaker) -> Vec<f32> {
+        let mut samples = Vec::new();
+        let mut out = [0.0; 480];
+        for _ in 0..60 {
+            speaker.fill(&mut out);
+            for [left, right] in out.as_chunks::<2>().0 {
+                assert_eq!(left.to_bits(), right.to_bits());
+                samples.push(*left);
+            }
+        }
+        samples
+    }
+
+    #[test]
+    fn deafen_drops_room_chime() {
+        let (mut speaker, shared, clock) = chime_speaker();
+        shared.set_deafened(true);
+        render_cues(&mut speaker);
+        shared.room_chime(Chime::FriendJoins, clock.micros(Instant::now()));
+        assert!(
+            render_cues(&mut speaker)
+                .iter()
+                .all(|sample| *sample == 0.0)
+        );
+        shared.set_deafened(false);
+        assert!(
+            render_cues(&mut speaker)
+                .iter()
+                .all(|sample| *sample == 0.0)
+        );
+        shared.room_chime(Chime::FriendLeaves, clock.micros(Instant::now()));
+        assert!(
+            render_cues(&mut speaker)
+                .iter()
+                .any(|sample| sample.abs() > 0.09)
+        );
+    }
+
+    #[test]
+    fn own_chime_heard_while_deafened() {
+        let (mut speaker, shared, clock) = chime_speaker();
+        shared.set_deafened(true);
+        shared.own_chime(Chime::YouDeafen, clock.micros(Instant::now()));
+        let heard = render_cues(&mut speaker);
+        let mut player = Player::idle();
+        player.start(Chime::YouDeafen, super::super::chime::LEVEL);
+        let mut expected = vec![0.0; heard.len() * 2];
+        cue::mix_over(&mut player, &mut expected);
+        assert_eq!(heard, expected.into_iter().step_by(2).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cues_keep_apart() {
+        for own in [false, true] {
+            let render = |old: bool, new: bool| {
+                let (mut speaker, shared, clock) = chime_speaker();
+                let now = clock.micros(Instant::now());
+                if old {
+                    if own {
+                        shared.control_cue(Cue::Rising, now);
+                    } else {
+                        shared.cue(Cue::Rising, now);
+                    }
+                }
+                if new {
+                    if own {
+                        shared.own_chime(Chime::YouMute, now);
+                    } else {
+                        shared.room_chime(Chime::FriendJoins, now);
+                    }
+                }
+                render_cues(&mut speaker)
+            };
+            let old = render(true, false);
+            let new = render(false, true);
+            let both = render(true, true);
+            assert!(old.iter().any(|sample| sample.abs() > 0.19));
+            assert!(new.iter().any(|sample| sample.abs() > 0.09));
+            for ((old, new), both) in old.iter().zip(&new).zip(&both) {
+                assert!((old + new - both).abs() < 1e-7);
+            }
+        }
+    }
+
+    #[test]
+    fn cue_volume_skips_the_security_cues() {
+        for which in 0..4 {
+            let (mut speaker, shared, clock) = chime_speaker();
+            shared.set_chime_volume(10);
+            let now = clock.micros(Instant::now());
+            match which {
+                0 => shared.room_chime(Chime::FriendJoins, now),
+                1 => shared.own_chime(Chime::YouMute, now),
+                2 => shared.cue(Cue::Rising, now),
+                _ => shared.control_cue(Cue::Rising, now),
+            }
+            let peak = render_cues(&mut speaker)
+                .iter()
+                .fold(0.0f32, |most, sample| most.max(sample.abs()));
+            let want = if which < 2 { 0.01 } else { 0.2 };
+            assert!((peak - want).abs() < 0.001, "{which}: {peak}");
+        }
+    }
+
+    #[test]
+    #[ignore = "takes two minutes on the render clock"]
+    fn render_callback_cost() {
+        for active in [false, true] {
+            let (mut speaker, shared, clock) = chime_speaker();
+            let periods = 60 * SAMPLE_RATE as usize / 128;
+            let mut times = Vec::with_capacity(periods);
+            let mut out = [0.0; 256];
+            let started = Instant::now();
+            for period in 0..periods {
+                let due = started
+                    + Duration::from_secs_f64(period as f64 * 128.0 / f64::from(SAMPLE_RATE));
+                std::thread::sleep(due.saturating_duration_since(Instant::now()));
+                if active && period % 75 == 0 {
+                    shared.room_chime(Chime::FriendJoins, clock.micros(Instant::now()));
+                }
+                let began = Instant::now();
+                speaker.fill(&mut out);
+                times.push(began.elapsed().as_nanos());
+            }
+            times.sort_unstable();
+            println!(
+                "render, cues {active}: 60 s at 128 frames, median {:.2} us, p99 {:.2} us",
+                times[times.len() / 2] as f64 / 1000.0,
+                times[(times.len() - 1) * 99 / 100] as f64 / 1000.0
+            );
+        }
     }
 
     // The control cue is the indicator over a game in exclusive fullscreen,

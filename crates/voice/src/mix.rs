@@ -10,10 +10,12 @@ pub const KNEE: f32 = 0.5;
 // instead of cutting mid-waveform, which clicks.
 const FADE: usize = 120;
 
-// The room holds the host and seven clients (the room crate's roster limit),
-// so a listener hears seven others at most. With room for all of them from
-// the start, a talker joining never grows the list on the render thread.
-const ROOM: usize = 8;
+// The room holds the host and seven clients, so a listener hears seven
+// others at most, but a host's roster can name eight that are not this PC.
+// The share cue and the room's chimes play beside them, which makes ten. With
+// room for all of them from the start, a talker joining never grows the list
+// on the render thread.
+const ROOM: usize = 10;
 
 // Where a talker's audio comes from: the jitter buffer in the app, anything
 // that makes frames in tests.
@@ -491,5 +493,29 @@ impl<K: PartialEq, S: FrameSource, T: StereoSource> Mixer<K, S, T> {
 impl<K: PartialEq, S: FrameSource> Default for Mixer<K, S> {
     fn default() -> Mixer<K, S> {
         Mixer::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Silent;
+
+    impl FrameSource for Silent {
+        fn next_frame(&mut self, _: &mut [f32]) -> Option<usize> {
+            None
+        }
+    }
+
+    // Eight others on a roster, the share cue and the room's chimes.
+    #[test]
+    fn a_full_room_never_grows_the_list() {
+        let mut mixer = Mixer::<u8, Silent>::new();
+        let room = mixer.voices.capacity();
+        for key in 0..10 {
+            mixer.add(key, Silent);
+        }
+        assert_eq!(mixer.voices.capacity(), room);
     }
 }

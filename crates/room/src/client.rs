@@ -341,6 +341,11 @@ pub(crate) struct Client {
     // The host's Hello on this link has come and its protocol is this PC's.
     // A numbered host sends it before anything else on every new link.
     host_hello: bool,
+    // The first roster after each Hello is where the room stands, not a
+    // change in it, so the sound cues take it as their new baseline
+    // (cues.rs). The epoch moves with each one.
+    fresh_roster: bool,
+    roster_epoch: u32,
     last_heard: Instant,
     // The silence under way: when the host was last heard before it.
     silent_since: Option<Instant>,
@@ -555,6 +560,8 @@ impl Client {
             sessions: Sessions::default(),
             heard_on_session: false,
             host_hello: false,
+            fresh_roster: false,
+            roster_epoch: 0,
             last_heard: setup.joined,
             silent_since: None,
             own_moved: None,
@@ -1211,6 +1218,10 @@ impl Client {
             keys::fingerprint(&author)
         );
         Ok(())
+    }
+
+    pub(crate) fn roster_epoch(&self) -> u32 {
+        self.roster_epoch
     }
 
     // `oversized` is what net dropped for not fitting the receive buffer.
@@ -2402,6 +2413,7 @@ impl Client {
                 match message {
                     Some(Message::Hello { version, .. }) => {
                         self.host_hello = true;
+                        self.fresh_roster = true;
                         self.link.feedback_read = version >= peer::FEEDBACK_SINCE;
                         self.link.limits_read = version >= peer::LIMITS_SINCE;
                         self.link.state_read = version >= peer::SHARE_STATE_SINCE;
@@ -2436,6 +2448,9 @@ impl Client {
                     address_name,
                 }) => self.host_addresses(&candidates, address_name, now),
                 Some(Message::Roster(roster)) => {
+                    if std::mem::take(&mut self.fresh_roster) {
+                        self.roster_epoch = self.roster_epoch.wrapping_add(1);
+                    }
                     let old = std::mem::replace(&mut self.roster, roster);
                     self.note_names();
                     let keys: Vec<[u8; 32]> =
@@ -2921,6 +2936,141 @@ mod tests {
             assert!(rig.client.secret.is_some());
             (rig, session)
         }
+    }
+
+    #[test]
+    fn roster_epoch_moves_with_each_fresh_roster() {
+        let start = Instant::now();
+        let timers = Timers::default();
+        let (mut rig, mut session) = Rig::connected(timers, start);
+        let roster = Message::Roster(Roster {
+            room: String::from("Tuesday night"),
+            entries: Vec::new(),
+        });
+        assert_eq!(rig.client.roster_epoch(), 0);
+        for want in [1, 1] {
+            let packet = rig.host.say(&mut session, &roster, start);
+            rig.deliver(&packet, start);
+            assert_eq!(rig.client.roster_epoch(), want);
+        }
+        let woke = start + Duration::from_secs(20);
+        rig.host.wire.packets();
+        assert!(rig.client.slept(Duration::from_secs(20), woke, &rig.socket));
+        rig.tick(woke);
+        let (_, mut session, response) = rig.host.answer_all(woke).pop().expect("a new handshake");
+        rig.deliver(&response, woke);
+        assert!(rig.host.open_all(&mut session) > 0);
+        rig.host.reliable = Reliable::new();
+        let hello = rig.host.hello(&mut session, woke);
+        rig.deliver(&hello, woke);
+        assert_eq!(rig.client.roster_epoch(), 1);
+        for want in [2, 2] {
+            let packet = rig.host.say(&mut session, &roster, woke);
+            rig.deliver(&packet, woke);
+            assert_eq!(rig.client.roster_epoch(), want);
+        }
+    }
+
+    #[test]
+    fn cue_baseline_leaves_out_what_is_yours() {
+        let now = Instant::now();
+        let (rig, _) = Rig::connected(Timers::default(), now);
+        let mut view = rig.client.view(now, 0);
+        view.people.push(Person {
+            key: [1; 32],
+            name: String::from("Ana"),
+            fingerprint: String::new(),
+            rtt_ms: None,
+            rtt_level: crate::view::Level::Good,
+            is_you: true,
+            is_host: false,
+            joined_by_invite: true,
+            reconnecting: false,
+            talking: false,
+            sharing: false,
+        });
+        let mut cues = crate::cues::Cues::new(&view, 0, crate::SoundCues::default(), now);
+        view.people[0].reconnecting = true;
+        view.people[0].key = [2; 32];
+        view.voice.muted = true;
+        view.share.current = Some(crate::view::CurrentShare {
+            key: [2; 32],
+            name: String::from("Ana"),
+            number: 1,
+            fps: 60,
+            yours: true,
+            watchers: Some(0),
+        });
+        assert_eq!(
+            cues.follow(&view, 0, now),
+            (None, Some(crate::talk::Chime::YouMute))
+        );
+        view.people[0].is_you = false;
+        assert_eq!(
+            cues.follow(&view, 0, now).0,
+            Some(crate::talk::Chime::FriendJoins)
+        );
+        view.share.current.as_mut().unwrap().yours = false;
+        assert_eq!(
+            cues.follow(&view, 0, now).0,
+            Some(crate::talk::Chime::ShareStarts)
+        );
+    }
+
+    // The host's Bye is a friend leaving, heard even with the room cues
+    // spent: it comes once. This PC's own leave is no friend leaving.
+    #[test]
+    fn cues_tell_how_the_room_ended() {
+        use crate::cues::{Cues, SoundCues};
+        use crate::talk::Chime;
+        let now = Instant::now();
+        let (mut rig, mut session) = Rig::connected(Timers::default(), now);
+        let with_friend = |mut view: View| {
+            view.people.push(Person {
+                key: [1; 32],
+                name: String::from("Bo"),
+                fingerprint: String::new(),
+                rtt_ms: None,
+                rtt_level: crate::view::Level::Good,
+                is_you: false,
+                is_host: false,
+                joined_by_invite: true,
+                reconnecting: false,
+                talking: false,
+                sharing: false,
+            });
+            view
+        };
+        let mut cues = Cues::new(&rig.client.view(now, 0), 0, SoundCues::default(), now);
+        for want in [Chime::FriendJoins, Chime::FriendLeaves, Chime::FriendJoins] {
+            let mut view = rig.client.view(now, 0);
+            if want == Chime::FriendJoins {
+                view = with_friend(view);
+            }
+            assert_eq!(cues.follow(&view, 0, now), (Some(want), None));
+        }
+        assert_eq!(cues.follow(&rig.client.view(now, 0), 0, now), (None, None));
+        let bye = rig.host.say(&mut session, &Message::Bye, now);
+        rig.deliver(&bye, now);
+        assert_eq!(rig.client.notice, Some(Notice::RoomClosed));
+        assert_eq!(
+            cues.follow(&rig.client.view(now, 0), 0, now),
+            (Some(Chime::FriendLeaves), None)
+        );
+
+        let (mut rig, _) = Rig::connected(Timers::default(), now);
+        let mut cues = Cues::new(&rig.client.view(now, 0), 0, SoundCues::default(), now);
+        rig.client.leave(now, &rig.socket);
+        assert_eq!(rig.client.state, LinkState::Closed);
+        assert_eq!(cues.follow(&rig.client.view(now, 0), 0, now), (None, None));
+
+        let (mut rig, _) = Rig::connected(Timers::default(), now);
+        let mut cues = Cues::new(&rig.client.view(now, 0), 0, SoundCues::default(), now);
+        rig.client.socket_failed();
+        assert_eq!(
+            cues.follow(&rig.client.view(now, 0), 0, now),
+            (None, Some(Chime::YouDrop))
+        );
     }
 
     // Asleep longer than reconnecting_after: the host may have let this PC

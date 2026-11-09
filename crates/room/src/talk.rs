@@ -23,9 +23,12 @@
 //   (devices.rs).
 //
 // The share cue (cue.rs) is asked for by whichever thread starts or ends
-// this PC's share, and made by the render thread.
+// this PC's share, and made by the render thread. The chimes (chime.rs) are
+// made there too, asked for by whichever thread builds a view that shows a
+// change (cues.rs).
 
 mod adapt;
+mod chime;
 mod cue;
 mod detect;
 mod devices;
@@ -54,12 +57,14 @@ use voice::process::Switches;
 use crate::chat;
 use crate::config::Timers;
 use crate::control::{LossPermille, MAX_ROSTER, PERMILLE, Periods};
+use crate::cues::{CUE_VOLUME, SoundCues};
 use crate::limit::Bucket;
 use crate::log::{Log, log};
 use crate::peer::{Clock, MEDIA_FLOWS_FOR};
 use crate::socket::Socket;
 use crate::view::{Buffer, MouthToEar, Numbers, Spread, Voice as VoiceView, VoiceLoss};
 
+pub(crate) use chime::Chime;
 pub(crate) use cue::Cue;
 pub(crate) use devices::Streams;
 pub(crate) use ear::{AHEAD_US, Ear, LONGEST_US, Speaker, ToSpeaker, WINDOW_US};
@@ -143,6 +148,8 @@ pub struct VoiceConfig {
     pub noise_suppression: bool,
     // A quiet microphone brought up to a steady level, on by default.
     pub automatic_volume: bool,
+    // Off here; the app supplies the sound cues saved on this PC.
+    pub cues: SoundCues,
     pub devices: Devices,
 }
 
@@ -162,6 +169,10 @@ impl Default for VoiceConfig {
             process_loopback: true,
             noise_suppression: false,
             automatic_volume: true,
+            cues: SoundCues {
+                on: false,
+                ..SoundCues::default()
+            },
             devices: Devices::Windows,
         }
     }
@@ -322,6 +333,11 @@ pub(crate) struct Shared {
     // and the control cue.
     cue: AtomicU64,
     control_cue: AtomicU64,
+    // The room's chime and this PC's own (chime::pack), and their level in
+    // percent.
+    room_chime: AtomicU64,
+    own_chime: AtomicU64,
+    chime_volume: AtomicU8,
     // Ears sent to the speakers that the render thread has not taken.
     ears_waiting: AtomicUsize,
     changed: OnceLock<Box<dyn Fn() + Send + Sync>>,
@@ -376,6 +392,14 @@ impl Shared {
             render_times: Timing::default(),
             cue: AtomicU64::new(0),
             control_cue: AtomicU64::new(0),
+            room_chime: AtomicU64::new(0),
+            own_chime: AtomicU64::new(0),
+            chime_volume: AtomicU8::new(
+                config
+                    .cues
+                    .volume
+                    .clamp(*CUE_VOLUME.start(), *CUE_VOLUME.end()),
+            ),
             ears_waiting: AtomicUsize::new(0),
             changed: OnceLock::new(),
             follow: OnceLock::new(),
@@ -431,6 +455,35 @@ impl Shared {
 
     fn take_control_cue(&self, now_us: u64) -> Option<Cue> {
         cue::unpack(self.control_cue.swap(0, Ordering::Relaxed), now_us)
+    }
+
+    pub(crate) fn room_chime(&self, chime: Chime, at_us: u64) {
+        self.room_chime
+            .store(chime::pack(chime, at_us), Ordering::Relaxed);
+    }
+
+    pub(crate) fn own_chime(&self, chime: Chime, at_us: u64) {
+        self.own_chime
+            .store(chime::pack(chime, at_us), Ordering::Relaxed);
+    }
+
+    fn take_room_chime(&self, now_us: u64) -> Option<Chime> {
+        chime::unpack(self.room_chime.swap(0, Ordering::Relaxed), now_us)
+    }
+
+    fn take_own_chime(&self, now_us: u64) -> Option<Chime> {
+        chime::unpack(self.own_chime.swap(0, Ordering::Relaxed), now_us)
+    }
+
+    pub(crate) fn set_chime_volume(&self, percent: u8) {
+        self.chime_volume.store(
+            percent.clamp(*CUE_VOLUME.start(), *CUE_VOLUME.end()),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn chime_level(&self) -> f32 {
+        chime::LEVEL * f32::from(self.chime_volume.load(Ordering::Relaxed)) / 100.0
     }
 
     pub(crate) fn set_held(&self, held: bool) {

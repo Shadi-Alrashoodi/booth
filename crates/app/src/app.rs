@@ -156,6 +156,7 @@ impl Setup {
             process_loopback: winver::shares_pc_sound(),
             noise_suppression: self.settings.noise_suppression(),
             automatic_volume: self.settings.automatic_volume(),
+            cues: self.settings.sound_cues(),
             #[cfg(feature = "memstats")]
             devices: crate::memstats::devices().unwrap_or(Devices::Windows),
             #[cfg(not(feature = "memstats"))]

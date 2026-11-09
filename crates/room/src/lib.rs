@@ -9,6 +9,7 @@ mod client;
 mod config;
 mod control;
 mod cookies;
+mod cues;
 mod error;
 mod host;
 mod invites;
@@ -60,6 +61,7 @@ pub use config::{
     Candidates, Config, DEFAULT_VIDEO_UPLOAD_KBPS, Lookup, LossKnob, MAX_VIDEO_UPLOAD_KBPS, Timers,
     VideoConfig, VideoSource,
 };
+pub use cues::{CUE_VOLUME, DEFAULT_CUE_VOLUME, SoundCues};
 pub use error::RoomError;
 pub use known::{
     BlockedKey, DamagedList, KnownDevice, KnownDevices, KnownError, KnownHost, List, ListProblem,
@@ -360,7 +362,13 @@ impl Room {
         self.threads.mute(muted);
     }
 
-    /// Deafened, the speakers play silence and the microphone closes too.
+    pub fn set_cues(&self, cues: SoundCues) {
+        self.threads.set_cues(cues);
+    }
+
+    /// Deafened, room sound and the share cue are silent and the microphone
+    /// closes too. The cues for this PC's mute, deafen and connection, and
+    /// the remote control cue, still play so their changes can be heard.
     /// Undeafened, the microphone opens again unless muted before.
     pub fn deafen(&self, deafened: bool) {
         self.threads.deafen(deafened);

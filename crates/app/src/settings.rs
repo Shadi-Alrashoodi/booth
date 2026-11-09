@@ -31,6 +31,15 @@ const ECHO_CANCELLATION: &str = "echo_cancellation";
 const NOISE_SUPPRESSION: &str = "noise_suppression";
 // On unless turned off; only off is saved.
 const AUTOMATIC_VOLUME: &str = "automatic_volume";
+// On unless turned off; only off is saved. The volume is in percent,
+// written only when moved off room::DEFAULT_CUE_VOLUME.
+const SOUND_CUES: &str = "sound_cues";
+const SOUND_CUE_VOLUME: &str = "sound_cue_volume";
+const SOUND_CUE_JOINS: &str = "sound_cue_joins";
+const SOUND_CUE_OWN_MUTE: &str = "sound_cue_own_mute";
+const SOUND_CUE_FRIEND_CONNECTION: &str = "sound_cue_friend_connection";
+const SOUND_CUE_OWN_CONNECTION: &str = "sound_cue_own_connection";
+const SOUND_CUE_SHARES: &str = "sound_cue_shares";
 const HOTKEY_PUSH_TO_TALK: &str = "hotkey_push_to_talk";
 const HOTKEY_MUTE: &str = "hotkey_mute";
 const HOTKEY_DEAFEN: &str = "hotkey_deafen";
@@ -53,7 +62,7 @@ const CHECK_FOR_NEW_VERSIONS: &str = "check_for_new_versions";
 const INVITE_LINKS: &str = "invite_links";
 const INVITE_LINK_WAIT_SECS: &str = "invite_link_wait_secs";
 // Every key this version knows, in the order a save adds the missing ones.
-const KEYS: [&str; 28] = [
+const KEYS: [&str; 35] = [
     NAME,
     PORT,
     STUN_SERVERS,
@@ -74,6 +83,13 @@ const KEYS: [&str; 28] = [
     ECHO_CANCELLATION,
     NOISE_SUPPRESSION,
     AUTOMATIC_VOLUME,
+    SOUND_CUES,
+    SOUND_CUE_VOLUME,
+    SOUND_CUE_JOINS,
+    SOUND_CUE_OWN_MUTE,
+    SOUND_CUE_FRIEND_CONNECTION,
+    SOUND_CUE_OWN_CONNECTION,
+    SOUND_CUE_SHARES,
     VIDEO_UPLOAD_MBITS,
     VSYNC_IN_VIEWER,
     HIDE_STRIP_IN_FULLSCREEN,
@@ -123,6 +139,14 @@ pub struct Settings {
     no_echo_cancellation: bool,
     noise_suppression: bool,
     fixed_volume: bool,
+    // None means room::DEFAULT_CUE_VOLUME.
+    cue_volume: Option<u8>,
+    no_sound_cues: bool,
+    no_cue_joins: bool,
+    no_cue_own_mute: bool,
+    no_cue_friend_connection: bool,
+    no_cue_own_connection: bool,
+    no_cue_shares: bool,
     // Only the ones off their defaults are saved.
     hotkeys: Bindings,
     // None means DEFAULT_UPLOAD_MBITS. Vsync and the strip's hide are off
@@ -350,6 +374,31 @@ impl Settings {
         self.fixed_volume = !on;
     }
 
+    pub fn sound_cues(&self) -> room::SoundCues {
+        room::SoundCues {
+            on: !self.no_sound_cues,
+            volume: self.cue_volume.unwrap_or(room::DEFAULT_CUE_VOLUME),
+            joins: !self.no_cue_joins,
+            own_mute: !self.no_cue_own_mute,
+            friend_connection: !self.no_cue_friend_connection,
+            own_connection: !self.no_cue_own_connection,
+            shares: !self.no_cue_shares,
+        }
+    }
+
+    pub fn set_sound_cues(&mut self, cues: room::SoundCues) {
+        self.no_sound_cues = !cues.on;
+        let volume = cues
+            .volume
+            .clamp(*room::CUE_VOLUME.start(), *room::CUE_VOLUME.end());
+        self.cue_volume = (volume != room::DEFAULT_CUE_VOLUME).then_some(volume);
+        self.no_cue_joins = !cues.joins;
+        self.no_cue_own_mute = !cues.own_mute;
+        self.no_cue_friend_connection = !cues.friend_connection;
+        self.no_cue_own_connection = !cues.own_connection;
+        self.no_cue_shares = !cues.shares;
+    }
+
     pub fn upload_mbits(&self) -> u32 {
         self.upload_mbits.unwrap_or(DEFAULT_UPLOAD_MBITS)
     }
@@ -524,6 +573,15 @@ impl Settings {
             ECHO_CANCELLATION => self.no_echo_cancellation.then(|| String::from("off")),
             NOISE_SUPPRESSION => self.noise_suppression.then(|| String::from("on")),
             AUTOMATIC_VOLUME => self.fixed_volume.then(|| String::from("off")),
+            SOUND_CUE_VOLUME => self.cue_volume.map(|volume| volume.to_string()),
+            SOUND_CUES => self.no_sound_cues.then(|| String::from("off")),
+            SOUND_CUE_JOINS => self.no_cue_joins.then(|| String::from("off")),
+            SOUND_CUE_OWN_MUTE => self.no_cue_own_mute.then(|| String::from("off")),
+            SOUND_CUE_FRIEND_CONNECTION => {
+                self.no_cue_friend_connection.then(|| String::from("off"))
+            }
+            SOUND_CUE_OWN_CONNECTION => self.no_cue_own_connection.then(|| String::from("off")),
+            SOUND_CUE_SHARES => self.no_cue_shares.then(|| String::from("off")),
             VIDEO_UPLOAD_MBITS => self.upload_mbits.map(|mbits| mbits.to_string()),
             VSYNC_IN_VIEWER => self.vsync.then(|| String::from("on")),
             HIDE_STRIP_IN_FULLSCREEN => self.hide_strip.then(|| String::from("on")),
@@ -616,6 +674,24 @@ impl Settings {
                     })?;
                 self.set_sensitivity_db(db);
             }
+            SOUND_CUE_VOLUME => {
+                let volume = value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit())
+                    .then(|| value.parse::<u8>().ok())
+                    .flatten()
+                    .filter(|volume| room::CUE_VOLUME.contains(volume))
+                    .ok_or_else(|| {
+                        format!(
+                            "{SOUND_CUE_VOLUME} is a percent from {} to {}; set it again in settings",
+                            room::CUE_VOLUME.start(),
+                            room::CUE_VOLUME.end()
+                        )
+                    })?;
+                let mut cues = self.sound_cues();
+                cues.volume = volume;
+                self.set_sound_cues(cues);
+            }
             VIDEO_UPLOAD_MBITS => {
                 let mbits = value
                     .bytes()
@@ -656,7 +732,13 @@ impl Settings {
             | CHECK_FOR_NEW_VERSIONS
             | INVITE_LINKS
             | NOISE_SUPPRESSION
-            | ECHO_CANCELLATION => {
+            | ECHO_CANCELLATION
+            | SOUND_CUES
+            | SOUND_CUE_JOINS
+            | SOUND_CUE_OWN_MUTE
+            | SOUND_CUE_FRIEND_CONNECTION
+            | SOUND_CUE_OWN_CONNECTION
+            | SOUND_CUE_SHARES => {
                 let on = match value {
                     "on" => true,
                     "off" => false,
@@ -668,6 +750,12 @@ impl Settings {
                     NOISE_SUPPRESSION => self.noise_suppression = on,
                     ECHO_CANCELLATION => self.no_echo_cancellation = !on,
                     INVITE_LINKS => self.no_invite_links = !on,
+                    SOUND_CUES => self.no_sound_cues = !on,
+                    SOUND_CUE_JOINS => self.no_cue_joins = !on,
+                    SOUND_CUE_OWN_MUTE => self.no_cue_own_mute = !on,
+                    SOUND_CUE_FRIEND_CONNECTION => self.no_cue_friend_connection = !on,
+                    SOUND_CUE_OWN_CONNECTION => self.no_cue_own_connection = !on,
+                    SOUND_CUE_SHARES => self.no_cue_shares = !on,
                     _ => self.check_for_new_versions = on,
                 }
             }
@@ -2185,6 +2273,92 @@ mod tests {
     }
 
     #[test]
+    fn sound_cue_keys_round_trip() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.sound_cues(), room::SoundCues::default());
+        assert!(settings.merge(b"").is_empty());
+        let cues = room::SoundCues {
+            on: false,
+            volume: 60,
+            joins: false,
+            own_mute: false,
+            friend_connection: false,
+            own_connection: false,
+            shares: false,
+        };
+        settings.set_sound_cues(cues);
+        let folder = Folder::new("sound-cues");
+        settings.save(&folder.0).unwrap();
+        let (saved, problems, _) = Settings::load(&folder.0);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(saved.sound_cues(), cues);
+        let bytes = settings.merge(b"# My settings\r\nname = Mara\r\nfuture_key = stay\r\n");
+        let (loaded, problems) = parse(&bytes);
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert_eq!(loaded.sound_cues(), cues);
+        let text = String::from_utf8(bytes).unwrap();
+        for line in [
+            "sound_cues = off",
+            "sound_cue_volume = 60",
+            "sound_cue_joins = off",
+            "sound_cue_own_mute = off",
+            "sound_cue_friend_connection = off",
+            "sound_cue_own_connection = off",
+            "sound_cue_shares = off",
+        ] {
+            assert_eq!(text.matches(line).count(), 1, "{text}");
+        }
+        let (mut old, problems) = parse(b"# My settings\r\nname = Mara\r\nfuture_key = stay\r\n");
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert_eq!(old.sound_cues(), room::SoundCues::default());
+        assert_eq!(
+            old.merge(b"# My settings\r\nname = Mara\r\nfuture_key = stay\r\n"),
+            b"# My settings\r\nname = Mara\r\nfuture_key = stay\r\n"
+        );
+        old.set_sound_cues(cues);
+        let bytes = old.merge(b"# My settings\r\nname = Mara\r\nfuture_key = stay\r\n");
+        assert!(bytes.starts_with(b"# My settings\r\nname = Mara\r\nfuture_key = stay\r\n"));
+        old.set_sound_cues(room::SoundCues::default());
+        assert!(
+            !String::from_utf8(old.merge(&bytes))
+                .unwrap()
+                .contains("sound_cue")
+        );
+        for volume in ["5", "151", "loud", "+10", ""] {
+            assert_eq!(
+                settings
+                    .set_from_file(SOUND_CUE_VOLUME, volume)
+                    .unwrap_err(),
+                "sound_cue_volume is a percent from 10 to 150; set it again in settings"
+            );
+        }
+        for key in [
+            SOUND_CUES,
+            SOUND_CUE_JOINS,
+            SOUND_CUE_OWN_MUTE,
+            SOUND_CUE_FRIEND_CONNECTION,
+            SOUND_CUE_OWN_CONNECTION,
+            SOUND_CUE_SHARES,
+        ] {
+            assert_eq!(
+                settings.set_from_file(key, "maybe").unwrap_err(),
+                format!("{key} is on or off; set it again in settings")
+            );
+        }
+        for (given, want) in [(0, 10), (10, 10), (100, 100), (150, 150), (200, 150)] {
+            settings.set_sound_cues(room::SoundCues {
+                volume: given,
+                ..room::SoundCues::default()
+            });
+            assert_eq!(settings.sound_cues().volume, want);
+        }
+        for volume in ["10", "100", "150"] {
+            settings.set_from_file(SOUND_CUE_VOLUME, volume).unwrap();
+            assert_eq!(settings.sound_cues().volume.to_string(), volume);
+        }
+    }
+
+    #[test]
     fn hotkeys_round_trip() {
         let folder = Folder::new("hotkeys");
         let mut hotkeys = Bindings::default();
@@ -2268,6 +2442,10 @@ mod tests {
         assert!(!changed(&|next| next.set_name("Tom")));
         assert!(!changed(&|next| next.set_port("41010").unwrap()));
         assert!(!changed(&|next| next.set_noise_suppression(true)));
+        assert!(!changed(&|next| next.set_sound_cues(room::SoundCues {
+            on: false,
+            ..room::SoundCues::default()
+        })));
     }
 
     #[test]
@@ -2482,7 +2660,7 @@ mod tests {
         assert!(settings.invite_links());
         assert_eq!(settings.invite_link_wait_secs(), 1);
         assert!(settings.merge(b"").is_empty());
-        assert_eq!(KEYS.len(), 28);
+        assert_eq!(KEYS.len(), 35);
         settings.set_invite_links(false);
         settings.set_invite_link_wait_secs(3);
         let text = settings.merge(b"future_link_key = kept\r\n");

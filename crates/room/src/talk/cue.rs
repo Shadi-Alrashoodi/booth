@@ -26,23 +26,23 @@ const CONTROL_HIGH_HZ: f64 = 880.00;
 const NOTE: usize = 80 * SAMPLE_RATE as usize / 1000;
 // Each note comes in over 5 ms and dies away over its last 20, so neither
 // end clicks and it sounds struck rather than switched on.
-const ATTACK: usize = 5 * SAMPLE_RATE as usize / 1000;
-const RELEASE: usize = 20 * SAMPLE_RATE as usize / 1000;
+pub(super) const ATTACK: usize = 5 * SAMPLE_RATE as usize / 1000;
+pub(super) const RELEASE: usize = 20 * SAMPLE_RATE as usize / 1000;
 // A cue cut short for a newer one dies away over 2.5 ms first: stopped
 // mid-wave it would click, and the newer one waits no longer than that.
-const FADE: usize = 25 * SAMPLE_RATE as usize / 10_000;
+pub(super) const FADE: usize = 25 * SAMPLE_RATE as usize / 10_000;
 // -14 dBFS at the peak, about as loud as a friend's voice from a sensible
 // microphone, and under the mixer's knee, so the limiter leaves the cue
 // alone unless someone talks over it.
-const PEAK: f32 = 0.2;
+pub(super) const PEAK: f32 = 0.2;
 const _: () = assert!(PEAK < voice::mix::KNEE);
 // Handed to the mixer 5 ms at a time, as a talker's frames are.
-const CHUNK: usize = 240;
+pub(super) const CHUNK: usize = 240;
 // The render thread takes a cue within a period, a few milliseconds on
 // most drivers and tens on the slowest. One that waited longer found the
 // speakers closed or opening again, and heard now it would mark a moment
 // long past.
-const LATE_US: u64 = 250_000;
+pub(super) const LATE_US: u64 = 250_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Cue {
@@ -144,20 +144,20 @@ impl Tone {
 }
 
 // A raised cosine: 0 when `at` is 0, 1 when it reaches `len`.
-fn swell(at: usize, len: usize) -> f64 {
+pub(super) fn swell(at: usize, len: usize) -> f64 {
     0.5 - 0.5 * (PI * at as f64 / len as f64).cos()
 }
 
-// The control cue added to both sides of what the mixer made, interleaved
-// stereo, and held by the limiter again where it plays: the mixer's own
-// limit is behind it already.
-pub(super) fn mix_over(tone: &mut Tone, out: &mut [f32]) {
+// The control cue or this PC's own chime added to both sides of what the
+// mixer made, interleaved stereo, and held by the limiter again where it
+// plays: the mixer's own limit is behind it already.
+pub(super) fn mix_over(source: &mut impl FrameSource, out: &mut [f32]) {
     let mut chunk = [0.0f32; CHUNK];
     let (frames, _) = out.as_chunks_mut::<2>();
     let mut done = 0;
     while done < frames.len() {
         let want = (frames.len() - done).min(CHUNK);
-        let Some(len) = tone.next_frame(&mut chunk[..want]) else {
+        let Some(len) = source.next_frame(&mut chunk[..want]) else {
             return;
         };
         for (frame, add) in frames[done..done + len].iter_mut().zip(&chunk[..len]) {

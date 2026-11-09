@@ -459,6 +459,40 @@ fn listen(hand: &mut Hand, span: Duration) -> (Vec<Passed>, Vec<(u32, bool)>) {
     (sound, told)
 }
 
+#[test]
+fn cues_never_go_out_as_pc_sound() {
+    let _alone = alone();
+    let pc = pc_sound(silence, Duration::ZERO);
+    let mut config = sharer("Mara", PC_SOUND_SINCE, silence, &pc);
+    config.0.voice.cues = room::SoundCues::default();
+    let (host, code, to_host) = hosting(config);
+    let share = shares(&host);
+    let mut watcher = hand_watcher(&code, to_host);
+    watcher.say(&watch(share));
+    watched_by(&host, 1);
+    host.room().share_sound(true);
+    let (sound, told) = listen(&mut watcher, Duration::from_millis(300));
+    assert!(sound.is_empty());
+    assert!(told.contains(&(share, true)), "{told:?}");
+    let before = common::voiced::cues(&host.speakers).len();
+    let bo = joins(member("Bo", PC_SOUND_SINCE), &code, to_host, 3);
+    let (sound, _) = listen(&mut watcher, Duration::from_millis(300));
+    assert!(sound.is_empty());
+    drop(bo);
+    host.member
+        .wait_for(WAIT, "Bo left", |v| v.people.len() == 2);
+    let (sound, _) = listen(&mut watcher, Duration::from_millis(300));
+    assert!(sound.is_empty());
+    let heard = common::voiced::cues(&host.speakers);
+    assert_eq!(heard.len(), before + 2, "{heard:?}");
+    let changes = &heard[before..];
+    assert!(changes[0].rising && !changes[1].rising, "{changes:?}");
+    assert!(
+        changes.iter().all(|cue| (6320..=6720).contains(&cue.len)),
+        "{changes:?}"
+    );
+}
+
 // The most of `hz` on the left in any frame of `sound`, decoded as a
 // watcher decodes it, each spell from its first frame.
 fn most_in_frames(sound: &[Passed], hz: f64) -> f64 {
