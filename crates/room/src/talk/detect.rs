@@ -80,6 +80,10 @@ impl Detector {
         }
     }
 
+    pub(crate) fn set_quietest(&mut self, db: i8) {
+        self.quietest_db = f32::from(db);
+    }
+
     // One frame, 5 or 10 ms. True when this frame goes out.
     pub(crate) fn wanted(&mut self, frame: &[f32]) -> bool {
         let mut wanted = false;

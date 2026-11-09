@@ -38,7 +38,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::sync::atomic::{
-    AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+    AtomicBool, AtomicI8, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
@@ -47,8 +47,9 @@ use crossbeam_channel::Sender;
 use session::Sealer;
 use stats::StreamStats;
 use voice::audio::fake::Fake;
-use voice::audio::{AudioError, Choice, Microphone, Render, StreamInfo};
+use voice::audio::{AudioError, Choice, Level, Microphone, Reading, Render, StreamInfo};
 use voice::codec::Mode;
+use voice::process::Switches;
 
 use crate::chat;
 use crate::config::Timers;
@@ -210,6 +211,15 @@ struct Status {
     error: Option<AudioError>,
 }
 
+// The room's open microphone for Settings' meter and lines, so Settings never
+// opens a second stream on it.
+#[derive(Clone, Debug)]
+pub struct MicNow {
+    pub level: Reading,
+    pub info: StreamInfo,
+    pub input: Choice,
+}
+
 // What the render thread needs to time what it plays: where the callback
 // under way starts, in samples since the stream began and on the ping clock,
 // and how long from being written to leaving the speaker.
@@ -269,9 +279,13 @@ impl Timing {
 // Arc. The panel and the room write the switches; the audio threads read
 // them once a frame.
 pub(crate) struct Shared {
-    talk: TalkMode,
-    constant_rate: bool,
-    sensitivity_db: i8,
+    talk: AtomicBool,
+    constant_rate: AtomicBool,
+    sensitivity_db: AtomicI8,
+    switches: Arc<Switches>,
+    noise_suppression: AtomicBool,
+    automatic_volume: AtomicBool,
+    level: Mutex<Option<(Arc<Level>, Choice)>>,
     // A host sends its own voice as Relayed from its own slot, since
     // clients take only that kind.
     host: bool,
@@ -282,6 +296,7 @@ pub(crate) struct Shared {
     // hear, so the microphone closes and Windows stops showing it in use.
     over: AtomicBool,
     sending: AtomicBool,
+    capture_generation: AtomicU64,
     redundancy: AtomicBool,
     repair: AtomicBool,
     expected_loss: AtomicU8,
@@ -321,17 +336,27 @@ impl Shared {
         host: bool,
     ) -> Arc<Shared> {
         Arc::new(Shared {
-            talk: config.talk,
-            constant_rate: config.constant_rate,
-            sensitivity_db: config
-                .sensitivity_db
-                .clamp(*SENSITIVITY_DB.start(), *SENSITIVITY_DB.end()),
+            talk: AtomicBool::new(config.talk == TalkMode::OpenMic),
+            constant_rate: AtomicBool::new(config.constant_rate),
+            sensitivity_db: AtomicI8::new(
+                config
+                    .sensitivity_db
+                    .clamp(*SENSITIVITY_DB.start(), *SENSITIVITY_DB.end()),
+            ),
+            switches: Arc::new(Switches::new(
+                config.noise_suppression,
+                config.automatic_volume,
+            )),
+            noise_suppression: AtomicBool::new(config.noise_suppression),
+            automatic_volume: AtomicBool::new(config.automatic_volume),
+            level: Mutex::default(),
             host,
             held: AtomicBool::new(false),
             muted: AtomicBool::new(false),
             deafened: AtomicBool::new(false),
             over: AtomicBool::new(false),
             sending: AtomicBool::new(false),
+            capture_generation: AtomicU64::new(0),
             redundancy: AtomicBool::new(false),
             repair: AtomicBool::new(false),
             expected_loss: AtomicU8::new(0),
@@ -412,6 +437,60 @@ impl Shared {
         self.held.store(held, Ordering::Relaxed);
     }
 
+    pub(crate) fn set_voice(&self, config: &VoiceConfig) {
+        self.talk
+            .store(config.talk == TalkMode::OpenMic, Ordering::Relaxed);
+        self.constant_rate
+            .store(config.constant_rate, Ordering::Relaxed);
+        self.sensitivity_db.store(
+            config
+                .sensitivity_db
+                .clamp(*SENSITIVITY_DB.start(), *SENSITIVITY_DB.end()),
+            Ordering::Relaxed,
+        );
+        self.noise_suppression
+            .store(config.noise_suppression, Ordering::Relaxed);
+        self.automatic_volume
+            .store(config.automatic_volume, Ordering::Relaxed);
+        let status = lock(&self.microphone);
+        self.follow_effects(status.info.as_ref());
+    }
+
+    fn follow_effects(&self, info: Option<&StreamInfo>) {
+        let effects = info.map(|info| info.effects).unwrap_or_default();
+        self.switches.noise_suppression.store(
+            self.noise_suppression.load(Ordering::Relaxed) && !effects.noise_suppression,
+            Ordering::Relaxed,
+        );
+        self.switches.automatic_volume.store(
+            self.automatic_volume.load(Ordering::Relaxed) && !effects.automatic_gain,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn talk_mode(&self) -> TalkMode {
+        if self.talk.load(Ordering::Relaxed) {
+            TalkMode::OpenMic
+        } else {
+            TalkMode::PushToTalk
+        }
+    }
+
+    pub(crate) fn microphone_now(&self) -> Option<MicNow> {
+        if !self.microphone_wanted() {
+            return None;
+        }
+        let status = lock(&self.microphone);
+        let info = status.info.clone()?;
+        let level = lock(&self.level);
+        let (level, input) = level.as_ref()?;
+        Some(MicNow {
+            level: level.read(),
+            info,
+            input: input.clone(),
+        })
+    }
+
     // Both return whether the microphone should run now.
     pub(crate) fn set_muted(&self, muted: bool) -> bool {
         self.muted.store(muted, Ordering::Relaxed);
@@ -474,7 +553,7 @@ impl Shared {
     pub(crate) fn view(&self) -> VoiceView {
         let wanted = self.microphone_wanted();
         VoiceView {
-            mode: self.talk,
+            mode: self.talk_mode(),
             // Deafened is muted too, so the row reads Unmute then, and
             // Unmute undeafens as well.
             muted: self.muted() || self.deafened(),

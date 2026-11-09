@@ -295,40 +295,49 @@ impl Speaker {
         }
     }
 
+    // The render's end of the orders, for taking them while no render runs.
+    pub(crate) fn orders(&self) -> Receiver<ToSpeaker> {
+        self.orders.clone()
+    }
+
+    pub(crate) fn take(&mut self, order: ToSpeaker) {
+        match order {
+            ToSpeaker::Add(key, ear, gain) => {
+                self.shared.ears_waiting.fetch_sub(1, Ordering::Relaxed);
+                let played = Played {
+                    ear,
+                    shared: Arc::clone(&self.shared),
+                    next_start: 0,
+                };
+                self.mixer.add(Key::Talker(key), Sound::Talker(played));
+                self.mixer.set_gain(&Key::Talker(key), gain);
+            }
+            // The room keeps its own reference for a while, so the
+            // decoder is not freed here.
+            ToSpeaker::Remove(key) => {
+                self.mixer.remove(&Key::Talker(key));
+            }
+            ToSpeaker::Volume(key, gain) => self.mixer.set_gain(&Key::Talker(key), gain),
+            ToSpeaker::AddStream(key, ear, gain) => {
+                let stream = sound::Stream::new(ear, Arc::clone(&self.shared));
+                self.mixer.add_stream(Key::Sharer(key), stream);
+                self.mixer
+                    .set_stream_gain(&Key::Sharer(key), SOUND_LEVEL * gain);
+            }
+            // As for a talker, the decoder is not freed here.
+            ToSpeaker::RemoveStream(key) => {
+                self.mixer.remove_stream(&Key::Sharer(key));
+            }
+            ToSpeaker::StreamVolume(key, gain) => self
+                .mixer
+                .set_stream_gain(&Key::Sharer(key), SOUND_LEVEL * gain),
+        }
+    }
+
     pub(crate) fn fill(&mut self, out: &mut [f32]) {
         let began = Instant::now();
         while let Ok(order) = self.orders.try_recv() {
-            match order {
-                ToSpeaker::Add(key, ear, gain) => {
-                    self.shared.ears_waiting.fetch_sub(1, Ordering::Relaxed);
-                    let played = Played {
-                        ear,
-                        shared: Arc::clone(&self.shared),
-                        next_start: 0,
-                    };
-                    self.mixer.add(Key::Talker(key), Sound::Talker(played));
-                    self.mixer.set_gain(&Key::Talker(key), gain);
-                }
-                // The room keeps its own reference for a while, so the
-                // decoder is not freed here.
-                ToSpeaker::Remove(key) => {
-                    self.mixer.remove(&Key::Talker(key));
-                }
-                ToSpeaker::Volume(key, gain) => self.mixer.set_gain(&Key::Talker(key), gain),
-                ToSpeaker::AddStream(key, ear, gain) => {
-                    let stream = sound::Stream::new(ear, Arc::clone(&self.shared));
-                    self.mixer.add_stream(Key::Sharer(key), stream);
-                    self.mixer
-                        .set_stream_gain(&Key::Sharer(key), SOUND_LEVEL * gain);
-                }
-                // As for a talker, the decoder is not freed here.
-                ToSpeaker::RemoveStream(key) => {
-                    self.mixer.remove_stream(&Key::Sharer(key));
-                }
-                ToSpeaker::StreamVolume(key, gain) => self
-                    .mixer
-                    .set_stream_gain(&Key::Sharer(key), SOUND_LEVEL * gain),
-            }
+            self.take(order);
         }
         let began_us = self.clock.micros(began);
         if let Some(cue) = self.shared.take_cue(began_us)

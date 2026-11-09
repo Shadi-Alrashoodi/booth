@@ -57,6 +57,7 @@ pub enum AudioError {
     StillClosing {
         direction: Direction,
         default: bool,
+        switched: bool,
     },
     // PC sound, the sound of every other program on this PC. `lost` when it
     // may come back by itself, as after the Windows Audio service restarts;
@@ -177,7 +178,13 @@ impl fmt::Display for AudioError {
                 f,
                 "could not start the audio thread: {err}. Close some programs and try again"
             ),
-            AudioError::StillClosing { direction, default } => {
+            AudioError::StillClosing { direction, default, switched } => {
+                if *switched {
+                    return f.write_str(match direction {
+                        Direction::Input => "the microphone is still closing. It opens again once it lets go",
+                        Direction::Output => "the speakers are still closing. They play again once they let go",
+                    });
+                }
                 let (closing, way_out) = match direction {
                     Direction::Input => (
                         "the last room's microphone is still closing. It opens here once it lets go",

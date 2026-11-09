@@ -22,12 +22,16 @@ pub(crate) const HOST_SLOT: u8 = 0;
 
 pub(crate) struct Mouth {
     shared: Arc<Shared>,
+    generation: u64,
     clock: Clock,
     low_delay: Encoder,
     repair: Encoder,
     mode: Mode,
     expected_loss: u8,
     detector: Detector,
+    talk: TalkMode,
+    sensitivity_db: i8,
+    constant_rate: bool,
     pcm: [f32; MAX_FRAME],
     filled: usize,
     // When the first sample in `pcm` was captured.
@@ -46,13 +50,18 @@ pub(crate) struct Mouth {
 impl Mouth {
     // Off the capture thread: the encoders allocate.
     pub(crate) fn new(shared: Arc<Shared>, clock: Clock) -> Result<Mouth, CodecError> {
-        let constant_rate = shared.constant_rate;
+        let constant_rate = shared.constant_rate.load(Ordering::Relaxed);
+        let sensitivity_db = shared.sensitivity_db.load(Ordering::Relaxed);
         Ok(Mouth {
+            generation: shared.capture_generation.load(Ordering::Relaxed),
             low_delay: Encoder::new(Mode::LowDelay, constant_rate)?,
             repair: Encoder::new(Mode::Repair, constant_rate)?,
             mode: Mode::LowDelay,
             expected_loss: 0,
-            detector: Detector::new().quietest(shared.sensitivity_db),
+            detector: Detector::new().quietest(sensitivity_db),
+            talk: shared.talk_mode(),
+            sensitivity_db,
+            constant_rate,
             pcm: [0.0; MAX_FRAME],
             filled: 0,
             first: None,
@@ -102,17 +111,35 @@ impl Mouth {
     pub(crate) fn restart(&mut self) {
         self.filled = 0;
         self.first = None;
-        self.detector = Detector::new().quietest(self.shared.sensitivity_db);
+        self.detector =
+            Detector::new().quietest(self.shared.sensitivity_db.load(Ordering::Relaxed));
         if self.sending {
             self.sending = false;
-            self.shared.sending.store(false, Ordering::Relaxed);
-            self.shared.changed();
+            if self.generation == self.shared.capture_generation.load(Ordering::Relaxed) {
+                self.shared.sending.store(false, Ordering::Relaxed);
+                self.shared.changed();
+            }
         }
     }
 
     fn frame(&mut self) {
+        if self.generation != self.shared.capture_generation.load(Ordering::Relaxed) {
+            return;
+        }
         let frame = self.mode.frame_samples();
-        let heard = match self.shared.talk {
+        let talk = self.shared.talk_mode();
+        if talk != self.talk {
+            self.talk = talk;
+            if talk == TalkMode::OpenMic {
+                self.detector = Detector::new().quietest(self.sensitivity_db);
+            }
+        }
+        let sensitivity_db = self.shared.sensitivity_db.load(Ordering::Relaxed);
+        if sensitivity_db != self.sensitivity_db {
+            self.sensitivity_db = sensitivity_db;
+            self.detector.set_quietest(sensitivity_db);
+        }
+        let heard = match talk {
             TalkMode::PushToTalk => self.shared.held.load(Ordering::Relaxed),
             // The detector hears every frame, sent or not, so its floor is
             // the room's and not only the voice's.
@@ -123,6 +150,12 @@ impl Mouth {
             return;
         }
         if !self.sending {
+            let constant_rate = self.shared.constant_rate.load(Ordering::Relaxed);
+            if constant_rate != self.constant_rate {
+                let _ = self.low_delay.set_constant_rate(constant_rate);
+                let _ = self.repair.set_constant_rate(constant_rate);
+                self.constant_rate = constant_rate;
+            }
             // A spell starts from a reset encoder, as the far side's decoder
             // does after the end of the one before.
             let _ = self.encoder().reset();
@@ -134,7 +167,11 @@ impl Mouth {
             }
             self.previous_seq = None;
             self.sending = true;
-            self.shared.sending.store(true, Ordering::Relaxed);
+            self.shared.sending.store(true, Ordering::SeqCst);
+            // The microphone may have been let go since the check above.
+            if self.generation != self.shared.capture_generation.load(Ordering::SeqCst) {
+                self.shared.sending.store(false, Ordering::SeqCst);
+            }
             self.shared.changed();
         }
         let last = !wanted;
@@ -171,7 +208,7 @@ impl Mouth {
             .then(|| &self.previous[..self.previous_len]);
         // At a constant rate the first packet of a spell carries padding
         // where the copy would be, so it is no shorter than the rest.
-        let pad = if copy && previous.is_none() && shared.constant_rate {
+        let pad = if copy && previous.is_none() && self.constant_rate {
             self.mode.packet_bytes()
         } else {
             0
@@ -253,7 +290,8 @@ impl Mouth {
 // this PC is sending.
 impl Drop for Mouth {
     fn drop(&mut self) {
-        if self.sending {
+        if self.sending && self.generation == self.shared.capture_generation.load(Ordering::Relaxed)
+        {
             self.shared.sending.store(false, Ordering::Relaxed);
             self.shared.changed();
         }
@@ -329,6 +367,79 @@ mod tests {
                 .all(|f| f.frame.len() == 20 && f.mode == Mode::LowDelay)
         );
         assert!(run(&mut mouth, &mut at, 100, 0.2).is_empty());
+    }
+
+    #[test]
+    fn live_talk_mode_and_sensitivity_keep_the_microphone() {
+        let (mut mouth, shared) = mouth(TalkMode::PushToTalk, true, false);
+        let mut at = Instant::now();
+        let mut config = VoiceConfig {
+            talk: TalkMode::OpenMic,
+            sensitivity_db: -30,
+            ..VoiceConfig::default()
+        };
+        shared.set_voice(&config);
+        assert!(run(&mut mouth, &mut at, 750, 0.0003).is_empty());
+        let floor = mouth.detector.floor_db();
+        assert!(run(&mut mouth, &mut at, 20, 0.01).is_empty());
+        config.sensitivity_db = -50;
+        shared.set_voice(&config);
+        assert!(!run(&mut mouth, &mut at, 20, 0.01).is_empty());
+        assert!((mouth.detector.floor_db() - floor).abs() < 1.0);
+        config.talk = TalkMode::PushToTalk;
+        shared.set_voice(&config);
+        let tail = run(&mut mouth, &mut at, 20, 0.1);
+        assert_eq!(tail.len(), 1);
+        assert!(read_spoken(&tail[0]).unwrap().last);
+        assert!(!shared.sending());
+        assert!(run(&mut mouth, &mut at, 20, 0.1).is_empty());
+        assert_eq!(shared.view().mode, TalkMode::PushToTalk);
+    }
+
+    #[test]
+    fn live_constant_rate_waits_for_the_next_spell() {
+        let (mut mouth, shared) = mouth(TalkMode::PushToTalk, true, false);
+        let mut at = Instant::now();
+        shared.redundancy.store(true, Ordering::Relaxed);
+        shared.set_held(true);
+        let first = run(&mut mouth, &mut at, 20, 0.2);
+        assert_eq!(read_spoken(&first[0]).unwrap().pad, 20);
+        shared.set_voice(&VoiceConfig {
+            constant_rate: false,
+            ..VoiceConfig::default()
+        });
+        let same = run(&mut mouth, &mut at, 20, 0.2);
+        assert!(mouth.constant_rate);
+        assert!(
+            same.iter()
+                .all(|bytes| read_spoken(bytes).unwrap().frame.len() == 20)
+        );
+        shared.set_held(false);
+        run(&mut mouth, &mut at, 20, 0.2);
+        shared.set_held(true);
+        let next = run(&mut mouth, &mut at, 100, 0.0);
+        assert!(!mouth.constant_rate);
+        assert_eq!(read_spoken(&next[0]).unwrap().pad, 0);
+        assert!(
+            next.iter()
+                .any(|bytes| read_spoken(bytes).unwrap().frame.len() < 20)
+        );
+    }
+
+    #[test]
+    fn a_retired_microphone_cannot_end_the_new_spell() {
+        let (mut old, shared) = mouth(TalkMode::PushToTalk, true, false);
+        let mut at = Instant::now();
+        shared.set_held(true);
+        run(&mut old, &mut at, 20, 0.2);
+        shared.capture_generation.fetch_add(1, Ordering::Relaxed);
+        let mut next = Mouth::new(Arc::clone(&shared), Clock::new(at)).unwrap();
+        run(&mut next, &mut at, 20, 0.2);
+        assert!(run(&mut old, &mut at, 20, 0.2).is_empty());
+        old.restart();
+        assert!(shared.sending());
+        drop(old);
+        assert!(shared.sending());
     }
 
     #[test]

@@ -3970,6 +3970,7 @@ pub(crate) mod tests {
             Some(AudioError::StillClosing {
                 direction,
                 default: true,
+                switched: false,
             })
         };
         let waiting = Voice {

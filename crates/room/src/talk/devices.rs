@@ -3,8 +3,8 @@
 // changes profile, and letting go of one far longer, over 30 s once; neither
 // the panel nor the room's threads wait for that. Each stream closes on its
 // own thread, so a slow close holds up no order here either. Orders are
-// taken one at a time, and a microphone opens only once the last one has let
-// go, so a room never has two on the device at once.
+// taken one at a time, and a stream opens only once the last one on the same
+// device has let go, so a room never has two on a device at once.
 //
 // A room can be left while its streams are still closing. They close on
 // their own threads, holding nothing of the room's (talk::Shared::let_go).
@@ -19,12 +19,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, never, select};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, after, never, select};
 use voice::audio::fake::Fake;
 use voice::audio::{
     AudioError, Capture, Choice, Direction, Event, Render, StreamInfo, StreamThread,
 };
-use voice::process::{Processor, Switches};
+use voice::process::Processor;
 
 use super::ear::Speaker;
 use super::mouth::Mouth;
@@ -35,7 +35,7 @@ use crate::peer::Clock;
 // Every stream a room in this process opened that has not ended yet, closing
 // ones included.
 static OPEN: Mutex<Vec<Opened>> = Mutex::new(Vec::new());
-// Numbers the rooms, so a room never waits for its own streams.
+// Numbers the rooms, so a wait can say whose device is still closing.
 static NEXT_ROOM: AtomicU64 = AtomicU64::new(0);
 // How often a room waiting for the last room's device asks again which one
 // it would open: Windows' default can move to another device meanwhile.
@@ -138,19 +138,19 @@ fn note_open(room: u64, device: &Which, thread: StreamThread) {
     });
 }
 
-// Another room's stream that may be on the device `device` would open now:
+// A stream that may be on the device `device` would open now:
 // one on the same id, or one whose device is not known yet because it is
 // still opening, or when Windows does not say which its default is. By id,
 // so a default that moved to other speakers does not wait for the old
 // ones, and a headset chosen in settings waits for the same headset opened
 // as Windows' default.
-fn in_the_way(room: u64, device: &Which) -> Option<StreamThread> {
-    let beside: Vec<StreamThread> = {
+fn in_the_way(device: &Which) -> Option<(u64, StreamThread)> {
+    let beside: Vec<(u64, StreamThread)> = {
         let mut open = lock(&OPEN);
         open.retain(|opened| opened.thread.running());
         open.iter()
-            .filter(|opened| opened.room != room && opened.device.beside(device))
-            .map(|opened| opened.thread.clone())
+            .filter(|opened| opened.device.beside(device))
+            .map(|opened| (opened.room, opened.thread.clone()))
             .collect()
     };
     if beside.is_empty() {
@@ -160,92 +160,106 @@ fn in_the_way(room: u64, device: &Which) -> Option<StreamThread> {
     let id = device.id_now();
     beside
         .into_iter()
-        .find(|thread| match (thread.device(), &id) {
+        .find(|(_, thread)| match (thread.device(), &id) {
             (Some(on), Some(id)) => on == *id,
             _ => true,
         })
 }
 
-// Waits until no other room has a stream left on the device `device` would
-// open, taking orders meanwhile. False when the room asked to stop. Only
-// this thread waits: the room is up and its network runs, and the panel
-// says under your row why that device has no sound. The line stays until
-// the device opens, or fails to, which replaces it (on_event); a caller
-// that opens nothing after the wait takes it away (not_waiting).
+// A wait for an earlier stream on the device a room would open, and whether
+// that stream is this room's own.
+struct Wait {
+    thread: StreamThread,
+    started: Instant,
+    own: bool,
+}
+
+// Whether no earlier stream is left on the device `device` would open, with
+// `wait` kept up to date. It never blocks: the devices thread waits in one
+// select, so a wait on one device holds up neither the other nor an order,
+// and the room's network runs meanwhile. The panel says under your row why
+// that device has no sound, unless the stream is this room's own and no new
+// choice waits for it, as for an unmute while the microphone of the mute
+// still closes; a new choice made during that wait puts the line up then,
+// and so does a wait that moves to the last room's stream. The line stays
+// until the device opens, or fails to, which replaces it (on_event); a
+// caller that opens nothing after the wait takes it away (not_waiting).
 fn earlier_closed(
     room: u64,
     device: &Which,
+    switched: bool,
+    wait: &mut Option<Wait>,
     shared: &Shared,
-    orders: &Receiver<Order>,
     log: &Log,
 ) -> bool {
-    let Some(mut first) = in_the_way(room, device) else {
+    let Some((owner, thread)) = in_the_way(device) else {
+        if let Some(done) = wait.take() {
+            log!(
+                log,
+                "voice: waited {} ms for {} {}",
+                done.started.elapsed().as_millis(),
+                if done.own {
+                    "this room's last"
+                } else {
+                    "the last room's"
+                },
+                device.word()
+            );
+        }
         return true;
     };
-    lock(device.status(shared)).error = Some(AudioError::StillClosing {
-        direction: device.direction,
-        default: device.choice == Choice::Default,
-    });
-    shared.changed();
-    let started = Instant::now();
+    let own = owner == room;
+    if !own || switched {
+        let line = AudioError::StillClosing {
+            direction: device.direction,
+            default: device.choice == Choice::Default,
+            switched: own,
+        };
+        let mut status = lock(device.status(shared));
+        if status.error.as_ref() != Some(&line) {
+            status.error = Some(line);
+            drop(status);
+            shared.changed();
+        }
+    }
+    if let Some(wait) = wait {
+        wait.thread = thread;
+        wait.own = own;
+        return false;
+    }
     log!(
         log,
         "voice: {}",
-        match device.direction {
-            Direction::Input =>
+        match (device.direction, own) {
+            (Direction::Input, true) =>
+                "the microphone is still closing, it opens again once it has let go",
+            (Direction::Output, true) =>
+                "the speakers are still closing, they open again once they have let go",
+            (Direction::Input, false) =>
                 "the last room's microphone is still closing, it opens here once it has let go",
-            Direction::Output =>
+            (Direction::Output, false) =>
                 "the last room's speakers are still closing, they open here once they have let go",
         }
     );
-    loop {
-        select! {
-            recv(first.ended()) -> _ => {}
-            recv(orders) -> order => match order {
-                // Mute and deafen are read again once it has let go.
-                Ok(Order::Follow) => {}
-                Ok(Order::Stop) | Err(_) => return false,
-            },
-            default(LOOK_AGAIN) => {}
-        }
-        match in_the_way(room, device) {
-            Some(next) => first = next,
-            None => break,
-        }
-    }
-    log!(
-        log,
-        "voice: waited {} ms for the last room's {}",
-        started.elapsed().as_millis(),
-        device.word()
-    );
-    true
-}
-
-// Waits for a stream's thread to end, taking orders meanwhile. False when
-// the room asked to stop first.
-fn wait_ended(thread: &StreamThread, orders: &Receiver<Order>) -> bool {
-    loop {
-        select! {
-            // Nothing is ever sent on it: it only disconnects.
-            recv(thread.ended()) -> _ => return true,
-            recv(orders) -> order => match order {
-                // Mute and deafen are read again once it has let go.
-                Ok(Order::Follow) => {}
-                Ok(Order::Stop) | Err(_) => return false,
-            },
-        }
-    }
+    *wait = Some(Wait {
+        thread,
+        started: Instant::now(),
+        own,
+    });
+    false
 }
 
 enum Order {
     // Open or close the microphone to match mute and deafen as they are now.
     Follow,
+    Voice(VoiceConfig),
     Stop,
 }
 
 pub(crate) struct Streams {
     orders: Sender<Order>,
+    devices: Devices,
+    process_loopback: bool,
     thread: Option<JoinHandle<()>>,
     // Disconnects when the thread has closed both streams.
     done: Receiver<()>,
@@ -265,11 +279,13 @@ impl Streams {
         shared.on_follow(move || {
             let _ = room_over.send(Order::Follow);
         });
+        let devices = config.devices.clone();
+        let process_loopback = config.process_loopback;
         let thread = thread::Builder::new()
             .name(String::from("voice devices"))
             .spawn(move || {
                 let run = Run {
-                    config: &config,
+                    config,
                     shared: &shared,
                     clock,
                     log: &log,
@@ -281,9 +297,17 @@ impl Streams {
             })?;
         Ok(Streams {
             orders,
+            devices,
+            process_loopback,
             thread: Some(thread),
             done,
         })
+    }
+
+    pub(crate) fn set_voice(&self, mut config: VoiceConfig) {
+        config.devices = self.devices.clone();
+        config.process_loopback = self.process_loopback;
+        let _ = self.orders.send(Order::Voice(config));
     }
 
     pub(crate) fn follow(&self) {
@@ -314,7 +338,7 @@ impl Drop for Streams {
 
 // The devices thread.
 struct Run<'a> {
-    config: &'a VoiceConfig,
+    config: VoiceConfig,
     shared: &'a Arc<Shared>,
     clock: Clock,
     log: &'a Log,
@@ -322,129 +346,231 @@ struct Run<'a> {
     room: u64,
 }
 
-// The room's microphone: the one open, or else the last one, still closing
-// after a mute, with what the log says once it has.
+// The room's microphone: the one open, or the wait before the next one
+// opens, and whether that one is a new choice. `closing` has every stream of
+// the room still closing, microphones let go at a mute or a new choice and
+// speakers at a new choice, each with what the log says once it has.
 #[derive(Default)]
 struct Microphone {
     open: Option<Capture>,
-    closing: Option<(StreamThread, &'static str)>,
+    wait: Option<Wait>,
+    switched: bool,
+    closing: Vec<(StreamThread, &'static str)>,
 }
 
 impl Run<'_> {
-    fn run(&self, speaker: Speaker) {
-        let (config, shared, log) = (self.config, self.shared, self.log);
+    fn run(mut self, speaker: Speaker) {
+        let shared = self.shared;
+        let log = self.log;
         log!(
             log,
             "voice: {}, constant rate {}, input {}, output {}",
-            match config.talk {
+            match self.config.talk {
                 super::TalkMode::PushToTalk => "push to talk",
                 super::TalkMode::OpenMic => "open mic",
             },
-            if config.constant_rate { "on" } else { "off" },
-            config.input.id().unwrap_or("windows default"),
-            config.output.id().unwrap_or("windows default")
+            if self.config.constant_rate {
+                "on"
+            } else {
+                "off"
+            },
+            self.config.input.id().unwrap_or("windows default"),
+            self.config.output.id().unwrap_or("windows default")
         );
-        let speakers = Which::of(config, Direction::Output);
-        if !earlier_closed(self.room, &speakers, shared, self.orders, log) || shared.left() {
-            return;
-        }
-        match open_speakers(config, shared, speaker, log) {
-            Ok(render) => {
-                note_open(self.room, &speakers, render.thread());
-                *lock(&shared.render) = Some(render);
-            }
-            Err(err) => {
-                log!(log, "voice: could not start the speakers: {err}");
-                lock(&shared.speakers).error = Some(err);
-                shared.changed();
-            }
-        }
+        // While no render pulls the talkers through, their orders are taken
+        // here instead, so none piles up for speakers that never come.
+        let unheard = speaker.orders();
+        let speaker = Arc::new(Mutex::new(speaker));
+        let mut retired = Arc::new(AtomicBool::new(false));
         let mut microphone = Microphone::default();
-        let mut going = self.follow(&mut microphone);
-        while going {
-            let closed = match &microphone.closing {
-                Some((thread, _)) => thread.ended().clone(),
-                None => never(),
-            };
-            select! {
-                recv(self.orders) -> order => match order {
-                    Ok(Order::Follow) => going = self.follow(&mut microphone),
-                    Ok(Order::Stop) | Err(_) => break,
-                },
-                recv(closed) -> _ => {
-                    if let Some((_, line)) = microphone.closing.take() {
-                        log!(log, "{line}");
+        let mut speakers_wait = None;
+        let mut speakers_switched = false;
+        let mut next = Order::Follow;
+        loop {
+            match next {
+                Order::Stop => break,
+                Order::Follow => {}
+                Order::Voice(config) => {
+                    let output = config.output != self.config.output;
+                    let input = config.input != self.config.input;
+                    let reopen = input
+                        || config.echo_cancellation != self.config.echo_cancellation
+                        || (output && config.echo_cancellation);
+                    if input {
+                        log!(
+                            log,
+                            "voice: input now {}",
+                            config.input.id().unwrap_or("windows default")
+                        );
+                    }
+                    if output {
+                        log!(
+                            log,
+                            "voice: output now {}",
+                            config.output.id().unwrap_or("windows default")
+                        );
+                    }
+                    if reopen {
+                        microphone.switched = true;
+                        self.close_microphone(&mut microphone);
+                    }
+                    if output {
+                        speakers_switched = true;
+                        speakers_wait = None;
+                        retired.store(true, Ordering::Release);
+                        if let Some(render) = lock(&shared.render).take() {
+                            microphone
+                                .closing
+                                .push((render.let_go(), "voice: speakers closed"));
+                        }
+                        *lock(&shared.speakers) = Status::default();
+                        retired = Arc::new(AtomicBool::new(false));
+                    }
+                    self.config = config;
+                }
+            }
+            if shared.left() {
+                break;
+            }
+            microphone.closing.retain(|(thread, line)| {
+                if thread.running() {
+                    true
+                } else {
+                    log!(log, "{line}");
+                    false
+                }
+            });
+            if lock(&shared.render).is_none() {
+                let which = Which::of(&self.config, Direction::Output);
+                if earlier_closed(
+                    self.room,
+                    &which,
+                    speakers_switched,
+                    &mut speakers_wait,
+                    shared,
+                    log,
+                ) {
+                    speakers_switched = false;
+                    match open_speakers(
+                        &self.config,
+                        shared,
+                        Arc::clone(&speaker),
+                        Arc::clone(&retired),
+                        log,
+                    ) {
+                        Ok(render) => {
+                            note_open(self.room, &which, render.thread());
+                            *lock(&shared.render) = Some(render);
+                        }
+                        Err(err) => {
+                            log!(log, "voice: could not start the speakers: {err}");
+                            lock(&shared.speakers).error = Some(err);
+                            shared.changed();
+                        }
                     }
                 }
             }
+            self.follow(&mut microphone);
+            let ended = |wait: &Option<Wait>| {
+                wait.as_ref()
+                    .map(|wait| wait.thread.ended().clone())
+                    .unwrap_or_else(never)
+            };
+            let closed = microphone
+                .closing
+                .first()
+                .map(|(thread, _)| thread.ended().clone())
+                .unwrap_or_else(never);
+            let (speakers_free, microphone_free) = (ended(&speakers_wait), ended(&microphone.wait));
+            let look_again = if speakers_wait.is_some() || microphone.wait.is_some() {
+                after(LOOK_AGAIN)
+            } else {
+                never()
+            };
+            let mut playing = lock(&shared.render)
+                .as_ref()
+                .map(Render::thread)
+                .filter(StreamThread::running);
+            next = loop {
+                let (stops, pending) = match &playing {
+                    Some(thread) => (thread.ended().clone(), never()),
+                    None => (never(), unheard.clone()),
+                };
+                select! {
+                    recv(self.orders) -> order => break order.unwrap_or(Order::Stop),
+                    recv(closed) -> _ => break Order::Follow,
+                    recv(speakers_free) -> _ => break Order::Follow,
+                    recv(microphone_free) -> _ => break Order::Follow,
+                    recv(look_again) -> _ => break Order::Follow,
+                    recv(stops) -> _ => playing = None,
+                    recv(pending) -> order => {
+                        if let Ok(order) = order {
+                            lock(&speaker).take(order);
+                        }
+                    }
+                }
+            };
         }
-        // Both asked at once, so a microphone slow to let go does not keep
-        // the speakers open too. Each closes on its own thread.
-        let open = microphone.open.take().map(Capture::let_go);
-        let render = lock(&shared.render).take();
-        let speakers = render.map(Render::let_go);
-        if let Some((thread, line)) = microphone.closing.take() {
+        retired.store(true, Ordering::Release);
+        self.close_microphone(&mut microphone);
+        if let Some(render) = lock(&shared.render).take() {
+            microphone
+                .closing
+                .push((render.let_go(), "voice: speakers closed"));
+        }
+        for (thread, line) in microphone.closing {
             let _ = thread.ended().recv();
             log!(log, "{line}");
-        }
-        if let Some(thread) = open {
-            let _ = thread.ended().recv();
-            log!(log, "voice: microphone closed, the room closed");
-        }
-        if let Some(thread) = speakers {
-            let _ = thread.ended().recv();
-            log!(log, "voice: speakers closed");
         }
     }
 
-    // False when the room was left, or asked to stop while the microphone
-    // waited for the last one to let go.
-    fn follow(&self, microphone: &mut Microphone) -> bool {
+    fn close_microphone(&self, microphone: &mut Microphone) {
+        if let Some(open) = microphone.open.take() {
+            // In this order, and the Mouth checks again after it marks a
+            // spell, so one the old microphone starts as it goes cannot leave
+            // your row reading as sending.
+            self.shared
+                .capture_generation
+                .fetch_add(1, Ordering::SeqCst);
+            self.shared.sending.store(false, Ordering::SeqCst);
+            let line = if self.shared.left() {
+                "voice: microphone closed, the room closed"
+            } else if self.shared.over() {
+                "voice: microphone closed, nobody is left to hear it"
+            } else {
+                "voice: microphone closed"
+            };
+            microphone.closing.push((open.let_go(), line));
+            *lock(&self.shared.microphone) = Status::default();
+            *lock(&self.shared.level) = None;
+            self.shared.changed();
+        }
+    }
+
+    fn follow(&self, microphone: &mut Microphone) {
         let shared = self.shared;
         let log = self.log;
-        if shared.left() {
-            return false;
+        let wanted = shared.microphone_wanted();
+        if !wanted {
+            self.close_microphone(microphone);
         }
-        if !shared.microphone_wanted() {
-            if let Some(open) = microphone.open.take() {
-                let line = if shared.over() {
-                    "voice: microphone closed, nobody is left to hear it"
-                } else {
-                    "voice: microphone closed"
-                };
-                // On its own thread, so a headset slow to let go keeps
-                // neither an unmute nor Leave waiting behind it here.
-                microphone.closing = Some((open.let_go(), line));
-                *lock(&shared.microphone) = Status::default();
-                shared.changed();
-            }
-            return true;
+        // A wait under way goes on while muted, so an unmute after it opens
+        // at once; a muted microphone starts none.
+        if microphone.open.is_some() || (!wanted && microphone.wait.is_none()) {
+            return;
         }
-        if microphone.open.is_some() {
-            return true;
+        let which = Which::of(&self.config, Direction::Input);
+        if !earlier_closed(
+            self.room,
+            &which,
+            microphone.switched,
+            &mut microphone.wait,
+            shared,
+            log,
+        ) {
+            return;
         }
-        if let Some((thread, line)) = microphone.closing.take() {
-            if thread.running() {
-                log!(
-                    log,
-                    "voice: the microphone is still closing, it opens again once it has let go"
-                );
-            }
-            if !wait_ended(&thread, self.orders) {
-                microphone.closing = Some((thread, line));
-                return false;
-            }
-            log!(log, "{line}");
-        }
-        let which = Which::of(self.config, Direction::Input);
-        if !earlier_closed(self.room, &which, shared, self.orders, log) {
-            return false;
-        }
-        // Mute, deafen or Leave may have come meanwhile.
-        if shared.left() {
-            return false;
-        }
-        if !shared.microphone_wanted() {
+        if !wanted {
             which.not_waiting(shared);
             log!(
                 log,
@@ -455,8 +581,9 @@ impl Run<'_> {
                     "muted meanwhile, the microphone stays closed"
                 }
             );
-            return true;
+            return;
         }
+        microphone.switched = false;
         let mouth = match Mouth::new(Arc::clone(shared), self.clock) {
             Ok(mouth) => mouth,
             Err(err) => {
@@ -465,10 +592,10 @@ impl Run<'_> {
                     "voice: could not make the opus encoder, nothing is sent: {err}"
                 );
                 which.not_waiting(shared);
-                return true;
+                return;
             }
         };
-        match open_microphone(self.config, shared, mouth, log) {
+        match open_microphone(&self.config, shared, mouth, log) {
             Ok(open) => {
                 note_open(self.room, &which, open.thread());
                 microphone.open = Some(open);
@@ -479,7 +606,6 @@ impl Run<'_> {
                 shared.changed();
             }
         }
-        true
     }
 }
 
@@ -489,9 +615,9 @@ fn open_microphone(
     mut mouth: Mouth,
     log: &Log,
 ) -> Result<Capture, AudioError> {
-    let wanted = (config.noise_suppression, config.automatic_volume);
-    let switches = Arc::new(Switches::new(wanted.0, wanted.1));
-    let mut processor = Processor::new(Arc::clone(&switches));
+    let mut processor = Processor::new(Arc::clone(&shared.switches));
+    let level = processor.level();
+    *lock(&shared.level) = Some((Arc::clone(&level), config.input.clone()));
     // Set at each open: a microphone opened again after a gap, or another
     // one once Windows' default moved, starts afresh.
     let fresh = Arc::new(AtomicBool::new(false));
@@ -504,28 +630,19 @@ fn open_microphone(
         let (samples, at) = processor.run(samples, at);
         mouth.hear(samples, at);
     };
-    let mut said = on_event(Arc::clone(shared), log.clone(), Side::Microphone);
+    let mut said = on_event(Arc::clone(shared), log.clone(), Side::Microphone, None);
     let away = Arc::clone(shared);
+    let generation = shared.capture_generation.load(Ordering::Relaxed);
     // Where Windows already suppresses noise or evens out the volume on
     // this microphone, Booth's own stage stands down rather than do it
     // twice. Opened comes before the first packet, on the same thread.
     let events = move |event: Event| {
-        match &event {
-            Event::Opened(info) => {
-                let effects = info.effects;
-                let noise = wanted.0 && !effects.noise_suppression;
-                let volume = wanted.1 && !effects.automatic_gain;
-                switches.noise_suppression.store(noise, Ordering::Relaxed);
-                switches.automatic_volume.store(volume, Ordering::Relaxed);
-                opened.store(true, Ordering::Relaxed);
-            }
-            // No packet comes to end a spell while the microphone is away,
-            // and nothing is sent.
-            Event::Lost(_) | Event::Gone(_) | Event::Failed(_) => {
-                if away.sending.swap(false, Ordering::Relaxed) {
-                    away.changed();
-                }
-            }
+        if generation != away.capture_generation.load(Ordering::Relaxed) {
+            return;
+        }
+        level.clear();
+        if matches!(event, Event::Opened(_)) {
+            opened.store(true, Ordering::Relaxed);
         }
         said(event);
     };
@@ -545,17 +662,41 @@ fn open_microphone(
 fn open_speakers(
     config: &VoiceConfig,
     shared: &Arc<Shared>,
-    mut speaker: Speaker,
+    speaker: Arc<Mutex<Speaker>>,
+    retired: Arc<AtomicBool>,
     log: &Log,
 ) -> Result<Render, AudioError> {
-    let fill = move |out: &mut [f32]| speaker.fill(out);
-    let events = on_event(Arc::clone(shared), log.clone(), Side::Speakers);
+    let fill = speaker_audio(speaker, Arc::clone(&retired));
+    let events = on_event(
+        Arc::clone(shared),
+        log.clone(),
+        Side::Speakers,
+        Some(retired),
+    );
     let choice = config.output.clone();
     match &config.devices {
         Devices::Windows => Render::start_stereo(choice, fill, events),
         Devices::Fake { speakers, .. } => {
             Render::start_stereo_with(speakers.device(), choice, fill, events)
         }
+    }
+}
+
+fn speaker_audio(
+    speaker: Arc<Mutex<Speaker>>,
+    retired: Arc<AtomicBool>,
+) -> impl FnMut(&mut [f32]) + Send + 'static {
+    move |out| {
+        if retired.load(Ordering::Acquire) {
+            out.fill(0.0);
+            return;
+        }
+        let mut speaker = lock(&speaker);
+        if retired.load(Ordering::Acquire) {
+            out.fill(0.0);
+            return;
+        }
+        speaker.fill(out);
     }
 }
 
@@ -575,12 +716,32 @@ impl Side {
 }
 
 // On the stream's own thread: what the view shows and the log says.
-fn on_event(shared: Arc<Shared>, log: Log, side: Side) -> impl FnMut(Event) + Send + 'static {
+fn on_event(
+    shared: Arc<Shared>,
+    log: Log,
+    side: Side,
+    retired: Option<Arc<AtomicBool>>,
+) -> impl FnMut(Event) + Send + 'static {
+    let generation = shared.capture_generation.load(Ordering::Relaxed);
     move |event| {
         let status = match side {
             Side::Microphone => &shared.microphone,
             Side::Speakers => &shared.speakers,
         };
+        let mut status = lock(status);
+        if retired
+            .as_ref()
+            .is_some_and(|retired| retired.load(Ordering::Acquire))
+            || (matches!(side, Side::Microphone)
+                && generation != shared.capture_generation.load(Ordering::Relaxed))
+        {
+            return;
+        }
+        // No packet ends a spell while the microphone is away. Retired
+        // streams must leave the current microphone's spell alone.
+        if matches!(side, Side::Microphone) && !matches!(event, Event::Opened(_)) {
+            shared.sending.store(false, Ordering::Relaxed);
+        }
         match event {
             Event::Opened(info) => {
                 log!(log, "voice: {} {}", side.word(), opened(&info));
@@ -590,7 +751,10 @@ fn on_event(shared: Arc<Shared>, log: Log, side: Side) -> impl FnMut(Event) + Se
                         .period
                         .store(info.period_frames, Ordering::Relaxed);
                 }
-                *lock(status) = Status {
+                if let Side::Microphone = side {
+                    shared.follow_effects(Some(&info));
+                }
+                *status = Status {
                     info: Some(info),
                     error: None,
                 };
@@ -601,7 +765,7 @@ fn on_event(shared: Arc<Shared>, log: Log, side: Side) -> impl FnMut(Event) + Se
                     "voice: {} lost, opened again in a moment: {err}",
                     side.word()
                 );
-                *lock(status) = Status {
+                *status = Status {
                     info: None,
                     error: Some(err),
                 };
@@ -612,19 +776,20 @@ fn on_event(shared: Arc<Shared>, log: Log, side: Side) -> impl FnMut(Event) + Se
                     "voice: {} not open, opened again once Windows gives it: {err}",
                     side.word()
                 );
-                *lock(status) = Status {
+                *status = Status {
                     info: None,
                     error: Some(err),
                 };
             }
             Event::Failed(err) => {
                 log!(log, "voice: {} stopped: {err}", side.word());
-                *lock(status) = Status {
+                *status = Status {
                     info: None,
                     error: Some(err),
                 };
             }
         }
+        drop(status);
         shared.changed();
     }
 }
@@ -661,4 +826,208 @@ fn opened(info: &StreamInfo) -> String {
         info.format,
         info.stream_latency.as_secs_f64() * 1000.0
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_processing_uses_the_switches_and_windows_effects() {
+        let fake = Fake::new(
+            voice::audio::fake::Setup::default(),
+            &[("mic", "Test microphone")],
+            Some("mic"),
+        );
+        let mut config = VoiceConfig {
+            automatic_volume: false,
+            devices: Devices::Fake {
+                microphone: fake.clone(),
+                speakers: fake.clone(),
+                pc_sound: fake.clone(),
+            },
+            ..VoiceConfig::default()
+        };
+        let shared = Shared::new(&config, None, false);
+        let clock = Clock::new(Instant::now());
+        let mouth = Mouth::new(Arc::clone(&shared), clock).unwrap();
+        let capture = open_microphone(&config, &shared, mouth, &Log::off()).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        let mut info = loop {
+            if let Some(mic) = shared.microphone_now() {
+                break mic.info;
+            }
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(5));
+        };
+        let mut events = on_event(Arc::clone(&shared), Log::off(), Side::Microphone, None);
+        let mut processor = Processor::new(Arc::clone(&shared.switches));
+        let samples = [0.01; 480];
+        let at = Instant::now();
+        config.noise_suppression = true;
+        config.automatic_volume = true;
+        info.effects = voice::audio::Effects {
+            noise_suppression: true,
+            automatic_gain: true,
+            ..Default::default()
+        };
+        events(Event::Opened(info.clone()));
+        shared.set_voice(&config);
+        assert_eq!(processor.run(&samples, at).0, samples);
+        info.effects = voice::audio::Effects::default();
+        events(Event::Opened(info.clone()));
+        config.automatic_volume = false;
+        shared.set_voice(&config);
+        assert_ne!(processor.run(&samples, at).0, samples);
+        config.noise_suppression = false;
+        shared.set_voice(&config);
+        assert_eq!(processor.run(&samples, at).0, samples);
+        config.automatic_volume = true;
+        shared.set_voice(&config);
+        for _ in 0..100 {
+            processor.run(&[0.0001; 480], at);
+        }
+        for _ in 0..100 {
+            processor.run(&samples, at);
+        }
+        assert!(processor.gain_db() > 0.0);
+        config.automatic_volume = false;
+        shared.set_voice(&config);
+        assert_eq!(processor.run(&samples, at).0, samples);
+        assert_eq!(fake.record().starts, 1);
+        capture.stop();
+    }
+
+    #[test]
+    fn retired_speakers_never_pull_from_the_mixer() {
+        let shared = Shared::new(&VoiceConfig::default(), None, false);
+        let clock = Clock::new(Instant::now());
+        let (_orders, taken) = crossbeam_channel::unbounded();
+        let speaker = Arc::new(Mutex::new(Speaker::new(taken, Arc::clone(&shared), clock)));
+        let retired = Arc::new(AtomicBool::new(false));
+        let mut old = speaker_audio(Arc::clone(&speaker), Arc::clone(&retired));
+        let mut current = speaker_audio(speaker, Arc::new(AtomicBool::new(false)));
+        retired.store(true, Ordering::Release);
+        shared.cue(super::super::Cue::Rising, clock.micros(Instant::now()));
+        let pending = shared.cue.load(Ordering::Relaxed);
+        assert_ne!(pending, 0);
+        let mut out = [1.0; 480];
+        old(&mut out);
+        assert!(out.iter().all(|sample| *sample == 0.0));
+        assert_eq!(shared.cue.load(Ordering::Relaxed), pending);
+        current(&mut out);
+        assert_eq!(shared.cue.load(Ordering::Relaxed), 0);
+    }
+
+    // Each talker's next frame is placed by a count of samples that the
+    // render keeps, so new speakers go on counting from the last.
+    #[test]
+    fn new_speakers_count_on_from_the_last() {
+        let fake = Fake::new(
+            voice::audio::fake::Setup::default(),
+            &[("spk", "Test speakers")],
+            Some("spk"),
+        );
+        let config = VoiceConfig {
+            devices: Devices::Fake {
+                microphone: fake.clone(),
+                speakers: fake.clone(),
+                pc_sound: fake.clone(),
+            },
+            ..VoiceConfig::default()
+        };
+        let shared = Shared::new(&config, None, false);
+        let clock = Clock::new(Instant::now());
+        let (_orders, taken) = crossbeam_channel::unbounded();
+        let speaker = Arc::new(Mutex::new(Speaker::new(taken, Arc::clone(&shared), clock)));
+        let played = || shared.render_now.start_sample.load(Ordering::Relaxed);
+        let until = Instant::now() + Duration::from_secs(3);
+        let retired = Arc::new(AtomicBool::new(false));
+        let first = open_speakers(
+            &config,
+            &shared,
+            Arc::clone(&speaker),
+            Arc::clone(&retired),
+            &Log::off(),
+        )
+        .unwrap();
+        while played() < 4800 {
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(5));
+        }
+        retired.store(true, Ordering::Release);
+        let _ = first.let_go().ended().recv();
+        *lock(&shared.speakers) = Status::default();
+        let before = played();
+        let second = open_speakers(
+            &config,
+            &shared,
+            speaker,
+            Arc::new(AtomicBool::new(false)),
+            &Log::off(),
+        )
+        .unwrap();
+        while lock(&shared.speakers).info.is_none() {
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(5));
+        }
+        // A callback after the open, which is where a count started again
+        // would show.
+        let opened = played();
+        while played() == opened {
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(played() > before, "{} after {before}", played());
+        second.stop();
+    }
+
+    // Speakers that will not run leave the talkers' orders to this thread,
+    // so they never pile up and refuse the next talker.
+    #[test]
+    fn orders_for_speakers_that_failed_are_taken_all_the_same() {
+        let microphone = Fake::new(
+            voice::audio::fake::Setup::default(),
+            &[("mic", "Test microphone")],
+            Some("mic"),
+        );
+        let speakers = Fake::new(
+            voice::audio::fake::Setup {
+                rate: 44_100,
+                ..Default::default()
+            },
+            &[("spk", "Test speakers")],
+            Some("spk"),
+        );
+        let config = VoiceConfig {
+            devices: Devices::Fake {
+                microphone: microphone.clone(),
+                speakers,
+                pc_sound: microphone,
+            },
+            ..VoiceConfig::default()
+        };
+        let shared = Shared::new(&config, None, false);
+        let clock = Clock::new(Instant::now());
+        let (orders, taken) = crossbeam_channel::unbounded();
+        let speaker = Speaker::new(taken, Arc::clone(&shared), clock);
+        let mut streams =
+            Streams::start(config, Arc::clone(&shared), speaker, clock, Log::off()).unwrap();
+        let until = Instant::now() + Duration::from_secs(3);
+        while !matches!(lock(&shared.speakers).error, Some(AudioError::Rate { .. })) {
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(5));
+        }
+        for key in 0..4 {
+            shared.ears_waiting.fetch_add(1, Ordering::Relaxed);
+            let ear = Arc::new(Mutex::new(super::super::ear::Ear::new().unwrap()));
+            let add = super::super::ear::ToSpeaker::Add([key; 32], ear, 1.0);
+            orders.send(add).unwrap();
+        }
+        while !orders.is_empty() || shared.ears_waiting.load(Ordering::Relaxed) != 0 {
+            assert!(Instant::now() < until, "the orders still wait");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(streams.stop(Duration::from_secs(1)));
+    }
 }

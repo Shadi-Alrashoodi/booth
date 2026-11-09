@@ -826,6 +826,26 @@ impl Threads {
         self.voice_changed(what, microphone);
     }
 
+    pub(crate) fn set_voice(&self, config: VoiceConfig) {
+        self.voice.set_voice(&config);
+        log!(
+            self.shared.log,
+            "voice: {}",
+            match config.talk {
+                talk::TalkMode::PushToTalk => "push to talk",
+                talk::TalkMode::OpenMic => "open mic",
+            }
+        );
+        if let Some(streams) = &self.streams {
+            streams.set_voice(config);
+        }
+        self.shared.commands.send(Command::Voice);
+    }
+
+    pub(crate) fn microphone_now(&self) -> Option<talk::MicNow> {
+        self.voice.microphone_now()
+    }
+
     fn voice_changed(&self, what: &str, microphone: bool) {
         let then = if microphone {
             "the microphone opens"

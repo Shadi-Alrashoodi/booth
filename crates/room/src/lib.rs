@@ -75,7 +75,7 @@ pub use share::{
     Capturing, Monitor, MonitorId, Show, TopWindow, WindowId, monitors, top_windows, window_monitor,
 };
 pub use talk::{
-    DEFAULT_SENSITIVITY_DB, Devices, MOST_VOLUME, SENSITIVITY_DB, TalkMode, VoiceConfig,
+    DEFAULT_SENSITIVITY_DB, Devices, MOST_VOLUME, MicNow, SENSITIVITY_DB, TalkMode, VoiceConfig,
 };
 pub use threads::AddressHook;
 pub use view::View;
@@ -364,6 +364,23 @@ impl Room {
     /// Undeafened, the microphone opens again unless muted before.
     pub fn deafen(&self, deafened: bool) {
         self.threads.deafen(deafened);
+    }
+
+    /// The voice settings from Settings, saved while the room runs. How you
+    /// talk, open mic sensitivity, constant-rate voice, noise suppression
+    /// and automatic volume change in place; a new input, output or echo
+    /// cancellation opens the device it needs again. The room keeps its own
+    /// devices and PC sound capture whatever `config` says, and nothing
+    /// here waits for a device.
+    pub fn set_voice(&self, config: VoiceConfig) {
+        self.threads.set_voice(config);
+    }
+
+    /// The room's own microphone as it is now: its level after processing,
+    /// what Windows opened, and the choice it was opened for. None while it
+    /// is closed, as it is while muted or deafened.
+    pub fn microphone_now(&self) -> Option<MicNow> {
+        self.threads.microphone_now()
     }
 
     /// How loud this PC plays the person with `key`, in percent of how

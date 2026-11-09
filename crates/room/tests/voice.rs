@@ -2259,7 +2259,431 @@ fn headset_by_name_waits_for_itself_as_default() {
 }
 
 fn closing(direction: Direction, default: bool) -> AudioError {
-    AudioError::StillClosing { direction, default }
+    AudioError::StillClosing {
+        direction,
+        default,
+        switched: false,
+    }
+}
+
+// A Save while deafened changes the choice and opens nothing until the
+// deafen ends, and then the new choice is the one that opens.
+#[test]
+fn live_voice_opens_no_microphone_while_deafened() {
+    let _alone = alone();
+    let (mut voice, microphone, speakers) = on_headset(Duration::from_millis(1));
+    let room = host_on(&voice, 0);
+    poll(Duration::from_secs(3), "both streams start", || {
+        both_started(&microphone, &speakers, 1)
+    });
+    room.room().deafen(true);
+    poll(Duration::from_secs(2), "the microphone closes", || {
+        (microphone.record().at_once == 0).then_some(())
+    });
+    voice.devices = Devices::Windows;
+    voice.input = Choice::Device(String::from("int"));
+    room.room().set_voice(voice.clone());
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(microphone.record().starts, 1);
+    room.room().deafen(false);
+    poll(Duration::from_secs(2), "the new microphone opens", || {
+        (microphone.record().starts == 2).then_some(())
+    });
+    assert_eq!(microphone.record().opens[1].1, "int");
+}
+
+#[test]
+fn live_voice_opens_no_microphone_after_the_room_ended() {
+    let _alone = alone();
+    let (host_voice, _, _) = on_headset(Duration::from_millis(1));
+    let mut host = host_on(&host_voice, 0);
+    let (mut voice, microphone, speakers) = on_headset(Duration::from_millis(1));
+    let mut config = common::config("Ana", timers());
+    config.voice = voice.clone();
+    let friend = Member::join_with(
+        config,
+        std::sync::Arc::new(keys::Identity::generate()),
+        common::host_invite(&host),
+    );
+    poll(Duration::from_secs(3), "both streams start", || {
+        both_started(&microphone, &speakers, 1)
+    });
+    host.leave();
+    poll(
+        Duration::from_secs(3),
+        "the room's microphone closes",
+        || (microphone.record().at_once == 0).then_some(()),
+    );
+    voice.devices = Devices::Windows;
+    voice.input = Choice::Device(String::from("int"));
+    friend.room().set_voice(voice.clone());
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(microphone.record().starts, 1);
+}
+
+#[test]
+fn live_input_switches_wait_only_on_the_same_device() {
+    let _alone = alone();
+    const CLOSE: Duration = Duration::from_millis(800);
+    let (mut voice, microphone, speakers) = on_headset(CLOSE);
+    let room = host_on(&voice, 0);
+    poll(Duration::from_secs(3), "both streams start", || {
+        both_started(&microphone, &speakers, 1)
+    });
+    voice.devices = Devices::Windows;
+    voice.input = Choice::Device(String::from("int"));
+    let switched = Instant::now();
+    room.room().set_voice(voice.clone());
+    poll(
+        Duration::from_secs(2),
+        "the other microphone starts",
+        || (microphone.record().starts == 2).then_some(()),
+    );
+    assert!(switched.elapsed() < CLOSE);
+    assert_eq!(microphone.record().opens[1].1, "int");
+    assert_eq!(microphone.record().at_once, 2);
+    poll(Duration::from_secs(2), "the old microphone closes", || {
+        (microphone.record().at_once == 1).then_some(())
+    });
+    voice.echo_cancellation = true;
+    room.room().set_voice(voice.clone());
+    room.wait_for(
+        Duration::from_secs(1),
+        "a switched microphone wait",
+        |view| {
+            view.voice.microphone
+                == Some(AudioError::StillClosing {
+                    direction: Direction::Input,
+                    default: false,
+                    switched: true,
+                })
+        },
+    );
+    assert_eq!(microphone.record().starts, 2);
+    voice.input = Choice::Device(String::from("pods"));
+    room.room().set_voice(voice.clone());
+    poll(
+        Duration::from_secs(2),
+        "the latest choice starts during the wait",
+        || (microphone.record().starts == 3).then_some(()),
+    );
+    assert_eq!(microphone.record().opens[2].1, "pods");
+    room.room().mute(true);
+    poll(
+        Duration::from_secs(2),
+        "mute closes both microphones",
+        || (microphone.record().at_once == 0).then_some(()),
+    );
+    voice.input = Choice::Device(String::from("int"));
+    room.room().set_voice(voice);
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(microphone.record().starts, 3);
+    assert!(room.room().microphone_now().is_none());
+    room.room().mute(false);
+    poll(
+        Duration::from_secs(2),
+        "unmute opens the saved microphone",
+        || (microphone.record().starts == 4).then_some(()),
+    );
+    assert_eq!(microphone.record().opens[3].1, "int");
+    assert_eq!(speakers.record().starts, 1);
+}
+
+#[test]
+fn live_voice_switches_and_meter_use_one_microphone() {
+    let _alone = alone();
+    let (config, microphone, speakers) =
+        voiced("Mara", timers(), tone_440, TalkMode::PushToTalk, true);
+    let mut voice = config.voice.clone();
+    let room = Member::host_with(config);
+    poll(Duration::from_secs(3), "both streams start", || {
+        both_started(&microphone, &speakers, 1)
+    });
+    let before = poll(Duration::from_secs(1), "the room meter has a level", || {
+        room.room()
+            .microphone_now()
+            .filter(|mic| mic.level.peak > 0.1)
+    });
+    assert_eq!(before.info.device, "Test microphone");
+    voice.talk = TalkMode::OpenMic;
+    voice.sensitivity_db = -35;
+    voice.noise_suppression = true;
+    voice.automatic_volume = true;
+    voice.constant_rate = false;
+    room.room().set_voice(voice.clone());
+    room.wait_for(Duration::from_secs(1), "open mic in the view", |view| {
+        view.voice.mode == TalkMode::OpenMic
+    });
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        (microphone.record().starts, speakers.record().starts),
+        (1, 1)
+    );
+    voice.input = Choice::Device(String::from("not-connected"));
+    room.room().set_voice(voice);
+    room.wait_for(
+        Duration::from_secs(2),
+        "the failed choice stays in view",
+        |view| matches!(view.voice.microphone, Some(AudioError::NotConnected { .. })),
+    );
+    assert!(room.room().microphone_now().is_none());
+    assert_eq!(microphone.record().starts, 1);
+}
+
+#[test]
+fn live_output_switch_keeps_a_talker_in_the_mixer() {
+    let _alone = alone();
+    let host = Voiced::host("Mara", timers(), tone_440);
+    let (config, microphone, speakers) =
+        voiced("Ana", timers(), silence, TalkMode::PushToTalk, true);
+    speakers.plug("other", "Other speakers");
+    let mut voice = config.voice.clone();
+    let friend = Member::join_with(
+        config,
+        std::sync::Arc::new(keys::Identity::generate()),
+        host_invite(&host.member),
+    );
+    host.room().talk(true);
+    poll(
+        Duration::from_secs(3),
+        "the talker reaches the first speakers",
+        || {
+            speakers
+                .record()
+                .written
+                .iter()
+                .any(|sample| sample.abs() > 0.01)
+                .then_some(())
+        },
+    );
+    voice.output = Choice::Device(String::from("other"));
+    friend.room().set_voice(voice);
+    poll(Duration::from_secs(2), "the other speakers start", || {
+        (speakers.record().starts == 2).then_some(())
+    });
+    let begin = speakers.record().written.len();
+    poll(
+        Duration::from_secs(3),
+        "the same talker reaches the other speakers",
+        || {
+            speakers.record().written[begin..]
+                .iter()
+                .any(|sample| sample.abs() > 0.01)
+                .then_some(())
+        },
+    );
+    assert_eq!(speakers.record().opens[1].1, "other");
+    assert_eq!(microphone.record().starts, 1);
+}
+
+#[test]
+fn live_voice_keeps_the_latest_order_while_a_microphone_closes() {
+    let _alone = alone();
+    let (mut voice, microphone, speakers) = on_headset(Duration::from_millis(500));
+    let room = host_on(&voice, 0);
+    poll(Duration::from_secs(3), "both streams start", || {
+        both_started(&microphone, &speakers, 1)
+    });
+    microphone.stall(true);
+    voice.echo_cancellation = true;
+    room.room().set_voice(voice.clone());
+    room.wait_for(
+        Duration::from_secs(1),
+        "the microphone is closing",
+        |view| {
+            matches!(
+                view.voice.microphone,
+                Some(AudioError::StillClosing { switched: true, .. })
+            )
+        },
+    );
+    voice.input = Choice::Device(String::from("pods"));
+    voice.talk = TalkMode::OpenMic;
+    voice.sensitivity_db = -40;
+    room.room().set_voice(voice);
+    microphone.stall(false);
+    poll(
+        Duration::from_secs(3),
+        "the latest microphone starts",
+        || (microphone.record().starts == 2).then_some(()),
+    );
+    assert_eq!(microphone.record().opens[1].1, "pods");
+    assert_eq!(microphone.record().most_at_once, 1);
+    assert_eq!(speakers.record().starts, 1);
+    room.wait_for(Duration::from_secs(1), "open mic after the wait", |view| {
+        view.voice.mode == TalkMode::OpenMic
+    });
+}
+
+#[test]
+fn mute_closes_the_microphone_while_switched_speakers_wait() {
+    let _alone = alone();
+    let (mut voice, microphone, speakers) = on_headset(Duration::from_millis(800));
+    let room = host_on(&voice, 0);
+    poll(Duration::from_secs(3), "both streams start", || {
+        both_started(&microphone, &speakers, 1)
+    });
+    speakers.stall(true);
+    voice.output = Choice::Device(String::from("pods"));
+    room.room().set_voice(voice);
+    room.wait_for(Duration::from_secs(1), "the speakers are closing", |view| {
+        matches!(
+            view.voice.speakers,
+            Some(AudioError::StillClosing { switched: true, .. })
+        )
+    });
+    let muted = Instant::now();
+    room.room().mute(true);
+    poll(
+        Duration::from_secs(2),
+        "the microphone closes during the wait",
+        || (microphone.record().at_once == 0).then_some(()),
+    );
+    assert!(muted.elapsed() < Duration::from_millis(1200));
+    assert_eq!(microphone.record().starts, 1);
+    assert!(room.room().microphone_now().is_none());
+    speakers.stall(false);
+    poll(Duration::from_secs(2), "the saved speakers start", || {
+        (speakers.record().starts == 2).then_some(())
+    });
+    assert_eq!(speakers.record().most_at_once, 1);
+}
+
+// Speakers waiting for the ones they replace hold up neither an unmute nor a
+// new microphone.
+#[test]
+fn switched_speakers_waiting_hold_up_no_microphone() {
+    let _alone = alone();
+    const CLOSE: Duration = Duration::from_secs(3);
+    let microphone = headset_and(tone_440, ("int", "Built in microphone"), Duration::ZERO);
+    let speakers = headset_and(silence, ("spk", "Built in speakers"), CLOSE);
+    let mut voice = common::quiet_voice();
+    voice.devices = Devices::Fake {
+        microphone: microphone.clone(),
+        speakers: speakers.clone(),
+        pc_sound: common::quiet_pc_sound(),
+    };
+    let room = host_on(&voice, 0);
+    poll(Duration::from_secs(3), "both streams start", || {
+        both_started(&microphone, &speakers, 1)
+    });
+    voice.output = Choice::Device(String::from("pods"));
+    room.room().set_voice(voice.clone());
+    room.wait_for(Duration::from_secs(1), "the speakers are closing", |view| {
+        matches!(
+            view.voice.speakers,
+            Some(AudioError::StillClosing { switched: true, .. })
+        )
+    });
+    let switched = Instant::now();
+    room.room().mute(true);
+    poll(Duration::from_secs(1), "the microphone closes", || {
+        (microphone.record().at_once == 0).then_some(())
+    });
+    room.room().mute(false);
+    poll(
+        Duration::from_secs(1),
+        "the unmute opens the microphone",
+        || (microphone.record().starts == 2).then_some(()),
+    );
+    voice.input = Choice::Device(String::from("int"));
+    room.room().set_voice(voice);
+    poll(Duration::from_secs(1), "the new microphone opens", || {
+        (microphone.record().starts == 3).then_some(())
+    });
+    assert!(switched.elapsed() < CLOSE / 2, "{:?}", switched.elapsed());
+    assert_eq!(speakers.record().starts, 1);
+    poll(CLOSE * 2, "the new speakers start", || {
+        (speakers.record().starts == 2).then_some(())
+    });
+    assert_eq!(speakers.record().most_at_once, 1);
+}
+
+// An unmute while the microphone let go at the mute still closes waits for
+// it and says nothing under your row: no other microphone was picked.
+#[test]
+fn an_unmute_waiting_for_its_own_microphone_says_nothing() {
+    let _alone = alone();
+    const CLOSE: Duration = Duration::from_millis(800);
+    let (voice, microphone, speakers) = on_headset(CLOSE);
+    let room = host_on(&voice, 0);
+    poll(Duration::from_secs(3), "both streams start", || {
+        both_started(&microphone, &speakers, 1)
+    });
+    room.room().mute(true);
+    poll(
+        Duration::from_secs(1),
+        "the microphone starts to close",
+        || (microphone.record().stops == 1).then_some(()),
+    );
+    room.room().mute(false);
+    room.holds_for(CLOSE / 2, "no line while it closes", |v| {
+        v.voice.microphone.is_none()
+    });
+    poll(CLOSE * 2, "the microphone opens again", || {
+        (microphone.record().starts == 2).then_some(())
+    });
+    assert_eq!(microphone.record().most_at_once, 1);
+}
+
+// A new choice saved while that unmute still waits is a switch, and the line
+// under your row says the new one opens once the old one lets go.
+#[test]
+fn a_new_choice_during_an_unmute_wait_says_so() {
+    let _alone = alone();
+    const CLOSE: Duration = Duration::from_millis(1500);
+    let (mut voice, microphone, speakers) = on_headset(CLOSE);
+    let room = host_on(&voice, 0);
+    poll(Duration::from_secs(3), "both streams start", || {
+        both_started(&microphone, &speakers, 1)
+    });
+    room.room().mute(true);
+    poll(
+        Duration::from_secs(1),
+        "the microphone starts to close",
+        || (microphone.record().stops == 1).then_some(()),
+    );
+    room.room().mute(false);
+    voice.echo_cancellation = true;
+    room.room().set_voice(voice);
+    room.wait_for(
+        Duration::from_secs(1),
+        "a switched microphone wait",
+        |view| {
+            matches!(
+                view.voice.microphone,
+                Some(AudioError::StillClosing {
+                    direction: Direction::Input,
+                    switched: true,
+                    ..
+                })
+            )
+        },
+    );
+    poll(CLOSE * 2, "the microphone opens again", || {
+        (microphone.record().starts == 2).then_some(())
+    });
+    assert_eq!(microphone.record().most_at_once, 1);
+}
+
+// The microphone cancels the echo of the output it was opened beside, so a
+// new output opens it again too.
+#[test]
+fn a_new_output_reopens_a_microphone_that_cancels_echo() {
+    let _alone = alone();
+    let (mut voice, microphone, speakers) = on_headset(Duration::ZERO);
+    voice.echo_cancellation = true;
+    let room = host_on(&voice, 0);
+    poll(Duration::from_secs(3), "both streams start", || {
+        both_started(&microphone, &speakers, 1)
+    });
+    voice.output = Choice::Device(String::from("spk"));
+    room.room().set_voice(voice);
+    poll(Duration::from_secs(2), "both open again", || {
+        both_started(&microphone, &speakers, 2)
+    });
+    assert_eq!(speakers.record().opens[1].1, "spk");
+    assert_eq!(microphone.record().most_at_once, 1);
 }
 
 fn says_closing(view: &View) -> bool {
@@ -2269,10 +2693,10 @@ fn says_closing(view: &View) -> bool {
 }
 
 // What the panel says under your row while the next room waits for the
-// last room's headset: the speakers' line first, since they open first,
-// then the microphone's, which here takes longer to let go. Each goes the
-// moment its device opens, and a room with nothing to wait for never says
-// it.
+// last room's headset: a line for each device while it waits, the speakers'
+// going first, since here they let go sooner than the microphone. Each goes
+// the moment its device opens, and a room with nothing to wait for never
+// says it.
 #[test]
 fn waiting_for_a_headset_says_so() {
     let _alone = alone();

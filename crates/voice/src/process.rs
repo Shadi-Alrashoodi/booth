@@ -18,7 +18,8 @@ use volume::Volume;
 pub use denoise::DELAY as NOISE_SUPPRESSION_DELAY;
 
 // Which stages run, read once a packet: a room sets them when it opens the
-// microphone, Settings' test as its switches move.
+// microphone and when Settings saves over it, Settings' test as its switches
+// move.
 pub struct Switches {
     pub noise_suppression: AtomicBool,
     pub automatic_volume: AtomicBool,

@@ -1907,7 +1907,14 @@ mod tests {
     fn device_still_closing() {
         use voice::audio::{AudioError, Direction};
         let closing = |direction, default| {
-            sentence(&AudioError::StillClosing { direction, default }.to_string())
+            sentence(
+                &AudioError::StillClosing {
+                    direction,
+                    default,
+                    switched: false,
+                }
+                .to_string(),
+            )
         };
         let lines = [
             closing(Direction::Input, true),

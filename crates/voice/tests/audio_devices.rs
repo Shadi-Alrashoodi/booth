@@ -113,6 +113,28 @@ fn an_empty_id_in_settings_is_windows_default() {
 
 #[test]
 fn errors_say_what_happened_and_what_to_do() {
+    for (direction, closing) in [
+        (
+            Direction::Input,
+            "the microphone is still closing. It opens again once it lets go",
+        ),
+        (
+            Direction::Output,
+            "the speakers are still closing. They play again once they let go",
+        ),
+    ] {
+        for default in [false, true] {
+            assert_eq!(
+                AudioError::StillClosing {
+                    direction,
+                    default,
+                    switched: true
+                }
+                .to_string(),
+                closing
+            );
+        }
+    }
     assert_eq!(
         AudioError::AccessDenied(Direction::Input).to_string(),
         "could not open the microphone: Windows says access is denied. Allow microphone access for desktop apps in Settings, Privacy and security, Microphone"
