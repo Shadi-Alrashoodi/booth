@@ -529,6 +529,8 @@ fn open_one(
     passed_over: &[String],
 ) -> Result<Box<dyn Encoder>, EncodeError> {
     #[cfg(feature = "fault")]
+    fault::asked(request.codec, request.height);
+    #[cfg(feature = "fault")]
     if kind != Kind::MfSoftware && fault::gpu_refuses(request.height) {
         return Err(EncodeError::EncoderLacks {
             problem: "this test keeps the GPU's encoders from opening",

@@ -17,6 +17,7 @@ struct Faults {
     software_refused: bool,
     gpu_refuses_past: Option<u32>,
     hevc_offered_to: Option<u32>,
+    tallest_asked: [Option<u32>; 2],
 }
 
 static FAULTS: Mutex<Faults> = Mutex::new(Faults {
@@ -26,6 +27,7 @@ static FAULTS: Mutex<Faults> = Mutex::new(Faults {
     software_refused: false,
     gpu_refuses_past: None,
     hevc_offered_to: None,
+    tallest_asked: [None, None],
 });
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static LIVE_AT_LAST_OPEN: AtomicUsize = AtomicUsize::new(0);
@@ -89,6 +91,12 @@ pub fn clear() {
     *faults() = Faults::default();
 }
 
+/// The tallest picture any encoder was asked to open for in `codec` since
+/// the last clear(), whether it opened or not.
+pub fn tallest_asked(codec: Codec) -> Option<u32> {
+    faults().tallest_asked[slot(codec)]
+}
+
 pub(crate) fn take_stall(codec: Codec) -> Option<u64> {
     faults().stalls[slot(codec)].take()
 }
@@ -107,6 +115,12 @@ pub(crate) fn take_software_failure() -> Option<u64> {
 
 pub(crate) fn take_software_refusal() -> bool {
     std::mem::take(&mut faults().software_refused)
+}
+
+pub(crate) fn asked(codec: Codec, height: u32) {
+    let mut faults = faults();
+    let tallest = &mut faults.tallest_asked[slot(codec)];
+    *tallest = (*tallest).max(Some(height));
 }
 
 pub(crate) fn gpu_refuses(height: u32) -> bool {

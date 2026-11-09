@@ -107,6 +107,16 @@ impl HevcOffer {
     pub(crate) fn covers(&self, size: (u32, u32), fps: u32) -> bool {
         self.kind.is_some() && self.fps == fps && size.0 <= self.size.0 && size.1 <= self.size.1
     }
+
+    // HEVC from this offer did not open at `size` and `fps`, which can be
+    // smaller than the offer's own when it covered them: the refusal is for
+    // that size, and a larger one is asked again.
+    pub(crate) fn did_not_open(&mut self, size: (u32, u32), fps: u32, why: String) {
+        self.size = size;
+        self.fps = fps;
+        self.kind = None;
+        self.why_not = why;
+    }
 }
 
 // What a window share on the software encoder keeps to, whatever size the
@@ -503,37 +513,49 @@ pub(crate) fn open(
         }
         let size = source.size();
         let fps = options.max_fps;
+        // H.264 keeps to the box every share had before 4K: 4K at 120 fps is
+        // past the levels its decoders have to take. A source past it opens
+        // again within it before any H.264 encoder opens.
+        let default = capture::Options::default();
+        let past_default = size.0 > default.max_width || size.1 > default.max_height;
+        let boxed = capture::Options {
+            max_width: options.max_width.min(default.max_width),
+            max_height: options.max_height.min(default.max_height),
+            ..options
+        };
         let mut chosen = codec_for(&source, choice, kind, pick, known.take(), size, fps, say);
-        let mut opened = source.encoder(chosen.kind, chosen.codec, size, fps, settings);
-        if let (Err(err), Codec::Hevc, None) = (&opened, chosen.codec, pick.codec) {
+        let mut opened = if chosen.codec == Codec::H264 && past_default {
+            None
+        } else {
+            Some(source.encoder(chosen.kind, chosen.codec, size, fps, settings))
+        };
+        if let (Some(Err(err)), Codec::Hevc, None) = (&opened, chosen.codec, pick.codec) {
+            let next = if past_default {
+                format!(
+                    "the source opens again within {}x{}, as H.264 needs",
+                    boxed.max_width, boxed.max_height
+                )
+            } else {
+                String::from("going on in H.264")
+            };
             say(Line::Log(format!(
-                "HEVC was offered at {}x{} and {fps} fps and did not open: {err}; going on in H.264",
+                "HEVC was offered at {}x{} and {fps} fps and did not open: {err}; {next}",
                 size.0, size.1
             )));
             if let Some(offer) = &mut chosen.hevc {
-                offer.kind = None;
-                offer.why_not = err.to_string();
+                offer.did_not_open(size, fps, err.to_string());
             }
             chosen.codec = Codec::H264;
             chosen.kind = kind;
-            opened = source.encoder(kind, Codec::H264, size, fps, settings);
+            opened =
+                (!past_default).then(|| source.encoder(kind, Codec::H264, size, fps, settings));
         }
-        let default = capture::Options::default();
-        if chosen.codec == Codec::H264
-            && (size.0 > default.max_width || size.1 > default.max_height)
-        {
-            // H.264 keeps to the box every share had before 4K: 4K at 120
-            // fps is past the levels its decoders have to take.
-            drop(opened);
+        let Some(opened) = opened else {
             drop(source);
             known = chosen.hevc;
-            options = capture::Options {
-                max_width: options.max_width.min(default.max_width),
-                max_height: options.max_height.min(default.max_height),
-                ..options
-            };
+            options = boxed;
             continue;
-        }
+        };
         match opened {
             Ok(encoder) => {
                 return Ok(Opened {
@@ -737,6 +759,24 @@ mod tests {
         };
         assert!(new_reason(Some(&offered), &first));
         assert!(!new_reason(Some(&first), &offered));
+    }
+
+    // HEVC that did not open at a size a larger offer covered is refused at
+    // that size alone: the larger one is asked again rather than taken as
+    // refused, and the smaller one is not.
+    #[test]
+    fn hevc_that_did_not_open_is_refused_only_at_its_size() {
+        let mut offer = HevcOffer {
+            size: (2560, 1440),
+            fps: 60,
+            kind: Some(Kind::Nvenc),
+            why_not: String::new(),
+        };
+        assert!(offer.covers((1280, 720), 60));
+        offer.did_not_open((1280, 720), 60, String::from("no NVENC session left"));
+        assert!(offer.is_for((1280, 720), 60));
+        assert!(!offer.is_for((2560, 1440), 60) && !offer.covers((2560, 1440), 60));
+        assert_eq!(offer.why_not, "no NVENC session left");
     }
 
     // A monitor's capture refused at open for what a running capture waits

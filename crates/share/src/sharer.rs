@@ -1083,7 +1083,7 @@ impl Sharer {
     // A picture from capture out to the viewers, through a new encoder
     // first when its size is new. False when that encoder did not open for
     // a window, which keeps the one it has, or when a monitor's new mode
-    // needs the software encoder's fit: nothing went out.
+    // needs the software encoder's fit or H.264's box: nothing went out.
     fn go(&mut self, mut frame: Frame, audience: &mut dyn Audience) -> Result<bool, String> {
         if (frame.width, frame.height) != self.size && !self.new_size(&frame, audience)? {
             return Ok(false);
@@ -1231,9 +1231,9 @@ impl Sharer {
     // A mode change on the shared monitor, or a shared window's new size: a
     // new encoder, whose first frame is an IDR, as a new share would start.
     // False when it did not open for a window, which keeps its encoder, or
-    // when a monitor's new mode is past what the software encoder takes: its
-    // pictures go on at the fit from the next one, and this frame does not
-    // go out.
+    // when a monitor's new mode is past what the software encoder takes, or
+    // past capture's default box in H.264: its pictures go on at the fit or
+    // within the box from the next one, and this frame does not go out.
     fn new_size(&mut self, frame: &Frame, audience: &mut dyn Audience) -> Result<bool, String> {
         let size = (frame.width, frame.height);
         let now = Instant::now();
@@ -1256,21 +1256,13 @@ impl Sharer {
             &mut say,
         );
         self.hevc_offer = chosen.hevc;
-        // H.264 keeps to capture's default box (source::open): a window past
-        // it goes on fitted while capture brings its pictures within it.
+        // H.264 keeps to capture's default box (source::open): capture
+        // brings the pictures within it, and meanwhile a window goes on
+        // fitted and a monitor's picture past it does not go out.
         let default = capture::Options::default();
         let past_default = size.0 > default.max_width || size.1 > default.max_height;
-        if window && past_default && chosen.codec == Codec::H264 {
-            self.keep_to_h264_box();
-            audience.line(Line::Log(format!(
-                "the window at {}x{} goes on fitted into {}x{} until a new encoder opens for its picture, which capture keeps within {}x{} as H.264 needs",
-                size.0,
-                size.1,
-                self.size.0,
-                self.size.1,
-                self.options.max_width,
-                self.options.max_height
-            )));
+        if past_default && chosen.codec == Codec::H264 {
+            self.keep_to_h264_box(size, None, audience);
             return Ok(false);
         }
         let settings = &self.setup.settings;
@@ -1282,20 +1274,10 @@ impl Sharer {
             Ok(encoder) => Ok(encoder),
             Err(err) if chosen.codec == Codec::Hevc && self.setup.codec.is_none() => {
                 if let Some(offer) = &mut self.hevc_offer {
-                    offer.kind = None;
-                    offer.why_not = err.to_string();
+                    offer.did_not_open(size, fps, err.to_string());
                 }
-                if window && past_default {
-                    self.keep_to_h264_box();
-                    audience.line(Line::Log(format!(
-                        "HEVC did not open at {}x{}: {err}; the window goes on fitted into {}x{} until a new encoder opens for its picture, which capture keeps within {}x{} as H.264 needs",
-                        size.0,
-                        size.1,
-                        self.size.0,
-                        self.size.1,
-                        self.options.max_width,
-                        self.options.max_height
-                    )));
+                if past_default {
+                    self.keep_to_h264_box(size, Some(&err), audience);
                     return Ok(false);
                 }
                 audience.line(Line::Log(format!(
@@ -1366,16 +1348,46 @@ impl Sharer {
         Ok(true)
     }
 
-    // A window that would need H.264 past capture's default box: capture
-    // takes H.264's box, and the window goes on fitted into the frame it has
-    // until its next picture comes within the box.
-    fn keep_to_h264_box(&mut self) {
+    // A picture at `size` that would need H.264 past capture's default box,
+    // `hevc` saying why HEVC did not open there if it was tried: capture
+    // takes H.264's box, and a window goes on fitted into the frame it has
+    // until its next picture comes within the box. A monitor's next picture
+    // comes within it, as at a fit for the software encoder.
+    fn keep_to_h264_box(
+        &mut self,
+        size: (u32, u32),
+        hevc: Option<&EncodeError>,
+        audience: &mut dyn Audience,
+    ) {
         let options = self.source_options_in(Some(Codec::H264), self.setup.fps);
         self.take_options(options);
-        let size = self.size;
+        let frame = self.size;
         if let Some(opened) = &mut self.opened {
-            opened.source.set_frame(Some(size));
+            opened.source.set_frame(Some(frame));
         }
+        let (what, next) = match self.setup.choice {
+            Choice::Window { .. } => (
+                "the window",
+                format!(
+                    "goes on fitted into {}x{} until a new encoder opens for its picture, which capture keeps within {}x{} as H.264 needs",
+                    frame.0, frame.1, options.max_width, options.max_height
+                ),
+            ),
+            _ => (
+                "the picture",
+                format!(
+                    "does not go out, and capture keeps the next one within {}x{} as H.264 needs",
+                    options.max_width, options.max_height
+                ),
+            ),
+        };
+        audience.line(Line::Log(match hevc {
+            Some(err) => format!(
+                "HEVC did not open at {}x{}: {err}; {what} {next}",
+                size.0, size.1
+            ),
+            None => format!("{what} at {}x{} {next}", size.0, size.1),
+        }));
     }
 
     // What came back since the last frame, all of it before this frame is
@@ -1529,8 +1541,7 @@ impl Sharer {
                 if codec == Codec::Hevc
                     && let Some(offer) = &mut self.hevc_offer
                 {
-                    offer.kind = None;
-                    offer.why_not = err.to_string();
+                    offer.did_not_open(self.size, self.fps, err.to_string());
                 }
                 return Err(err.to_string());
             }
@@ -2477,6 +2488,282 @@ mod tests {
         assert_eq!(
             (sharer.size(), sharer.codec()),
             ((2560, 1440), Some(Codec::H264)),
+            "{:?}",
+            watching.lines
+        );
+    }
+
+    // A monitor in HEVC under a 4K limit takes a mode past capture's default
+    // box where HEVC does not open, or is not offered: no H.264 encoder
+    // opens past the box. That picture does not go out, capture keeps the
+    // next one within the box, and the share goes on in HEVC at its size.
+    #[test]
+    fn a_monitor_past_h264s_box_without_hevc_keeps_to_the_box() {
+        let Some((_turn, adapter)) = gpu() else {
+            return;
+        };
+        if adapter.vendor_id != NVIDIA {
+            println!("skipped: no NVIDIA GPU, so no NVENC to share 4K in HEVC with");
+            return;
+        }
+        let four_k = capture::Options {
+            max_width: 4096,
+            max_height: 2160,
+            max_fps: 60,
+        };
+        for offered in [true, false] {
+            let mut sharer = pattern_share(adapter.clone(), (2560, 1440), None);
+            sharer
+                .set_limit(four_k, &mut |_| {})
+                .unwrap_or_else(|err| panic!("{err}"));
+            let mut watching = Watching {
+                takes_hevc: true,
+                ..Watching::default()
+            };
+            sharer
+                .next(&mut watching)
+                .unwrap_or_else(|err| panic!("{err}"));
+            assert_eq!(
+                (sharer.size(), sharer.codec()),
+                ((2560, 1440), Some(Codec::Hevc))
+            );
+            if offered {
+                encode::fault::refuse_gpu(1440);
+            } else {
+                encode::fault::refuse_hevc_offer(1440);
+            }
+            new_mode(&mut sharer, 3840, 2160);
+            let grown = sharer.next(&mut watching);
+            encode::fault::clear();
+            grown.unwrap_or_else(|err| panic!("{err}"));
+            assert_eq!(watching.sent.len(), 1, "{:?}", watching.lines);
+            assert_eq!(
+                (sharer.size(), sharer.codec()),
+                ((2560, 1440), Some(Codec::Hevc)),
+                "{:?}",
+                watching.lines
+            );
+            assert_eq!(
+                (sharer.options.max_width, sharer.options.max_height),
+                (4096, 1440),
+                "{:?}",
+                watching.lines
+            );
+            assert!(
+                watching.lines.iter().any(|line| matches!(
+                    line,
+                    Line::Log(text)
+                        if text.ends_with("capture keeps the next one within 4096x1440 as H.264 needs")
+                )),
+                "{:?}",
+                watching.lines
+            );
+            new_mode(&mut sharer, 3840, 2160);
+            sharer
+                .next(&mut watching)
+                .unwrap_or_else(|err| panic!("{err}"));
+            assert_eq!(watching.sent.len(), 2, "{:?}", watching.lines);
+            assert_eq!(
+                (sharer.size(), sharer.codec()),
+                ((2560, 1440), Some(Codec::Hevc))
+            );
+        }
+    }
+
+    // A share in HEVC under a 4K limit opened again at a 4K size where HEVC
+    // is offered and does not open, or is not offered: the source opens
+    // again within capture's default box before any H.264 encoder opens,
+    // and HEVC is asked again there. Where it did not open, the log says
+    // so, not that the share goes on in H.264.
+    #[test]
+    fn hevc_that_does_not_open_past_the_box_is_asked_again_within_it() {
+        let Some((_turn, adapter)) = gpu() else {
+            return;
+        };
+        if adapter.vendor_id != NVIDIA {
+            println!("skipped: no NVIDIA GPU, so no NVENC to share 4K in HEVC with");
+            return;
+        }
+        let four_k = capture::Options {
+            max_width: 4096,
+            max_height: 2160,
+            max_fps: 60,
+        };
+        for offered in [true, false] {
+            let mut sharer = pattern_share(adapter.clone(), (3840, 2160), None);
+            sharer
+                .set_limit(four_k, &mut |_| {})
+                .unwrap_or_else(|err| panic!("{err}"));
+            assert_eq!(
+                (sharer.size(), sharer.codec()),
+                ((3840, 2160), Some(Codec::Hevc))
+            );
+            encode::fault::clear();
+            if offered {
+                encode::fault::refuse_gpu(1440);
+            } else {
+                encode::fault::refuse_hevc_offer(1440);
+            }
+            let mut lines = Vec::new();
+            let opened = sharer.set_fps(30, &mut |line| lines.push(line));
+            let h264 = encode::fault::tallest_asked(Codec::H264);
+            encode::fault::clear();
+            assert_eq!(opened, Ok(true), "{lines:?}");
+            assert!(
+                h264.is_none_or(|height| height <= 1440),
+                "H.264 was asked for {h264:?} high: {lines:?}"
+            );
+            assert_eq!(
+                (sharer.size(), sharer.fps(), sharer.codec()),
+                ((2560, 1440), 30, Some(Codec::Hevc)),
+                "{lines:?}"
+            );
+            if !offered {
+                continue;
+            }
+            let said = |text: &str| {
+                lines
+                    .iter()
+                    .any(|line| matches!(line, Line::Log(log) if log.contains(text)))
+            };
+            assert!(
+                said("HEVC was offered at 3840x2160 and 30 fps and did not open: "),
+                "{lines:?}"
+            );
+            assert!(
+                said("; the source opens again within 4096x1440, as H.264 needs"),
+                "{lines:?}"
+            );
+            assert!(!said("going on in H.264"), "{lines:?}");
+        }
+    }
+
+    // HEVC offered at a size, then taken at a smaller one it covers, where
+    // it does not open, as when another program holds NVENC's sessions for
+    // a moment: back at the first size a gap later, HEVC is asked again and
+    // opens, rather than taken as refused there.
+    #[test]
+    fn a_failed_hevc_open_is_refused_at_its_own_size() {
+        let Some((_turn, adapter)) = gpu() else {
+            return;
+        };
+        let mut sharer = pattern_share(adapter, (2560, 1440), None);
+        if sharer.codec() != Some(Codec::Hevc) {
+            println!("skipped: no encoder here takes HEVC at 2560x1440 and 60 fps");
+            return;
+        }
+        let mut watching = Watching {
+            takes_hevc: true,
+            ..Watching::default()
+        };
+        encode::fault::refuse_gpu(0);
+        new_mode(&mut sharer, 1280, 720);
+        let smaller = sharer.next(&mut watching);
+        encode::fault::clear();
+        smaller.unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(
+            (sharer.size(), sharer.codec()),
+            ((1280, 720), Some(Codec::H264)),
+            "{:?}",
+            watching.lines
+        );
+        std::thread::sleep(SWITCH_GAP);
+        new_mode(&mut sharer, 2560, 1440);
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(
+            (sharer.size(), sharer.codec()),
+            ((2560, 1440), Some(Codec::Hevc)),
+            "{:?}",
+            watching.lines
+        );
+    }
+
+    // The same where the smaller size is step_down's, which opens the source
+    // again: step_up a gap later asks for HEVC again at the first size, and
+    // it opens.
+    #[test]
+    fn a_failed_hevc_reopen_is_refused_at_its_own_size() {
+        let Some((_turn, adapter)) = gpu() else {
+            return;
+        };
+        let mut sharer = pattern_share(adapter, (2560, 1440), None);
+        if sharer.codec() != Some(Codec::Hevc) {
+            println!("skipped: no encoder here takes HEVC at 2560x1440 and 60 fps");
+            return;
+        }
+        encode::fault::refuse_gpu(0);
+        let mut lines = Vec::new();
+        let stepped = sharer.step_down(&mut |line| lines.push(line));
+        encode::fault::clear();
+        assert_eq!(stepped, Ok(true), "{lines:?}");
+        assert_eq!(
+            (sharer.size(), sharer.codec()),
+            ((1920, 1080), Some(Codec::H264)),
+            "{lines:?}"
+        );
+        std::thread::sleep(SWITCH_GAP);
+        sharer
+            .step_up(&mut |line| lines.push(line))
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(
+            (sharer.size(), sharer.codec()),
+            ((2560, 1440), Some(Codec::Hevc)),
+            "{lines:?}"
+        );
+    }
+
+    // The same where the share is in H.264 for a viewer at the smaller size,
+    // and the change back to HEVC there does not open once every viewer
+    // takes it: at the first size a gap later, HEVC is asked again and
+    // opens.
+    #[test]
+    fn a_failed_change_back_to_hevc_is_refused_at_its_own_size() {
+        let Some((_turn, adapter)) = gpu() else {
+            return;
+        };
+        let mut sharer = pattern_share(adapter, (2560, 1440), None);
+        if sharer.codec() != Some(Codec::Hevc) {
+            println!("skipped: no encoder here takes HEVC at 2560x1440 and 60 fps");
+            return;
+        }
+        let mut watching = Watching::default();
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        new_mode(&mut sharer, 1280, 720);
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(
+            (sharer.size(), sharer.codec()),
+            ((1280, 720), Some(Codec::H264)),
+            "{:?}",
+            watching.lines
+        );
+        watching.takes_hevc = true;
+        std::thread::sleep(SWITCH_GAP);
+        encode::fault::refuse_gpu(0);
+        let back = sharer.next(&mut watching);
+        encode::fault::clear();
+        back.unwrap_or_else(|err| panic!("{err}"));
+        assert!(
+            watching.lines.iter().any(|line| matches!(
+                line,
+                Line::Log(text) if text.contains(" stays: HEVC did not open: ")
+            )),
+            "{:?}",
+            watching.lines
+        );
+        std::thread::sleep(SWITCH_GAP);
+        new_mode(&mut sharer, 2560, 1440);
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        assert_eq!(
+            (sharer.size(), sharer.codec()),
+            ((2560, 1440), Some(Codec::Hevc)),
             "{:?}",
             watching.lines
         );
