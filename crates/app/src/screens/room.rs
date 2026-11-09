@@ -4,8 +4,9 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use eframe::egui::emath::GuiRounding;
+use eframe::egui::text_edit::TextEditState;
 use eframe::egui::{
-    Align, Color32, Context, CursorIcon, InputState, Key, Layout, Modifiers, Rect, Response,
+    Align, Color32, Context, CursorIcon, Event, InputState, Key, Layout, Modifiers, Rect, Response,
     ScrollArea, Sense, Stroke, Ui, UiBuilder, Vec2, WidgetInfo, WidgetType, vec2,
 };
 use invite::ReplyCode;
@@ -15,7 +16,7 @@ use room::view::{
 };
 use room::{MOST_VOLUME, Monitor, Room};
 use voice::audio::{AudioError, Choice};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::controls::{self, Button};
 use crate::hotkeys::{self, Target};
@@ -58,6 +59,8 @@ pub struct InRoom {
     // pasted there was not one. Refusals come back in the view.
     paste: String,
     paste_error: Option<String>,
+    // The field's widget, so its undo history can go with the room.
+    paste_id: Option<eframe::egui::Id>,
     chat: Chat,
     // The devices from settings, as the room opened or as last saved in it,
     // and their periods, asked each time the stats panel opens.
@@ -204,6 +207,7 @@ impl InRoom {
             firewall,
             paste: String::new(),
             paste_error: None,
+            paste_id: None,
             chat: Chat::new(),
             devices,
             periods: PeriodsAsk::default(),
@@ -231,16 +235,27 @@ impl InRoom {
     }
 
     // From the app's logic while the panel is minimized: it comes back with
-    // Resume and Share PC sound waiting as if their block had just appeared,
-    // so a click meant for a game as the panel comes forward neither resumes
-    // a pause nor turns PC sound on. No frame runs to let go of Hold to talk
-    // either, and the mouse may be let go unseen, so only a new press holds
-    // when the panel is back.
+    // Resume, Share PC sound and Allow waiting as if their blocks had just
+    // appeared, so a click meant for a game as the panel comes forward
+    // neither resumes a pause, turns PC sound on nor allows control. No frame
+    // runs to let go of Hold to talk either, and the mouse may be let go
+    // unseen, so only a new press holds when the panel is back.
     pub fn out_of_sight(&mut self) {
         self.block_wait.out_of_sight();
+        self.allow_wait.out_of_sight();
         self.hold.press_over = true;
         if let Some(held) = self.hold.set(false) {
             self.target.button(held);
+        }
+    }
+
+    // From Leave. The code field is the same one in the next room, where
+    // Ctrl+Z would bring back from its undo history a code, which holds a
+    // friend's home address, or an invite pasted here by mistake.
+    pub fn forget_paste(&mut self, ctx: &Context) {
+        self.paste.zeroize();
+        if let Some(id) = self.paste_id {
+            ctx.data_mut(|data| data.remove::<TextEditState>(id));
         }
     }
 
@@ -619,7 +634,22 @@ impl InRoom {
     // of sight while it is being decided or done. True when it shows.
     fn request(&mut self, ui: &mut Ui, view: &View) -> bool {
         let request = control::request(view, self.control_offered);
-        let wait = self.allow_wait.follow(request, Instant::now());
+        // Where the block starts and how wide it is place Allow, with the
+        // name and fingerprint over it: the share block above moves it, and
+        // the width wraps the name.
+        let top = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), 0.0));
+        // Focus lost and back within one pass counts as lost, as on the link
+        // page: the click that brought the panel back was aimed elsewhere.
+        let focused = ui.input(|input| {
+            input.focused
+                && !input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::WindowFocused(false)))
+        });
+        let wait = self
+            .allow_wait
+            .follow(request, top, focused, Instant::now());
         if let Some(left) = wait {
             ui.ctx().request_repaint_after(left);
         }
@@ -790,6 +820,7 @@ impl InRoom {
             PASTE_CHARS,
             hide,
         );
+        self.paste_id = Some(field.id);
         if field.changed() {
             self.paste_error = None;
         }
@@ -2263,8 +2294,8 @@ pub(crate) mod tests {
     use eframe::egui::{Event, PlatformOutput, Pos2, TouchDeviceId, TouchId, TouchPhase, pos2};
     use room::ReplyRefused;
     use room::view::{
-        ControlView, CurrentShare, NoSound, Numbers, Party, Paused, Refusal, RouterState,
-        RunningShare, Strip,
+        ControlRequest, ControlView, CurrentShare, NoSound, Numbers, Party, Paused, Refusal,
+        RouterState, RunningShare, Strip,
     };
     use std::sync::mpsc::{Sender, channel};
 
@@ -3645,6 +3676,189 @@ pub(crate) mod tests {
         target.leave();
         hotkeys::leave(room);
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // A pause by hand puts its sentence and Resume above Allow, which moves
+    // down under a pointer left where it was: Allow waits again there, and
+    // again when the panel comes back from minimized over a game.
+    #[test]
+    fn allow_waits_again_when_a_pause_moves_it_or_the_panel_comes_back() {
+        let data_dir =
+            std::env::temp_dir().join(format!("booth-app-allow-wait-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let room = Arc::new(test_room(&data_dir));
+        let target = Target::default();
+        target.enter(Arc::clone(&room));
+        let mut in_room = test_in_room(&room, &target);
+        let ctx = accessible_panel();
+        let asked = |held| {
+            let mut view = room.view();
+            view.share.own = OwnShare::Sharing { number: 1, fps: 60 };
+            view.share.running = Some(RunningShare {
+                software: false,
+                paused: None,
+                held,
+            });
+            view.share.control.asked_by = Some(ControlRequest {
+                number: 3,
+                key: [9; 32],
+                name: String::from("Tom"),
+            });
+            view
+        };
+        // Where Allow is in a frame of the panel, and whether it waits.
+        let allow = |in_room: &mut InRoom, view: &View| {
+            let (_, output) = crate::controls::tests::frame(&ctx, Vec::new(), |ui| {
+                in_room.show(ui, view, false, hotkeys::State::default(), true, None)
+            });
+            let nodes = output.accesskit_update.expect("accesskit is on").nodes;
+            let (_, node) = nodes
+                .into_iter()
+                .find(|(_, node)| node.label() == Some("Allow"))
+                .expect("Allow");
+            (node.bounds().expect("Allow, placed").y0, node.is_disabled())
+        };
+        let (running, paused) = (asked(false), asked(true));
+        let (y, waits) = allow(&mut in_room, &running);
+        assert!(waits, "as the request shows");
+        allow(&mut in_room, &running);
+        std::thread::sleep(control::ALLOW_AFTER);
+        assert_eq!(allow(&mut in_room, &running), (y, false), "ready");
+
+        let (lower, waits) = allow(&mut in_room, &paused);
+        assert!(lower > y, "the pause moves Allow down");
+        assert!(waits, "moved by the pause");
+        allow(&mut in_room, &paused);
+        std::thread::sleep(control::ALLOW_AFTER);
+        assert_eq!(allow(&mut in_room, &paused), (lower, false), "ready");
+
+        in_room.out_of_sight();
+        assert_eq!(
+            allow(&mut in_room, &paused),
+            (lower, true),
+            "back from minimized"
+        );
+
+        drop(in_room);
+        target.leave();
+        hotkeys::leave(room);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // A narrower panel wraps the name over Allow to a second line while
+    // nothing above the block moves: Allow waits again there. And again as
+    // the panel gets focus back, since the click that brings it forward, as
+    // a game over it closes, was aimed at the game.
+    #[test]
+    fn allow_waits_again_when_the_panel_narrows_or_gets_focus() {
+        let data_dir =
+            std::env::temp_dir().join(format!("booth-app-allow-focus-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let room = Arc::new(test_room(&data_dir));
+        let target = Target::default();
+        target.enter(Arc::clone(&room));
+        let mut in_room = test_in_room(&room, &target);
+        let ctx = accessible_panel();
+        let name = "Tom from the third floor";
+        let mut view = room.view();
+        view.share.own = OwnShare::Sharing { number: 1, fps: 60 };
+        view.share.running = Some(RunningShare {
+            software: false,
+            paused: None,
+            held: false,
+        });
+        view.share.control.asked_by = Some(ControlRequest {
+            number: 3,
+            key: [9; 32],
+            name: String::from(name),
+        });
+        let asks = messages::wants_control(name);
+        // Where the request's sentence and Allow start in a frame of the
+        // panel this wide, and whether Allow waits.
+        let mut allow = |width: f32, focused: bool, events: Vec<Event>| {
+            let input = eframe::egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width, 640.0))),
+                focused,
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                in_room.show(ui, &view, false, hotkeys::State::default(), true, None);
+            });
+            let nodes = std::mem::take(&mut output.platform_output)
+                .accesskit_update
+                .expect("accesskit is on")
+                .nodes;
+            output.drop_without_applying_deltas();
+            let node = |line: &str| {
+                nodes
+                    .iter()
+                    .find(|(_, node)| [node.label(), node.value()].contains(&Some(line)))
+                    .map(|(_, node)| node.clone())
+                    .unwrap_or_else(|| panic!("nothing says {line}"))
+            };
+            let top = |label: &str| node(label).bounds().expect("placed").y0;
+            (top(&asks), top("Allow"), node("Allow").is_disabled())
+        };
+        let (said, y, waits) = allow(360.0, true, Vec::new());
+        assert!(waits, "as the request shows");
+        allow(360.0, true, Vec::new());
+        std::thread::sleep(control::ALLOW_AFTER);
+        assert_eq!(allow(360.0, true, Vec::new()), (said, y, false), "ready");
+
+        let (narrow_said, lower, waits) = allow(320.0, true, Vec::new());
+        assert_eq!(narrow_said, said, "nothing above the block moves");
+        assert!(lower > y, "the name takes a second line");
+        assert!(waits, "narrower");
+        allow(320.0, true, Vec::new());
+        std::thread::sleep(control::ALLOW_AFTER);
+        assert_eq!(
+            allow(320.0, true, Vec::new()),
+            (said, lower, false),
+            "ready"
+        );
+
+        // A game in front takes focus, and the panel under it goes on
+        // drawing with the request on show.
+        let gone = allow(320.0, false, vec![Event::WindowFocused(false)]);
+        assert!(gone.2, "focus gone");
+        std::thread::sleep(control::ALLOW_AFTER);
+        allow(320.0, false, Vec::new());
+        std::thread::sleep(control::ALLOW_AFTER);
+        // The game closes, and the click aimed at it brings the panel back.
+        let back = allow(320.0, true, vec![Event::WindowFocused(true)]);
+        assert!(back.2, "focus back");
+        allow(320.0, true, Vec::new());
+        std::thread::sleep(control::ALLOW_AFTER);
+        assert!(!allow(320.0, true, Vec::new()).2, "ready");
+        let both = vec![Event::WindowFocused(false), Event::WindowFocused(true)];
+        assert!(
+            allow(320.0, true, both).2,
+            "focus gone and back in one frame"
+        );
+
+        drop(in_room);
+        target.leave();
+        hotkeys::leave(room);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // A code left in the host's field by one frame of the panel on `ctx`.
+    // The field's id.
+    pub(crate) fn code_left(panel: &mut InRoom, ctx: &Context, code: &str) -> eframe::egui::Id {
+        panel.paste = String::from(code);
+        let host = View {
+            role: Role::Host,
+            invite: Some(invite()),
+            reply: None,
+            ..in_room()
+        };
+        crate::controls::tests::frame(ctx, Vec::new(), |ui| {
+            panel.show(ui, &host, false, hotkeys::State::default(), false, None)
+        });
+        panel.paste_id.expect("the field was drawn")
     }
 
     // Neither a code in the paste field, where a refused one stays, nor this

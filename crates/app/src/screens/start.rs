@@ -29,7 +29,7 @@ pub struct Start {
     pub room_name: String,
     pub paste: String,
     // The paste field's widget, so its undo history can be dropped with the
-    // invite once a join has used it.
+    // invite once a room opens.
     pub paste_id: Option<Id>,
     pub host_error: Option<String>,
     pub join_error: Option<String>,

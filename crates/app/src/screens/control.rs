@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    Event, Frame, Id, Key, Margin, Modifiers, Response, Ui, WidgetInfo, WidgetType,
+    Event, Frame, Id, Key, Margin, Modifiers, Rect, Response, Ui, WidgetInfo, WidgetType,
 };
 use room::MOST_VOLUME;
 use room::view::{LinkState, NoSound, Person, Role, ShareView, Unheard, View, WatchCap};
@@ -30,7 +30,10 @@ use crate::theme::{
 // another takes its place. The room already refuses an answer to a request
 // that is no longer on show, but the panel can draw the new one just before
 // a click aimed at the old one lands, and that click would allow whoever
-// asked since.
+// asked since. It waits again when Allow moves, as the share block above
+// grows or shrinks or the name or fingerprint over it changes, and when the
+// panel comes back from minimized or gets focus: a click aimed at what was
+// there, or at a game, must not land on Allow.
 pub const ALLOW_AFTER: Duration = Duration::from_millis(500);
 
 // The panic key as the request block uses it: its words, which Settings
@@ -145,27 +148,60 @@ pub enum Answer {
     Stop,
 }
 
-// When the request on show first showed, for ALLOW_AFTER.
+// When the request on show first showed as it is now, for ALLOW_AFTER.
 #[derive(Debug, Default)]
 pub struct AllowWait {
-    shown: Option<(u32, Instant)>,
+    shown: Option<(Showing, Instant)>,
+}
+
+// Whom Allow allows and where it is: the request; the name and the key's
+// fingerprint shown over Allow, since a name of another length can take a
+// line more or less; the block's top edge, where it starts and how wide it
+// is; and whether the panel has focus, since the click that brings it
+// forward was aimed at whatever was in front.
+#[derive(Debug, PartialEq)]
+struct Showing {
+    number: u32,
+    name: String,
+    key: [u8; 32],
+    top: Rect,
+    focused: bool,
 }
 
 impl AllowWait {
-    // Every frame in a room. How much longer Allow waits, or None when it
-    // can be pressed or there is nothing to allow.
-    pub fn follow(&mut self, request: Option<Request<'_>>, now: Instant) -> Option<Duration> {
-        let number = match request {
-            Some(Request::Asked { number, .. }) => number,
+    // From the app's logic while the panel is minimized: no frame runs, and
+    // Allow waits again as the panel comes back.
+    pub fn out_of_sight(&mut self) {
+        self.shown = None;
+    }
+
+    // Every frame in a room, with the request block's top edge and whether
+    // the panel has focus. How much longer Allow waits, or None when it can
+    // be pressed or there is nothing to allow.
+    pub fn follow(
+        &mut self,
+        request: Option<Request<'_>>,
+        top: Rect,
+        focused: bool,
+        now: Instant,
+    ) -> Option<Duration> {
+        let showing = match request {
+            Some(Request::Asked { number, name, key }) => Showing {
+                number,
+                name: name.to_owned(),
+                key,
+                top,
+                focused,
+            },
             Some(Request::Controlled { .. }) | None => {
                 self.shown = None;
                 return None;
             }
         };
-        let since = match self.shown {
-            Some((shown, since)) if shown == number => since,
+        let since = match &self.shown {
+            Some((shown, since)) if *shown == showing => *since,
             _ => {
-                self.shown = Some((number, now));
+                self.shown = Some((showing, now));
                 now
             }
         };
@@ -771,28 +807,95 @@ mod tests {
             name: "Jonas",
             key: [5; 32],
         };
+        let top = Rect::from_min_size(pos2(0.0, 80.0), vec2(360.0, 0.0));
         let mut wait = AllowWait::default();
-        assert_eq!(wait.follow(None, t), None);
-        assert_eq!(wait.follow(Some(tom), t), Some(ALLOW_AFTER));
+        assert_eq!(wait.follow(None, top, true, t), None);
+        assert_eq!(wait.follow(Some(tom), top, true, t), Some(ALLOW_AFTER));
         assert_eq!(
-            wait.follow(Some(tom), at(300)),
+            wait.follow(Some(tom), top, true, at(300)),
             Some(Duration::from_millis(200))
         );
-        assert_eq!(wait.follow(Some(tom), at(500)), None);
-        assert_eq!(wait.follow(Some(tom), at(2_000)), None);
+        assert_eq!(wait.follow(Some(tom), top, true, at(500)), None);
+        assert_eq!(wait.follow(Some(tom), top, true, at(2_000)), None);
         // Another request in its place: the wait starts again.
-        assert_eq!(wait.follow(Some(jonas), at(2_100)), Some(ALLOW_AFTER));
         assert_eq!(
-            wait.follow(Some(jonas), at(2_599)),
+            wait.follow(Some(jonas), top, true, at(2_100)),
+            Some(ALLOW_AFTER)
+        );
+        assert_eq!(
+            wait.follow(Some(jonas), top, true, at(2_599)),
             Some(Duration::from_millis(1))
         );
-        assert_eq!(wait.follow(Some(jonas), at(2_600)), None);
+        assert_eq!(wait.follow(Some(jonas), top, true, at(2_600)), None);
         // Gone and back with the same number is a fresh showing.
-        assert_eq!(wait.follow(None, at(3_000)), None);
-        assert_eq!(wait.follow(Some(jonas), at(3_100)), Some(ALLOW_AFTER));
+        assert_eq!(wait.follow(None, top, true, at(3_000)), None);
+        assert_eq!(
+            wait.follow(Some(jonas), top, true, at(3_100)),
+            Some(ALLOW_AFTER)
+        );
         // Allowed: nothing waits.
         let controlled = Request::Controlled { name: "Jonas" };
-        assert_eq!(wait.follow(Some(controlled), at(3_200)), None);
+        assert_eq!(wait.follow(Some(controlled), top, true, at(3_200)), None);
+    }
+
+    // The same request waits again wherever Allow moves: the share block
+    // above grows or shrinks, the panel gets narrower, the fingerprint shows
+    // late. And when the name or the fingerprint changes, or the panel comes
+    // back from minimized or gets focus.
+    #[test]
+    fn allow_waits_again_when_it_moves_or_comes_back() {
+        let t = Instant::now();
+        let at = |ms| t + Duration::from_millis(ms);
+        let asked = |name, key| {
+            Some(Request::Asked {
+                number: 3,
+                name,
+                key,
+            })
+        };
+        let top = Rect::from_min_size(pos2(0.0, 80.0), vec2(360.0, 0.0));
+        let lower = top.translate(vec2(0.0, 120.0));
+        let narrower = Rect::from_min_size(top.min, vec2(320.0, 0.0));
+        // A host can send the same request again under another name, which
+        // can take the sentence over Allow to two lines.
+        let long = "Tom from the third floor, desk 4";
+        let mut wait = AllowWait::default();
+        assert_eq!(
+            wait.follow(asked("Tom", [0; 32]), top, true, t),
+            Some(ALLOW_AFTER)
+        );
+        assert_eq!(wait.follow(asked("Tom", [0; 32]), top, true, at(500)), None);
+        for (name, key, place, focused, ms, why) in [
+            ("Tom", [0; 32], lower, true, 600, "moved down"),
+            ("Tom", [0; 32], top, true, 1_200, "moved back up"),
+            ("Tom", [0; 32], narrower, true, 1_800, "narrower"),
+            ("Tom", TOM, narrower, true, 2_400, "fingerprint shown late"),
+            ("Tom", MARA, narrower, true, 3_000, "another fingerprint"),
+            (long, MARA, narrower, true, 3_600, "another name"),
+            (long, MARA, narrower, false, 4_200, "focus gone"),
+            (long, MARA, narrower, true, 4_800, "focus back"),
+        ] {
+            assert_eq!(
+                wait.follow(asked(name, key), place, focused, at(ms)),
+                Some(ALLOW_AFTER),
+                "{why}"
+            );
+            assert_eq!(
+                wait.follow(asked(name, key), place, focused, at(ms + 500)),
+                None,
+                "{why}"
+            );
+        }
+        wait.out_of_sight();
+        assert_eq!(
+            wait.follow(asked(long, MARA), narrower, true, at(5_400)),
+            Some(ALLOW_AFTER),
+            "back from minimized"
+        );
+        assert_eq!(
+            wait.follow(asked(long, MARA), narrower, true, at(5_900)),
+            None
+        );
     }
 
     // With the switch off a request nobody can see is declined once, and so

@@ -408,7 +408,7 @@ impl App {
         room_injector(&self.hotkeys, &self.flags)
     }
 
-    fn host(&mut self) {
+    fn host(&mut self, ctx: &Context) {
         self.clear_link();
         let injector = self.injector();
         let (Ok(setup), Screen::Start(start)) = (&self.setup, &mut self.screen) else {
@@ -431,7 +431,10 @@ impl App {
             )
         });
         match opened {
-            Ok(room) => self.enter(room),
+            Ok(room) => {
+                forget_paste(start, ctx);
+                self.enter(room);
+            }
             Err(err) => start.host_error = Some(messages::room_error(&err)),
         }
     }
@@ -468,14 +471,7 @@ impl App {
         });
         match opened {
             Ok(room) => {
-                // The invite's secret has done its job; it should not sit in
-                // the field, or in the field's undo history where Ctrl+Z
-                // after Leave would bring it back, for the next person at
-                // this PC to copy.
-                start.paste.zeroize();
-                if let Some(id) = start.paste_id {
-                    ctx.data_mut(|data| data.remove::<TextEditState>(id));
-                }
+                forget_paste(start, ctx);
                 self.enter(room);
             }
             Err(err) => {
@@ -575,7 +571,7 @@ impl App {
         self.sweep = Sweep::default();
     }
 
-    fn leave(&mut self) {
+    fn leave(&mut self, ctx: &Context) {
         let Screen::Room(in_room) = &mut self.screen else {
             return;
         };
@@ -584,6 +580,7 @@ impl App {
             ..Start::default()
         };
         in_room.close_settings();
+        in_room.forget_paste(ctx);
         // The room writes its known list as it leaves, so the list read for
         // the start screen after it is the one it left.
         if let Screen::Room(in_room) = std::mem::replace(&mut self.screen, Screen::Checking) {
@@ -599,7 +596,7 @@ impl App {
     }
 
     // A known host joined again with the secret it gave, and no invite.
-    fn rejoin(&mut self, key: [u8; 32]) {
+    fn rejoin(&mut self, key: [u8; 32], ctx: &Context) {
         self.clear_link();
         let injector = self.injector();
         let (Ok(setup), Screen::Start(start)) = (&self.setup, &mut self.screen) else {
@@ -620,7 +617,10 @@ impl App {
             )
         });
         match opened {
-            Ok(room) => self.enter(room),
+            Ok(room) => {
+                forget_paste(start, ctx);
+                self.enter(room);
+            }
             Err(err) => start.known_error = Some(messages::room_error(&err)),
         }
     }
@@ -1004,7 +1004,7 @@ impl App {
 
     fn take_step(&mut self, step: Option<Step>, ctx: &Context) {
         match step {
-            Some(Step::Leave) => self.leave(),
+            Some(Step::Leave) => self.leave(ctx),
             Some(Step::OpenSettings) => self.open_room_settings(ctx),
             Some(Step::SaveSettings) => self.save_room_settings(),
             Some(Step::CloseSettings) => self.close_room_settings(),
@@ -1223,6 +1223,16 @@ fn opening(
         in_room.store(false, Ordering::Release);
     }
     opened
+}
+
+// Once a room opens, by Join or not, an invite in the paste field should not
+// sit there, or in the field's undo history where Ctrl+Z after Leave would
+// bring it back, for the next person at this PC to copy.
+fn forget_paste(start: &mut Start, ctx: &Context) {
+    start.paste.zeroize();
+    if let Some(id) = start.paste_id {
+        ctx.data_mut(|data| data.remove::<TextEditState>(id));
+    }
 }
 
 // A blocked panel can open no room, so there is nothing for the hotkeys to
@@ -1717,7 +1727,7 @@ impl eframe::App for App {
             self.answer(answer, ui.ctx(), window(frame));
         }
         match choice {
-            Some(Choice::Host) => self.host(),
+            Some(Choice::Host) => self.host(ui.ctx()),
             Some(Choice::Join) => self.join(ui.ctx()),
             Some(Choice::JoinLink) => {
                 if let Some(Waiting::Shown { invite, .. }) = &self.link {
@@ -1725,7 +1735,7 @@ impl eframe::App for App {
                 }
             }
             Some(Choice::DismissLink) => self.clear_link(),
-            Some(Choice::Rejoin(key)) => self.rejoin(key),
+            Some(Choice::Rejoin(key)) => self.rejoin(key, ui.ctx()),
             Some(Choice::SaveAddress(key)) => {
                 self.save_address(key);
                 ui.request_repaint();
@@ -2217,7 +2227,7 @@ mod tests {
         for app in [&blocked, &off, &room] {
             assert!(app.backlog.is_empty());
         }
-        room.leave();
+        room.leave(&Context::default());
         assert!(!room.in_room.load(Ordering::Acquire));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2408,7 +2418,7 @@ mod tests {
         let mut setup = setup_in(&dir);
         setup.config.port = held.local_addr().unwrap().port();
         let mut app = test_app(Ok(setup), Screen::Start(Start::default()));
-        app.host();
+        app.host(&Context::default());
         assert!(!app.in_room.load(Ordering::Acquire));
         assert!(start_of(&app).host_error.is_some());
         let _ = std::fs::remove_dir_all(dir);
@@ -2438,11 +2448,11 @@ mod tests {
             }),
         );
         let mut asked = Vec::new();
-        app.host();
+        app.host(&Context::default());
         asked.push(ASKED.take());
         app.join_invite(link_invite(), &Context::default());
         asked.push(ASKED.take());
-        app.rejoin(key);
+        app.rejoin(key, &Context::default());
         asked.push(ASKED.take());
         assert_eq!(asked, [Some(true); 3]);
         assert!(!app.in_room.load(Ordering::Acquire));
@@ -2565,8 +2575,79 @@ mod tests {
         assert!(matches!(app.screen, Screen::Room(_)));
         assert!(app.link.is_none());
         assert!(TextEditState::load(&ctx, id).is_none());
-        app.leave();
+        app.leave(&ctx);
         assert!(start_of(&app).paste.is_empty());
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // Host and Join on a known host take no invite from the paste field, but
+    // one pasted there and not used goes as Join's does, field and undo
+    // history, or Ctrl+Z after Leave would bring it back.
+    #[test]
+    fn host_and_rejoin_wipe_an_unused_paste() {
+        let dir = fresh_dir("paste-unused");
+        let host_dir = dir.join("host");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let host = room_tests::test_room(&host_dir);
+        room_tests::test_friend(&host, &dir).leave();
+        host.leave();
+        let known = Room::known_hosts(&dir).unwrap();
+        let key = *known[0].host_key();
+        let mut setup = setup_in(&dir);
+        setup.config.port = 0;
+        setup.config.candidates = Candidates::Fixed(Vec::new());
+        setup.config.video.source = room::VideoSource::Hooks;
+        let fake = Fake::new(FakeSetup::default(), &[("a", "Test sound")], Some("a"));
+        setup.config.voice.devices = Devices::Fake {
+            microphone: fake.clone(),
+            speakers: fake.clone(),
+            pc_sound: fake,
+        };
+        let mut app = test_app(
+            Ok(setup),
+            Screen::Start(Start {
+                known,
+                ..Start::default()
+            }),
+        );
+        let id = eframe::egui::Id::new("unused paste");
+        let ctx = Context::default();
+        let paste = |app: &mut App| {
+            TextEditState::default().store(&ctx, id);
+            let Screen::Start(start) = &mut app.screen else {
+                panic!("no start screen");
+            };
+            start.paste = String::from("booth1-private");
+            start.paste_id = Some(id);
+        };
+        paste(&mut app);
+        app.host(&ctx);
+        assert!(matches!(app.screen, Screen::Room(_)), "Host");
+        assert!(TextEditState::load(&ctx, id).is_none(), "Host");
+        app.leave(&ctx);
+        paste(&mut app);
+        app.rejoin(key, &ctx);
+        assert!(matches!(app.screen, Screen::Room(_)), "Join");
+        assert!(TextEditState::load(&ctx, id).is_none(), "Join");
+        app.leave(&ctx);
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // A code left in the room's field goes with the room, field and undo
+    // history: the field is the same one in the next room, where Ctrl+Z
+    // would bring it back.
+    #[test]
+    fn leave_wipes_a_code_left_in_the_room() {
+        let dir = fresh_dir("code-left");
+        let mut app = app_in_room(&dir);
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        let id = room_tests::code_left(in_room(&mut app), &ctx, "booth1-r-q8w2e4");
+        assert!(TextEditState::load(&ctx, id).is_some());
+        app.leave(&ctx);
+        assert!(TextEditState::load(&ctx, id).is_none());
         drop(app);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2639,7 +2720,7 @@ mod tests {
     }
 
     fn close_room(mut app: App) {
-        app.leave();
+        app.leave(&Context::default());
     }
 
     fn with_window(minimized: bool) -> RawInput {
@@ -3344,7 +3425,7 @@ mod tests {
         app.settings_draft_mut().unwrap().change(Action::Mute);
         app.follow_capture();
         assert!(app.hotkeys.capturing());
-        app.leave();
+        app.leave(&ctx);
         assert!(!app.hotkeys.capturing());
         let _ = ctx.run_logic(&with_window(false), |ctx| {
             eframe::App::logic(&mut app, ctx, &mut frame)
@@ -3578,7 +3659,7 @@ mod tests {
         app.take_step(Some(Step::ListNext), &Context::default());
         assert!(Settings::load(&dir).0.share_key_opens_list());
 
-        app.leave();
+        app.leave(&ctx);
         app.enter(room_tests::test_room(&dir));
         press_share_key_twice(&mut app, &ctx);
         thread::sleep(Duration::from_millis(100));
