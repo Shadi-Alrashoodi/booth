@@ -55,7 +55,7 @@ const IDLE_REPAINT: Duration = Duration::from_secs(1);
 const CHECK_POLL: Duration = Duration::from_millis(15);
 // The level meter is redrawn about 30 times a second while it shows; the
 // level itself is kept by the capture thread and read at each redraw.
-const METER_REPAINT: Duration = Duration::from_millis(33);
+pub(crate) const METER_REPAINT: Duration = Duration::from_millis(33);
 
 pub struct App {
     setup: Result<Setup, String>,
@@ -122,8 +122,8 @@ pub struct Setup {
     _held: Option<File>,
     identity: Arc<Identity>,
     config: Config,
-    // As saved, for the next room to start with; a room already open keeps
-    // what it started with.
+    // As saved, for the next room to start with. A room already open takes
+    // only what a Save over it applies.
     settings: Settings,
     // --port, which wins over the setting for this run: it is how two
     // copies share one PC for testing.
@@ -529,8 +529,8 @@ impl App {
             clicked.store(true, Ordering::Release);
             notify();
         }));
-        // Settings apply to the next room, and the viewer's windows read
-        // this one as they draw.
+        // Set again when Settings is saved in the room, and the viewer's
+        // windows read it as they draw.
         if let Ok(setup) = &self.setup {
             viewer::hide_strip_in_fullscreen(setup.settings.hide_strip());
         }
@@ -582,12 +582,14 @@ impl App {
             room_name: std::mem::take(&mut in_room.typed_room_name),
             ..Start::default()
         };
+        in_room.close_settings();
         // The room writes its known list as it leaves, so the list read for
         // the start screen after it is the one it left.
         if let Screen::Room(in_room) = std::mem::replace(&mut self.screen, Screen::Checking) {
             self.target.leave();
             hotkeys::leave(in_room.room);
         }
+        self.hotkeys.capture(false);
         self.share_key = ShareKey::default();
         self.in_room.store(false, Ordering::Release);
         self.screen = self.start(start);
@@ -723,6 +725,83 @@ impl App {
         };
     }
 
+    fn open_room_settings(&mut self, ctx: &Context) {
+        let (Ok(setup), Screen::Room(in_room)) = (&self.setup, &mut self.screen) else {
+            return;
+        };
+        self.stats_open = false;
+        if in_room.settings_draft_mut().is_some() {
+            return;
+        }
+        let mut draft = Draft::new(
+            &setup.settings,
+            KnownDevices::default(),
+            win::user_name().unwrap_or_default(),
+        );
+        draft.hotkeys_off = self.hotkeys.failed().map(messages::hotkeys_off);
+        let audio = SettingsAudio::in_room(ctx, &draft.input);
+        in_room.open_settings(draft, audio);
+        self.backlog
+            .add(String::from("settings: opened over the room"));
+    }
+
+    fn save_room_settings(&mut self) {
+        let (Ok(setup), Screen::Room(in_room)) = (&mut self.setup, &mut self.screen) else {
+            return;
+        };
+        let Some(draft) = in_room.settings_draft_mut() else {
+            return;
+        };
+        let before = setup.settings.clone();
+        draft.stop_waiting();
+        let saved = save_draft(setup, draft, &mut self.backlog, self.flags.controlled());
+        if !saved {
+            draft.show_reason = true;
+        }
+        if !setup.settings.invite_links() {
+            self.link = None;
+            self.inbox
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+        }
+        let after = setup.settings.hotkeys();
+        if after != before.hotkeys() && self.hotkeys.set_bindings(after) {
+            self.backlog.add(hotkeys::bindings_line(&after));
+        }
+        if setup.settings != before {
+            let now = &setup.settings;
+            if voice_settings_differ(now, &before) {
+                in_room.room.set_voice(setup.config.voice.clone());
+            }
+            viewer::hide_strip_in_fullscreen(now.hide_strip());
+            in_room.set_invite_links(now.invite_links());
+            in_room.set_panic_words(now.hotkeys().chord(Action::Panic).to_string());
+            in_room.set_devices([now.device(Direction::Input), now.device(Direction::Output)]);
+        }
+        self.hotkeys.capture(false);
+        if saved {
+            self.close_room_settings();
+        }
+    }
+
+    fn close_room_settings(&mut self) {
+        if let Screen::Room(in_room) = &mut self.screen {
+            in_room.close_settings();
+            self.hotkeys.capture(false);
+            self.backlog
+                .add(String::from("settings: closed over the room"));
+        }
+    }
+
+    fn settings_draft_mut(&mut self) -> Option<&mut Draft> {
+        match &mut self.screen {
+            Screen::Settings { draft, .. } => Some(draft),
+            Screen::Room(in_room) => in_room.settings_draft_mut(),
+            _ => None,
+        }
+    }
+
     // A refused field or a failed write keeps the screen open with the
     // reason under it, and what was typed stays for another try. Settings
     // that went in before a list failed count now: a later Save finds them
@@ -782,7 +861,7 @@ impl App {
         // Raw Input hears the keys of every window, and one typed in another
         // is not meant for the row that waits.
         if ctx.input(|input| input.viewport().focused == Some(false))
-            && let Screen::Settings { draft, .. } = &mut self.screen
+            && let Some(draft) = self.settings_draft_mut()
         {
             draft.stop_waiting();
         }
@@ -799,7 +878,7 @@ impl App {
                 Event::Pressed(Action::StatsPanel) => self.stats_key(ctx),
                 Event::Chord(chord) => self.chord(chord),
                 Event::Cancelled => {
-                    if let Screen::Settings { draft, .. } = &mut self.screen {
+                    if let Some(draft) = self.settings_draft_mut() {
                         draft.stop_waiting();
                     }
                 }
@@ -919,9 +998,12 @@ impl App {
         }
     }
 
-    fn take_step(&mut self, step: Option<Step>) {
+    fn take_step(&mut self, step: Option<Step>, ctx: &Context) {
         match step {
             Some(Step::Leave) => self.leave(),
+            Some(Step::OpenSettings) => self.open_room_settings(ctx),
+            Some(Step::SaveSettings) => self.save_room_settings(),
+            Some(Step::CloseSettings) => self.close_room_settings(),
             Some(Step::NewInvite { multi_use }) => {
                 if let Screen::Room(in_room) = &self.screen {
                     in_room.room.new_invite(multi_use);
@@ -940,15 +1022,21 @@ impl App {
     }
 
     fn chord(&mut self, chord: Chord) {
-        if let Screen::Settings { draft, .. } = &mut self.screen {
+        if let Some(draft) = self.settings_draft_mut() {
             draft.take_chord(chord);
         }
     }
 
     // The hotkeys read keys for settings exactly while a row waits for one.
     fn follow_capture(&mut self) {
-        let waiting =
-            matches!(&self.screen, Screen::Settings { draft, .. } if draft.waiting.is_some());
+        if let Screen::Room(in_room) = &mut self.screen
+            && !in_room.settings_on_top(self.stats_open)
+        {
+            in_room.stop_settings_wait();
+        }
+        let waiting = self
+            .settings_draft_mut()
+            .is_some_and(|draft| draft.waiting.is_some());
         self.hotkeys.capture(waiting);
     }
 
@@ -1155,8 +1243,8 @@ fn start_hotkeys(
     hotkeys
 }
 
-// Kept for the share key the moment it is picked, from inside a room, where
-// settings cannot be opened. A write that fails keeps it for this run and
+// Save builds on the saved settings, so a monitor picked while Settings
+// is open survives Save. A write that fails keeps it for this run and
 // says so in the log. While this PC is controlled it is a sharing setting
 // like the others and takes no change, whoever clicked, so if a window or a
 // region was picked last the key still opens the list.
@@ -1296,11 +1384,23 @@ pub(crate) fn link_receiver(
     }
 }
 
+// What a running room has to hear about after a Save over it.
+fn voice_settings_differ(now: &Settings, before: &Settings) -> bool {
+    now.device(Direction::Input) != before.device(Direction::Input)
+        || now.device(Direction::Output) != before.device(Direction::Output)
+        || now.talk_mode() != before.talk_mode()
+        || now.constant_rate() != before.constant_rate()
+        || now.sensitivity_db() != before.sensitivity_db()
+        || now.echo_cancellation() != before.echo_cancellation()
+        || now.noise_suppression() != before.noise_suppression()
+        || now.automatic_volume() != before.automatic_volume()
+}
+
 // True when all of it is on disk. While this PC is controlled a change to
-// the panic key, the other hotkeys or the sharing settings is refused
-// whole, and the draft stays for a Save once control has ended. The lock is
-// here, in what Save does, so no click on the settings screen can get past
-// it, the controller's included.
+// the panic key, the other hotkeys, the sharing settings, the voice devices
+// or how you talk is refused whole, and the draft stays for a Save once
+// control has ended. The lock is here, in what Save does, so no click on the
+// settings screen can get past it, the controller's included.
 fn save_draft(
     setup: &mut Setup,
     draft: &mut Draft,
@@ -1317,7 +1417,7 @@ fn save_draft(
     draft.locked = controlled;
     if controlled && next.locked_part_differs(&setup.settings) {
         backlog.add(String::from(
-            "settings: not saved, this pc is controlled and the change touches the hotkeys or the sharing settings",
+            "settings: not saved, this pc is controlled and the change touches the hotkeys, the sharing settings, the voice devices or how you talk",
         ));
         return false;
     }
@@ -1455,7 +1555,7 @@ impl eframe::App for App {
         if let Some(tray) = &mut self.tray {
             tray.show(tray::look(view.as_ref(), self.control_offered));
         }
-        self.take_step(step);
+        self.take_step(step, ctx);
         self.follow_panel_keys(ctx);
     }
 
@@ -1496,11 +1596,6 @@ impl eframe::App for App {
             {
                 self.stats_open = !self.stats_open;
             }
-            if self.stats_open
-                && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
-            {
-                self.stats_open = false;
-            }
             if let Some(problem) = &view.list_problem {
                 self.note(problem);
             }
@@ -1516,8 +1611,7 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 // The screen is laid out before the strip, not in a bottom
                 // panel, so Tab reaches the strip last as it reads. Settings
-                // has none: it never opens in a room, and an empty band under
-                // its bar would cut the bar off from the window's edge.
+                // outside a room has none, so its bar meets the window edge.
                 let whole = ui.max_rect();
                 let strip_height = if matches!(self.screen, Screen::Settings { .. }) {
                     0.0
@@ -1607,6 +1701,10 @@ impl eframe::App for App {
                     });
                 }
             });
+        if self.stats_open && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
+        {
+            self.stats_open = false;
+        }
         if strip_clicked {
             self.stats_open = !self.stats_open;
         }
@@ -1661,7 +1759,7 @@ impl eframe::App for App {
                 self.backlog.add(line);
             }
         }
-        self.take_step(step);
+        self.take_step(step, ui.ctx());
         // Change or Save pressed on this frame starts or ends a wait.
         self.follow_capture();
         self.follow_panel_keys(ui.ctx());
@@ -2970,8 +3068,9 @@ mod tests {
     }
 
     // While this PC is controlled, Save refuses a change to the panic key,
-    // the other hotkeys or the sharing settings, writes nothing, and keeps
-    // the draft for a Save once control has ended.
+    // the other hotkeys, the sharing settings, the voice devices or how you
+    // talk, writes nothing, and keeps the draft for a Save once control has
+    // ended.
     #[test]
     fn save_while_controlled() {
         use std::fs;
@@ -2999,6 +3098,14 @@ mod tests {
         refused("upload", &|draft| draft.upload_mbits = 40);
         refused("vsync", &|draft| draft.vsync = true);
         refused("hide strip", &|draft| draft.hide_strip = true);
+        let other = voice::audio::Choice::Device(String::from("other"));
+        refused("talk", &|draft| draft.talk = TalkMode::OpenMic);
+        refused("input", &|draft| draft.input = other.clone());
+        refused("output", &|draft| draft.output = other.clone());
+        refused("sensitivity", &|draft| {
+            draft.sensitivity_db = *room::SENSITIVITY_DB.start();
+        });
+        refused("constant rate", &|draft| draft.constant_rate = false);
         // Nothing else is locked.
         let mut draft = Draft::new(&setup.settings, KnownDevices::default(), String::new());
         draft.name = String::from("Tom");
@@ -3010,6 +3117,230 @@ mod tests {
         assert!(save_draft(&mut setup, &mut draft, &mut backlog, false));
         assert!(setup.settings.vsync());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn room_settings_save_only_applies_what_reached_disk() {
+        let dir = fresh_dir("room-settings-save");
+        let ctx = Context::default();
+        let mut app = app_in_room(&dir);
+        let room = Arc::clone(&in_room(&mut app).room);
+        std::fs::write(dir.join("devices.bin"), b"unreadable").unwrap();
+        app.open_room_settings(&ctx);
+        let draft = app.settings_draft_mut().unwrap();
+        assert!(draft.devices.is_empty() && draft.list_error.is_none());
+        assert_eq!(
+            std::fs::read(dir.join("devices.bin")).unwrap(),
+            b"unreadable"
+        );
+        draft.talk = TalkMode::OpenMic;
+        draft.invite_links = false;
+        let output = voice::audio::Choice::Device(String::from("other"));
+        draft.output = output.clone();
+        let panic: Chord = "F9".parse().unwrap();
+        draft.hotkeys.set(Action::Panic, panic);
+        draft.change(Action::Mute);
+        app.follow_capture();
+        assert!(app.hotkeys.capturing());
+        std::fs::create_dir(dir.join("settings.txt")).unwrap();
+        app.save_room_settings();
+        assert_eq!(room.view().voice.mode, TalkMode::PushToTalk);
+        assert_eq!(app.hotkeys.last_given(), input::Bindings::default());
+        assert!(app.settings_draft_mut().unwrap().show_reason);
+        assert!(!app.hotkeys.capturing());
+        assert!(app.setup.as_ref().unwrap().settings.invite_links());
+        let (_, links, devices) = room_tests::room_settings_values(in_room(&mut app));
+        assert!(links);
+        assert_eq!(devices[1], voice::audio::Choice::Default);
+        std::fs::remove_dir(dir.join("settings.txt")).unwrap();
+        app.remember_monitor(r"\\.\DISPLAY2");
+        app.save_room_settings();
+        assert!(app.settings_draft_mut().is_none());
+        let until = Instant::now() + Duration::from_secs(3);
+        while room.view().voice.mode != TalkMode::OpenMic {
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(Arc::ptr_eq(&room, &in_room(&mut app).room));
+        assert_eq!(app.hotkeys.last_given().chord(Action::Panic), panic);
+        let (words, links, devices) = room_tests::room_settings_values(in_room(&mut app));
+        assert_eq!(words, "F9");
+        assert!(!links);
+        assert_eq!(devices[1], output);
+        let saved = Settings::load(&dir).0;
+        assert_eq!(saved.share_monitor(), Some(r"\\.\DISPLAY2"));
+        assert_eq!(saved.talk_mode(), TalkMode::OpenMic);
+        assert!(!saved.invite_links());
+        drop(room);
+        close_room(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn each_voice_setting_counts_as_a_voice_change() {
+        let before = Settings::default();
+        let other = voice::audio::Choice::Device(String::from("other"));
+        let differs = |change: &dyn Fn(&mut Settings)| {
+            let mut now = before.clone();
+            change(&mut now);
+            voice_settings_differ(&now, &before)
+        };
+        assert!(differs(&|now| now.set_device(Direction::Input, &other)));
+        assert!(differs(&|now| now.set_device(Direction::Output, &other)));
+        assert!(differs(&|now| now.set_talk_mode(TalkMode::OpenMic)));
+        assert!(differs(&|now| now.set_constant_rate(false)));
+        assert!(differs(
+            &|now| now.set_sensitivity_db(*room::SENSITIVITY_DB.start())
+        ));
+        assert!(differs(&|now| now.set_echo_cancellation(false)));
+        assert!(differs(&|now| now.set_noise_suppression(true)));
+        assert!(differs(&|now| now.set_automatic_volume(false)));
+        assert!(!differs(&|now| now.set_name("Tom")));
+    }
+
+    #[test]
+    fn room_settings_from_the_gear_open_no_microphone() {
+        let dir = fresh_dir("room-settings-no-mic");
+        let mut app = app_in_room(&dir);
+        app.open_room_settings(&Context::default());
+        assert!(!room_tests::settings_have_a_microphone(in_room(&mut app)));
+        close_room(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn room_settings_keep_a_failed_device_choice() {
+        let dir = fresh_dir("room-settings-device");
+        let ctx = Context::default();
+        let mut app = app_in_room(&dir);
+        app.open_room_settings(&ctx);
+        app.settings_draft_mut().unwrap().input =
+            voice::audio::Choice::Device(String::from("missing"));
+        let before = Instant::now();
+        app.save_room_settings();
+        assert!(before.elapsed() < Duration::from_millis(500));
+        assert!(app.settings_draft_mut().is_none());
+        let room = Arc::clone(&in_room(&mut app).room);
+        let until = Instant::now() + Duration::from_secs(3);
+        while room.view().voice.microphone.is_none() {
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(
+            room.view().voice.microphone,
+            Some(voice::audio::AudioError::NotConnected { .. })
+        ));
+        assert_eq!(
+            Settings::load(&dir).0.device(Direction::Input).id(),
+            Some("missing")
+        );
+        app.open_room_settings(&ctx);
+        assert_eq!(
+            app.settings_draft_mut().unwrap().input.id(),
+            Some("missing")
+        );
+        app.close_room_settings();
+        drop(room);
+        close_room(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn room_settings_cancel_cover_and_leave_end_capture() {
+        let dir = fresh_dir("room-settings-cover");
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let mut app = app_in_room(&dir);
+        let mut frame = eframe::Frame::_new_kittest();
+        let draw = |app: &mut App, events| {
+            let mut input = with_window(false);
+            input.events = events;
+            let mut output = ctx.run_ui(input, |ui| {
+                eframe::App::ui(app, ui, &mut eframe::Frame::_new_kittest());
+            });
+            let tree = std::mem::take(&mut output.platform_output)
+                .accesskit_update
+                .unwrap();
+            output.drop_without_applying_deltas();
+            tree
+        };
+        app.open_room_settings(&ctx);
+        app.settings_draft_mut().unwrap().name = String::from("draft");
+        let tree = draw(&mut app, Vec::new());
+        assert!(
+            tree.nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some("Stats"))
+        );
+        assert!(
+            !tree
+                .nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some(messages::MESSAGE_HINT))
+        );
+        app.settings_draft_mut().unwrap().change(Action::Mute);
+        app.follow_capture();
+        assert!(app.hotkeys.capturing());
+        app.stats_open = true;
+        app.follow_capture();
+        assert!(!app.hotkeys.capturing());
+        assert!(app.settings_draft_mut().unwrap().waiting.is_none());
+        room_tests::cover_settings(in_room(&mut app));
+        let escape = || {
+            vec![eframe::egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }]
+        };
+        let tree = draw(&mut app, escape());
+        assert!(!in_room(&mut app).share_list_open());
+        assert!(app.stats_open);
+        assert!(
+            !tree
+                .nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some("Save"))
+        );
+        draw(&mut app, escape());
+        assert!(!app.stats_open);
+        assert_eq!(app.settings_draft_mut().unwrap().name, "draft");
+        draw(&mut app, escape());
+        assert!(app.settings_draft_mut().is_none());
+        assert!(!dir.join("settings.txt").exists());
+        app.open_room_settings(&ctx);
+        app.settings_draft_mut().unwrap().change(Action::Mute);
+        app.follow_capture();
+        assert!(app.hotkeys.capturing());
+        app.leave();
+        assert!(!app.hotkeys.capturing());
+        let _ = ctx.run_logic(&with_window(false), |ctx| {
+            eframe::App::logic(&mut app, ctx, &mut frame)
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn room_settings_stay_refused_while_controlled() {
+        let dir = fresh_dir("room-settings-controlled");
+        let mut app = app_in_room(&dir);
+        app.flags = Arc::new(Flags::controlled_for_tests());
+        app.open_room_settings(&Context::default());
+        let draft = app.settings_draft_mut().unwrap();
+        draft.talk = TalkMode::OpenMic;
+        draft.hotkeys.set(Action::Panic, "F9".parse().unwrap());
+        app.save_room_settings();
+        assert!(app.settings_draft_mut().unwrap().locked);
+        assert_eq!(
+            in_room(&mut app).room.view().voice.mode,
+            TalkMode::PushToTalk
+        );
+        assert!(!dir.join("settings.txt").exists());
+        close_room(app);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     // Pressing Save again, as the line says, once the program has let go of
@@ -3215,7 +3546,7 @@ mod tests {
         let dir = fresh_dir("list-next");
         let ctx = Context::default();
         let mut app = app_in_room(&dir);
-        app.take_step(Some(Step::ListNext));
+        app.take_step(Some(Step::ListNext), &Context::default());
         assert!(Settings::load(&dir).0.share_key_opens_list());
 
         app.leave();
@@ -3229,10 +3560,16 @@ mod tests {
         assert_eq!(room_tests::list_open(in_room(&mut app)), listed);
 
         // A monitor picked ends it, the same monitor as before included.
-        app.take_step(Some(Step::Remember(String::from(r"\\.\DISPLAY2"))));
+        app.take_step(
+            Some(Step::Remember(String::from(r"\\.\DISPLAY2"))),
+            &Context::default(),
+        );
         assert!(!Settings::load(&dir).0.share_key_opens_list());
-        app.take_step(Some(Step::ListNext));
-        app.take_step(Some(Step::Remember(String::from(r"\\.\DISPLAY2"))));
+        app.take_step(Some(Step::ListNext), &Context::default());
+        app.take_step(
+            Some(Step::Remember(String::from(r"\\.\DISPLAY2"))),
+            &Context::default(),
+        );
         assert!(!Settings::load(&dir).0.share_key_opens_list());
         press_share_key_twice(&mut app, &ctx);
         share_goes(&mut app, true);
@@ -3289,7 +3626,7 @@ mod tests {
         let friend_dir = fresh_dir("list-busy-friend");
         let ctx = Context::default();
         let mut app = app_in_room(&dir);
-        app.take_step(Some(Step::ListNext));
+        app.take_step(Some(Step::ListNext), &Context::default());
         let friend = room_tests::test_friend(&in_room(&mut app).room, &friend_dir);
         friend.share(30, None);
         let room = Arc::clone(&in_room(&mut app).room);
@@ -3360,7 +3697,7 @@ mod tests {
         for list_next in [false, true] {
             let mut app = app_in_room(&dir);
             if list_next {
-                app.take_step(Some(Step::ListNext));
+                app.take_step(Some(Step::ListNext), &Context::default());
             }
             let answer = room_tests::picker_open(in_room(&mut app));
             press_share_key_twice(&mut app, &ctx);

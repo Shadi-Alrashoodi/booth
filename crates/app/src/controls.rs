@@ -72,6 +72,75 @@ pub fn title_row(ui: &mut Ui, lead: Lead, verbs: &[Button]) -> Option<usize> {
     pressed
 }
 
+pub fn title_rows(
+    ui: &mut Ui,
+    title: &str,
+    verbs: &[Button],
+    least: &[f32],
+) -> (Option<usize>, Vec<Id>) {
+    let width = (ui.available_width() - 2.0 * SIDE).max(0.0);
+    let mut rows = Vec::new();
+    let mut start = 0;
+    let mut used = 0.0;
+    for (i, button) in verbs.iter().enumerate() {
+        let need = least[i].max(button.width(ui));
+        if i > start && used + STEP + need > width {
+            rows.push(start..i);
+            start = i;
+            used = 0.0;
+        }
+        if i > start {
+            used += STEP;
+        }
+        used += need;
+    }
+    rows.push(start..verbs.len());
+    let height = TITLE_ROW + (rows.len() - 1) as f32 * (CONTROL_HEIGHT + STEP);
+    let (outer, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    let mut header = ui.new_child(UiBuilder::new().max_rect(outer));
+    header.set_clip_rect(outer.intersect(ui.clip_rect()));
+    let mut pressed = None;
+    let mut ids = Vec::new();
+    for (row, range) in rows.into_iter().enumerate() {
+        let top =
+            outer.top() + (TITLE_ROW - CONTROL_HEIGHT) / 2.0 + row as f32 * (CONTROL_HEIGHT + STEP);
+        let rect = Rect::from_min_max(
+            pos2(outer.left() + SIDE, top),
+            pos2(outer.right() - SIDE, top + CONTROL_HEIGHT),
+        );
+        let drawn = buttons_width(&header, &verbs[range.clone()]);
+        let room = width - drawn - STEP;
+        if row == 0 && room >= 40.0 {
+            header.scope_builder(
+                UiBuilder::new()
+                    .max_rect(Rect::from_min_size(rect.min, vec2(room, CONTROL_HEIGHT)))
+                    .layout(Layout::left_to_right(Align::Center)),
+                |ui| {
+                    one_line(ui, title, theme::title(), CHALK);
+                },
+            );
+        }
+        let at = Rect::from_min_max(pos2(rect.right() - drawn, rect.top()), rect.max);
+        header.scope_builder(
+            UiBuilder::new()
+                .id_salt(("title verbs", range.start))
+                .max_rect(at)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                for i in range {
+                    let button = verbs[i];
+                    let response = ui.push_id(button.text, |ui| button.show(ui)).inner;
+                    ids.push(response.id);
+                    if button_pressed(ui, &response, button.enabled) {
+                        pressed = Some(i);
+                    }
+                }
+            },
+        );
+    }
+    (pressed, ids)
+}
+
 // Buttons side by side with the usual gap, as wide as buttons() lays them.
 pub fn buttons_width(ui: &Ui, buttons: &[Button]) -> f32 {
     let gap = ui.spacing().item_spacing.x;
@@ -383,6 +452,7 @@ pub struct Button<'a> {
     // a warning, or waiting.
     color: Option<Color32>,
     icon: Option<&'a str>,
+    icon_only: bool,
     height: f32,
     min_width: f32,
     enter_target: bool,
@@ -398,6 +468,7 @@ impl<'a> Button<'a> {
             on: false,
             color: None,
             icon: None,
+            icon_only: false,
             height: CONTROL_HEIGHT,
             min_width: 0.0,
             enter_target: false,
@@ -422,6 +493,11 @@ impl<'a> Button<'a> {
 
     pub fn icon(mut self, icon: &'a str) -> Button<'a> {
         self.icon = Some(icon);
+        self
+    }
+
+    pub fn icon_only(mut self) -> Button<'a> {
+        self.icon_only = true;
         self
     }
 
@@ -462,7 +538,7 @@ impl<'a> Button<'a> {
 
     fn icon_width(&self) -> f32 {
         if self.icon.is_some() {
-            ICON_SIZE + STEP
+            ICON_SIZE + if self.icon_only { 0.0 } else { STEP }
         } else {
             0.0
         }
@@ -474,7 +550,12 @@ impl<'a> Button<'a> {
         } else {
             0.0
         };
-        (text_width(ui, self.text, theme::medium()) + self.icon_width() + 2.0 * TEXT_PAD)
+        (text_width(
+            ui,
+            if self.icon_only { "" } else { self.text },
+            theme::medium(),
+        ) + self.icon_width()
+            + 2.0 * TEXT_PAD)
             .max(self.height)
             .max(self.min_width)
             .max(least)
@@ -510,7 +591,8 @@ impl<'a> Button<'a> {
             if paint.fill != Color32::TRANSPARENT {
                 painter.rect_filled(rect, CONTROL_RADIUS, paint.fill);
             }
-            let galley = painter.layout_no_wrap(self.text.to_owned(), theme::medium(), label_color);
+            let text = if self.icon_only { "" } else { self.text };
+            let galley = painter.layout_no_wrap(text.to_owned(), theme::medium(), label_color);
             let whole = self.icon_width() + galley.size().x;
             let left = rect.center().x - whole / 2.0;
             if let Some(icon) = self.icon {

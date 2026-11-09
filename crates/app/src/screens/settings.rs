@@ -62,9 +62,9 @@ pub struct Draft {
     pub key_refused: Option<Action>,
     // Why no key can be read: the hotkeys did not start.
     pub hotkeys_off: Option<String>,
-    // This PC is controlled, so the hotkeys and the sharing settings take
-    // no change and no row waits for a key. The panel sets it every frame;
-    // Save checks again for itself.
+    // This PC is controlled, so the hotkeys, the sharing settings, the voice
+    // devices and how you talk take no change and no row waits for a key. The
+    // panel sets it every frame; Save checks again for itself.
     pub locked: bool,
     // As listed when the screen opened, less what Remove and Unblock took
     // off. Those take effect on Save.
@@ -115,6 +115,33 @@ impl Refused {
 pub enum Press {
     Save,
     Cancel,
+}
+
+pub enum Place<'a> {
+    Start,
+    Room(Box<RoomFacts<'a>>),
+}
+
+pub struct RoomFacts<'a> {
+    pub microphone: Option<room::MicNow>,
+    pub muted: bool,
+    pub ended: bool,
+    pub problem: Option<&'a str>,
+    pub input: &'a Choice,
+    pub host: bool,
+    pub addresses_hidden: bool,
+}
+
+impl Place<'_> {
+    fn in_room(&self) -> bool {
+        matches!(self, Place::Room(_))
+    }
+
+    fn next_room(&self, ui: &mut Ui) {
+        if self.in_room() {
+            line(ui, messages::NEXT_ROOM, ASH);
+        }
+    }
 }
 
 impl Draft {
@@ -249,6 +276,24 @@ impl Draft {
 // however long the list above them grows; the list scrolls.
 pub fn show(ui: &mut Ui, draft: &mut Draft, audio: &mut SettingsAudio) -> Option<Press> {
     controls::title_row(ui, Lead::Title("Settings"), &[]);
+    panel(ui, draft, audio, Place::Start)
+}
+
+pub fn panel(
+    ui: &mut Ui,
+    draft: &mut Draft,
+    audio: &mut SettingsAudio,
+    place: Place<'_>,
+) -> Option<Press> {
+    // egui takes the focus out of a field on Escape before this panel draws,
+    // so whether one had it is read from the frame before.
+    let focus_id = ui.id().with("settings text focus");
+    let frame = ui.ctx().cumulative_frame_nr();
+    let typing = ui.ctx().text_edit_focused()
+        || ui.ctx().data(|data| {
+            data.get_temp::<(u64, bool)>(focus_id)
+                .is_some_and(|(at, typing)| at + 1 == frame && typing)
+        });
     let rest = ui.available_rect_before_wrap();
     let (list, bar) = rest.split_top_bottom_at_y(rest.bottom() - BAR_HEIGHT);
 
@@ -264,13 +309,31 @@ pub fn show(ui: &mut Ui, draft: &mut Draft, audio: &mut SettingsAudio) -> Option
                     in_view(&mut draft.show_reason, &said);
                     ui.add_space(SECTION_GAP);
                 }
-                fields.push(name(ui, draft));
-                ui.add_space(SECTION_GAP);
-                fields.extend(network(ui, draft));
-                hotkeys(ui, draft);
-                voice(ui, draft, audio);
-                sharing(ui, draft);
-                lists(ui, draft, Instant::now());
+                if place.in_room() {
+                    voice(ui, draft, audio, &place);
+                    hotkeys(ui, draft);
+                    sharing(ui, draft, &place);
+                    ui.add_space(SECTION_GAP);
+                    fields.push(name(ui, draft, &place));
+                    ui.add_space(SECTION_GAP);
+                    fields.extend(network(ui, draft, &place));
+                } else {
+                    fields.push(name(ui, draft, &place));
+                    ui.add_space(SECTION_GAP);
+                    fields.extend(network(ui, draft, &place));
+                    hotkeys(ui, draft);
+                    voice(ui, draft, audio, &place);
+                    sharing(ui, draft, &place);
+                }
+                match &place {
+                    Place::Start => lists(ui, draft, Instant::now()),
+                    Place::Room(facts) if facts.host => {
+                        ui.add_space(SECTION_GAP);
+                        head(ui, "Known devices");
+                        controls::prose(ui, messages::ROOM_KNOWN_DEVICES, theme::body(), ASH);
+                    }
+                    Place::Room(_) => {}
+                }
                 if cfg!(feature = "store") {
                     ui.add_space(SECTION_GAP);
                     head(ui, "About");
@@ -310,6 +373,15 @@ pub fn show(ui: &mut Ui, draft: &mut Draft, audio: &mut SettingsAudio) -> Option
             }
         });
     });
+    let focused = ui.ctx().text_edit_focused();
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(focus_id, (frame, focused)));
+    if !typing
+        && draft.waiting.is_none()
+        && ui.input_mut(|input| input.consume_key(eframe::egui::Modifiers::NONE, Key::Escape))
+    {
+        press = Some(Press::Cancel);
+    }
     press
 }
 
@@ -324,7 +396,7 @@ fn label(ui: &mut Ui, text: &str) {
     ui.add_space(STEP);
 }
 
-fn name(ui: &mut Ui, draft: &mut Draft) -> Response {
+fn name(ui: &mut Ui, draft: &mut Draft, place: &Place<'_>) -> Response {
     head(ui, "Name");
     // Empty means the Windows user name, which the field shows until a
     // name is typed.
@@ -338,10 +410,11 @@ fn name(ui: &mut Ui, draft: &mut Draft) -> Response {
     );
     ui.ctx()
         .accesskit_node_builder(field.id, |node| node.set_label("Name"));
+    place.next_room(ui);
     field
 }
 
-fn network(ui: &mut Ui, draft: &mut Draft) -> [Response; 2] {
+fn network(ui: &mut Ui, draft: &mut Draft, place: &Place<'_>) -> [Response; 2] {
     head(ui, "Network");
 
     label(ui, "Port");
@@ -354,17 +427,24 @@ fn network(ui: &mut Ui, draft: &mut Draft) -> [Response; 2] {
         in_view(&mut draft.show_reason, &said);
     }
 
+    place.next_room(ui);
     ui.add_space(FIELD_GAP);
     label(ui, "STUN servers");
-    let stun = controls::lines_field(
-        ui,
-        "stun servers",
-        &mut draft.stun_servers,
-        "STUN servers",
-        STUN_CHARS,
-    );
-    if stun.changed() {
-        draft.refused.stun_line = None;
+    let hide = matches!(place, Place::Room(facts) if facts.addresses_hidden);
+    if hide {
+        // A line here can be a friend's own address.
+        line(ui, messages::HIDDEN_WHILE_SHARING, ASH);
+    } else {
+        let stun = controls::lines_field(
+            ui,
+            "stun servers",
+            &mut draft.stun_servers,
+            "STUN servers",
+            STUN_CHARS,
+        );
+        if stun.changed() {
+            draft.refused.stun_line = None;
+        }
     }
     if let Some(at) = draft.refused.stun_line {
         let said = line(ui, &messages::stun_refused(at), BAD);
@@ -373,17 +453,22 @@ fn network(ui: &mut Ui, draft: &mut Draft) -> [Response; 2] {
         line(ui, messages::NO_STUN, ASH);
     }
 
+    place.next_room(ui);
     ui.add_space(FIELD_GAP);
     label(ui, "Address name");
     // The name is already written above the field, so no placeholder
     // repeats it.
-    let address = labelled(
+    let address = controls::hiding_field(
         ui,
         "address name",
         &mut draft.address_name,
-        "Address name",
+        "",
+        theme::mono(),
         ADDRESS_NAME_CHARS,
+        hide,
     );
+    ui.ctx()
+        .accesskit_node_builder(address.id, |node| node.set_label("Address name"));
     if address.changed() {
         draft.refused.address_name = false;
     }
@@ -393,6 +478,8 @@ fn network(ui: &mut Ui, draft: &mut Draft) -> [Response; 2] {
     } else {
         line(ui, messages::ADDRESS_NAME_ABOUT, ASH);
     }
+
+    place.next_room(ui);
 
     // The update check talks to GitHub, so it sits with the other settings
     // that decide who this PC talks to. Its sentence shows while it is on,
@@ -538,9 +625,13 @@ fn refused_line(draft: &Draft, action: Action) -> Option<String> {
 // what the room does to it; in open mic the meter is also the sensitivity, a
 // handle on its own scale. Hear yourself plays that same sound. Then the
 // output device, and constant-rate voice. Each choice that costs something
-// has its one sentence.
-fn voice(ui: &mut Ui, draft: &mut Draft, audio: &mut SettingsAudio) {
-    ui.add_space(SECTION_GAP);
+// has its one sentence. Over a room the meter is the room's own microphone,
+// which takes the switches only once Save applies them, and Hear yourself
+// stays off.
+fn voice(ui: &mut Ui, draft: &mut Draft, audio: &mut SettingsAudio, place: &Place<'_>) {
+    if !place.in_room() {
+        ui.add_space(SECTION_GAP);
+    }
     head(ui, "Voice");
     let lists = audio.lists();
     let (inputs, outputs) = match lists {
@@ -566,7 +657,15 @@ fn voice(ui: &mut Ui, draft: &mut Draft, audio: &mut SettingsAudio) {
     if controls::choice_row(ui, id, draft.echo_cancellation, name, None, kind).clicked() {
         draft.echo_cancellation = !draft.echo_cancellation;
     }
-    let echo = audio.echo();
+    let now = match place {
+        Place::Room(facts) => facts.microphone.as_ref(),
+        Place::Start => None,
+    };
+    let echo = if place.in_room() {
+        now.map(|mic| mic.info.echo.clone())
+    } else {
+        audio.echo()
+    };
     let can = winver::cancels_echo();
     let on = draft.echo_cancellation;
     if let Some(text) = messages::echo_line(can, on, audio.hearing(), echo.as_ref()) {
@@ -578,7 +677,12 @@ fn voice(ui: &mut Ui, draft: &mut Draft, audio: &mut SettingsAudio) {
         line(ui, text, color);
     }
 
-    let windows = audio.effects().unwrap_or_default();
+    let effects = if place.in_room() {
+        now.map(|mic| mic.info.effects)
+    } else {
+        audio.effects()
+    };
+    let windows = effects.unwrap_or_default();
     ui.add_space(STEP);
     let id = ui.id().with("noise suppression");
     let name = "Noise suppression";
@@ -625,7 +729,12 @@ fn voice(ui: &mut Ui, draft: &mut Draft, audio: &mut SettingsAudio) {
 
     ui.add_space(STEP);
     // The loudest 5 ms block is what the open mic gate goes by.
-    let (level, peak) = audio.level().map_or((0.0, 0.0), |level| {
+    let reading = if place.in_room() {
+        now.map(|mic| mic.level)
+    } else {
+        audio.level()
+    };
+    let (level, peak) = reading.map_or((0.0, 0.0), |level| {
         (meter_fraction(level.loudest), meter_fraction(level.peak))
     });
     if draft.talk == TalkMode::OpenMic {
@@ -639,25 +748,61 @@ fn voice(ui: &mut Ui, draft: &mut Draft, audio: &mut SettingsAudio) {
     } else {
         controls::meter(ui, level, peak, "Microphone level");
     }
-    match audio.problem() {
-        Some(problem) => line(ui, problem, BAD),
-        None => line(ui, messages::MICROPHONE_OPEN, ASH),
-    };
+    match place {
+        Place::Start => {
+            match audio.problem() {
+                Some(problem) => line(ui, problem, BAD),
+                None => line(ui, messages::MICROPHONE_OPEN, ASH),
+            };
+        }
+        Place::Room(facts) => {
+            let (text, color) = if let Some(problem) = facts.problem {
+                (problem, BAD)
+            } else if facts.ended {
+                (messages::ROOM_MICROPHONE_ENDED, ASH)
+            } else if facts.muted {
+                (messages::ROOM_MICROPHONE_MUTED, ASH)
+            } else if &draft.input
+                != facts
+                    .microphone
+                    .as_ref()
+                    .map_or(facts.input, |mic| &mic.input)
+            {
+                (messages::ROOM_MICROPHONE_PICKED, ASH)
+            } else {
+                (messages::ROOM_MICROPHONE, ASH)
+            };
+            line(ui, text, color);
+        }
+    }
 
     ui.add_space(STEP);
     let id = ui.id().with("hear yourself");
     let hearing = audio.hearing();
-    let kind = WidgetType::Checkbox;
-    // Turned on or off once the output list below is drawn from the lists
-    // it borrows.
-    let toggle = controls::choice_row(ui, id, hearing, "Hear yourself", None, kind).clicked();
-    if let Some(problem) = audio.hear_problem() {
-        line(ui, &problem, BAD);
-    } else if audio.tripped() {
-        line(ui, messages::HEAR_YOURSELF_TRIPPED, WARN);
+    let toggle = if place.in_room() {
+        controls::checkbox_row(
+            ui,
+            id,
+            false,
+            "Hear yourself",
+            false,
+            messages::ROOM_HEAR_YOURSELF,
+        );
+        line(ui, messages::ROOM_HEAR_YOURSELF, ASH);
+        false
     } else {
-        line(ui, messages::HEAR_YOURSELF, ASH);
-    }
+        let toggle =
+            controls::choice_row(ui, id, hearing, "Hear yourself", None, WidgetType::Checkbox)
+                .clicked();
+        if let Some(problem) = audio.hear_problem() {
+            line(ui, &problem, BAD);
+        } else if audio.tripped() {
+            line(ui, messages::HEAR_YOURSELF_TRIPPED, WARN);
+        } else {
+            line(ui, messages::HEAR_YOURSELF, ASH);
+        }
+        toggle
+    };
 
     ui.add_space(FIELD_GAP);
     label(ui, "Output device");
@@ -679,9 +824,8 @@ fn voice(ui: &mut Ui, draft: &mut Draft, audio: &mut SettingsAudio) {
 }
 
 // The video upload, vsync in the viewer and the strip hidden in fullscreen,
-// each with its one sentence when it is the choice that needs one. Like the
-// rest, they apply to the next room.
-fn sharing(ui: &mut Ui, draft: &mut Draft) {
+// each with its one sentence when it is the choice that needs one.
+fn sharing(ui: &mut Ui, draft: &mut Draft, place: &Place<'_>) {
     ui.add_space(SECTION_GAP);
     head(ui, "Sharing");
     controls::text(ui, "Video upload", theme::body(), ASH);
@@ -696,6 +840,7 @@ fn sharing(ui: &mut Ui, draft: &mut Draft) {
         "Video upload",
     );
     controls::prose(ui, messages::UPLOAD_ABOUT, theme::caption(), ASH);
+    place.next_room(ui);
 
     ui.add_space(FIELD_GAP);
     let id = ui.id().with("vsync");
@@ -707,6 +852,7 @@ fn sharing(ui: &mut Ui, draft: &mut Draft) {
         line(ui, messages::VSYNC_ON, ASH);
     }
 
+    place.next_room(ui);
     ui.add_space(STEP);
     let id = ui.id().with("hide strip");
     let name = "Hide the strip in fullscreen";
@@ -1214,7 +1360,7 @@ mod tests {
                 }
                 scroll.show(ui, |ui| {
                     controls::page(ui, |ui| {
-                        sharing(ui, draft);
+                        sharing(ui, draft, &Place::Start);
                         lists(ui, draft, now);
                     })
                 });
@@ -1288,7 +1434,7 @@ mod tests {
                 }
                 scroll.show(ui, |ui| {
                     controls::page(ui, |ui| {
-                        sharing(ui, draft);
+                        sharing(ui, draft, &Place::Start);
                         lists(ui, draft, now);
                     })
                 });
@@ -1680,6 +1826,189 @@ mod tests {
     }
 
     #[test]
+    fn room_settings_have_the_room_order_and_notes() {
+        for host in [true, false] {
+            let ctx = Context::default();
+            theme::apply(&ctx);
+            ctx.enable_accesskit();
+            let mut draft = typed("Mara");
+            draft.address_name = String::from("friends.example");
+            draft.stun_servers = String::from("stun.private.test:3478");
+            let input = Choice::Default;
+            let mut audio = SettingsAudio::in_room(&ctx, &input);
+            let (_, out) =
+                crate::controls::tests::frame_at(&ctx, vec2(360.0, 6000.0), Vec::new(), |ui| {
+                    panel(
+                        ui,
+                        &mut draft,
+                        &mut audio,
+                        Place::Room(Box::new(RoomFacts {
+                            microphone: None,
+                            muted: true,
+                            ended: false,
+                            problem: None,
+                            input: &input,
+                            host,
+                            addresses_hidden: true,
+                        })),
+                    )
+                });
+            let nodes = out.accesskit_update.unwrap().nodes;
+            let mut text: Vec<_> = nodes
+                .iter()
+                .filter(|(_, node)| node.bounds().is_some())
+                .collect();
+            text.sort_by(|(_, a), (_, b)| {
+                a.bounds().unwrap().y0.total_cmp(&b.bounds().unwrap().y0)
+            });
+            let labels: Vec<_> = text
+                .iter()
+                .filter_map(|(_, node)| node.label().or(node.value()))
+                .collect();
+            assert_eq!(
+                labels
+                    .iter()
+                    .filter(|text| **text == messages::NEXT_ROOM)
+                    .count(),
+                6
+            );
+            let groups = ["Voice", "Hotkeys", "Sharing", "Name", "Network"];
+            let positions =
+                groups.map(|group| labels.iter().position(|text| *text == group).unwrap());
+            assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+            assert_eq!(labels.contains(&"Known devices"), host);
+            assert_eq!(labels.contains(&messages::ROOM_KNOWN_DEVICES), host);
+            assert!(labels.contains(&messages::ROOM_MICROPHONE_MUTED));
+            assert!(labels.contains(&messages::ROOM_HEAR_YOURSELF));
+            let hear = nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some("Hear yourself"))
+                .unwrap();
+            assert!(hear.1.is_disabled());
+            assert_eq!(hear.1.description(), Some(messages::ROOM_HEAR_YOURSELF));
+            assert!(nodes.iter().any(|(_, node)| node.role()
+                == eframe::egui::accesskit::Role::PasswordInput
+                && node.label() == Some("Address name")));
+            assert!(!nodes.iter().any(|(_, node)| {
+                node.value()
+                    .is_some_and(|text| text.contains("friends.example"))
+            }));
+            assert!(!nodes.iter().any(|(_, node)| {
+                node.value()
+                    .is_some_and(|text| text.contains("stun.private.test"))
+            }));
+            assert!(labels.contains(&messages::HIDDEN_WHILE_SHARING));
+            assert_eq!(draft.stun_servers, "stun.private.test:3478");
+            assert_eq!(draft.address_name, "friends.example");
+            assert!(!labels.contains(&"Remove") && !labels.contains(&"Unblock"));
+        }
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let mut draft = typed("");
+        let mut audio = SettingsAudio::in_room(&ctx, &Choice::Default);
+        let (_, out) =
+            crate::controls::tests::frame_at(&ctx, vec2(360.0, 6000.0), Vec::new(), |ui| {
+                show(ui, &mut draft, &mut audio)
+            });
+        let labels: Vec<_> = out
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .into_iter()
+            .filter_map(|(_, node)| {
+                node.label().or(node.value()).map(|text| {
+                    (
+                        node.bounds().map_or(0.0, |bounds| bounds.y0),
+                        String::from(text),
+                    )
+                })
+            })
+            .collect();
+        let mut labels = labels;
+        labels.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let labels: Vec<_> = labels.iter().map(|(_, text)| text.as_str()).collect();
+        assert!(!labels.contains(&messages::NEXT_ROOM));
+        let groups = ["Settings", "Name", "Network", "Hotkeys", "Voice", "Sharing"];
+        let positions = groups.map(|group| labels.iter().position(|text| *text == group).unwrap());
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn settings_escape_leaves_a_field_before_cancelling() {
+        for in_room in [false, true] {
+            let ctx = Context::default();
+            theme::apply(&ctx);
+            ctx.enable_accesskit();
+            let mut draft = typed("");
+            draft.name = String::from("kept");
+            let mut audio = SettingsAudio::in_room(&ctx, &Choice::Default);
+            let input = Choice::Default;
+            let mut draw = |events| {
+                crate::controls::tests::frame_at(&ctx, vec2(360.0, 6000.0), events, |ui| {
+                    let place = if in_room {
+                        Place::Room(Box::new(RoomFacts {
+                            microphone: None,
+                            muted: false,
+                            ended: false,
+                            problem: None,
+                            input: &input,
+                            host: false,
+                            addresses_hidden: false,
+                        }))
+                    } else {
+                        Place::Start
+                    };
+                    panel(ui, &mut draft, &mut audio, place)
+                })
+            };
+            let (_, out) = draw(Vec::new());
+            let bounds = out
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .into_iter()
+                .find(|(_, node)| {
+                    node.label() == Some("Name")
+                        && node.role() == eframe::egui::accesskit::Role::TextInput
+                })
+                .unwrap()
+                .1
+                .bounds()
+                .unwrap();
+            let at = eframe::egui::pos2(
+                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            );
+            draw(crate::controls::tests::press(at));
+            draw(crate::controls::tests::release(at));
+            assert!(ctx.text_edit_focused());
+            let escape = || {
+                vec![
+                    eframe::egui::Event::Key {
+                        key: Key::Escape,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: eframe::egui::Modifiers::NONE,
+                    },
+                    eframe::egui::Event::Key {
+                        key: Key::Escape,
+                        physical_key: None,
+                        pressed: false,
+                        repeat: false,
+                        modifiers: eframe::egui::Modifiers::NONE,
+                    },
+                ]
+            };
+            assert!(draw(escape()).0.is_none());
+            assert!(!ctx.text_edit_focused());
+            assert!(matches!(draw(escape()).0, Some(Press::Cancel)));
+            assert_eq!(draft.name, "kept");
+        }
+    }
+
+    #[test]
     fn invite_link_settings_rows() {
         let ctx = Context::default();
         theme::apply(&ctx);
@@ -1687,8 +2016,9 @@ mod tests {
         let mut draft = typed("");
         for on in [true, false] {
             draft.invite_links = on;
-            let (_, output) =
-                crate::controls::tests::frame(&ctx, Vec::new(), |ui| network(ui, &mut draft));
+            let (_, output) = crate::controls::tests::frame(&ctx, Vec::new(), |ui| {
+                network(ui, &mut draft, &Place::Start)
+            });
             let nodes = output.accesskit_update.unwrap().nodes;
             assert!(
                 nodes

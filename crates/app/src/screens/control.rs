@@ -33,9 +33,9 @@ use crate::theme::{
 // asked since.
 pub const ALLOW_AFTER: Duration = Duration::from_millis(500);
 
-// The panic key as the request block uses it: its words, which cannot
-// change inside a room since settings cannot be opened there, and the cut
-// that Allow clears just before the room hears of it.
+// The panic key as the request block uses it: its words, which Settings
+// over the room can change, and the cut that Allow clears just before the
+// room hears of it.
 pub struct PanicKey {
     pub words: String,
     pub flags: Arc<Flags>,

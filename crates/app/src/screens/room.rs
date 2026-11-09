@@ -17,7 +17,7 @@ use room::{MOST_VOLUME, Monitor, Room};
 use voice::audio::{AudioError, Choice};
 use zeroize::Zeroizing;
 
-use crate::controls::{self, Button, Lead};
+use crate::controls::{self, Button};
 use crate::hotkeys::{self, Target};
 use crate::messages;
 use crate::monitors::{self, Pick};
@@ -26,8 +26,10 @@ use crate::screens::chat::{Chat, Composer};
 use crate::screens::control::{
     self, AllowWait, Answer, Decline, MenuItem, PanicKey, RowMenu, SoundWord,
 };
+use crate::screens::settings::{self, Draft, Place, RoomFacts};
 use crate::screens::stats;
 use crate::sound::PeriodsAsk;
+use crate::sound::SettingsAudio;
 use crate::strip;
 use crate::theme::{
     self, AMBER, ASH, BAD, CHALK, CONTROL_HEIGHT, FIELD_GAP, HALF_STEP, PANEL, QUIET_DOT,
@@ -57,8 +59,8 @@ pub struct InRoom {
     paste: String,
     paste_error: Option<String>,
     chat: Chat,
-    // The devices from settings as the room opened, and their periods,
-    // asked each time the stats panel opens.
+    // The devices from settings, as the room opened or as last saved in it,
+    // and their periods, asked each time the stats panel opens.
     devices: [Choice; 2],
     periods: PeriodsAsk,
     hold: Hold,
@@ -84,6 +86,9 @@ pub struct InRoom {
     block_wait: BlockWait,
     decline: Decline,
     menu: RowMenu,
+    settings: Option<Box<RoomSettings>>,
+    gear: Option<eframe::egui::Id>,
+    refocus_settings: bool,
     // How loud this PC plays each person, and the PC sound of their
     // shares, set in their row's menu and written when it closes.
     volumes: Volumes,
@@ -162,6 +167,9 @@ fn pointer_down_in_window(input: &InputState) -> bool {
 
 pub enum Step {
     Leave,
+    OpenSettings,
+    SaveSettings,
+    CloseSettings,
     NewInvite { multi_use: bool },
     NewCode,
     // A monitor was picked from the list, and its Windows name goes in the
@@ -214,6 +222,9 @@ impl InRoom {
             block_wait: BlockWait::default(),
             decline: Decline::default(),
             menu: RowMenu::default(),
+            settings: None,
+            gear: None,
+            refocus_settings: false,
             volumes,
             sound_volumes,
         }
@@ -338,11 +349,58 @@ impl InRoom {
             self.monitors = None;
         }
         let words = share.as_ref().map(ShareVerb::words);
-        let mut verbs: Vec<Button> = words.iter().map(VerbWords::button).collect();
+        let mut verbs: Vec<Button> = words
+            .iter()
+            .map(|words| words.button().on(self.monitors.is_some()))
+            .collect();
+        let gear = (!ends_here(view)).then_some(verbs.len());
+        if gear.is_some() {
+            let name = if self.settings_on_top(stats_open) {
+                "Close settings without saving"
+            } else {
+                "Settings"
+            };
+            verbs.push(
+                Button::new("Settings")
+                    .icon(theme::icons::regular::GEAR_SIX)
+                    .icon_only()
+                    .label(name)
+                    .on(self.settings.is_some()),
+            );
+        }
         let (exit, role) = way_out(view);
         verbs.push(Button::new(exit).role(role));
-        match controls::title_row(ui, Lead::Title(title), &verbs) {
+        let mut least: Vec<f32> = verbs.iter().map(|button| button.width(ui)).collect();
+        if share.is_some() {
+            least[0] = Button::new("Stop sharing").width(ui);
+        }
+        let (pressed, ids) = controls::title_rows(ui, title, &verbs, &least);
+        self.gear = gear.map(|at| ids[at]);
+        if std::mem::take(&mut self.refocus_settings)
+            && self.settings.is_none()
+            && let Some(id) = self.gear
+        {
+            ui.memory_mut(|memory| memory.request_focus(id));
+        }
+        match pressed {
             Some(0) if share.is_some() => self.share_pressed(share.as_ref()),
+            Some(at) if Some(at) == gear => {
+                if self.settings_on_top(stats_open) {
+                    // Enter or Space on the gear is the keyboard whatever
+                    // moved the focus there; only a click is the mouse.
+                    self.refocus_settings = !ui.input(|input| input.pointer.primary_clicked());
+                    if !self.refocus_settings
+                        && let Some(id) = ui.memory(|memory| memory.focused())
+                    {
+                        ui.memory_mut(|memory| memory.surrender_focus(id));
+                    }
+                    step = Some(Step::CloseSettings);
+                } else {
+                    self.monitors = None;
+                    self.list_room.clear();
+                    step = Some(Step::OpenSettings);
+                }
+            }
             Some(_) => step = Some(Step::Leave),
             None => {}
         }
@@ -417,6 +475,61 @@ impl InRoom {
             return step;
         }
         self.periods.closed();
+        if let Some(settings) = &mut self.settings {
+            // Under the share list it keeps its draft until the list goes.
+            if self.monitors.is_some() {
+                return step;
+            }
+            if block {
+                ui.add_space(STEP);
+            }
+            settings.draft.locked = self.control_offered && self.panic.flags.controlled();
+            if settings.draft.locked {
+                settings.draft.stop_waiting();
+            }
+            settings
+                .audio
+                .follow(&settings.draft.input, &settings.draft.output, false, true);
+            let microphone = self.room.microphone_now();
+            let metering = microphone.is_some();
+            let problem = view
+                .voice
+                .microphone
+                .as_ref()
+                .map(|err| messages::sentence(&err.to_string()));
+            let facts = RoomFacts {
+                microphone,
+                muted: view.voice.muted || view.voice.deafened,
+                ended: ends_here(view),
+                problem: problem.as_deref(),
+                input: &self.devices[0],
+                host: view.role == Role::Host,
+                addresses_hidden: addresses_hidden(&view.share),
+            };
+            let press = settings::panel(
+                ui,
+                &mut settings.draft,
+                &mut settings.audio,
+                Place::Room(Box::new(facts)),
+            );
+            if metering {
+                ui.request_repaint_after(crate::app::METER_REPAINT);
+            }
+            if let Some(press) = press {
+                self.refocus_settings = !ui.input(|input| input.pointer.primary_clicked());
+                if !self.refocus_settings
+                    && let Some(id) = ui.memory(|memory| memory.focused())
+                {
+                    ui.memory_mut(|memory| memory.surrender_focus(id));
+                }
+                step = step.or(Some(match press {
+                    settings::Press::Save => Step::SaveSettings,
+                    settings::Press::Cancel => Step::CloseSettings,
+                }));
+            }
+            return step;
+        }
+
         if !chat_shown(view) {
             let scroll = ScrollArea::vertical().id_salt("room").auto_shrink(false);
             scroll.show(ui, |ui| match view.role {
@@ -2090,6 +2203,57 @@ fn row_name(
 fn row_rect(ui: &mut Ui, height: f32) -> Rect {
     ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover())
         .0
+}
+
+struct RoomSettings {
+    draft: Draft,
+    audio: SettingsAudio,
+}
+
+impl InRoom {
+    pub fn open_settings(&mut self, draft: Draft, audio: SettingsAudio) {
+        if self.settings.is_none() {
+            self.settings = Some(Box::new(RoomSettings { draft, audio }));
+        }
+    }
+
+    // The audio part stops its device watch, which can be inside a slow
+    // Windows call while a headset changes profile.
+    pub fn close_settings(&mut self) {
+        if let Some(settings) = self.settings.take() {
+            let audio = settings.audio;
+            let _ = std::thread::Builder::new()
+                .name(String::from("settings close"))
+                .spawn(move || drop(audio));
+        }
+    }
+
+    pub fn settings_draft_mut(&mut self) -> Option<&mut Draft> {
+        self.settings.as_mut().map(|settings| &mut settings.draft)
+    }
+
+    pub fn settings_on_top(&self, stats_open: bool) -> bool {
+        self.settings.is_some() && !stats_open && !self.share_list_open()
+    }
+
+    pub fn stop_settings_wait(&mut self) {
+        if let Some(draft) = self.settings_draft_mut() {
+            draft.stop_waiting();
+        }
+    }
+
+    pub fn share_list_open(&self) -> bool {
+        self.monitors.is_some()
+    }
+    pub fn set_devices(&mut self, devices: [Choice; 2]) {
+        self.devices = devices;
+    }
+    pub fn set_panic_words(&mut self, words: String) {
+        self.panic.words = words;
+    }
+    pub fn set_invite_links(&mut self, on: bool) {
+        self.invite_links = on;
+    }
 }
 
 #[cfg(test)]
@@ -4162,6 +4326,806 @@ pub(crate) mod tests {
             Some(ShareVerb::Busy(String::from("Mara")))
         );
         assert_eq!(share_verb(&lost, OFF), None);
+    }
+
+    #[test]
+    fn room_title_rows_keep_every_verb_inside() {
+        for width in [360.0, 320.0, 240.0, 213.3] {
+            let mut last = None;
+            for share in ["Share", "Stop sharing", "Starting"] {
+                let ctx = accessible_panel();
+                let draw = |events| {
+                    let input = eframe::egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 640.0))),
+                        events,
+                        ..Default::default()
+                    };
+                    let mut result = None;
+                    let mut output = ctx.run_ui(input, |ui| {
+                        controls::note_focus_source(ui.ctx());
+                        let verbs = [
+                            Button::new(share),
+                            Button::new("Settings")
+                                .icon(theme::icons::regular::GEAR_SIX)
+                                .icon_only(),
+                            Button::new("Close room"),
+                        ];
+                        let least = [
+                            Button::new("Stop sharing").width(ui),
+                            verbs[1].width(ui),
+                            verbs[2].width(ui),
+                        ];
+                        let top = ui.cursor().top();
+                        let (_, ids) =
+                            controls::title_rows(ui, "Tuesday night raid group", &verbs, &least);
+                        result = Some((ui.cursor().top() - top, ids));
+                    });
+                    let name = output.shapes.iter().find_map(|shape| match &shape.shape {
+                        eframe::egui::Shape::Text(text)
+                            if text.galley.text() == "Tuesday night raid group" =>
+                        {
+                            Some(
+                                text.galley
+                                    .rows
+                                    .iter()
+                                    .flat_map(|row| row.glyphs.iter().map(|glyph| glyph.chr))
+                                    .collect::<String>(),
+                            )
+                        }
+                        _ => None,
+                    });
+                    let platform = std::mem::take(&mut output.platform_output);
+                    output.drop_without_applying_deltas();
+                    (result.unwrap(), platform, name)
+                };
+                let ((height, ids), out, drawn_name) = draw(Vec::new());
+                let nodes = out.accesskit_update.unwrap().nodes;
+                let mut buttons: Vec<_> = nodes
+                    .iter()
+                    .filter(|(_, node)| node.role() == eframe::egui::accesskit::Role::Button)
+                    .collect();
+                buttons.sort_by(|(_, a), (_, b)| {
+                    let a = a.bounds().unwrap();
+                    let b = b.bounds().unwrap();
+                    a.y0.total_cmp(&b.y0).then(a.x0.total_cmp(&b.x0))
+                });
+                assert_eq!(
+                    buttons
+                        .iter()
+                        .map(|(_, node)| node.label().unwrap())
+                        .collect::<Vec<_>>(),
+                    [share, "Settings", "Close room"]
+                );
+                for (_, node) in &buttons {
+                    let rect = node.bounds().unwrap();
+                    assert!(
+                        rect.x0 >= f64::from(SIDE) - 0.1
+                            && rect.x1 <= f64::from(width - SIDE) + 0.1,
+                        "{width}, {share}: {rect:?}"
+                    );
+                    assert!((rect.y1 - rect.y0 - 32.0).abs() < 0.1);
+                }
+                let gear = buttons[1].1.bounds().unwrap();
+                assert!((gear.x1 - gear.x0 - 40.0).abs() < 0.1);
+                let exit = buttons[2].1.bounds().unwrap();
+                assert_eq!(gear.y0 == exit.y0, width >= 320.0);
+                assert!(
+                    (height - if width >= 320.0 { 48.0 } else { 88.0 }).abs() < 0.1,
+                    "{height}"
+                );
+                let placement = (height, gear.x0, gear.y0, exit.x0, exit.y0);
+                if let Some(before) = last {
+                    assert_eq!(before, placement);
+                }
+                last = Some(placement);
+                let name = nodes
+                    .iter()
+                    .find(|(_, node)| node.value() == Some("Tuesday night raid group"));
+                assert_eq!(
+                    name.is_none(),
+                    share == "Stop sharing" && (width == 320.0 || width == 213.3)
+                );
+                assert_eq!(drawn_name.is_none(), name.is_none());
+                if let Some(name) = drawn_name {
+                    assert!(name.ends_with('\u{2026}'));
+                    assert_ne!(name, "\u{2026}");
+                }
+                ctx.memory_mut(|memory| {
+                    if let Some(id) = memory.focused() {
+                        memory.surrender_focus(id);
+                    }
+                });
+                for id in ids {
+                    draw(vec![key_event(Key::Tab, true), key_event(Key::Tab, false)]);
+                    assert_eq!(ctx.memory(|memory| memory.focused()), Some(id));
+                }
+            }
+        }
+    }
+
+    fn settings_room(tag: &str) -> (PathBuf, Arc<Room>, InRoom, voice::audio::fake::Fake) {
+        let dir =
+            std::env::temp_dir().join(format!("booth-room-settings-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = test_config(&dir, "Ana");
+        let microphone = voice::audio::fake::Fake::new(
+            voice::audio::fake::Setup {
+                signal: |_, _| 0.2,
+                ..Default::default()
+            },
+            &[("mic", "Test microphone")],
+            Some("mic"),
+        );
+        if let room::Devices::Fake {
+            microphone: input, ..
+        } = &mut config.voice.devices
+        {
+            *input = microphone.clone();
+        }
+        let room = Arc::new(
+            Room::host(
+                config,
+                Arc::new(keys::Identity::generate()),
+                String::new(),
+                Arc::new(|| {}),
+            )
+            .unwrap(),
+        );
+        let target = Target::default();
+        target.enter(Arc::clone(&room));
+        let screen = test_in_room(&room, &target);
+        (dir, room, screen, microphone)
+    }
+
+    pub(crate) fn room_settings_values(screen: &InRoom) -> (&str, bool, &[Choice; 2]) {
+        (&screen.panic.words, screen.invite_links, &screen.devices)
+    }
+
+    pub(crate) fn settings_have_a_microphone(screen: &InRoom) -> bool {
+        screen.settings.as_ref().unwrap().audio.has_microphone()
+    }
+
+    pub(crate) fn cover_settings(screen: &mut InRoom) {
+        screen.monitors = Some(Vec::new());
+    }
+
+    fn room_settings_frame(
+        screen: &mut InRoom,
+        ctx: &Context,
+        view: &View,
+        stats: bool,
+        events: Vec<Event>,
+    ) -> (Option<Step>, PlatformOutput) {
+        crate::controls::tests::frame(ctx, events, |ui| {
+            controls::note_focus_source(ui.ctx());
+            screen.show(ui, view, stats, hotkeys::State::default(), false, None)
+        })
+    }
+
+    #[test]
+    fn room_settings_say_when_they_are_locked() {
+        let (dir, room, mut screen, _) = settings_room("locked");
+        let ctx = accessible_panel();
+        let view = in_room();
+        let saved = crate::settings::Settings::default();
+        screen.open_settings(
+            Draft::new(&saved, room::KnownDevices::default(), String::new()),
+            SettingsAudio::in_room(&ctx, &Choice::Default),
+        );
+        let says_locked =
+            |out: PlatformOutput| {
+                out.accesskit_update.unwrap().nodes.iter().any(|(_, node)| {
+                    node.label().or(node.value()) == Some(messages::SETTINGS_LOCKED)
+                })
+            };
+        screen
+            .settings_draft_mut()
+            .unwrap()
+            .change(input::Action::Mute);
+        let (_, out) = room_settings_frame(&mut screen, &ctx, &view, false, Vec::new());
+        assert!(!says_locked(out));
+        let draft = screen.settings_draft_mut().unwrap();
+        assert!(!draft.locked);
+        assert_eq!(draft.waiting, Some(input::Action::Mute));
+        screen.panic.flags = Arc::new(crate::remote::Flags::controlled_for_tests());
+        let (_, out) = crate::controls::tests::frame(&ctx, Vec::new(), |ui| {
+            screen.show(ui, &view, false, hotkeys::State::default(), true, None)
+        });
+        assert!(says_locked(out));
+        let draft = screen.settings_draft_mut().unwrap();
+        assert!(draft.locked);
+        assert_eq!(draft.waiting, None);
+        drop(screen);
+        Arc::try_unwrap(room).ok().unwrap().leave();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn settings_gear_follows_the_room_and_keeps_the_room() {
+        let (dir, room, mut screen, _) = settings_room("gear");
+        for (role, notice, shown) in [
+            (Role::Host, None, true),
+            (Role::Client, None, true),
+            (Role::Client, Some(Notice::LostHost), true),
+            (Role::Client, Some(Notice::HostMoved), true),
+            (Role::Client, Some(Notice::StillTrying), false),
+            (Role::Host, Some(Notice::RoomClosed), false),
+        ] {
+            let ctx = accessible_panel();
+            let view = View {
+                role,
+                notice,
+                ..in_room()
+            };
+            let (_, out) = room_settings_frame(&mut screen, &ctx, &view, false, Vec::new());
+            let mut buttons: Vec<_> = out
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .into_iter()
+                .filter(|(_, node)| node.role() == eframe::egui::accesskit::Role::Button)
+                .collect();
+            buttons.sort_by(|(_, a), (_, b)| {
+                let a = a.bounds().unwrap();
+                let b = b.bounds().unwrap();
+                a.y0.total_cmp(&b.y0).then(a.x0.total_cmp(&b.x0))
+            });
+            let gear = buttons
+                .iter()
+                .position(|(_, node)| node.label() == Some("Settings"));
+            assert_eq!(gear.is_some(), shown);
+            if let Some(at) = gear {
+                if share_verb(&view, false).is_some() {
+                    assert_eq!(buttons[at - 1].1.label(), Some("Share"));
+                }
+                assert_eq!(
+                    buttons[at + 1].1.label(),
+                    Some(if role == Role::Host {
+                        "Close room"
+                    } else {
+                        "Leave"
+                    })
+                );
+            }
+        }
+        let ctx = accessible_panel();
+        let view = View {
+            role: Role::Host,
+            ..in_room()
+        };
+        screen.monitors = Some(Vec::new());
+        let mut output = ctx.run_ui(
+            eframe::egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(360.0, 640.0))),
+                ..Default::default()
+            },
+            |ui| {
+                screen.show(ui, &view, false, hotkeys::State::default(), false, None);
+            },
+        );
+        let nodes = &output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes;
+        let share = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Share"))
+            .unwrap()
+            .1
+            .bounds()
+            .unwrap();
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, eframe::egui::Shape::Rect(rect) if rect.fill == theme::CONTROL && (f64::from(rect.rect.left()) - share.x0).abs() < 0.1 && (f64::from(rect.rect.top()) - share.y0).abs() < 0.1)));
+        output.platform_output.accesskit_update.take();
+        output.drop_without_applying_deltas();
+        screen.monitors = None;
+        let (_, out) = room_settings_frame(&mut screen, &ctx, &view, false, Vec::new());
+        let bounds = out
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find(|(_, node)| node.label() == Some("Settings"))
+            .unwrap()
+            .1
+            .bounds()
+            .unwrap();
+        let at = pos2(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        room_settings_frame(
+            &mut screen,
+            &ctx,
+            &view,
+            false,
+            crate::controls::tests::press(at),
+        );
+        assert!(matches!(
+            room_settings_frame(
+                &mut screen,
+                &ctx,
+                &view,
+                false,
+                crate::controls::tests::release(at)
+            )
+            .0,
+            Some(Step::OpenSettings)
+        ));
+        let saved = crate::settings::Settings::default();
+        screen.open_settings(
+            Draft::new(&saved, room::KnownDevices::default(), String::new()),
+            SettingsAudio::in_room(&ctx, &Choice::Default),
+        );
+        screen.settings_draft_mut().unwrap().name = String::from("unsaved");
+        let (_, out) = room_settings_frame(&mut screen, &ctx, &view, false, Vec::new());
+        let nodes = out.accesskit_update.unwrap().nodes;
+        assert!(
+            nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some("Close settings without saving"))
+        );
+        assert!(!nodes.iter().any(|(_, node)| {
+            [
+                Some("Mara"),
+                Some(messages::MESSAGE_HINT),
+                Some("Hold to talk"),
+            ]
+            .contains(&node.label())
+        }));
+        assert!(Arc::ptr_eq(&room, &screen.room));
+        let ended = View {
+            notice: Some(Notice::RoomClosed),
+            ..view.clone()
+        };
+        let (_, out) = room_settings_frame(&mut screen, &ctx, &ended, false, Vec::new());
+        let nodes = out.accesskit_update.unwrap().nodes;
+        assert!(nodes.iter().any(|(_, node)| node.value() == Some("Voice")));
+        assert!(
+            !nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some("Settings")
+                    || node.label() == Some("Close settings without saving"))
+        );
+        assert_eq!(screen.settings_draft_mut().unwrap().name, "unsaved");
+        room_settings_frame(&mut screen, &ctx, &view, false, Vec::new());
+        room_settings_frame(
+            &mut screen,
+            &ctx,
+            &view,
+            false,
+            crate::controls::tests::press(at),
+        );
+        assert!(matches!(
+            room_settings_frame(
+                &mut screen,
+                &ctx,
+                &view,
+                false,
+                crate::controls::tests::release(at)
+            )
+            .0,
+            Some(Step::CloseSettings)
+        ));
+        screen.close_settings();
+        assert!(Arc::ptr_eq(&room, &screen.room));
+        assert!(!dir.join("settings.txt").exists());
+        drop(screen);
+        Arc::try_unwrap(room).ok().unwrap().leave();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn settings_escape_waits_for_the_top_panel_and_returns_focus() {
+        let (dir, room, mut screen, _) = settings_room("escape");
+        let ctx = accessible_panel();
+        let view = View {
+            role: Role::Host,
+            ..in_room()
+        };
+        room_settings_frame(&mut screen, &ctx, &view, false, Vec::new());
+        screen.open_settings(
+            Draft::new(
+                &crate::settings::Settings::default(),
+                room::KnownDevices::default(),
+                String::new(),
+            ),
+            SettingsAudio::in_room(&ctx, &Choice::Default),
+        );
+        screen.settings_draft_mut().unwrap().name = String::from("kept");
+        screen.monitors = Some(Vec::new());
+        room_settings_frame(&mut screen, &ctx, &view, true, Vec::new());
+        assert!(
+            room_settings_frame(
+                &mut screen,
+                &ctx,
+                &view,
+                true,
+                vec![key_event(Key::Escape, true), key_event(Key::Escape, false)]
+            )
+            .0
+            .is_none()
+        );
+        assert!(!screen.share_list_open());
+        assert!(!screen.settings_on_top(true));
+        assert_eq!(screen.settings_draft_mut().unwrap().name, "kept");
+        room_settings_frame(&mut screen, &ctx, &view, false, Vec::new());
+        let gear = screen.gear.unwrap();
+        ctx.memory_mut(|memory| memory.request_focus(gear));
+        assert!(matches!(
+            room_settings_frame(
+                &mut screen,
+                &ctx,
+                &view,
+                false,
+                vec![key_event(Key::Escape, true), key_event(Key::Escape, false)]
+            )
+            .0,
+            Some(Step::CloseSettings)
+        ));
+        screen.close_settings();
+        room_settings_frame(&mut screen, &ctx, &view, false, Vec::new());
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(gear));
+        drop(screen);
+        Arc::try_unwrap(room).ok().unwrap().leave();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn room_settings_use_the_rooms_microphone_and_keep_the_share_block() {
+        let (dir, room, mut screen, microphone) = settings_room("meter");
+        let ctx = accessible_panel();
+        let until = Instant::now() + Duration::from_secs(3);
+        while !room
+            .microphone_now()
+            .is_some_and(|mic| mic.level.peak > 0.1)
+        {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        screen.open_settings(
+            Draft::new(
+                &crate::settings::Settings::default(),
+                room::KnownDevices::default(),
+                String::new(),
+            ),
+            SettingsAudio::in_room(&ctx, &Choice::Default),
+        );
+        for (muted, picked, problem, expected) in [
+            (false, false, None, messages::ROOM_MICROPHONE),
+            (false, true, None, messages::ROOM_MICROPHONE_PICKED),
+            (true, true, None, messages::ROOM_MICROPHONE_MUTED),
+            (
+                false,
+                true,
+                Some(AudioError::NoDevice(voice::audio::Direction::Input)),
+                "Could not open the microphone: Windows has no microphone turned on. Plug one in, or turn one on in Windows Settings, System, Sound.",
+            ),
+        ] {
+            room.mute(muted);
+            screen.settings_draft_mut().unwrap().input = if picked {
+                Choice::Device(String::from("other"))
+            } else {
+                Choice::Default
+            };
+            let mut view = in_room();
+            view.role = Role::Host;
+            view.voice.muted = muted;
+            view.voice.microphone = problem;
+            let (_, out) = room_settings_frame(&mut screen, &ctx, &view, false, Vec::new());
+            let nodes = out.accesskit_update.unwrap().nodes;
+            assert!(
+                nodes.iter().any(|(_, node)| node.value() == Some(expected)),
+                "{expected}"
+            );
+            let meter = nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some("Microphone level"))
+                .unwrap();
+            if muted {
+                assert_eq!(meter.1.numeric_value(), Some(0.0));
+            } else if !picked {
+                assert!(meter.1.numeric_value().unwrap() > 0.7);
+            }
+        }
+        assert_eq!(microphone.record().most_at_once, 1);
+        screen.settings_draft_mut().unwrap().input = Choice::Default;
+        let ended = View {
+            role: Role::Host,
+            notice: Some(Notice::SocketFailed),
+            ..in_room()
+        };
+        let (_, out) = room_settings_frame(&mut screen, &ctx, &ended, false, Vec::new());
+        let lines: Vec<_> = out
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .into_iter()
+            .filter_map(|(_, node)| node.value().map(String::from))
+            .collect();
+        assert!(
+            lines
+                .iter()
+                .any(|text| text == messages::ROOM_MICROPHONE_ENDED)
+        );
+        assert!(!lines.iter().any(|text| text == messages::ROOM_MICROPHONE));
+        let mut view = in_room();
+        view.role = Role::Host;
+        view.share.own = OwnShare::Sharing { number: 1, fps: 60 };
+        view.share.running = Some(RunningShare {
+            software: false,
+            paused: None,
+            held: true,
+        });
+        let (_, out) = room_settings_frame(&mut screen, &ctx, &view, false, Vec::new());
+        let nodes = out.accesskit_update.unwrap().nodes;
+        assert!(nodes.iter().any(|(_, node)| node.label() == Some("Resume")));
+        assert!(
+            nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some(messages::SHARE_PC_SOUND))
+        );
+        let voice = nodes
+            .iter()
+            .find(|(_, node)| node.value() == Some("Voice"))
+            .unwrap()
+            .1
+            .bounds()
+            .unwrap();
+        let caption = nodes
+            .iter()
+            .find(|(_, node)| node.value() == Some(messages::SHARE_PC_SOUND_NOTE))
+            .unwrap()
+            .1
+            .bounds()
+            .unwrap();
+        assert!(
+            (voice.y0 - caption.y1 - 32.0).abs() < 0.1,
+            "{voice:?}, {caption:?}"
+        );
+        assert!(Arc::ptr_eq(&room, &screen.room));
+        drop(screen);
+        Arc::try_unwrap(room).ok().unwrap().leave();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn settings_buttons_return_focus_only_after_a_keyboard_close() {
+        let (dir, room, mut screen, _) = settings_room("focus");
+        let view = View {
+            role: Role::Host,
+            ..in_room()
+        };
+        for keyboard in [true, false] {
+            for name in ["Save", "Cancel", "Close settings without saving"] {
+                let ctx = accessible_panel();
+                if keyboard {
+                    room_settings_frame(&mut screen, &ctx, &view, false, Vec::new());
+                    ctx.memory_mut(|memory| {
+                        if let Some(id) = memory.focused() {
+                            memory.surrender_focus(id);
+                        }
+                    });
+                    for _ in 0..2 {
+                        room_settings_frame(
+                            &mut screen,
+                            &ctx,
+                            &view,
+                            false,
+                            vec![key_event(Key::Tab, true), key_event(Key::Tab, false)],
+                        );
+                    }
+                    assert_eq!(ctx.memory(|memory| memory.focused()), screen.gear);
+                    assert!(matches!(
+                        room_settings_frame(
+                            &mut screen,
+                            &ctx,
+                            &view,
+                            false,
+                            vec![key_event(Key::Enter, true), key_event(Key::Enter, false)]
+                        )
+                        .0,
+                        Some(Step::OpenSettings)
+                    ));
+                }
+                screen.open_settings(
+                    Draft::new(
+                        &crate::settings::Settings::default(),
+                        room::KnownDevices::default(),
+                        String::new(),
+                    ),
+                    SettingsAudio::in_room(&ctx, &Choice::Default),
+                );
+                let (_, out) = room_settings_frame(&mut screen, &ctx, &view, false, Vec::new());
+                if keyboard {
+                    assert_eq!(ctx.memory(|memory| memory.focused()), screen.gear);
+                }
+                let (id, node) = out
+                    .accesskit_update
+                    .unwrap()
+                    .nodes
+                    .into_iter()
+                    .find(|(_, node)| node.label() == Some(name))
+                    .unwrap();
+                let step = if keyboard {
+                    let request = eframe::egui::accesskit::ActionRequest {
+                        action: eframe::egui::accesskit::Action::Focus,
+                        target_tree: eframe::egui::accesskit::TreeId::ROOT,
+                        target_node: id,
+                        data: None,
+                    };
+                    room_settings_frame(
+                        &mut screen,
+                        &ctx,
+                        &view,
+                        false,
+                        vec![Event::AccessKitActionRequest(request)],
+                    );
+                    room_settings_frame(
+                        &mut screen,
+                        &ctx,
+                        &view,
+                        false,
+                        vec![key_event(Key::Enter, true), key_event(Key::Enter, false)],
+                    )
+                    .0
+                } else {
+                    let bounds = node.bounds().unwrap();
+                    let at = pos2(
+                        ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                        ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                    );
+                    room_settings_frame(
+                        &mut screen,
+                        &ctx,
+                        &view,
+                        false,
+                        crate::controls::tests::press(at),
+                    );
+                    room_settings_frame(
+                        &mut screen,
+                        &ctx,
+                        &view,
+                        false,
+                        crate::controls::tests::release(at),
+                    )
+                    .0
+                };
+                assert!(
+                    matches!(step, Some(Step::SaveSettings | Step::CloseSettings)),
+                    "{name}"
+                );
+                if keyboard && name == "Save" {
+                    let focused = ctx.memory(|memory| memory.focused());
+                    room_settings_frame(&mut screen, &ctx, &view, false, Vec::new());
+                    assert!(!screen.refocus_settings);
+                    assert_eq!(ctx.memory(|memory| memory.focused()), focused);
+                    assert_ne!(focused, screen.gear);
+                    assert!(matches!(
+                        room_settings_frame(
+                            &mut screen,
+                            &ctx,
+                            &view,
+                            false,
+                            vec![key_event(Key::Enter, true), key_event(Key::Enter, false)]
+                        )
+                        .0,
+                        Some(Step::SaveSettings)
+                    ));
+                }
+                screen.close_settings();
+                room_settings_frame(&mut screen, &ctx, &view, false, Vec::new());
+                assert_eq!(
+                    ctx.memory(|memory| memory.focused()),
+                    keyboard.then(|| screen.gear.unwrap()),
+                    "{name}"
+                );
+            }
+        }
+        drop(screen);
+        Arc::try_unwrap(room).ok().unwrap().leave();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_share_list_hides_the_room_only_over_settings() {
+        let (dir, room, mut screen, _) = settings_room("list");
+        let ctx = accessible_panel();
+        let view = View {
+            role: Role::Host,
+            ..in_room()
+        };
+        let labels = |out: PlatformOutput| -> Vec<String> {
+            out.accesskit_update
+                .unwrap()
+                .nodes
+                .into_iter()
+                .filter_map(|(_, node)| node.label().or(node.value()).map(str::to_owned))
+                .collect()
+        };
+        screen.monitors = Some(Vec::new());
+        let (_, out) = room_settings_frame(&mut screen, &ctx, &view, false, Vec::new());
+        assert!(
+            labels(out)
+                .iter()
+                .any(|text| text == messages::MESSAGE_HINT)
+        );
+        let (_, out) = room_settings_frame(&mut screen, &ctx, &view, true, Vec::new());
+        assert!(labels(out).iter().any(|text| text == "Ping interval"));
+        screen.open_settings(
+            Draft::new(
+                &crate::settings::Settings::default(),
+                room::KnownDevices::default(),
+                String::new(),
+            ),
+            SettingsAudio::in_room(&ctx, &Choice::Default),
+        );
+        let (_, out) = room_settings_frame(&mut screen, &ctx, &view, false, Vec::new());
+        let shown = labels(out);
+        assert!(!shown.iter().any(|text| text == messages::MESSAGE_HINT));
+        assert!(!shown.iter().any(|text| text == "Voice"));
+        drop(screen);
+        Arc::try_unwrap(room).ok().unwrap().leave();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn room_settings_hide_the_address_name_while_this_pc_shares() {
+        let (dir, room, mut screen, _) = settings_room("address");
+        let ctx = accessible_panel();
+        screen.open_settings(
+            Draft::new(
+                &crate::settings::Settings::default(),
+                room::KnownDevices::default(),
+                String::new(),
+            ),
+            SettingsAudio::in_room(&ctx, &Choice::Default),
+        );
+        let running = Some(RunningShare {
+            software: false,
+            paused: None,
+            held: false,
+        });
+        for (own, running, hidden) in [
+            (OwnShare::Off, None, false),
+            (OwnShare::Asking { fps: 60 }, None, true),
+            (
+                OwnShare::Sharing { number: 1, fps: 60 },
+                running.clone(),
+                true,
+            ),
+            (OwnShare::Off, running, true),
+            (OwnShare::Off, None, false),
+        ] {
+            let mut view = in_room();
+            view.role = Role::Host;
+            view.share.own = own;
+            view.share.running = running;
+            let (_, out) =
+                crate::controls::tests::frame_at(&ctx, vec2(360.0, 6000.0), Vec::new(), |ui| {
+                    controls::note_focus_source(ui.ctx());
+                    screen.show(ui, &view, false, hotkeys::State::default(), false, None)
+                });
+            let address = out
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .into_iter()
+                .find(|(_, node)| node.label() == Some("Address name"))
+                .unwrap()
+                .1;
+            assert_eq!(
+                address.role() == eframe::egui::accesskit::Role::PasswordInput,
+                hidden,
+                "{:?}",
+                view.share
+            );
+        }
+        drop(screen);
+        Arc::try_unwrap(room).ok().unwrap().leave();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

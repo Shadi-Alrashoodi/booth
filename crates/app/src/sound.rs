@@ -1,9 +1,11 @@
 // The panel's side of audio. While the settings screen shows: both device
 // lists, kept current, the chosen microphone open for the level meter, and
 // its rate and connection asked of Windows for the warning under the list.
-// In a room the room opens the devices itself; this only asks them for their
-// period each time the stats panel opens, for a side whose stream is closed,
-// as a muted microphone's is. Nothing here opens a device at any other time.
+// In a room the room opens the devices itself. Settings over it keeps the
+// lists and asks Windows about the picked microphone, opening no stream, and
+// the stats panel asks the devices for their period each time it opens, for
+// a side whose stream is closed, as a muted microphone's is. Nothing here
+// opens a device at any other time.
 
 use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,7 +25,7 @@ use crate::messages;
 
 pub struct SettingsAudio {
     watch: Result<Watch, String>,
-    mic: Mic,
+    mic: Option<Mic>,
     check: Check,
     // As the watch last read them, taken once a frame by follow.
     lists: Option<Result<Lists, String>>,
@@ -64,7 +66,7 @@ impl SettingsAudio {
         let switches = Arc::new(Switches::new(false, true));
         SettingsAudio {
             watch,
-            mic: Mic::new(ctx, open, Arc::clone(&switches), input),
+            mic: Some(Mic::new(ctx, open, Arc::clone(&switches), input)),
             check: Check::new(ctx, ask, input),
             lists: None,
             playback,
@@ -74,8 +76,33 @@ impl SettingsAudio {
         }
     }
 
+    pub fn in_room(ctx: &Context, input: &Choice) -> SettingsAudio {
+        let repaint = ctx.clone();
+        let watch = Watch::start(move || repaint.request_repaint())
+            .map_err(|err| messages::sentence(&err.to_string()));
+        let ask: Ask = Arc::new(|choice| {
+            let probe = audio::probe(Direction::Input, choice).ok()?;
+            Some(Microphone::new(&probe.engine, probe.hands_free))
+        });
+        SettingsAudio {
+            watch,
+            mic: None,
+            check: Check::new(ctx, ask, input),
+            lists: None,
+            playback: Playback::default(),
+            switches: Arc::new(Switches::new(false, true)),
+            speakers: None,
+            speakers_problem: Arc::default(),
+        }
+    }
+
     pub fn switches(&self) -> &Switches {
         &self.switches
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_microphone(&self) -> bool {
+        self.mic.is_some()
     }
 
     // Once a frame while the screen is up, and with `showing` false on each
@@ -95,8 +122,10 @@ impl SettingsAudio {
             _ => {}
         }
         let wish = (echo && !self.hearing()).then(|| output.id().map(str::to_owned));
-        self.mic.ask_echo(wish, showing);
-        let opened = self.mic.follow(input, showing);
+        let opened = self.mic.as_mut().is_some_and(|mic| {
+            mic.ask_echo(wish, showing);
+            mic.follow(input, showing)
+        });
         self.check.follow(input, opened);
         let lists = match &self.watch {
             Ok(watch) => watch
@@ -108,7 +137,9 @@ impl SettingsAudio {
             let changed = matches!(self.lists, Some(Ok(_)));
             self.lists = lists;
             if changed {
-                self.mic.retry();
+                if let Some(mic) = &mut self.mic {
+                    mic.retry();
+                }
                 self.check.ask(false);
             }
         }
@@ -125,21 +156,21 @@ impl SettingsAudio {
 
     // Why the meter's microphone is not running, until it runs.
     pub fn problem(&self) -> Option<&str> {
-        self.mic.problem.as_deref()
+        self.mic.as_ref()?.problem.as_deref()
     }
 
     // None while no stream runs.
     pub fn level(&self) -> Option<Reading> {
-        self.mic.level()
+        self.mic.as_ref()?.level()
     }
 
     // What the meter's microphone opened with, while it runs.
     pub fn echo(&self) -> Option<Echo> {
-        self.mic.info().map(|info| info.echo)
+        self.mic.as_ref()?.info().map(|info| info.echo)
     }
 
     pub fn effects(&self) -> Option<Effects> {
-        self.mic.info().map(|info| info.effects)
+        self.mic.as_ref()?.info().map(|info| info.effects)
     }
 
     pub fn hearing(&self) -> bool {
@@ -155,7 +186,7 @@ impl SettingsAudio {
         // Off keeps a trip, so the line under the switch still says why.
         self.playback.set_on(on);
         *lock(&self.speakers_problem) = None;
-        if !on {
+        if !on || self.mic.is_none() {
             return;
         }
         let playback = self.playback.clone();
@@ -637,7 +668,7 @@ pub(crate) mod tests {
         let switches = Arc::new(Switches::new(false, true));
         SettingsAudio {
             watch: Err(String::from("no device watch")),
-            mic: Mic::new(ctx, fake_open(fake), Arc::clone(&switches), input),
+            mic: Some(Mic::new(ctx, fake_open(fake), Arc::clone(&switches), input)),
             check: Check::new(ctx, Arc::new(|_: &Choice| None), input),
             lists: None,
             playback: Playback::default(),
@@ -659,6 +690,20 @@ pub(crate) mod tests {
         )
         .unwrap();
         audio.speakers = Some((output.clone(), render));
+    }
+
+    #[test]
+    fn room_settings_open_no_audio_stream() {
+        let ctx = Context::default();
+        let mut audio = SettingsAudio::in_room(&ctx, &Choice::Default);
+        audio.follow(&Choice::Default, &Choice::Default, true, true);
+        audio.hear(true, &Choice::Default);
+        assert!(audio.mic.is_none());
+        assert!(audio.speakers.is_none());
+        assert!(audio.level().is_none());
+        assert!(audio.problem().is_none());
+        assert!(audio.echo().is_none());
+        assert!(audio.effects().is_none());
     }
 
     // Frames as the panel draws them, every 5 ms, until `done`.
@@ -784,17 +829,20 @@ pub(crate) mod tests {
         let echoes = Arc::new(Mutex::new(Vec::new()));
         let plain = fake_open(&fake);
         let asked = Arc::clone(&echoes);
-        audio.mic.open = Arc::new(
+        audio.mic.as_mut().unwrap().open = Arc::new(
             move |choice, echo: Option<Option<String>>, processor, events| {
                 lock(&asked).push(echo.clone());
                 plain(choice, echo, processor, events)
             },
         );
 
-        let turn = audio.mic.turn.load(Ordering::Relaxed);
+        let turn = audio.mic.as_ref().unwrap().turn.load(Ordering::Relaxed);
         audio.follow(&input, &output, true, false);
         assert!(!audio.hearing());
-        assert_eq!(audio.mic.turn.load(Ordering::Relaxed), turn + 1);
+        assert_eq!(
+            audio.mic.as_ref().unwrap().turn.load(Ordering::Relaxed),
+            turn + 1
+        );
         wait_until("both streams close", || fake.record().at_once == 0);
         assert!(lock(&echoes).is_empty());
 

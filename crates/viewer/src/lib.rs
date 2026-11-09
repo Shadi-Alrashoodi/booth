@@ -72,8 +72,9 @@ const QUIET: Duration = Duration::from_millis(100);
 pub const STILL: Duration = Duration::from_millis(500);
 
 // The setting that hides the strip in fullscreen until the mouse moves. One
-// for every viewer in the process, set by the panel as a room opens, since
-// the room's share thread opens viewers without it.
+// for every viewer in the process, set by the panel as a room opens and when
+// Settings saves over it, since the room's share thread opens viewers
+// without it.
 static HIDE_STRIP: AtomicBool = AtomicBool::new(false);
 
 pub fn hide_strip_in_fullscreen(on: bool) {

@@ -478,6 +478,19 @@ pub const NO_STUN: &str = "With no STUN servers Booth cannot learn your outside 
 // Under the level meter: the one time Booth opens the microphone outside a
 // room, said where it happens.
 pub const MICROPHONE_OPEN: &str = "The microphone is open while this screen shows the meter.";
+// Settings over a room: under each value that waits for the next room, under
+// the meter, which shows the room's own microphone, and where a room cannot
+// do what the start screen does.
+pub const NEXT_ROOM: &str = "Applies at the next room.";
+pub const ROOM_MICROPHONE_MUTED: &str = "The microphone is closed while you are muted.";
+pub const ROOM_MICROPHONE_ENDED: &str = "The microphone closed when the room ended.";
+pub const ROOM_MICROPHONE: &str = "This is the microphone the room hears.";
+pub const ROOM_MICROPHONE_PICKED: &str =
+    "This is the microphone the room hears. The one you picked opens when you save.";
+pub const ROOM_HEAR_YOURSELF: &str =
+    "Works only outside a room, so it never plays over your friends.";
+pub const ROOM_KNOWN_DEVICES: &str = "Close the room to remove a known device.";
+
 pub const HEAR_YOURSELF: &str = "Use headphones.";
 pub const NOISE_SUPPRESSION_DELAY: &str = "Adds 10 to 20 ms of delay.";
 pub const WINDOWS_DOES_IT: &str = "Windows already does this for this microphone.";
@@ -734,7 +747,7 @@ pub fn volume_word(percent: u8) -> Option<String> {
 }
 
 // While this PC is controlled.
-pub const SETTINGS_LOCKED: &str = "The hotkeys, the panic key and the sharing settings cannot change while someone controls this PC. Stop control, then press Save again.";
+pub const SETTINGS_LOCKED: &str = "The hotkeys, the panic key, the sharing settings, your voice devices and how you talk cannot change while someone controls this PC. Stop control, then press Save again.";
 
 // Nothing can read a new key or act on one; the buttons still work.
 pub fn hotkeys_off(why: &str) -> String {

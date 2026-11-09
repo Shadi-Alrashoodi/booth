@@ -379,7 +379,8 @@ impl Settings {
 
     // What may not change while this PC is controlled, since the controller
     // can drive the settings screen too: the panic key with the other
-    // hotkeys, and the sharing settings. Compared by what they mean, so an
+    // hotkeys, the sharing settings, and the devices and how you talk, which
+    // Settings over a room applies at once. Compared by what they mean, so an
     // upload saved at its default is the same as one left out.
     pub fn locked_part_differs(&self, other: &Settings) -> bool {
         self.hotkeys != other.hotkeys
@@ -388,6 +389,11 @@ impl Settings {
             || self.hide_strip != other.hide_strip
             || self.share_monitor != other.share_monitor
             || self.share_key_opens_list != other.share_key_opens_list
+            || self.device(Direction::Input) != other.device(Direction::Input)
+            || self.device(Direction::Output) != other.device(Direction::Output)
+            || self.talk_mode() != other.talk_mode()
+            || self.sensitivity_db() != other.sensitivity_db()
+            || self.constant_rate() != other.constant_rate()
     }
 
     pub fn share_monitor(&self) -> Option<&str> {
@@ -2249,11 +2255,19 @@ mod tests {
             &|next| next.set_share_monitor(Some(r"\\.\DISPLAY2"))
         ));
         assert!(changed(&|next| next.set_share_key_opens_list(true)));
+        let other = Choice::Device(String::from("other"));
+        assert!(changed(&|next| next.set_device(Direction::Input, &other)));
+        assert!(changed(&|next| next.set_device(Direction::Output, &other)));
+        assert!(changed(&|next| next.set_talk_mode(TalkMode::OpenMic)));
+        assert!(changed(
+            &|next| next.set_sensitivity_db(*SENSITIVITY_DB.start())
+        ));
+        assert!(changed(&|next| next.set_constant_rate(false)));
         // The upload at its default, saved or not, is no change.
         assert!(!changed(&|next| next.set_upload_mbits(DEFAULT_UPLOAD_MBITS)));
         assert!(!changed(&|next| next.set_name("Tom")));
         assert!(!changed(&|next| next.set_port("41010").unwrap()));
-        assert!(!changed(&|next| next.set_constant_rate(false)));
+        assert!(!changed(&|next| next.set_noise_suppression(true)));
     }
 
     #[test]
