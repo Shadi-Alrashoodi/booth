@@ -775,6 +775,9 @@ impl App {
             if voice_settings_differ(now, &before) {
                 in_room.room.set_voice(setup.config.voice.clone());
             }
+            if now.sound_cues() != before.sound_cues() {
+                in_room.room.set_cues(now.sound_cues());
+            }
             viewer::hide_strip_in_fullscreen(now.hide_strip());
             in_room.set_invite_links(now.invite_links());
             in_room.set_panic_words(now.hotkeys().chord(Action::Panic).to_string());
@@ -3210,6 +3213,31 @@ mod tests {
     }
 
     #[test]
+    fn room_settings_apply_sound_cues_on_save() {
+        let dir = fresh_dir("room-settings-cues");
+        let ctx = Context::default();
+        let mut app = app_in_room(&dir);
+        let room = Arc::clone(&in_room(&mut app).room);
+        let before = room.sound_cues();
+        app.open_room_settings(&ctx);
+        let draft = app.settings_draft_mut().unwrap();
+        draft.cues.own_mute = false;
+        draft.cues.volume = 60;
+        let wanted = draft.cues;
+        std::fs::create_dir(dir.join("settings.txt")).unwrap();
+        app.save_room_settings();
+        assert_eq!(room.sound_cues(), before, "the write failed");
+        std::fs::remove_dir(dir.join("settings.txt")).unwrap();
+        app.save_room_settings();
+        assert!(app.settings_draft_mut().is_none());
+        assert_eq!(room.sound_cues(), wanted);
+        assert_eq!(Settings::load(&dir).0.sound_cues(), wanted);
+        drop(room);
+        close_room(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn room_settings_keep_a_failed_device_choice() {
         let dir = fresh_dir("room-settings-device");
         let ctx = Context::default();
@@ -3808,6 +3836,21 @@ mod tests {
         assert_eq!(setup.config.video_upload_kbps, 40_000);
         assert!(setup.config.video.vsync);
         assert_eq!(setup.config.video.loss, None);
+    }
+
+    #[test]
+    fn saved_sound_cues_reach_the_next_room() {
+        let dir = fresh_dir("sound-cues-next-room");
+        let mut setup = setup_in(&dir);
+        let wanted = room::SoundCues {
+            volume: 60,
+            own_mute: false,
+            ..room::SoundCues::default()
+        };
+        setup.settings.set_sound_cues(wanted);
+        setup.apply_settings();
+        assert_eq!(setup.config.voice.cues, wanted);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -17,6 +17,8 @@ use crate::update::RELEASES_PAGE;
 use crate::volumes::Problem;
 use crate::win;
 
+pub const SOUND_CUES_ABOUT: &str = "Short, quiet sounds when the room changes. Your own share and remote control keep their sounds either way.";
+
 pub const INVITE_LINKS_ABOUT: &str =
     "A booth:// link opens Booth and shows the invite. Nothing joins until you press Join.";
 pub const INVITE_LINKS_INSTALLER: &str =
@@ -1601,6 +1603,11 @@ mod tests {
                 "no capital: {text}"
             );
         }
+    }
+
+    #[test]
+    fn sound_cue_settings_sentences() {
+        assert_sentences(SOUND_CUES_ABOUT);
     }
 
     #[test]

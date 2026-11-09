@@ -49,6 +49,7 @@ pub struct Draft {
     pub echo_cancellation: bool,
     pub noise_suppression: bool,
     pub automatic_volume: bool,
+    pub cues: room::SoundCues,
     pub upload_mbits: u32,
     pub vsync: bool,
     pub hide_strip: bool,
@@ -159,6 +160,7 @@ impl Draft {
             echo_cancellation: saved.echo_cancellation(),
             noise_suppression: saved.noise_suppression(),
             automatic_volume: saved.automatic_volume(),
+            cues: saved.sound_cues(),
             upload_mbits: saved.upload_mbits(),
             vsync: saved.vsync(),
             hide_strip: saved.hide_strip(),
@@ -198,6 +200,7 @@ impl Draft {
         next.set_echo_cancellation(self.echo_cancellation);
         next.set_noise_suppression(self.noise_suppression);
         next.set_automatic_volume(self.automatic_volume);
+        next.set_sound_cues(self.cues);
         next.set_upload_mbits(self.upload_mbits);
         next.set_vsync(self.vsync);
         next.set_hide_strip(self.hide_strip);
@@ -311,6 +314,7 @@ pub fn panel(
                 }
                 if place.in_room() {
                     voice(ui, draft, audio, &place);
+                    sound_cues(ui, draft);
                     hotkeys(ui, draft);
                     sharing(ui, draft, &place);
                     ui.add_space(SECTION_GAP);
@@ -323,6 +327,7 @@ pub fn panel(
                     fields.extend(network(ui, draft, &place));
                     hotkeys(ui, draft);
                     voice(ui, draft, audio, &place);
+                    sound_cues(ui, draft);
                     sharing(ui, draft, &place);
                 }
                 match &place {
@@ -820,6 +825,59 @@ fn voice(ui: &mut Ui, draft: &mut Draft, audio: &mut SettingsAudio, place: &Plac
     }
     if !draft.constant_rate {
         line(ui, messages::CONSTANT_RATE_OFF, ASH);
+    }
+}
+
+fn sound_cues(ui: &mut Ui, draft: &mut Draft) {
+    ui.add_space(SECTION_GAP);
+    head(ui, "Sound cues");
+    let kind = WidgetType::Checkbox;
+    if controls::choice_row(
+        ui,
+        ui.id().with("sound cues"),
+        draft.cues.on,
+        "Play sound cues",
+        None,
+        kind,
+    )
+    .clicked()
+    {
+        draft.cues.on = !draft.cues.on;
+    }
+    line(ui, messages::SOUND_CUES_ABOUT, ASH);
+    if !draft.cues.on {
+        return;
+    }
+    ui.add_space(FIELD_GAP);
+    label(ui, "Cue volume");
+    let mut volume = u32::from(draft.cues.volume);
+    let range = u32::from(*room::CUE_VOLUME.start())..=u32::from(*room::CUE_VOLUME.end());
+    controls::slider(
+        ui,
+        ui.id().with("cue volume"),
+        &mut volume,
+        range,
+        "%",
+        "Cue volume",
+    );
+    draft.cues.volume = volume as u8;
+    ui.add_space(FIELD_GAP);
+    for (on, name) in [
+        (&mut draft.cues.joins, "A friend joins or leaves"),
+        (&mut draft.cues.own_mute, "You mute or deafen"),
+        (
+            &mut draft.cues.friend_connection,
+            "A friend's connection drops or comes back",
+        ),
+        (
+            &mut draft.cues.own_connection,
+            "Your connection drops or comes back",
+        ),
+        (&mut draft.cues.shares, "A friend's share starts or stops"),
+    ] {
+        if controls::choice_row(ui, ui.id().with(name), *on, name, None, kind).clicked() {
+            *on = !*on;
+        }
     }
 }
 
@@ -1577,6 +1635,72 @@ mod tests {
         draft.automatic_volume = false;
         let next = draft.settings(&Settings::default()).unwrap();
         assert!(!next.automatic_volume());
+    }
+
+    #[test]
+    fn sound_cues_saved() {
+        let mut draft = typed("");
+        assert_eq!(draft.cues, room::SoundCues::default());
+        draft.cues.on = false;
+        draft.cues.volume = 60;
+        draft.cues.own_mute = false;
+        let next = draft.settings(&Settings::default()).unwrap();
+        assert_eq!(next.sound_cues(), draft.cues);
+        assert_eq!(
+            Draft::new(&next, KnownDevices::default(), String::new()).cues,
+            draft.cues
+        );
+    }
+
+    #[test]
+    fn sound_cue_labels_fit() {
+        for width in [320.0, 360.0] {
+            let ctx = Context::default();
+            theme::apply(&ctx);
+            ctx.enable_accesskit();
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 800.0))),
+                ..RawInput::default()
+            };
+            let mut whole = Vec::new();
+            let mut output = ctx.run_ui(input, |ui| {
+                let column = width - 2.0 * SIDE - ui.spacing().scroll.allocated_width();
+                for label in [
+                    "Play sound cues",
+                    "A friend joins or leaves",
+                    "You mute or deafen",
+                    "A friend's connection drops or comes back",
+                    "Your connection drops or comes back",
+                    "A friend's share starts or stops",
+                ] {
+                    let galley =
+                        ui.painter()
+                            .layout_no_wrap(label.to_owned(), theme::body(), CHALK);
+                    whole.push((label, galley.size().x));
+                }
+                let rect = Rect::from_min_size(pos2(SIDE, 0.0), vec2(column, 800.0));
+                ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+                    sound_cues(ui, &mut typed(""))
+                });
+            });
+            let nodes = std::mem::take(&mut output.platform_output)
+                .accesskit_update
+                .expect("accesskit is on")
+                .nodes;
+            output.drop_without_applying_deltas();
+            for (label, full) in whole {
+                let shown = nodes
+                    .iter()
+                    .find(|(_, node)| node.value() == Some(label))
+                    .and_then(|(_, node)| node.bounds())
+                    .unwrap_or_else(|| panic!("no row for {label}"))
+                    .width() as f32;
+                assert!(
+                    shown >= full - 0.5,
+                    "{label}: {shown} of {full} px shown at {width}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -366,6 +366,10 @@ impl Room {
         self.threads.set_cues(cues);
     }
 
+    pub fn sound_cues(&self) -> SoundCues {
+        self.threads.sound_cues()
+    }
+
     /// Deafened, room sound and the share cue are silent and the microphone
     /// closes too. The cues for this PC's mute, deafen and connection, and
     /// the remote control cue, still play so their changes can be heard.

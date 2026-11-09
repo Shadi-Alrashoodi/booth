@@ -845,6 +845,10 @@ impl Threads {
         self.voice.set_chime_volume(cues.volume);
     }
 
+    pub(crate) fn sound_cues(&self) -> SoundCues {
+        lock(&self.shared.state).cues.settings()
+    }
+
     pub(crate) fn set_volume(&self, key: [u8; 32], percent: u8) {
         self.with_side(|side, _, _| side.set_volume(key, percent));
     }

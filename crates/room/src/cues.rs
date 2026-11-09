@@ -116,6 +116,10 @@ impl Cues {
         self.settings = settings;
     }
 
+    pub(crate) fn settings(&self) -> SoundCues {
+        self.settings
+    }
+
     pub(crate) fn follow(
         &mut self,
         view: &View,
