@@ -68,9 +68,10 @@ impl PortMap {
     // `stun` is what STUN saw last, which this answer is judged against.
     pub(crate) fn report(&mut self, report: Report, stun: Option<Ipv4Addr>) {
         self.answered = true;
-        self.stun = stun;
         // A failed renewal that reached no router keeps the address the
-        // router gave before, the best there is.
+        // router gave before, the best there is, and what STUN saw then. Put
+        // next to a STUN answer from after a move, it would read as a second
+        // router.
         let wan = match report {
             Report::Mapped {
                 protocol, external, ..
@@ -86,6 +87,7 @@ impl PortMap {
         };
         if wan.is_some() {
             self.wan = wan;
+            self.stun = stun;
         }
     }
 
@@ -423,6 +425,21 @@ mod tests {
         map.report(mapped_at(OTHER, 41000), Some(OTHER));
         assert_eq!(map.second_router(), None);
         assert_eq!(map.mapped(), Some(SocketAddrV4::new(OTHER, 41000)));
+    }
+
+    // The router asked again after a move may not answer at all, as on a
+    // network whose router maps nothing. Its old address against STUN's new
+    // one is no second router.
+    #[test]
+    fn silent_router_after_a_move() {
+        let mut map = asked(mapped_at(STUN, 41000));
+        assert!(map.stun_seen(Some(OTHER)), "ask the router again");
+        map.report(Report::Unmapped { wan: None }, Some(OTHER));
+        assert_eq!(map.second_router(), None);
+        assert_eq!(map.state(RouterState::Easy), RouterState::Easy);
+        assert!(!map.offer().second_router);
+        assert!(!map.stun_seen(Some(OTHER)));
+        assert_eq!(map.second_router(), None);
     }
 
     #[test]
