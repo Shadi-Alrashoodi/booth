@@ -68,8 +68,10 @@ pub struct Reliable {
     // in [expected, expected + WINDOW) are ever held, so slots never collide,
     // and WINDOW divides 2^32 so the slot stays right across wraparound.
     // expected itself is only held while delivered is full.
-    held: [Option<Vec<u8>>; WINDOW],
-    delivered: VecDeque<Vec<u8>>,
+    held: [Option<Zeroizing<Vec<u8>>>; WINDOW],
+    // Wiped if they go unread, here and in held: a PeerSecret can wait in
+    // either until it is read.
+    delivered: VecDeque<Zeroizing<Vec<u8>>>,
     ack_owed: bool,
 
     sent: u64,
@@ -178,11 +180,13 @@ impl Reliable {
     /// Taking a message can make room for one that was waiting, which owes
     /// the peer an ack, so call poll_transmit after reading.
     pub fn next_delivered(&mut self) -> Option<Vec<u8>> {
-        let message = self.delivered.pop_front()?;
+        let mut message = self.delivered.pop_front()?;
         if self.release() {
             self.ack_owed = true;
         }
-        Some(message)
+        // Moved out, not copied: once read, the message is the caller's to
+        // wipe.
+        Some(std::mem::take(&mut *message))
     }
 
     /// `timeout` is the retransmit timeout from an RttEstimator, None while
@@ -376,7 +380,7 @@ impl Reliable {
         if held.is_some() {
             return false;
         }
-        *held = Some(message.to_vec());
+        *held = Some(Zeroizing::new(message.to_vec()));
         self.release();
         true
     }

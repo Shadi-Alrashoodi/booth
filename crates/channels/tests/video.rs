@@ -387,8 +387,8 @@ fn parity_for_loss_is_the_fewest_that_will_do() {
             .map(|data| parity_for_loss(data, Some(percent)))
             .collect()
     };
-    // At 5 percent a frame of 3 to 5 or 8 to 10 data shards gets one more
-    // than the floor gives, and no frame two more.
+    // At 5 percent a frame of 3 to 5, 8 to 10 or 15 data shards gets one
+    // more than the floor gives, and no frame two more.
     assert_eq!(
         at(5.0),
         [1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4]
@@ -777,8 +777,10 @@ fn loss_up_to_the_parity_is_repaired() {
         let parity = usize::from(parity_count(data as u16, percent));
         let total = data + parity;
         for round in 0..12 {
-            // Lose exactly `parity` shards, then one more; the first rounds
-            // lose only data, the last only the first data shard and parity.
+            // Lose exactly `parity` shards, then one more. Round 0 loses
+            // from the front, where the data is, and round 1 from the back:
+            // the parity, then the last data shard too. The rest lose at
+            // random.
             let mut order: Vec<usize> = (0..total).collect();
             random.shuffle(&mut order);
             if round == 0 {

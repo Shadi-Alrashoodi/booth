@@ -53,7 +53,7 @@ fn facts(number: u32, idr: bool, survives_loss: bool) -> FrameFacts {
     }
 }
 
-// A frame of `data` data shards at 20 percent parity.
+// A frame of `data` data shards at `percent` percent parity.
 fn frame_of(facts: FrameFacts, data: usize, percent: u32) -> Sent {
     let len = data * SHARD - FRAME_HEADER - 7;
     let unit: Vec<u8> = (0..len).map(|i| (i as u32 ^ facts.number) as u8).collect();

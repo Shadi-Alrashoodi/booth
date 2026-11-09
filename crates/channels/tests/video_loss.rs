@@ -394,8 +394,8 @@ fn loss_5_parity_percentage() {
 
 // Under 1 in 100 at 5 percent, each drop hidden by invalidation: no whole
 // frame waits for an IDR, and no IDR is sent beyond the one every 2 s. Twice
-// 5 percent is under the floor, and frames of 3 to 5 and 8 to 10 data shards
-// get one parity shard more than it gives.
+// 5 percent is under the floor, and frames of 3 to 5, 8 to 10 and 15 data
+// shards get one parity shard more than it gives.
 #[test]
 fn loss_5_parity_rule() {
     let run = measure(random(5), Rule, Invalidates);

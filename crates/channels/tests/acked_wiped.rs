@@ -1,10 +1,12 @@
 // A PeerSecret goes to a friend on the host's control stream, and the stream
 // keeps a copy until the friend acks it. No buffer of the stream may be
 // freed with the secret still in it: not once the message is acked, and not
-// when the stream is dropped with it in flight, queued or resent. This file
-// is its own test binary, so its allocator can look into every block freed
-// while a test watches. Watched per thread, since the tests in this file run
-// side by side.
+// when the stream is dropped with it in flight, queued or resent. The
+// friend's stream keeps it until it is read, and the same goes there: not
+// when the stream is dropped with it waiting behind a lost frame, or
+// delivered and not yet read. This file is its own test binary, so its
+// allocator can look into every block freed while a test watches. Watched
+// per thread, since the tests in this file run side by side.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -162,4 +164,39 @@ fn resent_message_is_wiped_when_dropped() {
 
     let freed = freed_holding(&secret, || drop(host));
     assert_eq!(freed, 0, "a resent message was freed unwiped");
+}
+
+// The host queues a Hello before the PeerSecret. If the Hello's frame is
+// lost, the secret waits on the friend's side for the resend.
+#[test]
+fn held_message_is_wiped_when_dropped() {
+    let secret = secret();
+    let now = Instant::now();
+    let mut host = Reliable::new();
+    let mut friend = Reliable::new();
+    host.send(b"hello").unwrap();
+    host.send(&peer_secret(&secret)).unwrap();
+    host.poll_transmit(now, None).unwrap();
+    let frame = host.poll_transmit(now, None).unwrap();
+    friend.receive(&frame, now).unwrap();
+    wipe(frame);
+    assert_eq!(friend.next_delivered(), None, "the message was not held");
+
+    let freed = freed_holding(&secret, || drop(friend));
+    assert_eq!(freed, 0, "a held message was freed unwiped");
+}
+
+#[test]
+fn unread_message_is_wiped_when_dropped() {
+    let secret = secret();
+    let now = Instant::now();
+    let mut host = Reliable::new();
+    let mut friend = Reliable::new();
+    host.send(&peer_secret(&secret)).unwrap();
+    let frame = host.poll_transmit(now, None).unwrap();
+    friend.receive(&frame, now).unwrap();
+    wipe(frame);
+
+    let freed = freed_holding(&secret, || drop(friend));
+    assert_eq!(freed, 0, "an unread message was freed unwiped");
 }
