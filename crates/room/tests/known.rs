@@ -188,7 +188,12 @@ fn friend_keeps_the_hosts_addresses() {
         kind: CandidateKind::Public,
         addr: SocketAddr::from((*OUTSIDE.ip(), port)),
     };
-    let want = [lan, public(OUTSIDE.port()), public(host_port)];
+    // Windows picks the port the host is bound to, and once in a long while
+    // it picks 52000, which STUN's answer already has.
+    let mut want = vec![lan, public(OUTSIDE.port())];
+    if host_port != OUTSIDE.port() {
+        want.push(public(host_port));
+    }
     let hosts = poll(SAVE_WAIT, "the host's addresses on the list", || {
         let hosts = Room::known_hosts(&client_dir.0).expect("the list reads");
         hosts
