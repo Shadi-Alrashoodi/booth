@@ -3938,7 +3938,7 @@ pub(crate) mod tests {
         assert_eq!(
             voice_problem(&no_mic).as_deref(),
             Some(
-                "Could not open the microphone: Windows has no microphone turned on. Plug one in, or turn one on in Settings, System, Sound."
+                "Could not open the microphone: Windows has no microphone turned on. Plug one in, or turn one on in Windows Settings, System, Sound."
             )
         );
         let lost_speakers = Voice {

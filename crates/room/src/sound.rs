@@ -1058,7 +1058,7 @@ mod tests {
         };
         assert_eq!(
             stopped(&clause(&denied)),
-            "PC sound stopped: Windows says access is denied (0x80070005). Allow microphone access for desktop apps in Settings, Privacy and security, Microphone, then turn Share PC sound on again."
+            "PC sound stopped: Windows says access is denied (0x80070005). Allow microphone access for desktop apps in Windows Settings, Privacy and security, Microphone, then turn Share PC sound on again."
         );
         let format = AudioError::PcSound {
             code: 0x8889_0008,

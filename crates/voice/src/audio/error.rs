@@ -119,10 +119,10 @@ impl fmt::Display for AudioError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AudioError::NoDevice(Direction::Input) => f.write_str(
-                "could not open the microphone: Windows has no microphone turned on. Plug one in, or turn one on in Settings, System, Sound",
+                "could not open the microphone: Windows has no microphone turned on. Plug one in, or turn one on in Windows Settings, System, Sound",
             ),
             AudioError::NoDevice(Direction::Output) => f.write_str(
-                "could not open the output device: Windows has no speakers or headphones turned on. Plug some in, or turn them on in Settings, System, Sound",
+                "could not open the output device: Windows has no speakers or headphones turned on. Plug some in, or turn them on in Windows Settings, System, Sound",
             ),
             AudioError::NotConnected { direction, name } => {
                 let what = name.as_deref().unwrap_or("the device chosen in Booth's settings");
@@ -133,7 +133,7 @@ impl fmt::Display for AudioError {
                 )
             }
             AudioError::AccessDenied(Direction::Input) => f.write_str(
-                "could not open the microphone: Windows says access is denied. Allow microphone access for desktop apps in Settings, Privacy and security, Microphone",
+                "could not open the microphone: Windows says access is denied. Allow microphone access for desktop apps in Windows Settings, Privacy and security, Microphone",
             ),
             AudioError::AccessDenied(Direction::Output) => f.write_str(
                 "could not open the output device: Windows says access is denied. Start Booth again, and restart Windows if it keeps happening",
@@ -188,11 +188,11 @@ impl fmt::Display for AudioError {
                 let (closing, way_out) = match direction {
                     Direction::Input => (
                         "the last room's microphone is still closing. It opens here once it lets go",
-                        ", or choose another microphone in Settings, System, Sound",
+                        ", or choose another microphone in Windows Settings, System, Sound",
                     ),
                     Direction::Output => (
                         "the last room's speakers are still closing. They open here once they let go",
-                        ", or choose other speakers in Settings, System, Sound",
+                        ", or choose other speakers in Windows Settings, System, Sound",
                     ),
                 };
                 f.write_str(closing)?;
@@ -208,7 +208,7 @@ impl fmt::Display for AudioError {
                 lost: false,
                 ..
             } => f.write_str(
-                "could not start PC sound: Windows says access is denied (0x80070005). Allow microphone access for desktop apps in Settings, Privacy and security, Microphone, then turn Share PC sound on again",
+                "could not start PC sound: Windows says access is denied (0x80070005). Allow microphone access for desktop apps in Windows Settings, Privacy and security, Microphone, then turn Share PC sound on again",
             ),
             AudioError::PcSound { code, text, lost } => {
                 let code = if *code == 0 {

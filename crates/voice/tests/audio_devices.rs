@@ -136,8 +136,16 @@ fn errors_say_what_happened_and_what_to_do() {
         }
     }
     assert_eq!(
+        AudioError::NoDevice(Direction::Input).to_string(),
+        "could not open the microphone: Windows has no microphone turned on. Plug one in, or turn one on in Windows Settings, System, Sound"
+    );
+    assert_eq!(
+        AudioError::NoDevice(Direction::Output).to_string(),
+        "could not open the output device: Windows has no speakers or headphones turned on. Plug some in, or turn them on in Windows Settings, System, Sound"
+    );
+    assert_eq!(
         AudioError::AccessDenied(Direction::Input).to_string(),
-        "could not open the microphone: Windows says access is denied. Allow microphone access for desktop apps in Settings, Privacy and security, Microphone"
+        "could not open the microphone: Windows says access is denied. Allow microphone access for desktop apps in Windows Settings, Privacy and security, Microphone"
     );
     assert_eq!(
         AudioError::NotConnected {

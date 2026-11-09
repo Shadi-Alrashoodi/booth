@@ -1927,7 +1927,7 @@ mod tests {
         }
         assert_eq!(
             lines[0],
-            "The last room's microphone is still closing. It opens here once it lets go, or choose another microphone in Settings, System, Sound."
+            "The last room's microphone is still closing. It opens here once it lets go, or choose another microphone in Windows Settings, System, Sound."
         );
         assert_eq!(
             lines[3],
