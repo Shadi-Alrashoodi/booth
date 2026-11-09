@@ -220,6 +220,10 @@ pub struct Sharer {
     // recover request's numbers are the encoder's indices. It goes on across
     // new encoders.
     next: u64,
+    // The index of the frame last put to the pacer: a frame it drops for a
+    // newer one is that one, never a frame too big to send in between,
+    // which used up an index and was never put.
+    put: Option<u64>,
     answers: Answers,
     // The viewers' last loss report, which sets each frame's parity
     // (channels::video::parity_for_loss), and the percentage the stats
@@ -445,6 +449,7 @@ impl Sharer {
             packetizer,
             pacer,
             next: 0,
+            put: None,
             answers: Answers::new(encoder_bitrate),
             loss: None,
             parity: parity_percent(None),
@@ -1893,6 +1898,7 @@ impl Sharer {
             self.setup.spread,
             self.encoder_bitrate,
         );
+        let before = self.put.replace(index);
         let now = Instant::now();
         self.answers.went_out(now, again);
         if unit.idr {
@@ -1910,7 +1916,7 @@ impl Sharer {
         // The frame put before this one never went out. Only this thread
         // puts, so the count moving here is that frame and no other.
         if self.pacer.numbers().discarded > discarded
-            && let Some(before) = index.checked_sub(1)
+            && let Some(before) = before
         {
             self.lost_here(before as u32);
         }
@@ -2007,7 +2013,7 @@ fn within_default(limit: capture::Options) -> capture::Options {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, MutexGuard, PoisonError};
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 
     use super::*;
     use crate::PAYLOAD_LAN;
@@ -2767,6 +2773,125 @@ mod tests {
             "{:?}",
             watching.lines
         );
+    }
+
+    // What a test asks an encoder for: an IDR first and when forced, a few
+    // bytes a frame but for the frame `too_big` names, and every frame it is
+    // asked to recover, kept for the test. It answers a loss as NVENC does,
+    // with an invalidation.
+    struct Scripted {
+        too_big: (u64, usize),
+        recovered: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl Encoder for Scripted {
+        fn name(&self) -> &str {
+            "the test's encoder"
+        }
+
+        fn kind(&self) -> Kind {
+            Kind::Nvenc
+        }
+
+        fn codec(&self) -> Codec {
+            Codec::H264
+        }
+
+        fn encode(&mut self, frame: &encode::Frame<'_>) -> Result<AccessUnit, EncodeError> {
+            let (index, len) = self.too_big;
+            let now = Instant::now();
+            Ok(AccessUnit {
+                data: vec![0; if frame.index == index { len } else { 100 }],
+                index: frame.index,
+                idr: frame.index == 0 || frame.force_idr,
+                submitted: now,
+                ready: now,
+            })
+        }
+
+        fn set_bitrate(&mut self, _: u32) -> Result<(), EncodeError> {
+            Ok(())
+        }
+
+        fn recover(&mut self, lost_frame_index: u64) -> encode::Recovery {
+            self.recovered
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(lost_frame_index);
+            encode::Recovery::Invalidated
+        }
+
+        fn invalidates(&self) -> bool {
+            true
+        }
+    }
+
+    // While the pacer's thread is held up, frame 1 waits for it, frame 2 is
+    // too big to send and never put, and frame 3 takes frame 1's place: the
+    // frame the pacer dropped is 1, recovered at once, not 2 a second time.
+    // The pattern stands in for the source, and the encoder is the test's.
+    #[test]
+    fn a_frame_the_pacer_drops_is_the_one_put_before() {
+        let Some((_turn, adapter)) = gpu() else {
+            return;
+        };
+        let (opens, opened) = mpsc::channel::<()>();
+        let (reached, held) = mpsc::channel::<()>();
+        let send = {
+            let mut first = true;
+            move |_: &[u8]| {
+                if std::mem::take(&mut first) {
+                    let _ = reached.send(());
+                    let _ = opened.recv();
+                }
+            }
+        };
+        let setup = Setup {
+            choice: Choice::Pattern {
+                adapter,
+                width: 640,
+                height: 360,
+                busy: false,
+            },
+            fps: 60,
+            settings: Settings::default(),
+            encoder: Some(Kind::MfSoftware),
+            codec: Some(Codec::H264),
+            takes_hevc: false,
+            payload: PAYLOAD_LAN,
+            spread: false,
+            clock: Clock::starting(Instant::now()),
+            keep_times: false,
+        };
+        let mut sharer =
+            Sharer::open(setup, send, &mut |_| {}).unwrap_or_else(|err| panic!("{err}"));
+        // Dropped before the sharer if an assert fails, which lets the pacer
+        // go and the sharer's drop join it.
+        let _gate = opens;
+        let recovered = Arc::new(Mutex::new(Vec::new()));
+        let too_big = sharer.packetizer.largest_access_unit() + 1;
+        sharer.opened.as_mut().expect("a source").encoder = Box::new(Scripted {
+            too_big: (2, too_big),
+            recovered: Arc::clone(&recovered),
+        });
+        let mut watching = Watching::default();
+        sharer
+            .next(&mut watching)
+            .unwrap_or_else(|err| panic!("{err}"));
+        held.recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|err| panic!("the pacer sent nothing: {err}"));
+        for _ in 1..4 {
+            sharer
+                .next(&mut watching)
+                .unwrap_or_else(|err| panic!("{err}"));
+        }
+        let numbers = sharer.numbers();
+        assert_eq!((numbers.encoded, numbers.too_big), (4, 1));
+        assert_eq!(sharer.pace_numbers().discarded, 1);
+        let sent: Vec<u32> = watching.sent.iter().map(|sent| sent.number).collect();
+        assert_eq!(sent, [0, 1, 3]);
+        let recovered = recovered.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(*recovered, [2, 1]);
     }
 
     // The watchers' limit sets the box when nothing smaller does, and each
