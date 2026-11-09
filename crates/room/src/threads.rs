@@ -568,6 +568,13 @@ pub(crate) struct VoiceStart {
     pub clock: Clock,
 }
 
+// Whether the next start on this thread fails where the voice devices thread
+// would be made: no test can make Windows refuse a thread.
+#[cfg(test)]
+thread_local! {
+    static REFUSE_VOICE_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl Threads {
     // `router` is where a host asks for its port to be mapped, if anywhere.
     pub(crate) fn start(
@@ -666,22 +673,16 @@ impl Threads {
         gate.on_work(move || commands.send(Command::Control));
         let speakers = Arc::clone(&voice.shared);
         gate.on_cue(move |cue| speakers.control_cue(cue, clock.micros(Instant::now())));
-        let control_send = remote::start_sender(Arc::clone(&controls), shared.log.clone())?;
-        let streams = talk::Streams::start(
-            voice.config,
-            Arc::clone(&voice.shared),
-            voice.speaker,
-            voice.clock,
-            shared.log.clone(),
-        )?;
+        // Made before anything below can fail, so a failed start stops the
+        // receive thread, which holds the socket.
         let mut threads = Threads {
             shared: Arc::clone(&shared),
             voice: voice.shared,
             sharing,
             watching,
             controls,
-            control_send: Some(control_send),
-            streams: Some(streams),
+            control_send: None,
+            streams: None,
             video: Vec::new(),
             receive: Some(receive),
             timer: None,
@@ -690,6 +691,21 @@ impl Threads {
             saver,
             writer,
         };
+        threads.control_send = Some(remote::start_sender(
+            Arc::clone(&threads.controls),
+            shared.log.clone(),
+        )?);
+        #[cfg(test)]
+        if REFUSE_VOICE_THREAD.take() {
+            return Err(io::Error::other("a test refused the voice devices thread"));
+        }
+        threads.streams = Some(talk::Streams::start(
+            voice.config,
+            Arc::clone(&threads.voice),
+            voice.speaker,
+            voice.clock,
+            shared.log.clone(),
+        )?);
         let timer = thread::Builder::new().name("room timers".into()).spawn({
             let shared = Arc::clone(&shared);
             move || timers(&shared, &inbox, timer)
@@ -958,7 +974,8 @@ impl Threads {
         for thread in self.video.drain(..) {
             let _ = thread.join();
         }
-        // First, so the router is asked while everything else shuts down.
+        // Before the room leaves, so the router is asked while the rest shuts
+        // down.
         if let Some(mapper) = &self.mapper {
             mapper.close();
         }
@@ -1504,5 +1521,77 @@ mod tests {
         );
         // An Instant that stops while the PC sleeps sees no sleep at all.
         assert_eq!(sleeps.since_last(start + ms(24_000), ms(503_984)), None);
+    }
+
+    // A start that fails once the receive thread runs still stops it, so the
+    // socket is free for the next room on that port.
+    #[test]
+    fn failed_start_lets_go_of_the_socket() {
+        use crate::config::{Lookup, Timers};
+        use crate::host::HostSetup;
+        use crate::invites::Local;
+        use crate::known::{self, DeviceBook, KnownDevices};
+        use keys::Identity;
+
+        let socket = Arc::new(Socket::bind(0, Log::off()).unwrap());
+        let voice = talk::Shared::new(&crate::testing::fake_voice(), None, true);
+        let (speaker_in, speaker_out) = crossbeam_channel::unbounded();
+        let host = Host::new(HostSetup {
+            identity: Arc::new(Identity::generate()),
+            name: "Mara".to_owned(),
+            room_name: String::new(),
+            timers: Timers::default(),
+            local: Local::Fixed(Vec::new()),
+            port: socket.local_port(),
+            has_ipv6: socket.has_ipv6(),
+            router: None,
+            punch_loopback: false,
+            version: invite::VERSION,
+            address_name: None,
+            lookup: Lookup::default(),
+            devices: DeviceBook::new(KnownDevices::default(), true),
+            list_problem: None,
+            initiations_read: Arc::default(),
+            voice: Arc::clone(&voice),
+            speaker: speaker_in,
+            screen: crate::testing::quiet_screen(),
+            now: Instant::now(),
+            log: Log::off(),
+        });
+        let clock = host.clock();
+        // Nobody joins, so nothing is read or saved there.
+        let dir = std::env::temp_dir().join(format!("booth-failed-start-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (_, turn) = known::room_devices(&dir);
+        let held = Arc::downgrade(&socket);
+        REFUSE_VOICE_THREAD.set(true);
+        let started = Threads::start(
+            Side::Host(Box::new(host)),
+            socket,
+            Vec::new(),
+            None,
+            Outlets {
+                notify: Arc::new(|| {}),
+                log: Log::off(),
+                writer: None,
+                turn,
+            },
+            VoiceStart {
+                config: crate::testing::fake_voice(),
+                speaker: talk::Speaker::new(speaker_out, Arc::clone(&voice), clock),
+                shared: voice,
+                clock,
+            },
+            VideoConfig {
+                source: VideoSource::Hooks,
+                ..VideoConfig::default()
+            },
+        );
+        assert!(started.is_err());
+        assert!(
+            held.upgrade().is_none(),
+            "the receive thread still holds the socket"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,5 +1,6 @@
-// Voice in a room. Five threads touch it, and only one of them ever waits on
-// the room's state lock:
+// Voice in a room. Five threads run it, and only two of them ever wait on the
+// room's state lock. The panel's thread calls in too, and waits on that lock
+// only to set a talker's volume or the cues. The five:
 //
 // - The capture thread (mouth.rs) cuts the microphone into Opus frames,
 //   decides whether to send, encodes, and seals each packet itself with the

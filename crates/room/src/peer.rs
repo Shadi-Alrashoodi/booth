@@ -1082,9 +1082,9 @@ mod tests {
         }
     }
 
-    // Pings go every few ms during a call, so a pong after a gap with three
-    // or more unanswered ends a burst. One ping a second on an idle link
-    // never does: there the backoff is what holds retransmissions down.
+    // Pings go every 100 ms while voice or video flows, so a pong after a gap
+    // with three or more unanswered ends a burst. One ping a second on an idle
+    // link never does: there the backoff is what holds retransmissions down.
     #[test]
     fn a_pong_after_a_burst_brings_retransmissions_forward() {
         let ms = Duration::from_millis;

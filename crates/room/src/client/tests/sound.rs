@@ -649,9 +649,9 @@ fn sound_after_the_picture_ages_and_is_logged_with_no_pictures() {
 // Until the host's Hello says what it runs, nothing says the host is too old
 // for PC sound: every new session waits for it again, and the panel's switch
 // and the line under a watched sharer's PC sound slider would show the
-// old-host line meanwhile. This rig's host says the version of this build
-// first, older than PC_SOUND_SINCE until "move to 1.3.0", and 1.2.0 on the
-// second session.
+// old-host line meanwhile. On the first session this rig's host says the
+// version of this build, so the line shows only while this build is older
+// than PC_SOUND_SINCE. On the second it says 1.2.0, which always shows it.
 #[test]
 fn the_old_host_line_waits_for_the_hosts_hello() {
     // The switch's line, then whether a sharer's line says the host.
