@@ -1267,6 +1267,84 @@ fn moved_renewal_keeps_old_port() {
     ));
 }
 
+// The same for a forward by hand the room used as it is. It was never the
+// room's, so nothing is kept to delete at close.
+#[test]
+fn moved_off_a_kept_forward() {
+    let igd = FakeIgd::start();
+    forward_by_hand(&igd);
+    let (log, captured) = Log::capture(1024);
+    let (mut mapper, reports) = start(target(closed_port(), igd.ssdp), log);
+    let wait = Duration::from_secs(5);
+    assert_eq!(reports.recv_timeout(wait), Ok(mapped(Protocol::Upnp, 0)));
+    let console = (
+        PORT,
+        String::from("192.168.1.50"),
+        PORT,
+        String::from("console"),
+    );
+    *lock(&igd.table) = vec![console.clone()];
+    mapper.renewer().send(()).unwrap();
+    let Ok(Report::Mapped { external, .. }) = reports.recv_timeout(wait) else {
+        panic!("no renewal");
+    };
+    assert_ne!(external.port(), PORT);
+    mapper.close();
+    assert!(mapper.wait(Instant::now() + wait));
+
+    assert_eq!(*lock(&igd.table), [console]);
+    let lines = captured.lines();
+    assert!(
+        has_line(
+            &lines,
+            &format!(
+                "upnp: the router deleted the mapping for udp {}",
+                external.port()
+            )
+        ),
+        "{lines:#?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("may still be the room's")
+                || line.contains("deleting an older")),
+        "{lines:#?}"
+    );
+}
+
+// The same when its renewal fails and asking again from the start opens
+// nothing.
+#[test]
+fn failed_renewal_of_a_kept_forward() {
+    let igd = FakeIgd::start();
+    let forward = forward_by_hand(&igd);
+    let (log, captured) = Log::capture(1024);
+    let (mut mapper, reports) = start(target(closed_port(), igd.ssdp), log);
+    let wait = Duration::from_secs(5);
+    assert_eq!(reports.recv_timeout(wait), Ok(mapped(Protocol::Upnp, 0)));
+    igd.fail_once(&["GetExternalIPAddress", "GetExternalIPAddress"]);
+    mapper.renewer().send(()).unwrap();
+    assert!(matches!(
+        reports.recv_timeout(wait),
+        Ok(Report::Unmapped { .. })
+    ));
+    mapper.close();
+    assert!(mapper.wait(Instant::now() + wait));
+
+    assert_eq!(*lock(&igd.table), [forward]);
+    let lines = captured.lines();
+    assert!(
+        has_line(&lines, "port mapping: room closed, nothing to delete"),
+        "{lines:#?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("deleting an older")
+            || line.contains("forwarded to this pc before the room asked")),
+        "{lines:#?}"
+    );
+}
+
 #[test]
 fn silent_router() {
     let silent = FakeRouter::start(Speaks::Nothing);

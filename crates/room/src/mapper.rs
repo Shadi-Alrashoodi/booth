@@ -823,7 +823,8 @@ impl Job {
                 if !held.delete_on_close {
                     self.forget_stale(&held.service, held.external_port);
                 }
-                if let Some(old) = renewed.retired {
+                // A forward the room only used was never its to delete.
+                if let Some(old) = renewed.retired.filter(|old| old.delete_on_close) {
                     log!(
                         self.log,
                         "upnp: udp {} may still be the room's on the router, deleted when the room closes",
@@ -858,7 +859,7 @@ impl Job {
                         self.log,
                         "{word}: the renewal failed: {err}; the room is closing, so the router is not asked again"
                     );
-                    self.stale.push(old);
+                    self.retire(old);
                     return None;
                 }
                 log!(
@@ -871,7 +872,7 @@ impl Job {
                 match self.ladder_and_report() {
                     Some(fresh) if old.same_as(&fresh.held) => Some(fresh),
                     fresh => {
-                        self.stale.push(old);
+                        self.retire(old);
                         fresh
                     }
                 }
@@ -969,6 +970,13 @@ impl Job {
             Held::Upnp(held) => held.external_port != port || held.service != *service,
             _ => true,
         });
+    }
+
+    // A forward the room only used was never its to delete.
+    fn retire(&mut self, old: Held) {
+        if !matches!(&old, Held::Upnp(held) if !held.delete_on_close) {
+            self.stale.push(old);
+        }
     }
 
     // A UPnP entry that stays on the router comes back.
