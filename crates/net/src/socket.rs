@@ -16,7 +16,8 @@ use windows_sys::Win32::Networking::WinSock::{
 
 use crate::holder::{self, Holder};
 
-// Video comes later and hands the socket a whole frame at once.
+// Video on a LAN path hands the socket a whole frame at once, and the
+// watcher's socket gets it as one burst.
 const BUFFER_BYTES: usize = 1 << 20;
 
 // Our largest packet is 1400 bytes (video on a LAN). A buffer that holds a

@@ -14,8 +14,14 @@
 // in 6.3 ms, 37 Mbit/s into a 5.6 Mbit/s uplink with 12 KB of buffer, and
 // lost half its packets every time it was asked for again; a watcher behind
 // a router buffer of 10 to 20 ms never got a picture, in a simulated link.
-// Ordinary frames, which the encoder holds to about one frame's worth, keep
-// the half interval.
+// A frame keeps the half interval while its packets, parity included, come
+// to no more than one frame's worth, which is what half an interval holds at
+// twice the rate. The encoder holds a frame's data to about one frame's
+// worth and parity adds at least a fifth, so a frame near its target on a
+// busy screen comes to more and goes at twice the rate too: over about 5 ms
+// at 120 fps, more as parity grows with loss. Sent faster over an uplink
+// under twice the rate, such a frame would reach the watcher no sooner and
+// would only deepen the router queue that voice waits in.
 //
 // A share that pauses cancels what it put before (cancel below): the frame
 // in the mailbox, what is left of the one under way and those waiting
@@ -245,8 +251,8 @@ impl Pacer {
 
     // Hands one frame to the thread. `interval` is the sharer's frame
     // interval; with `spread` the packets leave evenly over half of it, less
-    // SPREAD_MARGIN, or at twice `rate_bps` if that takes longer, otherwise
-    // all at once.
+    // SPREAD_MARGIN, or at twice `rate_bps` if that takes longer than half of
+    // it, otherwise all at once.
     //
     // A frame still in the mailbox is dropped for this one. The thread takes
     // a frame within microseconds unless it is held up, by a send that
@@ -354,12 +360,13 @@ impl Going {
     fn new(job: Job, start: Instant, spreads: bool) -> Going {
         let (mut span, mut long) = (Duration::ZERO, false);
         if spreads && job.spread {
-            span = (job.interval.min(LONGEST_SPREAD) / 2).saturating_sub(SPREAD_MARGIN);
+            let half = job.interval.min(LONGEST_SPREAD) / 2;
+            span = half.saturating_sub(SPREAD_MARGIN);
             if job.rate_bps > 0 {
                 let bits = job.burst.bytes.len() as u64 * 8;
                 let at_twice =
                     Duration::from_micros(bits * 1_000_000 / (2 * u64::from(job.rate_bps)));
-                if at_twice > span {
+                if at_twice > half {
                     (span, long) = (at_twice, true);
                 }
             }
@@ -717,6 +724,38 @@ mod tests {
             .collect();
         assert!(got.is_sorted(), "{got:?}");
         assert_eq!(pacer.numbers().cut_short, 3);
+    }
+
+    // The rate takes over only past half an interval at twice it, that is
+    // past one frame's worth. A frame under that keeps the half interval
+    // less SPREAD_MARGIN, though at twice the rate it would take longer. A
+    // frame whose data alone is one frame's worth is past it with its parity.
+    #[test]
+    fn a_frame_under_one_frames_worth_keeps_the_half_interval() {
+        let interval = Duration::from_nanos(8_333_333);
+        let going = |packets: usize, bytes: usize| {
+            let mut burst = Burst::new();
+            for _ in 0..packets {
+                burst.push(&vec![0; bytes]);
+            }
+            let job = Job {
+                burst,
+                interval,
+                spread: true,
+                rate_bps: 15_000_000,
+                cancels: 0,
+            };
+            Going::new(job, Instant::now(), true)
+        };
+        // 114 400 bits at twice 15 Mbit/s take 3.81 ms, under half of 8.33.
+        let under = going(13, 1100);
+        assert_eq!(under.span, interval / 2 - SPREAD_MARGIN);
+        assert!(!under.long);
+        // 15 625 bytes in 14 data and 3 parity shards of 1152 bytes, each with
+        // its 10-byte header: 158 032 bits take 5.27 ms.
+        let full = going(17, 1162);
+        assert_eq!(full.span, Duration::from_micros(5_267));
+        assert!(full.long);
     }
 
     // After a cancel nothing put before it goes: not what is left of the
