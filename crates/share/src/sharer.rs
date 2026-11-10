@@ -138,8 +138,8 @@ pub struct Setup {
     // Video bytes in a packet: PAYLOAD_INTERNET, or PAYLOAD_LAN when every
     // viewer is on the LAN.
     pub payload: usize,
-    // Each frame's packets spread over half a frame interval, for a viewer
-    // on an internet path (net::pace), or all at once.
+    // Each frame's packets spread out, for a viewer on an internet path
+    // (net::pace), or all at once.
     pub spread: bool,
     // The clock the frames' capture and encode times are written in.
     pub clock: Clock,
