@@ -21,7 +21,7 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::System::LibraryLoader::{
     GetModuleHandleW, LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
 };
-use windows_sys::Win32::System::SystemInformation::GetSystemTime;
+use windows_sys::Win32::System::SystemInformation::{GetSystemTime, GetTickCount};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentProcessId, OpenProcessToken,
 };
@@ -134,14 +134,66 @@ pub fn take_foreground(hwnd: isize) -> bool {
 
 // For winit's message hook, which sees each message the panel's thread takes
 // off its queue before winit translates and dispatches it.
-pub fn panel_key_hook(keys: Rc<RefCell<PanelKeys>>) -> impl FnMut(*const c_void) -> bool + 'static {
+pub fn panel_key_hook(hook: Rc<RefCell<PanelHook>>) -> impl FnMut(*const c_void) -> bool + 'static {
     move |msg| {
         // SAFETY: winit hands its hook a pointer to the MSG it just took off
         // the queue, alive until the hook returns.
         let msg = unsafe { &*msg.cast::<MSG>() };
-        keys.try_borrow_mut()
-            .is_ok_and(|mut keys| keep_from_panel(&mut keys, msg))
+        hook.try_borrow_mut().is_ok_and(|mut hook| hook.keep(msg))
     }
+}
+
+// How long a key can wait in the queue before the panel reads it: far longer
+// than a pass, and far shorter than the 49.7 days the clock takes to wrap.
+const QUEUED_MS: u32 = 60_000;
+
+// PanelKeys as the message hook has them. The hotkeys take every key pressed
+// until the pass that ends a wait, and a key pressed while that pass runs is
+// read after it, so PanelKeys go on waiting until a key message stamped
+// later comes.
+#[derive(Default)]
+pub struct PanelHook {
+    pub keys: PanelKeys,
+    // The wait as the panel last set it.
+    capture: bool,
+    // When it ended, on the clock Windows stamps messages with, while
+    // PanelKeys still wait.
+    ended: Option<u32>,
+}
+
+impl PanelHook {
+    // `now` is tick_count().
+    pub fn set_capture(&mut self, on: bool, now: u32) {
+        if on {
+            self.ended = None;
+            self.keys.set_capture(true);
+        } else if self.capture {
+            self.ended = Some(now);
+        }
+        self.capture = on;
+    }
+
+    // Only a key message ends the wait here: a posted message comes off the
+    // queue ahead of keys pressed before it, whatever its time.
+    pub fn keep(&mut self, msg: &MSG) -> bool {
+        if let Some(ended) = self.ended
+            && matches!(
+                msg.message,
+                WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP
+            )
+            && ended.wrapping_sub(msg.time) > QUEUED_MS
+        {
+            self.ended = None;
+            self.keys.set_capture(false);
+        }
+        keep_from_panel(&mut self.keys, msg)
+    }
+}
+
+// The clock Windows stamps messages with, in milliseconds since it started.
+pub fn tick_count() -> u32 {
+    // SAFETY: takes no arguments.
+    unsafe { GetTickCount() }
 }
 
 // True keeps the message from the panel: a press never translated makes no
@@ -536,7 +588,7 @@ mod tests {
     use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::{RDW_INTERNALPAINT, RedrawWindow};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        VK_BACK, VK_F10, VK_LMENU, VK_M, VK_PACKET, VK_RETURN, VK_SPACE,
+        VK_BACK, VK_ESCAPE, VK_F10, VK_LMENU, VK_M, VK_PACKET, VK_RETURN, VK_SPACE,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, HWND_MESSAGE, IsWindow, PostMessageW, RegisterClassExW,
@@ -737,6 +789,67 @@ mod tests {
             !keep_from_panel(&mut keys, &down(VK_PROCESSKEY, 0x32, 0)),
             "the input method's key while Settings waits"
         );
+    }
+
+    fn at(time: u32, msg: MSG) -> MSG {
+        MSG { time, ..msg }
+    }
+
+    // The hotkeys can hear a key end the wait, and the pass that takes it
+    // from them end it here, before this thread reads that key's message.
+    // Each key pressed until then is the wait's, read before or after.
+    #[test]
+    fn keys_pressed_before_the_wait_ended_stay_the_waits() {
+        let mut hook = PanelHook::default();
+        hook.set_capture(true, 1000);
+        hook.set_capture(false, 1010);
+        // The same pass looks again once ui has run.
+        hook.set_capture(false, 1020);
+        let steps = [
+            (
+                "a posted message",
+                at(1030, message(WM_CLOSE, 0, 0, 0)),
+                false,
+            ),
+            ("Esc pressed", at(1005, down(VK_ESCAPE, 0x01, 0)), true),
+            ("Space pressed", at(1010, down(VK_SPACE, 0x39, 0)), true),
+            (
+                "M pressed after the first look",
+                at(1015, down(VK_M, 0x32, 0)),
+                false,
+            ),
+            ("Esc let go", at(1040, up(VK_ESCAPE, 0x01)), false),
+            (
+                "Space repeating",
+                at(1045, down(VK_SPACE, 0x39, AGAIN)),
+                true,
+            ),
+            (
+                "Esc pressed again",
+                at(1050, down(VK_ESCAPE, 0x01, 0)),
+                false,
+            ),
+            ("its repeat", at(1080, down(VK_ESCAPE, 0x01, AGAIN)), false),
+        ];
+        for (what, msg, kept) in steps {
+            assert_eq!(hook.keep(&msg), kept, "{what}");
+        }
+
+        // A wait that ended just after the clock wrapped.
+        hook.set_capture(true, 1100);
+        hook.set_capture(false, 20);
+        let before_the_wrap = at(u32::MAX - 5, down(VK_RETURN, 0x1C, 0));
+        assert!(hook.keep(&before_the_wrap), "Enter before the wrap");
+        // A wait can end with no key after it, and the next one's keys are
+        // its own all the same.
+        hook.set_capture(true, 40);
+        let next = at(45, down(VK_RETURN, 0x1C, 0));
+        assert!(hook.keep(&next), "Enter for the next wait");
+        // Weeks after a wait, when the clock has gone round far enough that
+        // its end looks still to come, a key goes to the panel.
+        hook.set_capture(false, 50);
+        let long_after = at(50 + (1 << 31) + 10, down(VK_RETURN, 0x1C, 0));
+        assert!(!hook.keep(&long_after), "Enter weeks later");
     }
 
     #[test]

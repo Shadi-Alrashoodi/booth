@@ -41,7 +41,6 @@ use std::time::Duration;
 use eframe::egui::{IconData, ViewportBuilder};
 use eframe::egui_wgpu::{SurfaceConfig, WgpuConfiguration, WgpuSetup, WgpuSetupCreateNew};
 use eframe::wgpu;
-use input::PanelKeys;
 use winit::platform::windows::EventLoopBuilderExtWindows;
 
 use crate::app::NotStarted;
@@ -187,7 +186,7 @@ fn main() -> ExitCode {
         ));
     }
     // The message hook and the panel both run on this thread.
-    let panel_keys = Rc::new(RefCell::new(PanelKeys::default()));
+    let panel_keys = Rc::new(RefCell::new(win::PanelHook::default()));
     let ended = run_panel(
         || {
             eframe::run_native(
@@ -603,7 +602,7 @@ fn port_number(text: &str) -> Option<u16> {
     text.parse().ok().filter(|&port| port != 0)
 }
 
-fn native_options(panel_keys: Rc<RefCell<PanelKeys>>) -> eframe::NativeOptions {
+fn native_options(panel_keys: Rc<RefCell<win::PanelHook>>) -> eframe::NativeOptions {
     let mut setup = WgpuSetupCreateNew::without_display_handle();
     // DX12 only: it is on every Windows 10 and 11 PC, and leaving Vulkan and
     // GL out means one driver path to test instead of three.

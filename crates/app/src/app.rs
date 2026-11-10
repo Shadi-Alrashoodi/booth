@@ -11,7 +11,7 @@ use eframe::egui::{
     CentralPanel, Context, Frame, Key, KeyboardShortcut, Modifiers, Ui, UiBuilder, ViewportCommand,
 };
 use eframe::wgpu::rwh::{HasWindowHandle, RawWindowHandle};
-use input::{Action, Chord, Event, PanelKeys};
+use input::{Action, Chord, Event};
 use invite::{CodeError, Invite};
 use keys::Identity;
 use net::firewall::FirewallState;
@@ -112,7 +112,7 @@ pub struct App {
     focused: Option<bool>,
     // Shared with the message hook (main.rs), which runs between passes on
     // this thread.
-    panel_keys: Rc<RefCell<PanelKeys>>,
+    panel_keys: Rc<RefCell<win::PanelHook>>,
     // Only while the panel draws on the CPU. On a card nothing is looked at.
     card_watch: Option<CardWatch>,
 }
@@ -189,7 +189,7 @@ impl App {
         setup: Result<Setup, String>,
         firewall: Firewall,
         mut backlog: Backlog,
-        panel_keys: Rc<RefCell<PanelKeys>>,
+        panel_keys: Rc<RefCell<win::PanelHook>>,
         link: Option<Zeroizing<String>>,
     ) -> App {
         theme::apply(&cc.egui_ctx);
@@ -1047,13 +1047,14 @@ impl App {
     // The message hook decides between passes what egui gets of each key, so
     // after each pass it learns what the panel is doing.
     fn follow_panel_keys(&self, ctx: &Context) {
-        let Ok(mut keys) = self.panel_keys.try_borrow_mut() else {
+        let Ok(mut hook) = self.panel_keys.try_borrow_mut() else {
             return;
         };
-        keys.set_bindings(self.hotkeys.bindings());
-        keys.set_capture(self.hotkeys.capturing());
-        keys.set_typing(ctx.text_edit_focused());
-        keys.set_focused(ctx.input(|input| input.viewport().focused != Some(false)));
+        hook.keys.set_bindings(self.hotkeys.bindings());
+        hook.set_capture(self.hotkeys.capturing(), win::tick_count());
+        hook.keys.set_typing(ctx.text_edit_focused());
+        hook.keys
+            .set_focused(ctx.input(|input| input.viewport().focused != Some(false)));
     }
 
     fn logging(&self) -> bool {
@@ -2868,6 +2869,67 @@ mod tests {
         let (choice, _) = draw(start, release(forget));
         // These frames are real time, and a slow PC may take them past the wait.
         assert!(choice.is_none() || closed.elapsed() >= Duration::from_millis(500));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Esc goes down as a pass begins, the hotkey thread hears it and that
+    // pass ends the wait, and only then does the panel's thread read the
+    // Esc itself. It was the wait's: Settings stays open with what was
+    // typed, and the next Esc closes it.
+    #[test]
+    fn the_esc_that_ends_a_wait_never_closes_settings() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN};
+        let dir = fresh_dir("esc-ends-wait");
+        let mut app = app_in_settings(&dir, Start::default(), |draft| {
+            draft.name = String::from("typed");
+            draft.change(Action::Mute);
+        });
+        let (tell, heard) = std::sync::mpsc::channel();
+        app.hotkeys = Hotkeys::hearing(heard);
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        // What the message hook does not keep reaches egui on the next pass.
+        let pass = |app: &mut App, esc: Option<MSG>| {
+            let mut input = with_window(false);
+            if let Some(esc) = esc
+                && !app.panel_keys.borrow_mut().keep(&esc)
+            {
+                input.events.push(eframe::egui::Event::Key {
+                    key: Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                });
+            }
+            let mut frame = eframe::Frame::_new_kittest();
+            ctx.run_ui(input, |ui| {
+                eframe::App::logic(app, ui.ctx(), &mut frame);
+                eframe::App::ui(app, ui, &mut frame);
+            })
+            .drop_without_applying_deltas();
+        };
+        let esc = |time| MSG {
+            message: WM_KEYDOWN,
+            wParam: usize::from(VK_ESCAPE),
+            lParam: (0x01 << 16) | 1,
+            time,
+            ..MSG::default()
+        };
+        pass(&mut app, None);
+        assert!(app.hotkeys.capturing());
+        let pressed = esc(win::tick_count());
+        tell.send((Event::Cancelled, Instant::now())).unwrap();
+        pass(&mut app, None);
+        assert!(!app.hotkeys.capturing());
+        pass(&mut app, Some(pressed));
+        let draft = app.settings_draft_mut().expect("Settings closed");
+        assert_eq!(draft.waiting, None);
+        assert_eq!(draft.name, "typed");
+        // Pressed a moment later.
+        pass(&mut app, Some(esc(win::tick_count().wrapping_add(100))));
+        assert!(matches!(app.screen, Screen::Start(_)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

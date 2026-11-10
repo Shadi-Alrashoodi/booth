@@ -356,6 +356,15 @@ impl Hotkeys {
     pub fn last_given(&self) -> Bindings {
         self.bindings
     }
+
+    // No hotkey thread; what a test sends is heard as if one had heard it.
+    #[cfg(test)]
+    pub fn hearing(heard: Receiver<(Event, Instant)>) -> Hotkeys {
+        Hotkeys {
+            heard,
+            ..Hotkeys::off()
+        }
+    }
 }
 
 // One log line per action by name while a room is open, and per pause at any
