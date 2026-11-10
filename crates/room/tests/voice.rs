@@ -2368,6 +2368,7 @@ fn live_input_switches_wait_only_on_the_same_device() {
         || (microphone.record().starts == 3).then_some(()),
     );
     assert_eq!(microphone.record().opens[2].1, "pods");
+    assert_eq!(microphone.record().at_once, 2);
     room.room().mute(true);
     poll(
         Duration::from_secs(2),
@@ -2479,7 +2480,8 @@ fn live_output_switch_keeps_a_talker_in_the_mixer() {
 #[test]
 fn live_voice_keeps_the_latest_order_while_a_microphone_closes() {
     let _alone = alone();
-    let (mut voice, microphone, speakers) = on_headset(Duration::from_millis(500));
+    const CLOSE: Duration = Duration::from_millis(500);
+    let (mut voice, microphone, speakers) = on_headset(CLOSE);
     let room = host_on(&voice, 0);
     poll(Duration::from_secs(3), "both streams start", || {
         both_started(&microphone, &speakers, 1)
@@ -2510,6 +2512,14 @@ fn live_voice_keeps_the_latest_order_while_a_microphone_closes() {
     assert_eq!(microphone.record().opens[1].1, "pods");
     assert_eq!(microphone.record().most_at_once, 1);
     assert_eq!(speakers.record().starts, 1);
+    let mic = poll(
+        Duration::from_secs(1),
+        "the meter has the latest choice",
+        || room.room().microphone_now(),
+    );
+    assert_eq!(mic.input, Choice::Device(String::from("pods")));
+    thread::sleep(2 * CLOSE);
+    assert_eq!(microphone.record().starts, 2);
     room.wait_for(Duration::from_secs(1), "open mic after the wait", |view| {
         view.voice.mode == TalkMode::OpenMic
     });
