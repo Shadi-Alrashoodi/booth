@@ -253,9 +253,9 @@ pub fn packages_in_exe(
     Ok((booth_version, out))
 }
 
-// Returns the crate, and a sentence when a person should look at what the
-// tool decided.
-pub fn license_crate(package: &Package) -> Result<(Crate, Option<String>), String> {
+// Returns the crate, and a sentence for each thing the tool decided that a
+// person should look at.
+pub fn license_crate(package: &Package) -> Result<(Crate, Vec<String>), String> {
     let label = format!("{} {}", package.name, package.version);
     let Some(expression) = package.license.clone() else {
         return Err(format!(
@@ -324,7 +324,7 @@ pub fn license_crate(package: &Package) -> Result<(Crate, Option<String>), Strin
         .clone();
 
     let mut texts: Vec<Text> = Vec::new();
-    let mut manual = None;
+    let mut manual = Vec::new();
     let mut used_files = HashSet::new();
     for license in &chosen {
         let mut own: Vec<usize> = (0..files.len())
@@ -361,7 +361,7 @@ pub fn license_crate(package: &Package) -> Result<(Crate, Option<String>), Strin
                     });
                 }
             }
-            manual = Some(format!(
+            manual.push(format!(
                 "{label}: its license file is not a text the tool recognises as {license}; it is included as the crate ships it"
             ));
         } else if let Some(text) = standard_text(license) {
@@ -371,7 +371,7 @@ pub fn license_crate(package: &Package) -> Result<(Crate, Option<String>), Strin
                 body: normalize(text),
                 standard: true,
             });
-            manual = Some(format!(
+            manual.push(format!(
                 "{label}: ships no {license} text; the standard text is used"
             ));
         } else if let Some(text) = answered(package, license) {
@@ -381,7 +381,7 @@ pub fn license_crate(package: &Package) -> Result<(Crate, Option<String>), Strin
                 body: text,
                 standard: true,
             });
-            manual = Some(format!(
+            manual.push(format!(
                 "{label}: ships no {license} text or notice anywhere; the release tool's answer is used"
             ));
         }
@@ -754,9 +754,9 @@ pub fn collect(root: &Path, metadata: &str, tree: &str) -> Result<(Collected, Ff
     let mut crates = Vec::new();
     let mut manual = Vec::new();
     for package in &packages {
-        let (krate, note) = license_crate(package)?;
+        let (krate, notes) = license_crate(package)?;
         crates.push(krate);
-        manual.extend(note);
+        manual.extend(notes);
     }
     let copied = read_copied(root)?;
     let fonts = fonts::read(&root.join("assets").join("fonts"), &packages)?;
@@ -985,7 +985,7 @@ mod tests {
         assert_eq!(krate.used_under, ["MIT"]);
         assert_eq!(krate.texts.len(), 1);
         assert!(!krate.texts[0].standard);
-        assert!(manual.is_none());
+        assert!(manual.is_empty());
     }
 
     #[test]
@@ -994,12 +994,26 @@ mod tests {
         let (krate, manual) = license_crate(&folder.package("MIT OR Apache-2.0")).unwrap();
         assert_eq!(krate.used_under, ["Apache-2.0"]);
         assert!(krate.texts[0].standard);
-        assert!(manual.unwrap().contains("standard text"));
+        assert!(manual[0].contains("standard text"));
 
         let err = license_crate(&folder.package("MIT")).err().unwrap();
         assert!(
             err.contains("sample 1.0.0") && err.contains("add an answer"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn every_standard_text_gets_its_note() {
+        let folder = Folder::new("and-standard");
+        let (krate, manual) = license_crate(&folder.package("Apache-2.0 AND BSL-1.0")).unwrap();
+        assert!(krate.texts.iter().all(|t| t.standard));
+        assert_eq!(
+            manual,
+            [
+                "sample 1.0.0: ships no Apache-2.0 text; the standard text is used",
+                "sample 1.0.0: ships no BSL-1.0 text; the standard text is used",
+            ]
         );
     }
 
@@ -1021,7 +1035,7 @@ mod tests {
         );
         assert!(text.body.contains("\n\nPermission is hereby granted"));
         assert!(!text.body.contains("<year>") && !text.body.contains("Copyright"));
-        assert!(manual.unwrap().contains("answer"));
+        assert!(manual[0].contains("answer"));
 
         package.version = "3.5.1".into();
         let err = license_crate(&package).err().unwrap();
@@ -1079,7 +1093,7 @@ mod tests {
             krate.texts[0].body,
             "Copyright 2020 Someone. Old style permission text."
         );
-        assert!(manual.unwrap().contains("not a text the tool recognises"));
+        assert!(manual[0].contains("not a text the tool recognises"));
     }
 
     // Beside a text the tool recognises, a license file it does not is kept
@@ -1099,7 +1113,7 @@ mod tests {
             .map(|t| (t.label.as_str(), t.from.as_deref()))
             .collect();
         assert_eq!(texts, [("MIT", None), ("notice", Some("LICENSE-ODD"))]);
-        assert!(manual.is_none());
+        assert!(manual.is_empty());
     }
 
     const BSD3_TEXT: &str = "Copyright 2009 The Go Authors.\n\nRedistribution and use in source and binary forms, with or without modification, are permitted. Neither the name of Google Inc. nor the names of its contributors may be used to endorse or promote products";
@@ -1181,7 +1195,7 @@ mod tests {
         let (krate, manual) = license_crate(&folder.package("MIT")).unwrap();
         assert_eq!(krate.texts.len(), 1);
         assert_eq!(krate.texts[0].label, "MIT");
-        assert!(krate.texts[0].from.is_none() && manual.is_none());
+        assert!(krate.texts[0].from.is_none() && manual.is_empty());
     }
 
     #[test]
