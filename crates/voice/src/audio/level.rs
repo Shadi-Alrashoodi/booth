@@ -1,5 +1,5 @@
 // The level meter. The capture thread writes, the panel reads whenever it
-// draws, so the two share nothing but two atomics and neither ever waits.
+// draws, so the two share nothing but three atomics and neither ever waits.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 

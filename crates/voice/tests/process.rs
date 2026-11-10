@@ -115,7 +115,7 @@ fn restart_empties_the_meter() {
 }
 
 // Speech in 400 ms words with 200 ms of the room between them, at `db` dBFS
-// RMS over a room 35 dB quieter, after a second of the room alone.
+// RMS over a room about 40 dB quieter, after a second of the room alone.
 fn speech(seconds: usize, db: f32) -> Vec<f32> {
     let amplitude = 10f32.powf(db / 20.0) * 2f32.sqrt();
     let room = 10f32.powf((db - 35.0) / 20.0);
