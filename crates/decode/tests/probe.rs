@@ -19,6 +19,7 @@ const SIZES: [(u32, u32); 9] = [
     (256, 2160),
 ];
 const ASKED: usize = 200;
+const INTEL: u32 = 0x8086;
 
 #[test]
 fn every_gpu_answers() {
@@ -48,12 +49,10 @@ fn every_gpu_answers() {
                     Ok(()) => println!("  {codec} {width}x{height}: decodes"),
                     Err(err) => println!("  {codec} {width}x{height}: {err}"),
                 }
-                if let Err(err) = &answer {
-                    assert!(
-                        matches!(err, DecodeError::NotDecodable { .. }),
-                        "an answer, not a failure: {err:?}"
-                    );
-                }
+                assert!(
+                    answered(adapter.vendor_id, codec, &answer),
+                    "{codec} {width}x{height}: {answer:?}"
+                );
                 // NVIDIA's decoders take both codecs at the sizes Booth
                 // shares and H.264 no wider than 4096 (tests/peer_sps.rs
                 // finds the same through FFmpeg). HEVC as wide as 8192 but
@@ -86,6 +85,28 @@ fn every_gpu_answers() {
             "a probe took {max:.3} ms, the first {first:.3}"
         );
     }
+}
+
+// A refusal says why the driver does not decode the size, except for HEVC on
+// Intel graphics, which stays off whatever the driver says.
+fn answered(vendor_id: u32, codec: Codec, answer: &Result<(), DecodeError>) -> bool {
+    if codec == Codec::Hevc && vendor_id == INTEL {
+        return matches!(answer, Err(DecodeError::HevcUntested { .. }));
+    }
+    matches!(answer, Ok(()) | Err(DecodeError::NotDecodable { .. }))
+}
+
+// every_gpu_answers asks only this PC's GPUs, so the rule it holds Intel
+// graphics to is checked here too.
+#[test]
+fn hevc_untested_on_intel() {
+    let untested = Err(DecodeError::HevcUntested {
+        gpu: "Intel(R) Iris(R) Xe Graphics".to_string(),
+    });
+    assert!(answered(INTEL, Codec::Hevc, &untested));
+    assert!(!answered(INTEL, Codec::Hevc, &Ok(())));
+    assert!(!answered(INTEL, Codec::H264, &untested));
+    assert!(!answered(common::NVIDIA, Codec::Hevc, &untested));
 }
 
 #[test]

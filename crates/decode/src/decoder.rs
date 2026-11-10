@@ -136,9 +136,9 @@ pub struct Decoder {
     // Bytes of SEI handed to FFmpeg since it last showed a picture or was
     // flushed, kept to MOST_SEI_KEPT.
     sei_kept: usize,
-    // Times the format callback chose d3d11va, each time FFmpeg set its
-    // video decoder and surface pool up afresh: the first IDR, then each
-    // new size or profile.
+    // Times FFmpeg set its video decoder and surface pool up afresh on
+    // d3d11va: the first IDR, then each new size or profile. A setup it could
+    // not finish does not count (fields.c).
     setups: Cell<u64>,
 }
 

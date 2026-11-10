@@ -223,7 +223,8 @@ mod tests {
 
     // FFmpeg rounds an HEVC surface pool up to 128 each way, and the limit
     // counts blocks of that, so shapes H.264 takes can be past it in HEVC.
-    // The sizes Booth shares pass in both, and reach the driver.
+    // Booth's shares and larger pictures up to the limit pass in both, and
+    // reach the driver.
     #[test]
     fn hevc_pool_size_limit() {
         let device = warp(D3D11_CREATE_DEVICE_FLAG(0));

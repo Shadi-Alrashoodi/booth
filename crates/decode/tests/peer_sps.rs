@@ -229,6 +229,7 @@ fn too_wide_for_the_gpu() {
     // 2048 macroblocks, inside Booth's limit, but twice as wide as the
     // 4096 that NVIDIA's and every other H.264 hardware decoder stops at.
     let idr = with_sps(&s.units[0], &sps_like(&s.sps, 8192, 64, 8, None));
+    let setups = s.decoder.setups();
     let err = s.decoder.decode(&idr).unwrap_err();
     println!("{err}");
     assert!(
@@ -241,6 +242,11 @@ fn too_wide_for_the_gpu() {
             }
         ),
         "{err:?}"
+    );
+    assert_eq!(
+        s.decoder.setups(),
+        setups,
+        "a setup that failed does not count"
     );
     s.whole(3);
     s.whole(4);

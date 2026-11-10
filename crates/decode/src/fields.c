@@ -80,8 +80,8 @@ void booth_device_fill(AVBufferRef *device, ID3D11Device *d3d, ID3D11DeviceConte
 // The frame size comes from the peer's SPS, and FFmpeg sizes its pool of
 // about 20 decoder surfaces by it before the GPU gets a say. The largest
 // frame of H.264 level 5.2, 36864 macroblocks (4096x2304; a 5120x1440
-// ultrawide share is 28800), keeps that pool under 300 MB of video memory.
-// Booth never sends more than 1440 lines.
+// picture is 28800), keeps that pool under 300 MB of video memory.
+// Booth's own shares fit 4096x1440 in H.264 and 4096x2160 in HEVC.
 //
 // FFmpeg rounds an HEVC pool up to 128 in both directions rather than 16
 // (libavcodec/dxva2.c), so for HEVC the limit counts 16x16 blocks of the
@@ -117,8 +117,9 @@ int booth_too_large(int codec_id, int64_t width, int64_t height)
 
 // What pick_d3d11 did during one decode call, through AVCodecContext.opaque:
 // why it turned the stream down, if it did, and this bit if it chose d3d11va.
-// The bit stays through a refusal, as a setup that ran costs the same whatever
-// a later slice brings.
+// The bit stays through the refusal of a later slice, as a setup that ran
+// costs the same whatever a later slice brings. A setup FFmpeg could not
+// finish leaves no decoder behind, so booth_refused_setup replaces the bit.
 const int booth_chose_d3d11 = 8;
 const int booth_refused_too_large = 2;
 // Not 8-bit 4:2:0, the one format the viewer draws (NV12). FFmpeg has no
