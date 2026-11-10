@@ -387,8 +387,8 @@ pub fn license_crate(package: &Package) -> Result<(Crate, Option<String>), Strin
         }
     }
     for (i, file) in files.iter().enumerate() {
-        let notice =
-            file.kind == Kind::Notice || (file.kind == Kind::Mixed && !used_files.contains(&i));
+        let notice = file.kind == Kind::Notice
+            || (matches!(file.kind, Kind::Mixed | Kind::OwnWords) && !used_files.contains(&i));
         // A crate that bundles a library often ships the library's license
         // at its top as well; the same text is printed once.
         if !notice || texts.iter().any(|t| t.body == file.text) {
@@ -472,7 +472,9 @@ enum Kind {
     // a choice of licenses, any license file the tool does not recognise.
     Notice,
     // In a crate under one license, a license file the tool does not
-    // recognise, taken as that license in the crate's own words.
+    // recognise: taken as that license in the crate's own words when the
+    // crate ships no text of it the tool recognises, and otherwise kept as a
+    // notice.
     OwnWords,
 }
 
@@ -1078,6 +1080,26 @@ mod tests {
             "Copyright 2020 Someone. Old style permission text."
         );
         assert!(manual.unwrap().contains("not a text the tool recognises"));
+    }
+
+    // Beside a text the tool recognises, a license file it does not is kept
+    // as a notice, as it is in a crate with a choice of licenses.
+    #[test]
+    fn single_license_keeps_an_unrecognised_file() {
+        let folder = Folder::new("text-and-odd")
+            .with("LICENSE-MIT", MIT_TEXT)
+            .with(
+                "LICENSE-ODD",
+                "Parts of this crate are also under terms of their own.",
+            );
+        let (krate, manual) = license_crate(&folder.package("MIT")).unwrap();
+        let texts: Vec<(&str, Option<&str>)> = krate
+            .texts
+            .iter()
+            .map(|t| (t.label.as_str(), t.from.as_deref()))
+            .collect();
+        assert_eq!(texts, [("MIT", None), ("notice", Some("LICENSE-ODD"))]);
+        assert!(manual.is_none());
     }
 
     const BSD3_TEXT: &str = "Copyright 2009 The Go Authors.\n\nRedistribution and use in source and binary forms, with or without modification, are permitted. Neither the name of Google Inc. nor the names of its contributors may be used to endorse or promote products";
