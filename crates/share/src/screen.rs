@@ -40,10 +40,13 @@ const PRESENT_RETRY: Duration = Duration::from_secs(2);
 // picture a refresh later.
 // On a LAN it leads its picture by the encode, the decode and the present,
 // 4 to 5 ms; over the internet the frame's packets also spread over half an
-// interval less 2 ms and the path's jitter falls between the two, 12 to 15
-// ms at worst at 60 fps. An IDR can take longer, and its pointer then shows
-// alone this late, once. About one refresh at 60 Hz: nobody takes it for a
-// stuck pointer, where 50 ms starts to read as one.
+// interval less 2 ms, or at twice the encoder's rate if that takes longer,
+// and the path's jitter falls between the pointer and its picture. That
+// comes to 12 to 15 ms at 60 fps, and 16 to 19 ms for a busy screen's frame,
+// which takes about 10 ms at twice the rate, more as its parity grows with
+// loss. An IDR can take longer, and its pointer then shows alone this late,
+// once. About one refresh at 60 Hz: nobody takes it for a stuck pointer,
+// where 50 ms starts to read as one.
 pub const POINTER_HOLD: Duration = Duration::from_millis(20);
 // The largest picture a share sends: in HEVC, to watchers that all take it
 // (Screen::takes_4k). Every other share fits capture's default.
