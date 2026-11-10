@@ -119,12 +119,8 @@ fn spread_frame_timing() {
     let mut clumps_per_frame = Vec::new();
     let mut clumps = Vec::new();
     let mut held_up = Vec::new();
-    // The sharer passes the encoder's rate with every frame. At 81 Mbit/s, a
-    // little over the most it uses, the 72 packets are just under one frame's
-    // worth, so they keep the half interval.
-    let rate_bps = 81_000_000;
     for number in 0..20u8 {
-        pacer.put(frame(&pacer, number, 72, 1166), FPS_120, true, rate_bps);
+        pacer.put(frame(&pacer, number, 72, 1166), FPS_120, true, 0);
         let sent = take(&receiver, 72);
         // The next frame starts at another point of the timer's tick.
         let pause = Duration::from_micros(2_100 + 370 * u64::from(number));

@@ -14,14 +14,21 @@
 // in 6.3 ms, 37 Mbit/s into a 5.6 Mbit/s uplink with 12 KB of buffer, and
 // lost half its packets every time it was asked for again; a watcher behind
 // a router buffer of 10 to 20 ms never got a picture, in a simulated link.
-// A frame keeps the half interval while its packets, parity included, come
-// to no more than one frame's worth, which is what half an interval holds at
-// twice the rate. The encoder holds a frame's data to about one frame's
-// worth and parity adds at least a fifth, so a frame near its target on a
-// busy screen comes to more and goes at twice the rate too: over about 5 ms
-// at 120 fps, more as parity grows with loss. Sent faster over an uplink
-// under twice the rate, such a frame would reach the watcher no sooner and
-// would only deepen the router queue that voice waits in.
+// No other frame goes faster than twice the rate either. One that would
+// take longer at it than half the interval less SPREAD_MARGIN goes at it,
+// and newer frames wait behind it as behind an IDR. At 120 fps that is any
+// frame past about half a frame's worth, parity included: a medium one of
+// 0.7 to 0.8 frames' worth goes over about 3 ms, and one near its target on
+// a busy screen, its data about one frame's worth and parity at least a
+// fifth more, over about 5 ms, more as parity grows with loss. Sent over
+// the shorter span in a simulated link, the medium frames reached the
+// watcher's screen about a third of a millisecond sooner, within the spread
+// from run to run, yet behind a 12 KB router buffer at 14 to 16.5 Mbit/s
+// five to thirteen times as many frames were lost beyond what parity could
+// recover, and behind a deeper one a voice-sized packet waited up to 1 ms
+// longer at the 99th percentile. Over an uplink under twice the rate a
+// frame sent faster reaches the watcher no sooner and only deepens the
+// router queue that voice waits in.
 //
 // A share that pauses cancels what it put before (cancel below): the frame
 // in the mailbox, what is left of the one under way and those waiting
@@ -33,10 +40,11 @@
 //
 // Each wake sends every packet whose time on the even schedule has come.
 // The timer wakes about 0.5 ms late whatever the wait (tests/pace.rs), so the
-// packets leave in clumps, one per wake: at 120 fps, 72 packets are due 30
-// microseconds apart and go as the first alone, then about 17 at a time
-// every half millisecond. Waking per packet cannot do better on this timer,
-// and on a finer one the clumps get smaller by themselves.
+// packets leave in clumps, one per wake: 72 packets spread over half a
+// 120 fps interval less SPREAD_MARGIN are due 30 microseconds apart and go
+// as the first alone, then about 17 at a time every half millisecond.
+// Waking per packet cannot do better on this timer, and on a finer one the
+// clumps get smaller by themselves.
 
 mod timer;
 
@@ -58,20 +66,21 @@ pub use timer::{Signal, Timer, Woken, awake, wait};
 
 // The high-resolution timer wakes about 0.5 ms late, under 1 ms late at the
 // 99th percentile, and once in a few thousand wakes 1.5 to 3 ms late on a
-// busy PC (tests/pace.rs). The spread ends this much before half the
-// interval, so the last packet leaves inside it all but that rarely. With
-// 1 ms it once left 4.13 ms after the first at 120 fps, 36 microseconds short
-// of the limit, and with 1.5 ms 4.00 ms. More would leave a 120 fps spread
-// so short that one wake that late sends nearly the whole frame at once. No
-// margin covers a stall of the whole PC, which once held a wait up 7.7 ms.
+// busy PC (tests/pace.rs). A spread not at twice the rate ends this much
+// before half the interval, so its last packet leaves inside it all but that
+// rarely. With 1 ms it once left 4.13 ms after the first at 120 fps, 36
+// microseconds short of the limit, and with 1.5 ms 4.00 ms. More would leave
+// a 120 fps spread so short that one wake that late sends nearly the whole
+// frame at once. No margin covers a stall of the whole PC, which once held a
+// wait up 7.7 ms.
 pub const SPREAD_MARGIN: Duration = Duration::from_millis(2);
 
 // A frame interval longer than this is not a video frame rate, and spreading
 // over half of it would hold packets back for no reason.
 const LONGEST_SPREAD: Duration = Duration::from_millis(50);
 
-// Newer frames that wait behind a big frame still being spread. One more
-// sends the rest of it and of them at once, as for any frame.
+// Newer frames that wait behind a frame still being spread at twice the
+// rate. One more sends the rest of it and of them at once, as for any frame.
 const WAIT_BEHIND: usize = 2;
 
 // Packets for one frame, each kept whole, in one buffer that is reused.
@@ -251,8 +260,8 @@ impl Pacer {
 
     // Hands one frame to the thread. `interval` is the sharer's frame
     // interval; with `spread` the packets leave evenly over half of it, less
-    // SPREAD_MARGIN, or at twice `rate_bps` if that takes longer than half of
-    // it, otherwise all at once.
+    // SPREAD_MARGIN, or at twice `rate_bps` if that takes longer, otherwise
+    // all at once.
     //
     // A frame still in the mailbox is dropped for this one. The thread takes
     // a frame within microseconds unless it is held up, by a send that
@@ -347,7 +356,8 @@ impl fmt::Debug for Pacer {
 }
 
 // The frame being sent: packet `next` is the next to go. `long` when the
-// span is past half the interval, at twice the rate (WAIT_BEHIND).
+// span is past half the interval less SPREAD_MARGIN, at twice the rate
+// (WAIT_BEHIND).
 struct Going {
     job: Job,
     next: usize,
@@ -360,13 +370,12 @@ impl Going {
     fn new(job: Job, start: Instant, spreads: bool) -> Going {
         let (mut span, mut long) = (Duration::ZERO, false);
         if spreads && job.spread {
-            let half = job.interval.min(LONGEST_SPREAD) / 2;
-            span = half.saturating_sub(SPREAD_MARGIN);
+            span = (job.interval.min(LONGEST_SPREAD) / 2).saturating_sub(SPREAD_MARGIN);
             if job.rate_bps > 0 {
                 let bits = job.burst.bytes.len() as u64 * 8;
                 let at_twice =
                     Duration::from_micros(bits * 1_000_000 / (2 * u64::from(job.rate_bps)));
-                if at_twice > half {
+                if at_twice > span {
                     (span, long) = (at_twice, true);
                 }
             }
@@ -726,17 +735,17 @@ mod tests {
         assert_eq!(pacer.numbers().cut_short, 3);
     }
 
-    // The rate takes over only past half an interval at twice it, that is
-    // past one frame's worth. A frame under that keeps the half interval
-    // less SPREAD_MARGIN, though at twice the rate it would take longer. A
-    // frame whose data alone is one frame's worth is past it with its parity.
+    // No frame goes faster than twice the rate. One that takes longer at it
+    // than half the interval less SPREAD_MARGIN goes at it and is long, even
+    // one that fits in half the interval at it; one that takes less keeps
+    // that span.
     #[test]
-    fn a_frame_under_one_frames_worth_keeps_the_half_interval() {
+    fn no_frame_goes_faster_than_twice_the_rate() {
         let interval = Duration::from_nanos(8_333_333);
-        let going = |packets: usize, bytes: usize| {
+        let going = |packets: usize| {
             let mut burst = Burst::new();
             for _ in 0..packets {
-                burst.push(&vec![0; bytes]);
+                burst.push(&[0; 1162]);
             }
             let job = Job {
                 burst,
@@ -747,15 +756,17 @@ mod tests {
             };
             Going::new(job, Instant::now(), true)
         };
-        // 114 400 bits at twice 15 Mbit/s take 3.81 ms, under half of 8.33.
-        let under = going(13, 1100);
-        assert_eq!(under.span, interval / 2 - SPREAD_MARGIN);
-        assert!(!under.long);
-        // 15 625 bytes in 14 data and 3 parity shards of 1152 bytes, each with
-        // its 10-byte header: 158 032 bits take 5.27 ms.
-        let full = going(17, 1162);
-        assert_eq!(full.span, Duration::from_micros(5_267));
-        assert!(full.long);
+        // A frame's worth at 15 Mbit/s and 120 fps is 15 625 bytes. 6 packets
+        // of 1162 bytes, 0.45 of it, take 1.86 ms at twice the rate, under
+        // the 2.17 ms of half the interval less SPREAD_MARGIN.
+        let small = going(6);
+        assert_eq!(small.span, interval / 2 - SPREAD_MARGIN);
+        assert!(!small.long);
+        // 11 packets, 0.82 of it, take 3.41 ms: past 2.17 ms, under half the
+        // interval.
+        let medium = going(11);
+        assert_eq!(medium.span, Duration::from_micros(3_408));
+        assert!(medium.long);
     }
 
     // After a cancel nothing put before it goes: not what is left of the
