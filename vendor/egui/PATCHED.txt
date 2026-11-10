@@ -1,4 +1,6 @@
-egui 0.36.2 from crates.io, with a selection highlight for right-to-left rows.
+egui 0.36.2 from crates.io, with a selection highlight and AccessKit
+positions for right-to-left rows, and word keys that work on a cursor
+past the last char.
 
 Why
 egui 0.36.2 draws a selection as one rectangle per row, from the caret at
@@ -9,10 +11,20 @@ the first and last rows of a selection over several right-to-left rows,
 the rectangle covered the wrong part, and selected letters outside it
 turned ink on the panel colour and all but disappeared. A two-row Arabic
 message selected whole showed no highlight at all. Copy was right in
-every case. This folder is 0.36.2 with its selection painter changed,
-used through [patch.crates-io] in the workspace Cargo.toml. Drop the
-folder and the patch line once an egui release paints selections on
-bidi text, which will be the release that lays it out (vendor/epaint).
+every case. 0.36.2 also gives AccessKit the positions of a right-to-left
+row as if it ran left to right. Its word keys fail on a cursor past the
+last char, a place the galley has when IBM Plex Sans builds a letter of
+the text from two glyphs: Ctrl+Delete there stops every build. That place
+comes from 0.36.2's layout, not from bidi (see vendor/epaint/PATCHED.txt).
+This folder is 0.36.2 with its selection painter, its AccessKit text
+positions and its word keys changed, used through [patch.crates-io] in
+the workspace Cargo.toml. Drop the folder and the patch line once an egui
+release does all three: paints selections on bidi text, gives AccessKit
+correct positions for rows with right-to-left text, and has word keys
+that work on a cursor past the last char. The first will come with the
+release that lays bidi text out (vendor/epaint), which can do it without
+the other two, and dropping the folder then could bring the Ctrl+Delete
+crash back.
 
 Where it comes from
 The egui-0.36.2.crate in the local cargo cache, no download. Its SHA-256,

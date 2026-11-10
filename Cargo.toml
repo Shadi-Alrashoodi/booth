@@ -77,5 +77,7 @@ opt-level = 3
 epaint = { path = "vendor/epaint" }
 # egui 0.36.2 draws a selection as one rectangle per row from caret to caret,
 # which misses the selected letters on a right-to-left or mixed row. Vendored
-# to draw one rectangle per run of selected letters.
+# to draw one rectangle per run of selected letters, to give AccessKit the
+# positions of right-to-left rows and to stop Ctrl+Delete crashing on a
+# cursor past the last char; vendor/egui/PATCHED.txt says when it can go.
 egui = { path = "vendor/egui" }
