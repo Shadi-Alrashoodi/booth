@@ -1,10 +1,13 @@
 // Opening and dropping the Media Foundation encoders 30 times each, the
 // hardware one in both codecs, leaves nothing behind: handles, threads,
 // private memory and GPU memory of this test process are counted before and
-// after. A process of its own, so no other test moves the numbers.
+// after. A process of its own, so no other test moves the numbers: the only
+// other test here reads this program's imports and is over before anything
+// is counted.
 
 mod common;
 
+use std::ffi::CStr;
 use std::mem::size_of;
 
 use encode::{Codec, EncodeError, Encoder, Frame, Kind, Preset, Settings};
@@ -19,9 +22,9 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_QUERY_VIDEO_MEMORY_INFO, IDXGIAdapter, IDXGIAdapter3, IDXGIDevice, IDXGIFactory1,
 };
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFTransform, MF_VERSION, MFMediaType_Video, MFSTARTUP_LITE, MFShutdown,
-    MFStartup, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
-    MFT_FRIENDLY_NAME_Attribute, MFT_REGISTER_TYPE_INFO, MFT_TRANSFORM_CLSID_Attribute, MFTEnumEx,
+    IMFActivate, IMFTransform, MF_VERSION, MFMediaType_Video, MFSTARTUP_LITE,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_FRIENDLY_NAME_Attribute, MFT_REGISTER_TYPE_INFO, MFT_TRANSFORM_CLSID_Attribute,
     MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12,
 };
 use windows::Win32::System::Com::{
@@ -31,15 +34,32 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::ProcessStatus::{
     K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentProcessId, GetProcessHandleCount,
 };
-use windows::core::Interface;
+use windows::core::{GUID, HRESULT, Interface, s, w};
 
 use common::Gpu;
+
+// The mfplat.dll exports called here, found by name for the reason in
+// src/mf/platform.rs: linked, they would stop this test program from starting
+// on an N edition, where open() says skipped. The signatures are the ones in
+// mfapi.h.
+type Proc = unsafe extern "system" fn() -> isize;
+type Startup = unsafe extern "system" fn(u32, u32) -> HRESULT;
+type Shutdown = unsafe extern "system" fn() -> HRESULT;
+type Enumerate = unsafe extern "system" fn(
+    GUID,
+    MFT_ENUM_FLAG,
+    *const MFT_REGISTER_TYPE_INFO,
+    *const MFT_REGISTER_TYPE_INFO,
+    *mut *mut Option<IMFActivate>,
+    *mut u32,
+) -> HRESULT;
 
 // Windows' thread pool opens and closes a few handles of its own from one
 // moment to the next: after 10 opens, what was left beyond the driver's own
@@ -174,20 +194,29 @@ fn bare_encoder_handles(encoder_name: &str, codec: Codec, count: i64) -> i64 {
     };
     // SAFETY: COM and Media Foundation started and stopped in pairs around
     // plain calls; the activation array is taken over element by element
-    // and freed once.
+    // and freed once. The encoders opened before this loaded mfplat.dll,
+    // which stays loaded, and each export has the signature it is given.
     unsafe {
         let com = CoInitializeEx(None, COINIT_MULTITHREADED);
-        MFStartup(MF_VERSION, MFSTARTUP_LITE).expect("MFStartup");
+        let mfplat = GetModuleHandleW(w!("mfplat.dll")).expect("mfplat.dll");
+        let startup = GetProcAddress(mfplat, s!("MFStartup")).expect("MFStartup");
+        let startup = std::mem::transmute::<Proc, Startup>(startup);
+        let enumerate = GetProcAddress(mfplat, s!("MFTEnumEx")).expect("MFTEnumEx");
+        let enumerate = std::mem::transmute::<Proc, Enumerate>(enumerate);
+        let shutdown = GetProcAddress(mfplat, s!("MFShutdown")).expect("MFShutdown");
+        let shutdown = std::mem::transmute::<Proc, Shutdown>(shutdown);
+        startup(MF_VERSION, MFSTARTUP_LITE).ok().expect("MFStartup");
         let mut array: *mut Option<IMFActivate> = std::ptr::null_mut();
         let mut listed = 0;
-        MFTEnumEx(
+        enumerate(
             MFT_CATEGORY_VIDEO_ENCODER,
             MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-            Some(&input),
-            Some(&output),
+            &input,
+            &output,
             &mut array,
             &mut listed,
         )
+        .ok()
         .expect("MFTEnumEx");
         let list: Vec<IMFActivate> = (0..listed as usize)
             .filter_map(|i| array.add(i).read())
@@ -221,7 +250,7 @@ fn bare_encoder_handles(encoder_name: &str, codec: Codec, count: i64) -> i64 {
         }
         let mut after = 0;
         GetProcessHandleCount(GetCurrentProcess(), &mut after).expect("handle count");
-        let _ = MFShutdown();
+        let _ = shutdown();
         if com.is_ok() {
             CoUninitialize();
         }
@@ -348,5 +377,45 @@ fn open_and_drop_leaks_nothing() {
         // up to 50 MB from one encoder to the next as the heap grows and
         // shrinks, and over 400 software encoders it stayed under the same
         // ceiling. A leaked encoder shows in its threads anyway.
+    }
+}
+
+// The DLLs this test program imports, read from its own image, where the
+// loader has put each part at its RVA from the start.
+fn imported_dlls() -> Vec<String> {
+    // SAFETY: reads inside the headers and import directory of the running
+    // exe, at the offsets the PE format gives a 64-bit image: e_lfanew at
+    // 0x3C, the optional header 24 bytes past the signature it points to,
+    // the import directory's RVA 120 bytes into that, and descriptors of 20
+    // bytes with the DLL name's RVA at 12, the last one all zeros.
+    unsafe {
+        let base = GetModuleHandleW(None).expect("this program's image").0 as *const u8;
+        let at = |offset: usize| base.add(offset).cast::<u32>().read_unaligned() as usize;
+        let imports = at(at(0x3C) + 24 + 120);
+        (imports..)
+            .step_by(20)
+            .map(|descriptor| at(descriptor + 12))
+            .take_while(|&name| name != 0)
+            .map(|name| {
+                CStr::from_ptr(base.add(name).cast())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+}
+
+// Media Foundation is found at run time, so on an N edition, which ships
+// without these DLLs, this program starts and the test above says skipped.
+#[test]
+fn starts_without_media_foundation() {
+    let dlls = imported_dlls();
+    let imports = |name: &str| dlls.iter().any(|dll| dll.eq_ignore_ascii_case(name));
+    assert!(
+        imports("kernel32.dll"),
+        "the imports were misread: {dlls:?}"
+    );
+    for dll in ["mfplat.dll", "mf.dll", "mfreadwrite.dll"] {
+        assert!(!imports(dll), "{dll} is linked: {dlls:?}");
     }
 }
