@@ -22,8 +22,10 @@ fn check_function(script: &str) -> &str {
     let start = script
         .find("function Assert-OptimisedLibopus")
         .expect("the script has no Assert-OptimisedLibopus");
+    // A checkout with core.autocrlf on has CRLF line ends.
     let end = script[start..]
         .find("\n}\n")
+        .or_else(|| script[start..].find("\n}\r\n"))
         .expect("Assert-OptimisedLibopus has no end");
     &script[start..start + end + 2]
 }
@@ -61,6 +63,18 @@ fn with_padding(code: &[u8]) -> Vec<u8> {
     exe.extend_from_slice(code);
     exe.extend_from_slice(&[0xCC, 0x00, 0x90]);
     exe
+}
+
+#[test]
+fn check_is_found_with_either_line_end() {
+    for script in [RELEASE_SCRIPT, STORE_SCRIPT] {
+        let lf = script.replace("\r\n", "\n");
+        let crlf = lf.replace('\n', "\r\n");
+        assert_eq!(
+            check_function(&crlf).replace("\r\n", "\n"),
+            check_function(&lf)
+        );
+    }
 }
 
 #[test]
