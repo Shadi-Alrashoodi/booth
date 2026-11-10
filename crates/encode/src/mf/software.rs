@@ -25,8 +25,8 @@ use windows::core::Interface;
 use super::codec::CodecApi;
 use super::platform::{self, Functions, Mf};
 use super::{
-    Buffer, Output, change_bitrate, check_idr_on_request, configure, create, has_idr, has_slice,
-    mf_error, note_own_buffer, request_idr, sample_time,
+    Buffer, Output, Outputs, change_bitrate, check_idr_on_request, configure, create, has_idr,
+    has_slice, mf_error, note_own_buffer, request_idr, sample_time,
 };
 use crate::{
     AccessUnit, Codec, EncodeError, Encoder, Frame, Kind, Recovery, Request, Settings, gpu,
@@ -349,20 +349,6 @@ impl Software {
         Ok(sample)
     }
 
-    /// The output for the frame just fed in, None when the encoder wants
-    /// more input first. It may come in more than one sample: see has_slice.
-    fn take_output(&mut self) -> Result<Option<Vec<u8>>, EncodeError> {
-        let mut data = Vec::new();
-        while !has_slice(Codec::H264, &data) {
-            match self.output.take(&self.transform, &self.fns)? {
-                Some(bytes) => data.extend_from_slice(&bytes),
-                None if data.is_empty() => return Ok(None),
-                None => break,
-            }
-        }
-        Ok(has_slice(Codec::H264, &data).then_some(data))
-    }
-
     // From here on every loss is answered with an IDR, and the frames' headers
     // say so.
     fn long_term_failed(&mut self, what: &str) {
@@ -372,9 +358,9 @@ impl Software {
         ));
     }
 
-    fn drain(&mut self) -> Result<(), EncodeError> {
+    fn drain(transform: &IMFTransform) -> Result<(), EncodeError> {
         // SAFETY: a plain message to a streaming encoder.
-        unsafe { self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0) }
+        unsafe { transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0) }
             .map_err(mf_error("drain the software encoder"))
     }
 }
@@ -455,26 +441,20 @@ impl Encoder for Software {
                 source,
             }
         })?;
-        if self.drain_every_frame {
-            self.drain().inspect_err(|_| self.idr_next = true)?;
-        }
-        let mut data = self.take_output().inspect_err(|_| self.idr_next = true)?;
-        if data.is_none() && !self.drain_every_frame {
-            // It wants the next frame before giving this one back, a frame
-            // of delay if Booth fed it one. Drained instead, from now on.
-            self.drain_every_frame = true;
+        let draining = self.drain_every_frame;
+        let taken = take_frame(
+            &self.transform,
+            &mut self.output,
+            &self.fns,
+            &mut self.drain_every_frame,
+            || Software::drain(&self.transform),
+        );
+        if self.drain_every_frame && !draining {
             self.notes.push_str(
                 ". The encoder held a frame back until drained, so every frame is drained",
             );
-            self.drain().inspect_err(|_| self.idr_next = true)?;
-            data = self.take_output().inspect_err(|_| self.idr_next = true)?;
         }
-        let Some(data) = data else {
-            self.idr_next = true;
-            return Err(EncodeError::EncoderMisbehaved {
-                problem: "the software encoder kept a frame even when told to drain: share again",
-            });
-        };
+        let data = taken.inspect_err(|_| self.idr_next = true)?;
         let ready = Instant::now();
 
         let idr = has_idr(Codec::H264, &data);
@@ -582,6 +562,57 @@ impl Drop for Software {
     }
 }
 
+/// The frame just fed in, out of the encoder. One that wants the next frame
+/// before giving this one back is drained for it with `drain`, and so is
+/// every frame after: `drain_every_frame` turns on.
+fn take_frame(
+    transform: &impl Outputs,
+    output: &mut Output,
+    fns: &Functions,
+    drain_every_frame: &mut bool,
+    drain: impl Fn() -> Result<(), EncodeError>,
+) -> Result<Vec<u8>, EncodeError> {
+    if *drain_every_frame {
+        drain()?;
+    }
+    let mut data = frame_output(transform, output, fns, *drain_every_frame)?;
+    if !has_slice(Codec::H264, &data) && !*drain_every_frame {
+        // It wants the next frame before giving this one back, a frame
+        // of delay if Booth fed it one. Drained instead, from now on.
+        // What it gave before asking, parameter sets in a sample of
+        // their own, goes ahead of the frame.
+        *drain_every_frame = true;
+        drain()?;
+        data.extend(frame_output(transform, output, fns, true)?);
+    }
+    if !has_slice(Codec::H264, &data) {
+        return Err(EncodeError::EncoderMisbehaved {
+            problem: "the software encoder kept a frame even when told to drain: share again",
+        });
+    }
+    Ok(data)
+}
+
+/// What the encoder gives out for the frame just fed in, which may come in
+/// more than one sample (see has_slice): up to its first slice, or once
+/// `drained`, everything until it asks for more input. Only that ends a
+/// drain, and until then the encoder refuses the next frame.
+fn frame_output(
+    transform: &impl Outputs,
+    output: &mut Output,
+    fns: &Functions,
+    drained: bool,
+) -> Result<Vec<u8>, EncodeError> {
+    let mut data = Vec::new();
+    while drained || !has_slice(Codec::H264, &data) {
+        match output.take(transform, fns)? {
+            Some(bytes) => data.extend_from_slice(&bytes),
+            None => break,
+        }
+    }
+    Ok(data)
+}
+
 /// Whether `buffer` is the only reference to its object. The encoder may
 /// keep a frame's sample after its output is out (it does not promise
 /// otherwise: MFT_INPUT_STREAM_DOES_NOT_ADDREF), and a buffer it still holds
@@ -625,4 +656,177 @@ fn staging(device: &ID3D11Device, width: u32, height: u32) -> Result<ID3D11Textu
         action: "create the texture the software encoder reads frames through",
         source: windows::Win32::Foundation::E_POINTER.into(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+    use std::mem::ManuallyDrop;
+
+    use windows::Win32::Foundation::E_FAIL;
+    use windows::Win32::Media::MediaFoundation::{
+        MF_E_TRANSFORM_NEED_MORE_INPUT, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO,
+        MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
+    };
+
+    use super::super::output_sample;
+    use super::*;
+
+    const PARAMETER_SETS: &[u8] = &[
+        0, 0, 0, 1, 0x67, 0x64, 0, 0x28, 0, 0, 0, 1, 0x68, 0xee, 0x3c, 0x80,
+    ];
+    const IDR: &[u8] = &[0, 0, 0, 1, 0x65, 0x88, 0x84];
+    const SEI: &[u8] = &[0, 0, 0, 1, 0x06, 0x05, 0x01, 0x80];
+
+    // Windows' own encoder gives every frame back at once on the PCs it was
+    // tried on (tests/mf.rs checks it), and nothing makes it hold one. This
+    // one does, and keeps Media Foundation's rules for a synchronous
+    // encoder: drained, it gives out what it held, a sample a call, and only
+    // asking for more input ends the drain. So these show what take_frame
+    // does with an encoder that keeps those rules. No test shows Windows'
+    // own encoder holding a frame, or what it does once drained.
+    struct Holding {
+        ready: RefCell<VecDeque<Vec<u8>>>,
+        held: RefCell<Vec<Vec<u8>>>,
+        draining: Cell<bool>,
+        fns: Functions,
+    }
+
+    impl Holding {
+        fn drain(&self) -> Result<(), EncodeError> {
+            self.draining.set(true);
+            self.ready.borrow_mut().extend(self.held.take());
+            Ok(())
+        }
+    }
+
+    impl Outputs for Holding {
+        fn stream_info(&self) -> windows::core::Result<MFT_OUTPUT_STREAM_INFO> {
+            Ok(MFT_OUTPUT_STREAM_INFO {
+                dwFlags: MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32,
+                cbSize: 0,
+                cbAlignment: 0,
+            })
+        }
+
+        fn process_output(
+            &self,
+            buffers: &mut [MFT_OUTPUT_DATA_BUFFER; 1],
+            _: &mut u32,
+        ) -> windows::core::Result<()> {
+            let Some(bytes) = self.ready.borrow_mut().pop_front() else {
+                self.draining.set(false);
+                return Err(MF_E_TRANSFORM_NEED_MORE_INPUT.into());
+            };
+            let sample = output_sample(&self.fns, bytes.len() as u32).map_err(|_| E_FAIL)?;
+            // SAFETY: plain calls on the sample made above; while locked,
+            // `data` points at a buffer of at least the size it was made with.
+            unsafe {
+                let buffer = sample.GetBufferByIndex(0)?;
+                let mut data = std::ptr::null_mut();
+                buffer.Lock(&mut data, None, None)?;
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len());
+                buffer.Unlock()?;
+                buffer.SetCurrentLength(bytes.len() as u32)?;
+            }
+            buffers[0].pSample = ManuallyDrop::new(Some(sample));
+            Ok(())
+        }
+
+        fn take_new_format(&self) -> Result<(), EncodeError> {
+            Ok(())
+        }
+    }
+
+    // None on an edition of Windows with no Media Foundation.
+    fn holding(ready: &[&[u8]], held: &[&[u8]]) -> Option<(Holding, Output, Mf)> {
+        let mf = match Mf::start() {
+            Ok(mf) => mf,
+            Err(e @ EncodeError::MediaFoundationMissing) => {
+                println!("skipped: {e}");
+                return None;
+            }
+            Err(e) => panic!("{e}"),
+        };
+        let encoder = Holding {
+            ready: RefCell::new(ready.iter().map(|b| b.to_vec()).collect()),
+            held: RefCell::new(held.iter().map(|b| b.to_vec()).collect()),
+            draining: Cell::new(false),
+            fns: mf.fns,
+        };
+        let output = Output::of(&encoder, false).unwrap_or_else(|e| panic!("{e}"));
+        Some((encoder, output, mf))
+    }
+
+    #[test]
+    fn parameter_sets_ahead_of_a_held_frame_are_kept() {
+        let Some((encoder, mut output, mf)) = holding(&[PARAMETER_SETS], &[IDR]) else {
+            return;
+        };
+        let mut drain_every_frame = false;
+        let taken = take_frame(
+            &encoder,
+            &mut output,
+            &mf.fns,
+            &mut drain_every_frame,
+            || encoder.drain(),
+        );
+        assert_eq!(
+            taken.unwrap_or_else(|e| panic!("{e}")),
+            [PARAMETER_SETS, IDR].concat()
+        );
+        assert!(drain_every_frame, "the next frame would be held back too");
+        assert!(
+            !encoder.draining.get(),
+            "the drain is not over, so the next frame would be refused"
+        );
+    }
+
+    #[test]
+    fn a_drain_is_taken_to_its_end() {
+        let Some((encoder, mut output, mf)) = holding(&[], &[PARAMETER_SETS, IDR, SEI]) else {
+            return;
+        };
+        let mut drain_every_frame = true;
+        let taken = take_frame(
+            &encoder,
+            &mut output,
+            &mf.fns,
+            &mut drain_every_frame,
+            || encoder.drain(),
+        );
+        assert_eq!(
+            taken.unwrap_or_else(|e| panic!("{e}")),
+            [PARAMETER_SETS, IDR, SEI].concat()
+        );
+        assert!(
+            !encoder.draining.get(),
+            "the drain is not over, so the next frame would be refused"
+        );
+    }
+
+    #[test]
+    fn a_frame_kept_through_the_drain_is_an_error() {
+        let Some((encoder, mut output, mf)) = holding(&[PARAMETER_SETS], &[]) else {
+            return;
+        };
+        let mut drain_every_frame = false;
+        let taken = take_frame(
+            &encoder,
+            &mut output,
+            &mf.fns,
+            &mut drain_every_frame,
+            || encoder.drain(),
+        );
+        assert!(
+            matches!(taken, Err(EncodeError::EncoderMisbehaved { .. })),
+            "{taken:?}"
+        );
+        assert!(drain_every_frame, "the next frame would be held back too");
+        assert!(
+            !encoder.draining.get(),
+            "the drain is not over, so the next frame would be refused"
+        );
+    }
 }
