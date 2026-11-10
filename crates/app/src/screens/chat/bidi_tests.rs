@@ -80,7 +80,7 @@ fn copied(output: &PlatformOutput) -> Option<&str> {
     })
 }
 
-// A message in a chat column COLUMN wide, 12 from the left and 40 down.
+// A message in a chat column COLUMN wide, SIDE from the left and 40 down.
 fn message(ui: &mut Ui, text: &str) -> Response {
     let column = Rect::from_min_size(pos2(SIDE, 40.0), vec2(COLUMN, 400.0));
     ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {

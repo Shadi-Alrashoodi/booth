@@ -121,11 +121,7 @@ fn value_line(ui: &mut Ui, label: &str, value: &str, font: &FontId, color: Color
     } else {
         rect.right()
     };
-    let value = if gap > 0.0 {
-        value.to_owned()
-    } else {
-        controls::fit_middle(ui, value, font, (right - least).max(0.0))
-    };
+    let value = fit_value(ui, value, font, (right - least - gap).max(0.0));
     let value_width = controls::text_width(ui, &value, font.clone()) + gap;
     controls::split_row(
         ui,
@@ -152,6 +148,21 @@ fn value_line(ui: &mut Ui, label: &str, value: &str, font: &FontId, color: Color
             }
         },
     );
+}
+
+// A value that starts with a person's name in its isolates has only the name
+// cut, so the numbers after it stay whole. The mark that ends the isolate
+// stays too, or the numbers would be laid out in the name's direction.
+fn fit_value(ui: &Ui, value: &str, font: &FontId, room: f32) -> String {
+    let Some((name, after)) = value
+        .strip_prefix('\u{2068}')
+        .and_then(|rest| rest.rsplit_once('\u{2069}'))
+    else {
+        return controls::fit_middle(ui, value, font, room);
+    };
+    let room = (room - controls::text_width(ui, after, font.clone())).max(0.0);
+    let name = controls::fit_middle(ui, name, font, room);
+    format!("\u{2068}{name}\u{2069}{after}")
 }
 
 // Measured as laid out, not rounded up, so units of different lengths still
@@ -969,6 +980,7 @@ fn mapping(word: MappingWord) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eframe::egui::{Context, RawInput, Shape};
     use net::firewall::Profiles;
     use room::view::{AfterPicture, Codec, KnobNumbers, NameMatch};
     use std::net::Ipv4Addr;
@@ -2251,6 +2263,86 @@ mod tests {
         };
         assert_eq!(voice_lines(&tens, None), [("Frame size", text("10 ms"))]);
         assert!(voice_lines(&Numbers::default(), None).is_empty());
+    }
+
+    // A name as long as names get, or one of the widest glyphs, is cut in its
+    // middle to fit a voice line, at every window width and whatever the
+    // widest unit: the label and the numbers after the name are drawn whole.
+    #[test]
+    fn a_long_name_in_a_loss_line_is_cut_in_its_middle() {
+        use room::view::Buffer;
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        for name in ["Bartholomew Featherstonehaugh Jr", "\u{FDFD}\u{FDFD}"] {
+            let n = Numbers {
+                buffer: Some(Buffer {
+                    name: String::from(name),
+                    ms: 10,
+                    frames: 2,
+                }),
+                voice_loss: vec![
+                    (String::from(name), loss(10.5, 0.0)),
+                    (String::from(name), loss(10.5, 3.0)),
+                ],
+                ..Numbers::default()
+            };
+            let lines = voice_lines(&n, None);
+            assert_eq!(lines.len(), 3, "{lines:?}");
+            for (label, value) in lines {
+                let (_, after) = value.rsplit_once('\u{2069}').unwrap();
+                for window in (320..=720).step_by(10) {
+                    for widest in [" ms", " Mbit/s"] {
+                        let size = vec2(window as f32, 200.0);
+                        let input = RawInput {
+                            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)),
+                            ..RawInput::default()
+                        };
+                        let output = ctx.run_ui(input, |ui| {
+                            let font = theme::mono();
+                            let gutter = width(ui, widest, &font);
+                            controls::gutter(ui, SIDE, SIDE, |ui| {
+                                value_line(ui, label, &value, &font, CHALK, gutter);
+                            });
+                        });
+                        let drawn: Vec<(String, bool)> = output
+                            .shapes
+                            .iter()
+                            .filter_map(|clipped| match &clipped.shape {
+                                Shape::Text(text) => {
+                                    Some((text.galley.text().to_owned(), text.galley.elided))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        output.drop_without_applying_deltas();
+                        let at = format!("{value:?}, {window} px, widest unit {widest:?}");
+                        assert_eq!(drawn.len(), 2, "{at}: {drawn:?}");
+                        assert_eq!(drawn[0], (String::from(label), false), "{at}");
+                        let (shown, elided) = &drawn[1];
+                        assert!(!elided, "{at}: {shown:?}");
+                        let cut = shown
+                            .strip_prefix('\u{2068}')
+                            .and_then(|rest| rest.strip_suffix(after))
+                            .and_then(|rest| rest.strip_suffix('\u{2069}'));
+                        let Some(cut) = cut else {
+                            panic!("{at}: {shown:?}");
+                        };
+                        match cut.split_once('\u{2026}') {
+                            Some((head, tail)) => {
+                                assert!(name.starts_with(head), "{at}: {shown:?}");
+                                assert!(name.ends_with(tail), "{at}: {shown:?}");
+                                let (head, tail) = (head.chars().count(), tail.chars().count());
+                                assert!(head.abs_diff(tail) <= 1, "{at}: {shown:?}");
+                            }
+                            None => {
+                                assert_eq!(cut, name, "{at}");
+                                assert!(window > 320, "{at}: {shown:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Muted, the microphone is closed, and its period is what the device
