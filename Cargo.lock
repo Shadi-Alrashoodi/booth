@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "annexb"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "proptest",
 ]
@@ -199,7 +199,7 @@ checksum = "fb5dfbc6d8d2675589ccbe4d0fd61df2419075625f8c1a62325e718e2b0049f9"
 
 [[package]]
 name = "app"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "arboard",
  "capture",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "capture"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "windows",
 ]
@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "channels"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "proptest",
  "reed-solomon-simd",
@@ -894,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "decode"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "annexb",
  "capture",
@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "encode"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "annexb",
  "cc",
@@ -1597,7 +1597,7 @@ dependencies = [
 
 [[package]]
 name = "input"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "proptest",
  "windows-sys 0.61.2",
@@ -1605,7 +1605,7 @@ dependencies = [
 
 [[package]]
 name = "invite"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "blake2",
  "getrandom 0.3.4",
@@ -1703,7 +1703,7 @@ dependencies = [
 
 [[package]]
 name = "keys"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "blake2",
  "getrandom 0.3.4",
@@ -1956,7 +1956,7 @@ dependencies = [
 
 [[package]]
 name = "net"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "getrandom 0.3.4",
  "proptest",
@@ -2875,7 +2875,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "release"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "minisign",
 ]
@@ -2888,7 +2888,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "room"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "capture",
  "channels",
@@ -3104,7 +3104,7 @@ dependencies = [
 
 [[package]]
 name = "session"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "blake2",
  "chacha20poly1305",
@@ -3127,7 +3127,7 @@ dependencies = [
 
 [[package]]
 name = "share"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "capture",
  "channels",
@@ -3328,7 +3328,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stats"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "proptest",
 ]
@@ -3633,7 +3633,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "viewer"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "capture",
  "stats",
@@ -3642,7 +3642,7 @@ dependencies = [
 
 [[package]]
 name = "voice"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "crossbeam-channel",
  "getrandom 0.3.4",
