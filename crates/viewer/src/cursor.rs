@@ -280,6 +280,7 @@ pub(crate) struct Pointer {
     exclusion: ID3D11BlendState,
     scissor: ID3D11RasterizerState,
     shape: Option<Shape>,
+    waiting: Option<(Images, (i32, i32))>,
     at: (i32, i32),
     scale: f32,
     visible: bool,
@@ -309,6 +310,7 @@ impl Pointer {
             )?,
             scissor: scissor(device)?,
             shape: None,
+            waiting: None,
             at: (0, 0),
             scale: 1.0,
             visible: false,
@@ -316,7 +318,10 @@ impl Pointer {
     }
 
     // A shape that cannot be read leaves the pointer hidden until the next
-    // one, rather than failing the frame.
+    // one, rather than failing the frame. So does one that finds too little
+    // video memory, as while a game holds it, but that one is tried again at
+    // every update after, since the sharer sends a shape only when it
+    // changes.
     pub(crate) fn update(&mut self, cursor: &Cursor) -> Result<(), ViewerError> {
         self.at = (cursor.x, cursor.y);
         self.visible = cursor.visible;
@@ -325,8 +330,15 @@ impl Pointer {
         }
         if let Some(shape) = &cursor.shape {
             self.shape = None;
-            if let Ok(images) = images(shape) {
-                self.shape = Some(self.upload(&images, (shape.hotspot_x, shape.hotspot_y))?);
+            self.waiting = images(shape)
+                .ok()
+                .map(|images| (images, (shape.hotspot_x, shape.hotspot_y)));
+        }
+        if let Some((images, hotspot)) = self.waiting.take() {
+            match self.upload(&images, hotspot) {
+                Ok(shape) => self.shape = Some(shape),
+                Err(err) if err.out_of_memory() => self.waiting = Some((images, hotspot)),
+                Err(err) => return Err(err),
             }
         }
         Ok(())

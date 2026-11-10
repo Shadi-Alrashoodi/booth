@@ -96,6 +96,9 @@ pub(crate) struct Picture {
     constants: ID3D11Buffer,
     views: Vec<Planes>,
     kept: Option<Kept>,
+    // The last picture given to keep has no copy: making one failed, most
+    // likely for too little video memory.
+    no_copy: bool,
     presents: u64,
 }
 
@@ -126,6 +129,7 @@ impl Picture {
                 .ok_or_else(|| ViewerError::missing("make the picture's constants", "buffer"))?,
             views: Vec::new(),
             kept: None,
+            no_copy: false,
             presents: 0,
         })
     }
@@ -254,8 +258,20 @@ impl Picture {
             .is_none_or(|kept| (kept.width, kept.height) != (video.width, video.height));
         if size_changed {
             self.kept = None;
-            let texture = nv12_texture(&self.device, video.width, video.height)?;
-            let planes = planes(&self.device, &texture, 0)?;
+            let made = nv12_texture(&self.device, video.width, video.height)
+                .and_then(|texture| planes(&self.device, &texture, 0));
+            self.no_copy = made.is_err();
+            let planes = match made {
+                Ok(planes) => planes,
+                // Too little video memory, as while a game holds it, leaves
+                // no copy rather than ending the watch. Until one is kept, a
+                // present with no new picture draws nothing unless the
+                // window's size or what the strip says changed, so the
+                // window goes on showing the last frame and mapping the
+                // mouse through it (Viewer::present).
+                Err(err) if err.out_of_memory() => return Ok(()),
+                Err(err) => return Err(err),
+            };
             self.kept = Some(Kept {
                 planes,
                 width: video.width,
@@ -298,6 +314,10 @@ impl Picture {
 
     pub(crate) fn gauge(&self) {
         stats::gauge!("viewer.picture.views", self.views);
+    }
+
+    pub(crate) fn no_copy(&self) -> bool {
+        self.no_copy
     }
 
     #[cfg(test)]
@@ -421,6 +441,8 @@ fn nv12_texture(
     height: u32,
 ) -> Result<ID3D11Texture2D, ViewerError> {
     let step = || format!("make a {width}x{height} texture for the last picture");
+    #[cfg(any(test, feature = "fault"))]
+    crate::fault::kept(step())?;
     let desc = D3D11_TEXTURE2D_DESC {
         Width: width,
         Height: height,

@@ -27,6 +27,7 @@ pub enum ErrorKind {
 pub struct ViewerError {
     kind: ErrorKind,
     message: String,
+    out_of_memory: bool,
 }
 
 impl ViewerError {
@@ -34,6 +35,7 @@ impl ViewerError {
         ViewerError {
             kind,
             message: message.into(),
+            out_of_memory: false,
         }
     }
 
@@ -52,7 +54,10 @@ impl ViewerError {
         } else {
             ErrorKind::Other
         };
-        ViewerError::new(kind, format!("could not {step}: {}", meaning(err)))
+        ViewerError {
+            out_of_memory: err.code() == E_OUTOFMEMORY,
+            ..ViewerError::new(kind, format!("could not {step}: {}", meaning(err)))
+        }
     }
 
     // For a call that answered with a Windows object missing instead of an
@@ -71,6 +76,12 @@ impl ViewerError {
 
     pub fn kind(&self) -> ErrorKind {
         self.kind
+    }
+
+    // Windows had too little memory for the step, which for a texture can
+    // mean a game holding the video memory for a while.
+    pub(crate) fn out_of_memory(&self) -> bool {
+        self.out_of_memory
     }
 }
 

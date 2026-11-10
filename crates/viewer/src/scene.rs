@@ -186,6 +186,10 @@ impl Scene {
         self.pointer.has_shape()
     }
 
+    pub(crate) fn no_copy(&self) -> bool {
+        self.picture.no_copy()
+    }
+
     pub(crate) fn gauge(&self) {
         self.picture.gauge();
         self.painter.gauge();

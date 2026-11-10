@@ -1671,8 +1671,10 @@ mod tests {
         }
     }
 
-    // Only a resize gets another try: a lost device, or the frame itself
-    // failing to draw, show or be kept, ends the watch as before.
+    // Only a resize gets another try here: a lost device, or the frame
+    // itself failing to draw, show or be kept, ends the watch as before. A
+    // pointer shape or a copy of the picture that finds too little video
+    // memory never comes here, as the viewer leaves it out and tries again.
     #[test]
     fn other_present_failures_end_the_watch_at_once() {
         let mut failures = PresentFailures::default();

@@ -44,7 +44,7 @@ use crate::cursor::Local;
 use crate::device::{Gpu, Locked};
 use crate::path::{Reading, Stats};
 use crate::scene::{Scene, Target};
-use crate::strip::{Band, Look};
+use crate::strip::{Band, Look, Said};
 use crate::window::{Fullscreen, Window};
 
 pub use crate::control::{Capturing, ControlOut, MouseButton, MouseMode, Pointing};
@@ -189,7 +189,10 @@ pub struct Presented {
     // statistics fail, stop following the window, or name no path
     // (path.rs).
     pub path: Option<PresentPath>,
-    // False when the window is minimized and nothing was drawn.
+    // False when nothing was drawn: the window is minimized, or the frame
+    // has no picture and the last one has no copy to draw again, while the
+    // window's size and what the strip says of the link, the share and
+    // control stay as they were.
     pub shown: bool,
 }
 
@@ -220,8 +223,10 @@ pub struct Viewer {
     // in place of the swap chain's own.
     #[cfg(test)]
     told: Option<windows::Win32::Graphics::Dxgi::DXGI_FRAME_PRESENTATION_MODE>,
-    // Where the last present put the strip.
+    // Where the last present put the strip, and what the strip said at the
+    // last present that drew it.
     band: Band,
+    said: Option<Said>,
     // The controller's mouse on the picture as the last present found it,
     // and since when it has been there; whether a present was made after it
     // came to rest (control::DRIFT_AFTER).
@@ -269,6 +274,7 @@ impl Viewer {
             #[cfg(test)]
             told: None,
             band: Band::Below,
+            said: None,
             local: None,
             rested: false,
         })
@@ -426,7 +432,8 @@ impl Viewer {
         }
         // No target means the last resize failed after ResizeBuffers, maybe
         // for a moment's lack of memory; trying again is the way back.
-        if size != self.swap.size || self.swap.target.is_none() {
+        let resizing = size != self.swap.size || self.swap.target.is_none();
+        if resizing {
             self.path.changed(self.swap.last_present());
             if let Err(err) = self.swap.resize(&self.gpu, &self.scene, size) {
                 // As while minimized, so the present that tries again shows
@@ -434,6 +441,31 @@ impl Viewer {
                 let _ = self.scene.hold(frame.video.as_ref(), frame.cursor);
                 return Err(err.resizing());
             }
+        }
+        // With no new picture and no copy of the last one, which too little
+        // video memory can leave, drawing would put the window's tone over
+        // the picture and take away the placement the mouse is mapped
+        // through. So nothing is drawn, as while minimized, and the last
+        // frame stays until a picture comes. New numbers in the strip wait
+        // for it, and so does the pointer drawn in the frame, so this PC's
+        // own pointer shows over the picture meanwhile. New buffers have no
+        // frame to keep, and a change in what the strip says of the link,
+        // the share or control, such as the key that releases control,
+        // matters more than the frame: those get the tone.
+        if frame.video.is_none()
+            && !resizing
+            && self.scene.no_copy()
+            && self.said == Some(frame.strip.said())
+        {
+            self.scene.hold(None, frame.cursor)?;
+            shared.set_has_shape(false);
+            self.presented_at = Instant::now();
+            self.strip_new = false;
+            return Ok(Presented {
+                took: started.elapsed(),
+                path: self.path.word(),
+                shown: false,
+            });
         }
         let look = Look {
             size,
@@ -458,6 +490,7 @@ impl Viewer {
         )?;
         shared.set_placed(placed);
         shared.set_has_shape(self.scene.has_shape());
+        self.said = Some(frame.strip.said());
         // Interval 0 also with vsync: composed, a present takes the place of
         // one not shown yet, where at interval 1 it would wait a refresh
         // behind that one, so a pointer moved alone just before its picture
@@ -949,6 +982,260 @@ mod tests {
             .unwrap();
         assert!(again.shown);
         assert_eq!(viewer.scene.kept_size(), size(&square));
+    }
+
+    // The sharer's pointer, with a new shape.
+    fn shaped() -> Cursor {
+        Cursor {
+            x: 0,
+            y: 0,
+            visible: true,
+            scale: 1.0,
+            shape: Some(CursorShape {
+                kind: CursorKind::Color,
+                width: 32,
+                height: 32,
+                pitch: 128,
+                hotspot_x: 0,
+                hotspot_y: 0,
+                bytes: vec![0xff; 32 * 32 * 4],
+            }),
+        }
+    }
+
+    // A pointer shape that finds too little video memory, as while a game
+    // holds it, is left out of that present instead of ending the watch,
+    // and goes in at the next present, though that one comes without it.
+    #[test]
+    fn a_pointer_shape_short_of_memory_goes_in_at_the_next_present() {
+        let _screen = one_at_a_time();
+        let Some(mut viewer) = hidden("Booth viewer shape test") else {
+            return;
+        };
+        let strip = Strip::default();
+        let picture = capture::Pattern::new(viewer.device(), 320, 180, 0)
+            .and_then(|mut pattern| pattern.next())
+            .unwrap();
+        fault::fail_shapes(1);
+        let presented = viewer
+            .present(&Frame {
+                video: Some(video(&picture)),
+                cursor: Some(&shaped()),
+                strip: &strip,
+            })
+            .unwrap();
+        assert!(presented.shown);
+        assert!(!viewer.scene.has_shape());
+
+        let moved = Cursor {
+            x: 8,
+            shape: None,
+            ..shaped()
+        };
+        let again = viewer
+            .present(&Frame {
+                video: None,
+                cursor: Some(&moved),
+                strip: &strip,
+            })
+            .unwrap();
+        assert!(again.shown);
+        assert!(viewer.scene.has_shape());
+    }
+
+    // A failed resize whose pointer shape finds too little video memory as
+    // well still keeps its picture, and the shape goes in once a present
+    // works.
+    #[test]
+    fn a_failed_resize_short_of_memory_for_the_shape_keeps_its_picture() {
+        let _screen = one_at_a_time();
+        let Some(mut viewer) = hidden("Booth viewer resize shape test") else {
+            return;
+        };
+        let strip = Strip::default();
+        let wide = capture::Pattern::new(viewer.device(), 320, 180, 0)
+            .and_then(|mut pattern| pattern.next())
+            .unwrap();
+        let square = capture::Pattern::new(viewer.device(), 480, 480, 0)
+            .and_then(|mut pattern| pattern.next())
+            .unwrap();
+        let size = |frame: &capture::Frame| Some((frame.width, frame.height));
+        assert_ne!(size(&wide), size(&square));
+        viewer
+            .present(&Frame {
+                video: Some(video(&wide)),
+                cursor: None,
+                strip: &strip,
+            })
+            .unwrap();
+
+        fault::fail_resizes(1);
+        fault::fail_shapes(1);
+        viewer.swap.target = None;
+        let failed = viewer
+            .present(&Frame {
+                video: Some(video(&square)),
+                cursor: Some(&shaped()),
+                strip: &strip,
+            })
+            .unwrap_err();
+        assert_eq!(failed.kind(), ErrorKind::Resize, "{failed}");
+        assert_eq!(viewer.scene.kept_size(), size(&square));
+        assert!(!viewer.scene.has_shape());
+
+        let still = Cursor {
+            shape: None,
+            ..shaped()
+        };
+        let again = viewer
+            .present(&Frame {
+                video: None,
+                cursor: Some(&still),
+                strip: &strip,
+            })
+            .unwrap();
+        assert!(again.shown);
+        assert!(viewer.scene.has_shape());
+        assert_eq!(viewer.scene.kept_size(), size(&square));
+    }
+
+    // A picture of a new size whose copy finds too little video memory is
+    // still shown and the watch goes on, and a later picture is kept.
+    #[test]
+    fn a_picture_short_of_memory_for_its_copy_is_still_shown() {
+        let _screen = one_at_a_time();
+        let Some(mut viewer) = hidden("Booth viewer copy test") else {
+            return;
+        };
+        let strip = Strip::default();
+        let picture = capture::Pattern::new(viewer.device(), 320, 180, 0)
+            .and_then(|mut pattern| pattern.next())
+            .unwrap();
+        let frame = Frame {
+            video: Some(video(&picture)),
+            cursor: None,
+            strip: &strip,
+        };
+        fault::fail_kept_pictures(1);
+        let presented = viewer.present(&frame).unwrap();
+        assert!(presented.shown);
+        assert_eq!(viewer.scene.kept_size(), None);
+
+        viewer.present(&frame).unwrap();
+        assert_eq!(
+            viewer.scene.kept_size(),
+            Some((picture.width, picture.height))
+        );
+    }
+
+    // Until a copy is kept, a present with no new picture draws nothing, so
+    // the picture and the placement the mouse is mapped through stay, and a
+    // new pointer shape still goes in. This PC's own pointer shows meanwhile,
+    // as the one drawn stays where it was. New buffers get the window's tone.
+    #[test]
+    fn a_picture_with_no_copy_stays_until_the_next() {
+        let _screen = one_at_a_time();
+        let Some(mut viewer) = hidden("Booth viewer no copy test") else {
+            return;
+        };
+        let strip = Strip::default();
+        let picture = capture::Pattern::new(viewer.device(), 320, 180, 0)
+            .and_then(|mut pattern| pattern.next())
+            .unwrap();
+        let frame = Frame {
+            video: Some(video(&picture)),
+            cursor: None,
+            strip: &strip,
+        };
+        let still = Frame {
+            video: None,
+            cursor: None,
+            strip: &strip,
+        };
+        fault::fail_kept_pictures(1);
+        viewer.present(&frame).unwrap();
+        let placed = viewer.window.shared().placed();
+        assert!(placed.is_some());
+
+        let again = viewer
+            .present(&Frame {
+                video: None,
+                cursor: Some(&shaped()),
+                strip: &strip,
+            })
+            .unwrap();
+        assert!(!again.shown, "drawn with no copy of the picture");
+        assert_eq!(viewer.window.shared().placed(), placed);
+        assert!(viewer.scene.has_shape());
+
+        viewer.swap.target = None;
+        assert!(viewer.present(&still).unwrap().shown);
+        assert_eq!(viewer.window.shared().placed(), None);
+        assert!(viewer.window.shared().has_shape());
+        assert!(!viewer.present(&still).unwrap().shown);
+        assert!(
+            !viewer.window.shared().has_shape(),
+            "this PC's pointer left hidden with nothing drawn"
+        );
+
+        viewer.present(&frame).unwrap();
+        assert!(viewer.present(&still).unwrap().shown);
+        assert_eq!(viewer.window.shared().placed(), placed);
+    }
+
+    // With no copy of the picture, new numbers in the strip wait for the
+    // next picture, but control starting or the link being lost is drawn at
+    // once, over the window's tone.
+    #[test]
+    fn what_the_strip_says_is_drawn_with_no_copy_of_the_picture() {
+        let _screen = one_at_a_time();
+        let Some(mut viewer) = hidden("Booth viewer no copy strip test") else {
+            return;
+        };
+        let live = Strip {
+            state: LinkState::Live,
+            ..Strip::default()
+        };
+        let picture = capture::Pattern::new(viewer.device(), 320, 180, 0)
+            .and_then(|mut pattern| pattern.next())
+            .unwrap();
+        fault::fail_kept_pictures(1);
+        viewer
+            .present(&Frame {
+                video: Some(video(&picture)),
+                cursor: None,
+                strip: &live,
+            })
+            .unwrap();
+        assert!(viewer.window.shared().placed().is_some());
+
+        let mut still = |strip: &Strip| {
+            viewer
+                .present(&Frame {
+                    video: None,
+                    cursor: None,
+                    strip,
+                })
+                .unwrap()
+                .shown
+        };
+        let numbers = Strip {
+            rtt_ms: Some(20.0),
+            ..live
+        };
+        assert!(!still(&numbers), "drawn for a number");
+        let controlling = Strip {
+            controlling: Some(String::from("Ctrl+Shift+End")),
+            ..numbers
+        };
+        assert!(still(&controlling), "control's release key left out");
+        assert!(!still(&controlling));
+        let lost = Strip {
+            state: LinkState::Lost,
+            ..controlling
+        };
+        assert!(still(&lost), "the lost link left out");
+        assert_eq!(viewer.window.shared().placed(), None);
     }
 
     // New numbers in the strip of a still picture want a present of their

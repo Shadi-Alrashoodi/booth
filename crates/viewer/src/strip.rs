@@ -92,6 +92,29 @@ impl Default for Strip {
     }
 }
 
+impl Strip {
+    pub(crate) fn said(&self) -> Said {
+        Said {
+            state: self.state,
+            share_state: self.share_state,
+            controlling: self.controlling.is_some(),
+            control_paused: self.control_paused,
+        }
+    }
+}
+
+// What the strip says of the link, the share and control, as against its
+// numbers. With no copy of the picture to draw again, a change in these is
+// still drawn, over the window's tone, so the strip never goes on saying
+// what is no longer so (Viewer::present).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Said {
+    state: LinkState,
+    share_state: ShareState,
+    controlling: bool,
+    control_paused: bool,
+}
+
 const PAUSED: &str = "The shared PC has an administrator window in front. Control is paused.";
 // What stays of it in a strip too narrow for the whole sentence.
 const PAUSED_SHORT: &str = "Control is paused.";

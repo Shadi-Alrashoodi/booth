@@ -2,6 +2,7 @@
 // back: the same Scene the window uses, fed the capture crate's test
 // pattern and nothing from the screen.
 
+use std::sync::MutexGuard;
 use std::time::Duration;
 
 use capture::{Nv12Image, Pattern};
@@ -15,10 +16,12 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint};
 
+use crate::ErrorKind;
 use crate::Video;
 use crate::control;
 use crate::cursor::{Cursor, CursorKind, CursorShape, Local};
 use crate::device::{self, Gpu};
+use crate::fault;
 use crate::palette::{AMBER, Colour, SAGE, WARN, WINDOW};
 use crate::picture::VIEW_IDLE;
 use crate::scene::{Scene, Target};
@@ -47,6 +50,9 @@ struct Offscreen {
     band: Band,
     // The controller's mouse, while this PC controls in absolute mode.
     local: Option<Local>,
+    // The faults a viewer test puts in (fault.rs) would reach this scene
+    // too, so it waits for those tests.
+    _faults: MutexGuard<'static, ()>,
 }
 
 // BGRA, top row first.
@@ -69,6 +75,7 @@ impl Image {
 
 impl Offscreen {
     fn new() -> Option<Offscreen> {
+        let faults = crate::tests::one_at_a_time();
         let gpu = gpu()?;
         let scene = Scene::new(&gpu).unwrap();
         let pattern = Pattern::new(&gpu.device, WIDTH, HEIGHT, 0).unwrap();
@@ -78,6 +85,7 @@ impl Offscreen {
             pattern,
             band: Band::Below,
             local: None,
+            _faults: faults,
         })
     }
 
@@ -607,6 +615,52 @@ fn a_monochrome_pointer_inverts_like_windows() {
     assert!(off_by(image.rgb(left + 12, top + 12), under) <= 2, "screen");
 }
 
+// A shape that finds too little video memory waits to be tried again, but
+// only until the sharer sends another: a newer shape is drawn in its place,
+// and one that cannot be read hides the pointer.
+#[test]
+fn a_newer_shape_takes_the_place_of_one_waiting_for_memory() {
+    let Some(mut screen) = Offscreen::new() else {
+        return;
+    };
+    let size = (WIDTH, HEIGHT + band_height(96));
+    let cursor = Cursor {
+        x: 100,
+        y: 50,
+        visible: true,
+        scale: 1.0,
+        shape: Some(colour_pointer()),
+    };
+    let blue = Cursor {
+        shape: Some(CursorShape {
+            bytes: [255, 0, 0, 255].repeat(16 * 16),
+            ..colour_pointer()
+        }),
+        ..cursor.clone()
+    };
+    let unreadable = Cursor {
+        shape: Some(CursorShape {
+            bytes: vec![0; 100],
+            ..colour_pointer()
+        }),
+        ..cursor.clone()
+    };
+
+    fault::fail_shapes(1);
+    let (image, nv12) = screen.draw(size, Some(&cursor), &plain(), 96);
+    assert!(!screen.scene.has_shape());
+    assert!(off_by(image.rgb(105, 53), nv12_rgb(&nv12, 105, 53)) <= 2);
+    let (image, _) = screen.draw(size, Some(&blue), &plain(), 96);
+    assert_eq!(image.rgb(105, 53), [0, 0, 255], "the newer shape");
+
+    fault::fail_shapes(1);
+    screen.draw(size, Some(&cursor), &plain(), 96);
+    assert!(!screen.scene.has_shape());
+    let (image, nv12) = screen.draw(size, Some(&unreadable), &plain(), 96);
+    assert!(!screen.scene.has_shape(), "the shape before came back");
+    assert!(off_by(image.rgb(105, 53), nv12_rgb(&nv12, 105, 53)) <= 2);
+}
+
 fn live_strip() -> Strip {
     Strip {
         state: LinkState::Live,
@@ -900,4 +954,37 @@ fn a_still_frame_draws_the_kept_picture() {
         .filter(|&(x, y)| off_by(first.rgb(x, y), again.rgb(x, y)) > 0)
         .count();
     assert_eq!(differ, 0, "{differ} pixels differ from the frame before");
+}
+
+// Only too little video memory is let pass: a pointer shape or a copy of the
+// picture that fails for any other reason fails the frame, which ends the
+// watch.
+#[test]
+fn a_shape_or_copy_refused_for_another_reason_fails_the_frame() {
+    let Some(mut screen) = Offscreen::new() else {
+        return;
+    };
+    let cursor = Cursor {
+        x: 100,
+        y: 50,
+        visible: true,
+        scale: 1.0,
+        shape: Some(colour_pointer()),
+    };
+    fault::fail_shapes(1);
+    fault::refuse(1);
+    let failed = screen.scene.hold(None, Some(&cursor)).unwrap_err();
+    assert_eq!(failed.kind(), ErrorKind::Other, "{failed}");
+
+    let frame = screen.pattern.next().unwrap();
+    let video = Video {
+        texture: &frame.texture,
+        index: 0,
+        width: frame.width,
+        height: frame.height,
+    };
+    fault::fail_kept_pictures(1);
+    fault::refuse(1);
+    let failed = screen.scene.keep(&video).unwrap_err();
+    assert_eq!(failed.kind(), ErrorKind::Other, "{failed}");
 }

@@ -28,10 +28,10 @@ windows = { workspace = true, features = [
 ] }
 
 [features]
-# Tests only (share's tests turn it on): src/fault.rs, which makes resizes
-# and pointer shapes fail as they do when video memory runs short, and keeps
-# what the last present that reached the screen had. A release build never
-# has it.
+# Tests only (share's tests turn it on): src/fault.rs, which makes resizes,
+# pointer shapes and copies of the last picture fail as they do when video
+# memory runs short, and keeps what the last present that reached the screen
+# had. A release build never has it.
 fault = []
 
 [dev-dependencies]

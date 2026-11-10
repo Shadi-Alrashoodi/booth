@@ -233,7 +233,7 @@ impl Shared {
         self.capturing.store(code_of(mode), Ordering::Release);
     }
 
-    fn placed(&self) -> Option<Placement> {
+    pub(crate) fn placed(&self) -> Option<Placement> {
         *self.placed.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -268,7 +268,7 @@ impl Shared {
         self.has_shape.store(has, Ordering::Release);
     }
 
-    fn has_shape(&self) -> bool {
+    pub(crate) fn has_shape(&self) -> bool {
         self.has_shape.load(Ordering::Acquire)
     }
 
