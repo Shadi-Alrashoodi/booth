@@ -55,7 +55,7 @@ impl Backlog {
         let left_out = (self.dropped > 0).then(|| {
             let lines = if self.dropped == 1 { "line" } else { "lines" };
             let text = format!(
-                "{} earlier {lines} left out here, only the newest {LINES_KEPT} wait for the log",
+                "{} earlier {lines} dropped, only the newest {LINES_KEPT} kept",
                 self.dropped
             );
             (self.lines[0].0.clone(), text)
@@ -180,9 +180,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), LINES_KEPT + 2, "{log}");
-        let left_out = format!(
-            " host   2 earlier lines left out here, only the newest {LINES_KEPT} wait for the log"
-        );
+        let left_out =
+            format!(" host   2 earlier lines dropped, only the newest {LINES_KEPT} kept");
         assert!(lines[0].ends_with(&left_out), "{}", lines[0]);
         assert!(lines[1].ends_with(" host   2"), "{}", lines[1]);
         assert_eq!(lines[0].split(' ').next(), lines[1].split(' ').next());
@@ -204,9 +203,7 @@ mod tests {
         let log = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let first = log.lines().next().unwrap_or_default();
-        let left_out = format!(
-            " panel  1 earlier line left out here, only the newest {LINES_KEPT} wait for the log"
-        );
+        let left_out = format!(" panel  1 earlier line dropped, only the newest {LINES_KEPT} kept");
         assert!(first.ends_with(&left_out), "{first}");
     }
 }

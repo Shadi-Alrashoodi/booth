@@ -17,7 +17,8 @@ use crate::update::RELEASES_PAGE;
 use crate::volumes::Problem;
 use crate::win;
 
-pub const SOUND_CUES_ABOUT: &str = "Short, quiet sounds when the room changes. Your own share and remote control keep their sounds either way.";
+pub const SOUND_CUES_ABOUT: &str =
+    "Short, quiet sounds when the room changes. The sounds for your own share play either way.";
 
 pub const INVITE_LINKS_ABOUT: &str =
     "A booth:// link opens Booth and shows the invite. Nothing joins until you press Join.";
@@ -483,7 +484,7 @@ pub const MICROPHONE_OPEN: &str = "The microphone is open while this screen show
 // Settings over a room: under each value that waits for the next room, under
 // the meter, which shows the room's own microphone, and where a room cannot
 // do what the start screen does.
-pub const NEXT_ROOM: &str = "Applies at the next room.";
+pub const NEXT_ROOM: &str = "Applies in the next room.";
 pub const ROOM_MICROPHONE_MUTED: &str = "The microphone is closed while you are muted.";
 pub const ROOM_MICROPHONE_ENDED: &str = "The microphone closed when the room ended.";
 pub const ROOM_MICROPHONE: &str = "This is the microphone the room hears.";

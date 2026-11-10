@@ -67,5 +67,5 @@ MIT or Apache-2.0, at your option: [LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](
 
 - avcodec-62.dll and avutil-60.dll are FFmpeg 8.1.3 with only the H.264 and HEVC decoders and their Direct3D 11 paths, under the LGPL 2.1 or later. Booth loads them at runtime from next to booth.exe, so you can swap in your own build. The unmodified source and the build recipe are in the [ffmpeg-8.1.3 release](https://github.com/Shadi-Alrashoodi/booth/releases/tag/ffmpeg-8.1.3), and the zip's ffmpeg folder has the LGPL text, the other notices and the build details. The DLLs are based in part on the work of the Independent JPEG Group.
 - The IBM Plex fonts: SIL Open Font License 1.1, in `assets\fonts\OFL.txt`. The Phosphor icon font, from egui-phosphor: MIT.
-- `vendor\egui` and `vendor\epaint` are egui and epaint 0.36.2 with right-to-left fixes, and in egui a fix for a Ctrl+Delete crash, MIT or Apache-2.0; `PATCHED.txt` in each says what changed.
+- `vendor\egui` and `vendor\epaint` are egui and epaint 0.36.2, MIT or Apache-2.0, with fixes for right-to-left text and, in egui, for a Ctrl+Delete crash; `PATCHED.txt` in each says what changed.
 - THIRD-PARTY-LICENSES.txt in the zip lists every Rust crate in booth.exe with its license, and NVIDIA's notice for the encoder declarations in `crates\encode`.

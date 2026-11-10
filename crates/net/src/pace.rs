@@ -22,13 +22,12 @@
 // a busy screen, its data about one frame's worth and parity at least a
 // fifth more, over about 5 ms, more as parity grows with loss. Sent over
 // the shorter span in a simulated link, the medium frames reached the
-// watcher's screen about a third of a millisecond sooner, within the spread
-// from run to run, yet behind a 12 KB router buffer at 14 to 16.5 Mbit/s
-// five to thirteen times as many frames were lost beyond what parity could
-// recover, and behind a deeper one a voice-sized packet waited up to 1 ms
-// longer at the 99th percentile. Over an uplink under twice the rate a
-// frame sent faster reaches the watcher no sooner and only deepens the
-// router queue that voice waits in.
+// watcher's screen only about a third of a millisecond sooner. Behind a 12 KB
+// router buffer at 14 to 16.5 Mbit/s, five to thirteen times as many frames
+// were then lost beyond what parity could recover, and behind a deeper one a
+// voice-sized packet waited up to 1 ms longer at the 99th percentile. Over an
+// uplink under twice the rate a frame sent faster reaches the watcher no
+// sooner and only deepens the router queue that voice waits in.
 //
 // A share that pauses cancels what it put before (cancel below): the frame
 // in the mailbox, what is left of the one under way and those waiting
