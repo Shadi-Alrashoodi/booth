@@ -492,12 +492,15 @@ impl Drop for ScreenDc {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
     use std::sync::Mutex;
+    use std::thread;
 
     use windows::Win32::Graphics::Gdi::{CreateBitmap, CreateDIBSection};
     use windows::Win32::System::Threading::{GR_GDIOBJECTS, GetCurrentProcess, GetGuiResources};
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateIconIndirect, DestroyIcon, IDC_ARROW, IDC_IBEAM, LoadCursorW,
+        CreateIconIndirect, DestroyIcon, GetIconInfoExW, ICONINFOEXW, IDC_ARROW, IDC_IBEAM,
+        LoadCursorW,
     };
 
     use super::*;
@@ -719,6 +722,9 @@ mod tests {
 
     // An icon made from known bitmaps, given to `test` and destroyed after.
     fn with_cursor(mask: HBITMAP, color: HBITMAP, hotspot: (u32, u32), test: impl FnOnce(isize)) {
+        // GetIconInfo scales a cursor made unaware for an aware caller, and
+        // other tests make the process aware at any moment.
+        crate::make_process_dpi_aware().unwrap();
         let info = ICONINFO {
             fIcon: false.into(),
             xHotspot: hotspot.0,
@@ -738,6 +744,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    // The handle and where Windows says the cursor came from, for a failure.
+    fn origin(cursor: isize) -> String {
+        let mut info = ICONINFOEXW {
+            cbSize: size_of::<ICONINFOEXW>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: a live ICONINFOEXW whose size says so; a gone handle fails.
+        if !unsafe { GetIconInfoExW(HICON(cursor as *mut c_void), &mut info) }.as_bool() {
+            return format!("cursor {cursor:#x} is gone");
+        }
+        let _bitmaps = Bitmaps(info.hbmMask, info.hbmColor);
+        let name = &info.szModName;
+        let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+        let module = String::from_utf16_lossy(&name[..end]);
+        format!(
+            "cursor {cursor:#x} from module {module:?}, resource {}",
+            info.wResID
+        )
     }
 
     fn mono_bitmap(width: i32, height: i32, bits: &[u8]) -> HBITMAP {
@@ -782,7 +808,14 @@ mod tests {
             |cursor| {
                 let shape = shape(cursor).unwrap();
                 assert_eq!(shape.kind, CursorKind::Monochrome);
-                assert_eq!((shape.width, shape.height), (32, 64));
+                assert_eq!(
+                    (shape.width, shape.height),
+                    (32, 64),
+                    "{}, hot spot {},{}",
+                    origin(cursor),
+                    shape.hotspot_x,
+                    shape.hotspot_y
+                );
                 assert_eq!((shape.hotspot_x, shape.hotspot_y), (3, 5));
                 assert_eq!(shape.bytes, mask);
             },
@@ -814,6 +847,44 @@ mod tests {
                 let shape = shape(cursor).unwrap();
                 assert_eq!(shape.kind, CursorKind::MaskedColor);
                 assert_eq!(&shape.bytes[..8], &[50, 100, 200, 0xff, 0, 0, 0, 0]);
+            },
+        );
+    }
+
+    // In a process of its own, which starts DPI unaware, with another thread
+    // asking for awareness between making a cursor and reading it.
+    #[test]
+    fn awareness_changed_midway() {
+        const CHILD: &str = "BOOTH_POINTER_AWARE_MIDWAY";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pointer::tests::awareness_changed_midway",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let said = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && said.contains("1 passed"),
+                "{said}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mask = mask_rows(&[0x0f0f_0000; 64]);
+        with_cursor(
+            mono_bitmap(32, 64, &mask),
+            HBITMAP::default(),
+            (3, 5),
+            |cursor| {
+                thread::spawn(|| crate::make_process_dpi_aware().unwrap())
+                    .join()
+                    .unwrap();
+                let shape = shape(cursor).unwrap();
+                assert_eq!((shape.width, shape.height), (32, 64), "{}", origin(cursor));
             },
         );
     }

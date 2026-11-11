@@ -407,13 +407,8 @@ fn a_window_kept_in_a_frame() {
     assert!(capture.again().unwrap().is_none());
 }
 
-// A window whose text changes as fast as its thread paints, about 180 times
-// a second, shared at 120: more than 60 frames a second where Windows takes
-// a shorter interval than its own pace, build 26100 and later, and no more
-// than 60 where it does not. The frames the fps cap held and sent later are
-// counted: judged by the moments frames arrive, a quarter of them were;
-// judged by Windows' stamps, from 1 in 40 to 1 in 10, the holds a change
-// rate off the refresh grid makes anyway.
+// A window changing about 180 times a second, shared at 120. The cap judges
+// frames by Windows' stamps; its holds come in bursts, so the run is long.
 #[test]
 fn a_fast_window_comes_at_the_rate_asked() {
     let _turn = ALONE.write().unwrap_or_else(|p| p.into_inner());
@@ -443,7 +438,7 @@ fn a_fast_window_comes_at_the_rate_asked() {
     let (mut frames, mut held) = (0u32, 0u32);
     let changed = changes.load(Ordering::Relaxed);
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(2) {
+    while start.elapsed() < Duration::from_secs(5) {
         if let Next::Frame(frame) = capture.next().unwrap() {
             frames += 1;
             if frame.converted.elapsed() > Duration::from_millis(1) {
