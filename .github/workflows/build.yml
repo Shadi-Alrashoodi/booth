@@ -69,6 +69,11 @@ jobs:
       - if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: cargo clippy --workspace --locked -- -D warnings
 
+      # The tests too. This turns on the features the tests ask for, such as
+      # capture's fault, so the line above still checks the build without them.
+      - if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
       # --show-output puts the line each hardware test prints when the runner
       # has no GPU encoder, monitor or microphone for it into the log. The
       # voice test outage_of_200_ms counts the frames a listener's buffer

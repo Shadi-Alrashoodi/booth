@@ -9,12 +9,13 @@ use std::time::{Duration, Instant};
 
 use capture::{Next, Options, PauseReason, WINDOW_GONE, WindowCapture, WindowId};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+#[cfg(feature = "fault")]
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DispatchMessageW, IsWindow, IsZoomed, MSG, PM_REMOVE, PeekMessageW,
-    PostMessageW, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOZORDER, SetWindowPos, SetWindowTextW, ShowWindowAsync, TranslateMessage,
-    WINDOW_STYLE, WM_CLOSE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP,
-    WS_VISIBLE,
+    PostMessageW, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
+    SetWindowPos, SetWindowTextW, ShowWindowAsync, TranslateMessage, WINDOW_STYLE, WM_CLOSE,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{HSTRING, w};
 

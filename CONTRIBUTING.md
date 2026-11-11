@@ -10,7 +10,7 @@ Open an issue with the bug report form. It asks for what happened, your Booth an
 
 Small fixes are welcome as pull requests. For anything bigger, open an issue first so we agree on it before you spend time on it.
 
-Before you open a pull request: one change per pull request, a test where it makes sense, `cargo test --workspace --locked` and `cargo clippy --workspace --locked` both clean, and code and comments that read like the code around them. The README says how to build.
+Before you open a pull request: one change per pull request, a test where it makes sense, `cargo test --workspace --locked`, `cargo clippy --workspace --locked` and `cargo clippy --workspace --all-targets --locked` all clean, and code and comments that read like the code around them. The README says how to build.
 
 Anything that changes what goes over the wire, the invite format or what an older Booth in the same room understands needs an issue first. Those have to stay compatible.
 
