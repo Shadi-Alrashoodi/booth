@@ -27,14 +27,14 @@ share = { path = "crates/share" }
 annexb = { path = "crates/annexb" }
 release = { path = "crates/release" }
 
-# Crypto is pinned exactly. blake2 and x25519-dalek match what snow itself uses,
-# so there is one copy of each primitive in the binary.
+# Crypto is pinned exactly. snow uses this blake2 and the curve25519-dalek
+# under x25519-dalek, so there is one copy of each primitive in the binary.
 snow = { version = "=0.10.0", default-features = false, features = ["use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"] }
 blake2 = "=0.10.6"
 x25519-dalek = { version = "=2.0.1", features = ["static_secrets", "zeroize"] }
 getrandom = "=0.3.4"
-subtle = "2.6"
-zeroize = "1.8"
+subtle = "=2.6.1"
+zeroize = "=1.9.0"
 
 windows-sys = "0.61"
 # For COM, which windows-sys leaves to the caller: the firewall rules.
