@@ -92,6 +92,16 @@ fn due(nth: usize, count: usize, interval: Duration) -> Duration {
     span * nth as u32 / count as u32
 }
 
+// The thread starts a frame's schedule when it takes the frame, after `put`.
+fn none_early(put: Instant, sent: &[Sent], interval: Duration) {
+    for (nth, packet) in sent.iter().enumerate() {
+        assert!(
+            packet.at - put >= due(nth, sent.len(), interval),
+            "packet {nth} went early"
+        );
+    }
+}
+
 // Packets sent one after another inside a wake are microseconds apart at
 // most; wakes are further apart than this.
 const CLUMP_GAP: Duration = Duration::from_micros(20);
@@ -102,14 +112,8 @@ const CLUMP_GAP: Duration = Duration::from_micros(20);
 // two packets of a frame is such a stall.
 const HELD_UP: Duration = Duration::from_micros(1_900);
 
-// The timer's granularity sets the clumps (pace.rs): each wake sends the
-// packets that came due since the one before. At most two frames in 20 may
-// be held up by a stall. In every other one the last packet goes inside half
-// an interval (with no gap over 1.9 ms it goes a little over 4 ms after the
-// first at 120 fps, at most), the tolerance against the even schedule is
-// 1.5 ms at the 95th percentile, and the clumps must show a real spread: at
-// least three wakes in each frame, and a typical clump no bigger than the
-// packets due in a millisecond.
+// Packets leave in clumps, one per wake of the timer (pace.rs), and a stall
+// of the whole PC may hold up two frames in 20.
 #[test]
 fn spread_frame_timing() {
     let (pacer, receiver) = recording();
@@ -120,7 +124,9 @@ fn spread_frame_timing() {
     let mut clumps = Vec::new();
     let mut held_up = Vec::new();
     for number in 0..20u8 {
-        pacer.put(frame(&pacer, number, 72, 1166), FPS_120, true, 0);
+        let burst = frame(&pacer, number, 72, 1166);
+        let put = Instant::now();
+        pacer.put(burst, FPS_120, true, 0);
         let sent = take(&receiver, 72);
         // The next frame starts at another point of the timer's tick.
         let pause = Duration::from_micros(2_100 + 370 * u64::from(number));
@@ -130,13 +136,8 @@ fn spread_frame_timing() {
                 (packet.frame, packet.index, packet.len),
                 (number, nth as u16, 1166)
             );
-            // A packet goes at or after its time; the first packet's own
-            // time is a few microseconds after the thread took the frame.
-            assert!(
-                packet.at - first + Duration::from_micros(50) >= due(nth, 72, FPS_120),
-                "packet {nth} went early"
-            );
         }
+        none_early(put, &sent, FPS_120);
         let last = sent[71].at - first;
         let longest = sent
             .windows(2)
@@ -217,6 +218,30 @@ fn spread_frame_timing() {
     assert_eq!(pacer.numbers().frames, 20);
     assert_eq!(pacer.numbers().packets, 20 * 72);
     assert_eq!(pacer.numbers().cut_short, 0);
+}
+
+// The first packet's send is held up past when the next few are due.
+#[test]
+fn slow_first_send() {
+    let (sender, receiver) = mpsc::channel();
+    let pacer = Pacer::start(move |packet: &[u8]| {
+        let start = Instant::now();
+        if packet[1..3] == [0, 0] {
+            while start.elapsed() < Duration::from_micros(200) {}
+        }
+        let _ = sender.send(Sent {
+            at: Instant::now(),
+            frame: packet[0],
+            index: u16::from_le_bytes([packet[1], packet[2]]),
+            len: packet.len(),
+        });
+    })
+    .unwrap();
+    assert!(pacer.note().is_none(), "{:?}", pacer.note());
+    let burst = frame(&pacer, 1, 72, 1166);
+    let put = Instant::now();
+    pacer.put(burst, FPS_120, true, 0);
+    none_early(put, &take(&receiver, 72), FPS_120);
 }
 
 // The old frame is spread over 23 ms, so the new one comes in the middle of

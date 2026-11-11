@@ -158,10 +158,6 @@ mod tests {
     // second copy of Booth would.
     #[test]
     fn port_held_by_another_process() {
-        let port = {
-            let free = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            free.local_addr().unwrap().port()
-        };
         let exe = std::env::current_exe().unwrap();
         let mut child = Command::new(&exe)
             .args([
@@ -170,7 +166,7 @@ mod tests {
                 "--ignored",
                 "--nocapture",
             ])
-            .env(PORT_VAR, port.to_string())
+            .env(PORT_VAR, "0")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -179,8 +175,10 @@ mod tests {
         let holding = lines
             .by_ref()
             .map_while(Result::ok)
-            .any(|line| line.contains(HOLDING));
-        assert!(holding, "the second process did not take port {port}");
+            .find_map(|line| Some(line.split_once(HOLDING)?.1.trim().parse::<u16>()));
+        let port = holding
+            .and_then(Result::ok)
+            .expect("the second process did not take a port");
         let asked = std::time::Instant::now();
         let holder = udp_port(port);
         println!("windows named the holder in {:?}", asked.elapsed());
@@ -202,7 +200,7 @@ mod tests {
             return;
         };
         let held = UdpSocket::bind((Ipv4Addr::LOCALHOST, port.parse().unwrap())).unwrap();
-        println!("{HOLDING} {port}");
+        println!("{HOLDING} {}", held.local_addr().unwrap().port());
         let _ = std::io::stdin().read(&mut [0u8; 1]);
         drop(held);
     }
@@ -213,7 +211,12 @@ mod tests {
             let gone = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
             gone.local_addr().unwrap().port()
         };
-        assert_eq!(udp_port(port), None);
+        // Another test running beside this one can be given the freed port.
+        let holder = udp_port(port);
+        assert!(
+            holder.as_ref().is_none_or(Holder::is_this_process),
+            "{holder:?}"
+        );
     }
 
     #[test]
