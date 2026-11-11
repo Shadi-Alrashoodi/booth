@@ -108,12 +108,12 @@ fn optimised_code_passes_both_scripts() {
 fn both_scripts_check_the_exe_they_just_built() {
     for (build, check, script) in [
         (
-            "Invoke-Tool 'the release build' ",
+            "Invoke-Build 'the release build' ",
             "Assert-OptimisedLibopus $booth $target",
             RELEASE_SCRIPT,
         ),
         (
-            "Invoke-Tool 'the store build' ",
+            "Invoke-Build 'the store build' ",
             "Assert-OptimisedLibopus (Join-Path $target 'release\\booth.exe') $target",
             STORE_SCRIPT,
         ),

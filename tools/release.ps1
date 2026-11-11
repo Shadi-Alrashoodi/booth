@@ -7,8 +7,10 @@
 # and latest.txt.minisig. Nothing is uploaded or published.
 # The key's password comes from the generic credential booth-release (Control
 # Panel, Credential Manager, Windows Credentials); without it, it is asked for.
-# -Rehearsal warns and goes on where a real run stops, for a build never to be published.
-# -FfmpegSource only puts FFmpeg's source and build recipe in dist\ffmpeg-<its version>.
+# -Rehearsal warns and goes on where a real run stops, for a build never to be published,
+# and writes to dist\<version>-rehearsal instead.
+# -FfmpegSource puts FFmpeg's source and build recipe in dist\ffmpeg-<its version>,
+# first building third_party\ffmpeg again unless it holds build-ffmpeg.ps1's pinned build.
 # -CredentialTarget reads another credential, for a test with a throwaway key.
 # The key is made once, and the public key it prints goes in RELEASE_KEY in
 # crates\app\src\update\mod.rs:
@@ -198,7 +200,7 @@ function Read-FfmpegSource {
 }
 
 if ($FfmpegSource -and ($SecretKey -or $Rehearsal -or $PSBoundParameters.ContainsKey('CredentialTarget'))) {
-    throw '-FfmpegSource builds and signs nothing, so it takes no -SecretKey, -Rehearsal or -CredentialTarget. Run it on its own: powershell -ExecutionPolicy Bypass -File tools\release.ps1 -FfmpegSource'
+    throw '-FfmpegSource makes no release of Booth, so it takes no -SecretKey, -Rehearsal or -CredentialTarget; run it on its own: powershell -ExecutionPolicy Bypass -File tools\release.ps1 -FfmpegSource'
 }
 
 $git = Get-Command git -ErrorAction SilentlyContinue
@@ -226,6 +228,24 @@ if (-not $releasesPage) {
 # The archive and the recipe zip, which is tools\build-ffmpeg.ps1 and
 # tools\ffmpeg.
 if ($FfmpegSource) {
+    # The recipe zipped below has to be this build's. As in a release, build-ffmpeg.ps1
+    # builds again, or stops, unless the DLLs, source and build.sh match its pins.
+    & (Join-Path $PSScriptRoot 'build-ffmpeg.ps1')
+    # Its compiler and MSYS2 versions are held to SOURCE.txt's Build line here; MSYS2's
+    # SHA-256 pins are not, as that line does not carry them.
+    $recipeScript = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'build-ffmpeg.ps1')
+    $msvc, $sdk, $msys2Base = foreach ($pattern in "^\`$msvc = '([^']+)'", "^\`$sdk = '([^']+)'", "/(msys2-base-[^/']+)\.tar\.xz'") {
+        [regex]::Match($recipeScript, "(?m)$pattern").Groups[1].Value
+    }
+    $packageNames = @([regex]::Matches($recipeScript, "(?m)^\s+'([^']+)-x86_64\.pkg\.tar\.zst'") | ForEach-Object { $_.Groups[1].Value })
+    if (-not ($msvc -and $sdk -and $msys2Base -and $packageNames)) {
+        throw "could not read the compiler and MSYS2 pins from tools\build-ffmpeg.ps1; keep its `$msvc, `$sdk, MSYS2 and package lines in their usual form."
+    }
+    $built = "$(Get-Content -LiteralPath (Join-Path $root 'third_party\ffmpeg\SOURCE.txt') | Where-Object { $_.StartsWith('Build: ') })"
+    $words = $built -split '[\s,;]+'
+    if (-not $built.StartsWith("Build: MSVC $msvc and Windows SDK $sdk from ") -or @(@($msys2Base) + $packageNames | Where-Object { $words -cnotcontains $_ }).Count -gt 0) {
+        throw "tools\build-ffmpeg.ps1 pins other tools than third_party\ffmpeg was built with, so its recipe zip would not be the recipe that built the DLLs; build FFmpeg again with: powershell -ExecutionPolicy Bypass -File tools\build-ffmpeg.ps1 -Force"
+    }
     $source = Read-FfmpegSource
     $archive = Join-Path $root "third_party\ffmpeg\$($source.Archive)"
     if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
@@ -234,12 +254,6 @@ if ($FfmpegSource) {
     $got = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
     if ($got -ne $source.ArchiveSha256) {
         throw "$archive has SHA-256 $got, not the $($source.ArchiveSha256) SOURCE.txt gives, so it is not the source the DLLs were built from. $rebuildFfmpeg"
-    }
-    # The recipe has to be the one that built the DLLs. SOURCE.txt pins
-    # build.sh, which holds every option; build-ffmpeg.ps1 only runs it.
-    $buildSh = Join-Path $PSScriptRoot 'ffmpeg\build.sh'
-    if ((Get-FileHash -LiteralPath $buildSh -Algorithm SHA256).Hash -ne $source.BuildShSha256) {
-        throw "tools\ffmpeg\build.sh has changed since third_party\ffmpeg was built, so the recipe zip would not be the recipe that built the DLLs. $rebuildFfmpeg"
     }
 
     $out = Join-Path $root "dist\$($source.Release)"
@@ -476,13 +490,17 @@ if ($iscc) {
 # --- This PC's folders, which no file of the release may hold -------------
 
 # Cargo resolves a relative CARGO_HOME or CARGO_TARGET_DIR against the
-# folder it runs in, which is the repository's.
+# folder it runs in, which is the repository's. Any .. is taken out, as
+# CMake writes libopus's paths without one.
 function Resolve-FromRoot([string]$Path) {
-    if ([System.IO.Path]::IsPathRooted($Path)) { $Path } else { Join-Path $root $Path }
+    [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($root, $Path))
 }
 $target = if ($env:CARGO_TARGET_DIR) { Resolve-FromRoot $env:CARGO_TARGET_DIR } else { Join-Path $root 'target' }
 $cargoHome = if ($env:CARGO_HOME) { Resolve-FromRoot $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
 $buildFolders = @($cargoHome, $root, $target | ForEach-Object { $_.TrimEnd('\', '/') } | Select-Object -Unique)
+if ($env:CARGO_BUILD_TARGET) {
+    throw "CARGO_BUILD_TARGET moves the build out of $target\release, where it is packed from; clear it with: Remove-Item Env:CARGO_BUILD_TARGET"
+}
 
 # rustc writes the full path of a downloaded crate's source into booth.exe
 # for every place it can panic from, and of any file include!d from a build
@@ -510,6 +528,8 @@ $remaps = foreach ($folder in $buildFolders | Sort-Object Length) {
 $buildArgs = @('--config', ('target.x86_64-pc-windows-msvc.rustflags=[' + ($remaps -join ', ') + ']'))
 $trims = foreach ($folder in $buildFolders | Sort-Object Length -Descending) { "/d1trimfile:$folder\" }
 $buildEnvironment = @{ CFLAGS = ((@($env:CFLAGS) + $trims) -join ' ').Trim() }
+$buildArgs += '--target-dir', $target
+if ($env:CARGO_HOME) { $buildEnvironment.CARGO_HOME = $cargoHome }
 
 # The search. Text with one byte per letter is read as Latin-1, byte for
 # byte, and a folder is looked for as rustc writes it, in UTF-8, and as
@@ -618,9 +638,20 @@ function Assert-OptimisedLibopus([string]$Exe, [string]$TargetFolder) {
     }
 }
 
+# The exe is deleted first: a build.target in a cargo config file sends the
+# build elsewhere, and an older one left in its place would be used.
+function Invoke-Build([string]$What, [string[]]$Arguments, [string]$Exe) {
+    if (Test-Path -LiteralPath $Exe) { Remove-Item -LiteralPath $Exe -Force }
+    Invoke-Tool $What 'cargo' (@('build', '--release', '--locked') + $Arguments + $buildArgs) $buildEnvironment
+    if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) {
+        throw "cargo built no $Exe, most likely because a build.target in a cargo config file moves the build; take it out and run this script again."
+    }
+}
+
 Write-Host "Booth $version"
 
 $dist = Join-Path $root "dist\$version"
+if ($Rehearsal) { $dist += '-rehearsal' }
 $staging = Join-Path $root 'dist\staging'
 
 # --- The crate check and the release key ---------------------------------
@@ -638,7 +669,7 @@ if ($Rehearsal) { $rehearsalArgs = @('--rehearsal') }
 # settle shared crates' features for both, and booth.exe would not be the
 # -p app build the license list describes. Both get the path flags, or the
 # crates they share would be built again for each.
-Invoke-Tool 'the release tool build' 'cargo' (@('build', '--release', '--locked', '-p', 'release') + $buildArgs) $buildEnvironment
+Invoke-Build 'the release tool build' @('-p', 'release') $releaseTool
 Invoke-WithKey 'the release key check' 'check-key' @($SecretKey, $releaseKey)
 
 # Only now, and held to the key's own bytes: check-key sees through a junction
@@ -672,11 +703,11 @@ New-Item -ItemType Directory -Force $files | Out-Null
 # The licenses first: they refuse an FFmpeg build that cannot ship, which
 # is quicker to hear before the long build than after it.
 Invoke-Tool 'collecting the third-party licenses' $releaseTool @('licenses', $root, $files)
-Invoke-Tool 'the release build' 'cargo' (@('build', '--release', '--locked', '-p', 'app') + $buildArgs) $buildEnvironment
+Invoke-Build 'the release build' @('-p', 'app') $booth
 Assert-OptimisedLibopus $booth $target
 
 Copy-Item -LiteralPath $booth -Destination $files
-Copy-Item -Path (Join-Path $root 'third_party\ffmpeg\bin\*.dll') -Destination $files
+Get-ChildItem -LiteralPath (Join-Path $root 'third_party\ffmpeg\bin') -Filter '*.dll' -File | Copy-Item -Destination $files
 
 # The zip's ffmpeg\SOURCE.txt gives each FFmpeg DLL's SHA-256 as the build
 # wrote it, and the release tool checks only that the lines are there, so
@@ -689,6 +720,11 @@ foreach ($dll in Get-ChildItem -LiteralPath $files -Filter '*.dll' -File) {
     $got = (Get-FileHash -LiteralPath $dll.FullName -Algorithm SHA256).Hash
     if (-not $ffmpegHashes.ContainsKey($dll.Name) -or $got -ne $ffmpegHashes[$dll.Name]) {
         throw "$($dll.Name) from third_party\ffmpeg\bin has SHA-256 $got, which is not the one third_party\ffmpeg\SOURCE.txt gives it, so the zip would describe other DLLs than it holds. Build FFmpeg again with: powershell -ExecutionPolicy Bypass -File tools\build-ffmpeg.ps1"
+    }
+}
+foreach ($dll in $ffmpegHashes.Keys) {
+    if (-not (Test-Path -LiteralPath (Join-Path $files $dll) -PathType Leaf)) {
+        throw "$dll, which third_party\ffmpeg\SOURCE.txt gives the SHA-256 of, did not go into the zip; build FFmpeg again with: powershell -ExecutionPolicy Bypass -File tools\build-ffmpeg.ps1"
     }
 }
 
@@ -764,8 +800,12 @@ if ($strays -or $missing) {
 }
 
 Write-Host ''
-Write-Host "Release $version is in $dist, not published:"
+Write-Host "$(if ($Rehearsal) { 'Rehearsal' } else { 'Release' }) $version is in $dist, not published:"
 Write-Listing $dist
 Write-Host "zip SHA-256: $sha256"
 if ($installerSha256) { Write-Host "installer SHA-256: $installerSha256" }
+if ($Rehearsal) {
+    Write-Host 'This is a rehearsal, never to be published: upload none of it. A release comes from a run without -Rehearsal.'
+    return
+}
 Write-Host "FFmpeg's source archive and recipe are not part of it. The zip sends people to $($ffmpegRelease.Address) for them, so while that release is not up yet, gather it first with: powershell -ExecutionPolicy Bypass -File tools\release.ps1 -FfmpegSource, and upload it before this one. Then upload these files to the release with the tag v$version, marked as the latest release."

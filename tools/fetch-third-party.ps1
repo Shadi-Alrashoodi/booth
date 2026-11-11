@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 
 function Get-Sha256($path) {
-    (Get-FileHash $path -Algorithm SHA256).Hash
+    (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
 }
 
 # --- FFmpeg ---------------------------------------------------------------
@@ -29,10 +29,10 @@ $nvencSha256 = '4677A397E3EC5300A6B38BF49CBA42BB63A922AB26F24BC63A05ED08857CBA16
 $nvencTarget = Join-Path $root 'third_party\nv-codec-headers'
 $nvencHeader = Join-Path $nvencTarget 'nvEncodeAPI.h'
 
-if ((Test-Path $nvencHeader) -and (Get-Sha256 $nvencHeader) -eq $nvencSha256) {
+if ((Test-Path -LiteralPath $nvencHeader) -and (Get-Sha256 $nvencHeader) -eq $nvencSha256) {
     Write-Host "nvEncodeAPI.h is already in $nvencTarget (n12.2.72.0), nothing to fetch"
 } else {
-    if (Test-Path $nvencHeader) {
+    if (Test-Path -LiteralPath $nvencHeader) {
         Write-Host "$nvencHeader does not match the pinned hash, fetching it again"
     }
     $download = Join-Path $env:TEMP 'nvEncodeAPI-n12.2.72.0.h'

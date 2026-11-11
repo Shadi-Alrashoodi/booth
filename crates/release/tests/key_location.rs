@@ -106,16 +106,23 @@ fn refuses_a_key_inside_the_folder_with_no_git_there() {
 
 // With the tools stubbed: check-key refuses, or lets it go on.
 fn empty_dist_after_check(root: &Path, key: &Path, check_key: &str) -> String {
+    empty_after_check(root, key, check_key, false)
+}
+
+fn empty_after_check(root: &Path, key: &Path, check_key: &str, rehearsal: bool) -> String {
     let clear_folder = script_lines("function Clear-Folder", "# System.IO.Compression");
     let section = script_lines("$dist = Join-Path $root", "# --- Third-party files");
+    let rehearsal = if rehearsal { "$true" } else { "$false" };
     powershell(
         &format!(
             "$root = $env:BOOTH_TEST_ROOT
             $SecretKey = $env:BOOTH_TEST_KEY
             $target = Join-Path $root 'target'
             $version = '1.2.3'
+            $Rehearsal = {rehearsal}
             {clear_folder}
             function Invoke-Tool {{ }}
+            function Invoke-Build {{ }}
             function Invoke-WithKey {{ {check_key} }}
             try {{
                 {section}
@@ -160,6 +167,40 @@ fn an_accepted_key_lets_the_folders_be_emptied() {
     assert_eq!(fs::read_dir(&dist).unwrap().count(), 0, "{said}");
     assert!(!staging.exists(), "{said}");
     assert!(key.is_file(), "{said}");
+}
+
+#[test]
+fn rehearsal_keeps_key_copy() {
+    let folder = Folder::new("rehearsal-copy");
+    let copy = folder.0.join(r"dist\1.2.3-rehearsal\copy.key");
+    place_key(&copy);
+    let release = folder.0.join(r"dist\1.2.3\old.zip");
+    place_key(&release);
+    fs::write(&release, "the zip").unwrap();
+    let key = folder.0.join(r"keys\test.key");
+    place_key(&key);
+    let said = empty_after_check(&folder.0, &key, "", true);
+    assert!(said.contains("stopped: "), "{said}");
+    assert!(said.contains("same bytes as the release key"), "{said}");
+    assert!(said.contains("Nothing was deleted"), "{said}");
+    assert!(copy.is_file(), "{said}");
+    assert!(release.is_file(), "{said}");
+}
+
+#[test]
+fn rehearsal_empties_own_folder_only() {
+    let folder = Folder::new("rehearsal-own");
+    let rehearsal = folder.0.join(r"dist\1.2.3-rehearsal");
+    place_key(&rehearsal.join("old.zip"));
+    let release = folder.0.join(r"dist\1.2.3\old.zip");
+    place_key(&release);
+    let key = folder.0.join(r"keys\test.key");
+    place_key(&key);
+    fs::write(&key, "the kez").unwrap();
+    let said = empty_after_check(&folder.0, &key, "", true);
+    assert!(said.contains("went on"), "{said}");
+    assert_eq!(fs::read_dir(&rehearsal).unwrap().count(), 0, "{said}");
+    assert!(release.is_file(), "{said}");
 }
 
 fn junction(link: &Path, target: &Path) {

@@ -33,6 +33,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+$cargoDenyVersion = '0.20.2'
 
 # -Quiet keeps a tool's output, which for makeappx is a line per file, and
 # shows it only when the tool fails.
@@ -56,6 +57,13 @@ function Invoke-Tool([string]$What, [string]$Exe, [string[]]$Arguments, [hashtab
     }
 }
 
+# For cargo-deny's version, whose stderr must not stop the script.
+function Get-ToolOutput([string]$Exe, [string[]]$Arguments) {
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & $Exe @Arguments 2>$null } finally { $ErrorActionPreference = $saved }
+}
+
 function Write-Utf8([string]$Path, [string]$Text) {
     [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding $false))
 }
@@ -67,6 +75,16 @@ function Assert-OptimisedLibopus([string]$Exe, [string]$TargetFolder) {
     $unoptimised = -join ([char[]](0x89, 0x4C, 0x24, 0x08, 0x48, 0x83, 0xEC, 0x18, 0x8B, 0x44, 0x24, 0x20, 0x0F, 0xBD, 0xC0, 0x89, 0x04, 0x24, 0x8B, 0x04, 0x24, 0x48, 0x83, 0xC4, 0x18, 0xC3))
     if ([System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes($Exe)).Contains($unoptimised)) {
         throw "$Exe holds libopus built with no optimisation, so every voice frame would cost about three times the CPU. Build it again: run cargo clean -p opusic-sys --release --target-dir `"$TargetFolder`" and then run this script again."
+    }
+}
+
+# As release.ps1 does: the exe is deleted first, since a build.target in a
+# cargo config file sends the build elsewhere and an older one would be used.
+function Invoke-Build([string]$What, [string[]]$Arguments, [string]$Exe) {
+    if (Test-Path -LiteralPath $Exe) { Remove-Item -LiteralPath $Exe -Force }
+    Invoke-Tool $What 'cargo' (@('build', '--release', '--locked') + $Arguments + $buildArgs) $buildEnvironment
+    if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) {
+        throw "cargo built no $Exe, most likely because a build.target in a cargo config file moves the build; take it out and run this script again."
     }
 }
 
@@ -126,6 +144,16 @@ if (-not $sdkBin) {
 $makeappx = Join-Path $sdkBin.FullName 'x64\makeappx.exe'
 $makepri = Join-Path $sdkBin.FullName 'x64\makepri.exe'
 
+$denyVersion = $null
+$denyCommand = Get-Command cargo-deny -ErrorAction SilentlyContinue
+if ($denyCommand) {
+    $denyVersion = (Get-ToolOutput $denyCommand.Source @('--version')) -replace '^cargo-deny\s+', ''
+}
+if ($denyVersion -ne $cargoDenyVersion) {
+    $found = if ($denyVersion) { "cargo-deny $denyVersion is installed" } else { 'cargo-deny is not installed' }
+    throw "$found; the package is checked with $cargoDenyVersion. Install it with: cargo install --locked cargo-deny@$cargoDenyVersion"
+}
+
 # --- The build ------------------------------------------------------------
 
 foreach ($name in 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS') {
@@ -135,7 +163,10 @@ foreach ($name in 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS') {
 }
 # Out of target\release, so the normal build there is never the Store's.
 $target = Join-Path $root 'target\store'
-$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+if ($env:CARGO_BUILD_TARGET) {
+    throw "CARGO_BUILD_TARGET moves the build out of $target\release, where it is packed from; clear it with: Remove-Item Env:CARGO_BUILD_TARGET"
+}
+$cargoHome = if ($env:CARGO_HOME) { [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($root, $env:CARGO_HOME)) } else { Join-Path $env:USERPROFILE '.cargo' }
 $buildFolders = @($cargoHome, $root, $target | ForEach-Object { $_.TrimEnd('\', '/') } | Select-Object -Unique)
 foreach ($folder in $buildFolders) {
     if ($folder -match '\s') {
@@ -150,8 +181,13 @@ $remaps = foreach ($folder in $buildFolders | Sort-Object Length) {
 $buildArgs = @('--config', ('target.x86_64-pc-windows-msvc.rustflags=[' + ($remaps -join ', ') + ']'), '--target-dir', $target)
 $trims = foreach ($folder in $buildFolders | Sort-Object Length -Descending) { "/d1trimfile:$folder\" }
 $buildEnvironment = @{ CFLAGS = ((@($env:CFLAGS) + $trims) -join ' ').Trim() }
+if ($env:CARGO_HOME) { $buildEnvironment.CARGO_HOME = $cargoHome }
 
 Write-Host "Booth $version for the Microsoft Store, package version $packageVersion"
+
+# As release.ps1 does. It also downloads the crates the license step then
+# reads with cargo offline.
+Invoke-Tool 'cargo deny' 'cargo' @('deny', '--locked', 'check', '--hide-inclusion-graph')
 
 $out = Join-Path $root 'dist\store'
 $layout = Join-Path $out 'layout'
@@ -161,13 +197,13 @@ New-Item -ItemType Directory -Force $layout | Out-Null
 
 & (Join-Path $PSScriptRoot 'fetch-third-party.ps1')
 
-Invoke-Tool 'the release tool build' 'cargo' (@('build', '--release', '--locked', '-p', 'release') + $buildArgs) $buildEnvironment
+Invoke-Build 'the release tool build' @('-p', 'release') (Join-Path $target 'release\release.exe')
 Invoke-Tool 'collecting the third-party licenses' (Join-Path $target 'release\release.exe') @('licenses', $root, $layout)
-Invoke-Tool 'the store build' 'cargo' (@('build', '--release', '--locked', '-p', 'app', '--features', 'store') + $buildArgs) $buildEnvironment
+Invoke-Build 'the store build' @('-p', 'app', '--features', 'store') (Join-Path $target 'release\booth.exe')
 Assert-OptimisedLibopus (Join-Path $target 'release\booth.exe') $target
 
 Copy-Item -LiteralPath (Join-Path $target 'release\booth.exe') -Destination $layout
-Copy-Item -Path (Join-Path $root 'third_party\ffmpeg\bin\*.dll') -Destination $layout
+Get-ChildItem -LiteralPath (Join-Path $root 'third_party\ffmpeg\bin') -Filter '*.dll' -File | Copy-Item -Destination $layout
 foreach ($file in 'LICENSE-MIT', 'LICENSE-APACHE') {
     Copy-Item -LiteralPath (Join-Path $root $file) -Destination $layout
 }
@@ -182,6 +218,11 @@ foreach ($dll in Get-ChildItem -LiteralPath $layout -Filter '*.dll' -File) {
     $got = (Get-FileHash -LiteralPath $dll.FullName -Algorithm SHA256).Hash
     if (-not $ffmpegHashes.ContainsKey($dll.Name) -or $got -ne $ffmpegHashes[$dll.Name]) {
         throw "$($dll.Name) from third_party\ffmpeg\bin has SHA-256 $got, not the one third_party\ffmpeg\SOURCE.txt gives it. Build FFmpeg again with: powershell -ExecutionPolicy Bypass -File tools\build-ffmpeg.ps1"
+    }
+}
+foreach ($dll in $ffmpegHashes.Keys) {
+    if (-not (Test-Path -LiteralPath (Join-Path $layout $dll) -PathType Leaf)) {
+        throw "$dll, which third_party\ffmpeg\SOURCE.txt gives the SHA-256 of, did not go into the package; build FFmpeg again with: powershell -ExecutionPolicy Bypass -File tools\build-ffmpeg.ps1"
     }
 }
 
@@ -390,23 +431,34 @@ Remove-Item -LiteralPath $priConfig -Force
 
 $latin1 = [System.Text.Encoding]::GetEncoding(28591)
 $options = [System.Text.RegularExpressions.RegexOptions]'IgnoreCase, CultureInvariant'
-$needles = @(New-Object regex ':[\\/]+Users\b', $options) + @(
-    $env:USERPROFILE, $cargoHome, $root, $target | Where-Object { $_ } | ForEach-Object {
-        $parts = @($_ -split '[\\/]+' | Where-Object { $_ }) | ForEach-Object { [regex]::Escape($_) }
-        New-Object regex ($parts -join '[\\/]+'), $options
-    })
+# As release.ps1 searches: one-byte text is read as Latin-1, so there a
+# folder is looked for as rustc writes it, in UTF-8, and as cl.exe does, in ANSI.
+function Get-Needles([bool]$OneByte) {
+    [pscustomobject]@{ Folder = ':\Users'; Regex = New-Object regex ':[\\/]+Users\b', $options }
+    foreach ($folder in $env:USERPROFILE, $cargoHome, $root, $target | Where-Object { $_ }) {
+        $forms = if ($OneByte) {
+            [System.Text.Encoding]::UTF8, [System.Text.Encoding]::Default |
+                ForEach-Object { $latin1.GetString($_.GetBytes($folder)) } | Select-Object -Unique
+        } else { $folder }
+        foreach ($form in $forms) {
+            $parts = @($form -split '[\\/]+' | Where-Object { $_ }) | ForEach-Object { [regex]::Escape($_) }
+            [pscustomobject]@{ Folder = $folder; Regex = New-Object regex ($parts -join '[\\/]+'), $options }
+        }
+    }
+}
+$oneByteNeedles = @(Get-Needles $true)
+$wideNeedles = @(Get-Needles $false)
 $hits = @()
 foreach ($file in Get-ChildItem -LiteralPath $layout -Recurse -File) {
     $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
-    $texts = @($latin1.GetString($bytes))
+    $texts = @(@{ Text = $latin1.GetString($bytes); Needles = $oneByteNeedles })
     if ($bytes.Length -ge 2) {
-        $texts += [System.Text.Encoding]::Unicode.GetString($bytes)
-        $texts += [System.Text.Encoding]::Unicode.GetString($bytes, 1, $bytes.Length - 1)
+        $texts += @{ Text = [System.Text.Encoding]::Unicode.GetString($bytes); Needles = $wideNeedles }
+        $texts += @{ Text = [System.Text.Encoding]::Unicode.GetString($bytes, 1, $bytes.Length - 1); Needles = $wideNeedles }
     }
     foreach ($text in $texts) {
-        foreach ($needle in $needles) {
-            $found = $needle.Match($text)
-            if ($found.Success) { $hits += "$($file.FullName) holds $($found.Value)" }
+        foreach ($needle in $text.Needles) {
+            if ($needle.Regex.IsMatch($text.Text)) { $hits += "$($file.FullName) holds $($needle.Folder)" }
         }
     }
 }
