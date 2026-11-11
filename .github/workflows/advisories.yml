@@ -1,0 +1,41 @@
+name: advisories
+
+on:
+  schedule:
+    - cron: '37 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - run: rustup toolchain install
+
+      # The version tools\release.ps1 checks with.
+      - name: cargo-deny
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $name = 'cargo-deny-0.20.2-x86_64-pc-windows-msvc'
+          $sha256 = '975A22143262FD27476D19EE00C7AF67978426E40E1DEE94EED6BBADE1CF87DC'
+          $archive = Join-Path $env:RUNNER_TEMP "$name.tar.gz"
+          Invoke-WebRequest -Uri "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/$name.tar.gz" -OutFile $archive -UseBasicParsing
+          $got = (Get-FileHash $archive -Algorithm SHA256).Hash
+          if ($got -ne $sha256) { throw "the cargo-deny download does not match the pinned hash: expected $sha256, got $got" }
+          & (Join-Path $env:SystemRoot 'System32\tar.exe') -xzf $archive -C $env:RUNNER_TEMP
+          if ($LASTEXITCODE -ne 0) { throw "could not unpack $archive (tar exit code $LASTEXITCODE)" }
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $env:RUNNER_TEMP $name)
+
+      # Licenses, bans and sources change only with a push, and the push build
+      # checks them. Advisories come out between pushes.
+      - run: cargo deny --locked check advisories

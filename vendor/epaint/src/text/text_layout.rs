@@ -1884,11 +1884,12 @@ mod tests {
     #[test]
     fn test_zero_max_width() {
         let pixels_per_point = 1.0;
-        let mut fonts = FontsImpl::new(TextOptions::default(), FontDefinitions::default());
+        let mut fonts = plex_fonts();
         let mut layout_job = LayoutJob::single_section("W".into(), TextFormat::default());
         layout_job.wrap.max_width = 0.0;
         let galley = layout(&mut fonts, pixels_per_point, layout_job.into());
         assert_eq!(galley.rows.len(), 1);
+        assert_eq!(galley.rows[0].row.glyphs.len(), 1);
     }
 
     #[test]
@@ -2052,13 +2053,14 @@ mod tests {
     #[test]
     fn test_empty_row() {
         let pixels_per_point = 1.0;
-        let mut fonts = FontsImpl::new(TextOptions::default(), FontDefinitions::default());
+        let mut fonts = plex_fonts();
 
         let font_id = FontId::default();
         let font_height = fonts
             .font(&font_id.family)
             .styled_metrics(pixels_per_point, font_id.size, &VariationCoords::default())
             .row_height;
+        assert!(font_height > 0.0);
 
         let job = LayoutJob::simple(String::new(), font_id, Color32::WHITE, f32::INFINITY);
 
@@ -2366,7 +2368,12 @@ mod tests {
     #[test]
     fn test_grapheme_cluster_cursor_roundtrip() {
         let pixels_per_point = 1.0;
-        let mut fonts = FontsImpl::new(TextOptions::default(), FontDefinitions::default());
+        // Subpixel binning off, as the app draws text: with it on, the glyph
+        // after a continuation glyph can sit a pixel to its left.
+        let mut fonts = plex_fonts_with(TextOptions {
+            subpixel_binning: false,
+            ..Default::default()
+        });
         let font_id = FontId::default();
 
         // "A" + flag emoji (2 codepoints) + "B" = 4 chars
@@ -2378,6 +2385,7 @@ mod tests {
             f32::INFINITY,
         );
         let galley = layout(&mut fonts, pixels_per_point, job.into());
+        assert_eq!(galley.rows[0].row.glyphs.len(), 4);
 
         // Walking through every cursor index should produce valid positions.
         for i in 0..=galley.end().index.0 {
@@ -2406,8 +2414,12 @@ mod tests {
     }
 
     /// Plex Sans with Plex Sans Arabic after it, the fonts the app ships.
-    /// The upstream tests use egui's default fonts, which are not built here.
+    /// Most upstream tests use egui's default fonts, which are not built here.
     fn plex_fonts() -> FontsImpl {
+        plex_fonts_with(TextOptions::default())
+    }
+
+    fn plex_fonts_with(options: TextOptions) -> FontsImpl {
         let mut definitions = FontDefinitions::empty();
         for (name, bytes) in [
             (
@@ -2427,7 +2439,7 @@ mod tests {
             FontFamily::Proportional,
             vec!["plex-sans".to_owned(), "plex-sans-arabic".to_owned()],
         );
-        FontsImpl::new(TextOptions::default(), definitions)
+        FontsImpl::new(options, definitions)
     }
 
     fn layout_simple(fonts: &mut FontsImpl, text: &str) -> Arc<Galley> {

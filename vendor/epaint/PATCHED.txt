@@ -140,6 +140,9 @@ Other changes to the crate
 - The 13 upstream tests that need egui's default fonts are ignored unless
   the default_fonts feature is on. Booth does not build that feature, and
   the epaint_default_fonts crate is not in its Cargo.lock.
+- test_zero_max_width, test_empty_row and
+  test_grapheme_cluster_cursor_roundtrip, which laid nothing out without
+  those fonts, run on Plex, the last with subpixel binning off as in the app.
 - Everything else is as upstream wrote it, its TODO lines included.
 
 LICENSE-MIT and LICENSE-APACHE are egui's, from github.com/emilk/egui at tag

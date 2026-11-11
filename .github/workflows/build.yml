@@ -10,7 +10,7 @@ permissions:
 jobs:
   windows:
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 60
     defaults:
       run:
         shell: powershell
@@ -74,25 +74,39 @@ jobs:
       - if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      # --show-output puts the line each hardware test prints when the runner
-      # has no GPU encoder, monitor or microphone for it into the log. The
-      # voice test outage_of_200_ms counts the frames a listener's buffer
-      # holds after an outage, which a late scheduler moves by one here three
-      # runs in five; on a PC it does so about one run in twenty, and it runs
-      # there. --exact holds each --skip to a whole test name, so the jitter
-      # buffer test whose name begins outage_of_200_ms still runs here.
+      # The memstats build, which --workspace never turns on.
       - if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
-        timeout-minutes: 60
+        run: cargo clippy -p app --features memstats --all-targets --locked -- -D warnings
+
+      # --show-output logs the note each hardware test prints when the runner
+      # lacks its device. Room's outage_of_200_ms is often a frame off here,
+      # and --exact still runs the jitter test whose name starts the same.
+      - if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        timeout-minutes: 30
         run: cargo test --workspace --locked --no-fail-fast -- --show-output --exact --skip client_follows_the_hosts_ping_from_a_new_address --skip video_reaches_only_the_watchers --skip outage_of_200_ms
 
-      # On four busy cores these two miss what they wait for: the host's
-      # notice that lasts only until the friend is heard again, and a 256 KB
-      # pointer shape crossing two control streams within 3 s. Their files
-      # run again here, one test at a time, all but the first, which misses
-      # here too.
+      # The other two skipped above miss what they wait for on four busy cores.
+      # Their files run again one test at a time, all but the first, which
+      # misses here too.
       - if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
-        timeout-minutes: 20
-        run: cargo test -p room --locked --no-fail-fast --test address --test share -- --show-output --test-threads=1 --skip client_follows_the_hosts_ping_from_a_new_address
+        timeout-minutes: 5
+        run: cargo test -p room --locked --no-fail-fast --test address --test share -- --show-output --test-threads=1 --exact --skip client_follows_the_hosts_ping_from_a_new_address
+
+      # The vendored epaint and egui are patched in, not workspace members, so
+      # --workspace leaves their tests out.
+      - if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        timeout-minutes: 5
+        run: cargo test -p epaint -p egui --locked --no-fail-fast
+
+      # memstats' test, after the others so most of its build is done.
+      - if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        timeout-minutes: 5
+        run: cargo test -p app --features memstats --locked --no-fail-fast --bin booth -- memstats::tests
 
       - if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: cargo build --release --locked -p app
+
+      # release_encode_drops_bad_parts builds only without debug assertions.
+      - if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        timeout-minutes: 5
+        run: cargo test -p invite --release --locked --no-fail-fast
