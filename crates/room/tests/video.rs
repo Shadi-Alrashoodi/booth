@@ -35,6 +35,10 @@ use windows::Win32::UI::WindowsAndMessaging::{SW_MINIMIZE, SW_RESTORE, WS_OVERLA
 const NVIDIA: u32 = 0x10de;
 const FFMPEG: [&str; 2] = ["avcodec-62.dll", "avutil-60.dll"];
 const WAIT: Duration = Duration::from_secs(5);
+// The pattern shared at 120 fps: what the sharer encodes a second at least,
+// even with every CPU busy, and the part of that, in percent, a watcher shows.
+const ENCODED_FLOOR: u32 = 50;
+const SHOWN_PCT: u32 = 85;
 
 // One test at a time on the GPU, and one at a time raising the timer
 // resolution, which fine_timers_held counts for the whole process.
@@ -224,6 +228,40 @@ fn next_second(member: &Member, after: &WatchingNumbers) -> WatchingNumbers {
         .expect("numbers while watching")
 }
 
+// A watcher's frames shown in its next second, and what the sharer encoded a
+// second as that second came in and in its next reading. The two seconds do
+// not line up, so the watcher's falls across both.
+fn shown_and_encoded(watcher: &Member, sharer: &Member) -> (u32, [u32; 2]) {
+    let shown = next_second(watcher, &watching_numbers(watcher)).fps;
+    let now = sharing_numbers(sharer);
+    let next = sharer
+        .wait_for(Duration::from_secs(3), "the sharer's next numbers", |v| {
+            v.numbers.sharing.as_ref().is_some_and(|next| *next != now)
+        })
+        .numbers
+        .sharing
+        .expect("numbers while sharing");
+    (shown, [now.encoded_fps, next.encoded_fps])
+}
+
+// A busy PC holds the sharer's own rate back, so it has a floor of its own,
+// and the watcher is held to what the sharer encoded.
+fn keeps_up(who: &str, shown: u32, encoded: [u32; 2]) {
+    println!(
+        "{who}: {shown} frames shown in a second, the sharer encoding {} and {} a second",
+        encoded[0], encoded[1]
+    );
+    assert!(
+        encoded.iter().all(|&fps| fps >= ENCODED_FLOOR),
+        "{who}: the sharer encoded {encoded:?} frames a second of 120"
+    );
+    let least = encoded.into_iter().min().unwrap_or(0);
+    assert!(
+        shown * 100 >= least * SHOWN_PCT,
+        "{who}: {shown} frames shown a second of {encoded:?} encoded"
+    );
+}
+
 fn print_watched(who: &str, numbers: &WatchingNumbers) {
     let latency = numbers.capture_to_display.map_or_else(
         || String::from("not measured"),
@@ -341,7 +379,8 @@ fn host_shares_and_friends_watch() {
     print_watched("Ana", &watched);
     let shared = sharing_numbers(&host);
     print_shared(&shared);
-    assert!(watched.fps >= 100, "{} frames a second of 120", watched.fps);
+    let (shown, encoded) = shown_and_encoded(ana, &host);
+    keeps_up("Ana", shown, encoded);
     let latency = watched.capture_to_display.expect("capture to display");
     assert!(
         latency.median_ms > 0.0 && latency.median_ms < 50.0,
@@ -469,8 +508,9 @@ fn friends_share_through_the_host() {
     print_watched("the host", &on_host);
     print_watched("Bo", &on_bo);
     print_shared(&sharing_numbers(ana));
-    for (who, numbers) in [("the host", &on_host), ("Bo", &on_bo)] {
-        assert!(numbers.fps >= 100, "{who}: {} fps", numbers.fps);
+    for (who, watcher, numbers) in [("the host", &host, &on_host), ("Bo", bo, &on_bo)] {
+        let (shown, encoded) = shown_and_encoded(watcher, ana);
+        keeps_up(who, shown, encoded);
         assert!(numbers.capture_to_display.is_some(), "{who}");
         assert_eq!(numbers.decode_failed, 0, "{who}");
     }

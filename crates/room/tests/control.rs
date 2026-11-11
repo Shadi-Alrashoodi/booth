@@ -888,10 +888,25 @@ fn hostile_input_breaks_nothing() {
         v.share.control.controlled_by.is_none() && v.share.control.asked_by.is_none()
     });
     host.wait_for("no controller", |v| v.share.control.controller.is_none());
+    // Bo asks from his own roster, which can be a moment behind the host's.
+    bo.wait_for("no controller as Bo sees it", |v| {
+        v.share.control.controller.is_none()
+    });
     control_between(bo, ana, share, "Bo, after Eve");
-    for member in [&host, ana, bo] {
+    for member in [ana, bo] {
         assert_eq!(member.view().strip.state, LinkState::Live);
     }
+    // Eve answers no pings, and a second after her last message the host's
+    // strip follows her. Nobody else may be reconnecting.
+    let view = host.view();
+    assert!(
+        view.people
+            .iter()
+            .filter(|person| person.name != "Eve")
+            .all(|person| !person.reconnecting),
+        "{:?}",
+        view.people
+    );
 }
 
 // The host's End control, from the row menu: both sides are told the host

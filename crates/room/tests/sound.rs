@@ -172,7 +172,7 @@ fn a_friends_pc_sound_reaches_its_watchers_on_their_sides() {
         .expect("a share")
         .number;
     for watcher in [&host, &ana, &cy] {
-        watcher.room().watch(share, true);
+        watches(watcher, share);
     }
     host.member.wait_for(WAIT, "three watching", |v| {
         v.share

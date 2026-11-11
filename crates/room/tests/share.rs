@@ -900,8 +900,11 @@ fn pointer_flood_is_limited() {
     assert_eq!(numbers.video_relayed + numbers.video_dropped, 1000);
     assert!(numbers.video_dropped > 0);
     assert!(numbers.video_relayed as f64 <= most + 1.0);
-    let got = seen(&bo.room().watching(), 0, Duration::from_millis(200));
-    assert!(got.pointer.is_some_and(|(at, _)| at == share));
+    // The host counts an update as it sends it; Bo has it a moment later.
+    let (at, _) = poll(WAIT, "a pointer at Bo's", || {
+        seen(&bo.room().watching(), 0, Duration::ZERO).pointer
+    });
+    assert_eq!(at, share);
 }
 
 // Video from anyone who does not share, and from someone who is not in the

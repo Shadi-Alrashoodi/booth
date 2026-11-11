@@ -44,6 +44,15 @@ fn last_200_ms(samples: &[f32]) -> &[f32] {
     &samples[samples.len().saturating_sub(9600)..]
 }
 
+// Each 50 ms of the last 200 measured on its own, then the mean: when the
+// jitter buffer grows by a frame inside the window, the tone after the step
+// is out of phase with the tone before, and over the whole window they cancel.
+fn last_200_ms_amplitude(samples: &[f32], hz: f64) -> f64 {
+    let blocks = last_200_ms(samples).chunks(2400);
+    let count = blocks.len() as f64;
+    blocks.map(|block| amplitude(block, hz)).sum::<f64>() / count
+}
+
 // The time of the frame played last before the view was stored. The view
 // is stored again only when something it shows changed, and a voice packet
 // changes nothing it shows, so a new time comes with the pings, about every
@@ -136,7 +145,8 @@ fn held_talk_reaches_the_host() {
         .wait_for(Duration::from_secs(2), "Ana talking on the host", |v| {
             talking(v, "Ana")
         });
-    assert!(you_talk(&ana.view()));
+    ana.member
+        .wait_for(OWN_VIEW_WITHIN, "Ana's own view says she talks", you_talk);
 
     let arrived = poll(
         Duration::from_secs(4),
@@ -148,6 +158,7 @@ fn held_talk_reaches_the_host() {
         },
     );
     let delay = arrived.saturating_duration_since(tone_at);
+    let round_trip = host.view().numbers.rtt_min_ms.expect("a round trip to Ana");
     let at_tone = mouth_to_ear_around(&host.member);
     thread::sleep(Duration::from_millis(500));
     let before = host.view().numbers;
@@ -197,17 +208,15 @@ fn held_talk_reaches_the_host() {
     assert_eq!((m2e.name.as_str(), buffer.name.as_str()), ("Ana", "Ana"));
     assert!(ms(delay) < 30.0, "{:.1} ms", ms(delay));
     assert!(m2e.avg_ms < 30.0 && m2e.p95_ms < 30.0, "{m2e:?}");
-    // The room counts a render period and the 1.5 ms the fake reports as
-    // Windows' own latency, which the fake's playback clock leaves out. The
-    // stats' times for the frames either side of the tone are what the tone
-    // is checked against, not the 10 s average: that also holds the frames
-    // played before the buffer grew to its steady depth, a frame sooner, so
-    // it reads lower the later in the spell the buffer grew.
+    // The room counts a render period and the fake's 1.5 ms, which its
+    // playback clock leaves out. Ana's capture times reach the host's clock
+    // through the offset, good to half the round trip of the ping that set it.
     let modelled = f64::from(PERIOD) * 1000.0 / RATE as f64 + 1.5;
+    let within = 2.0 + f64::from(round_trip) / 2.0;
     let apart = at_tone.map(|m2e| f64::from(m2e) - ms(delay));
     assert!(
-        apart.iter().any(|apart| (apart - modelled).abs() < 2.0),
-        "the two clocks are {:.1} and {:.1} ms apart",
+        apart.iter().any(|apart| (apart - modelled).abs() < within),
+        "the two clocks are {:.1} and {:.1} ms apart, the round trip {round_trip:.1} ms",
         apart[0],
         apart[1]
     );
@@ -259,17 +268,7 @@ fn three_hear_each_other_not_themselves() {
             talking(v, "Ana")
         });
     thread::sleep(Duration::from_millis(400));
-    // Each 50 ms measured on its own, then the mean. On a busy PC the jitter
-    // buffer can grow by a 5 ms frame inside the window, and the tone after
-    // that step is out of phase with the tone before it: measured over the
-    // whole 200 ms the two cancel, down to 0.6 of the 660 Hz level. 50 ms
-    // still holds whole cycles of both tones.
-    let on = |who: &Voiced, hz| {
-        let heard = who.heard().0;
-        let blocks = last_200_ms(&heard).chunks(2400);
-        let count = blocks.len() as f64;
-        blocks.map(|block| amplitude(block, hz)).sum::<f64>() / count
-    };
+    let on = |who: &Voiced, hz| last_200_ms_amplitude(&who.heard().0, hz);
     let (host_440, host_660) = (on(&host, 440.0), on(&host, 660.0));
     let (bo_440, ana_440) = (on(&bo, 440.0), on(&ana, 440.0));
     println!(
@@ -391,16 +390,50 @@ fn loss_turns_on_redundancy_then_10_ms_frames() {
         "voice: microphone opened: \"Test microphone\", period 2.67 ms (128 frames)",
         "engine 48000 Hz, resampled by windows no, bluetooth hands-free no, small period yes",
         "voice: speakers opened: \"Test speakers\"",
-        "voice: redundancy on, a listener lost ",
-        " percent one or two frames at a time over the last 2 s",
-        "voice: 10 ms frames with opus repair data, a listener lost ",
-        // Reports land about a second apart, so these two read 2 s or 3 s.
-        "voice: back to 5 ms frames, 0.0 percent scattered loss, under 1 for ",
-        "voice: redundancy off, no scattered loss reported for ",
         "voice: microphone closed, the room closed",
     ] {
         assert!(text.contains(line), "no {line:?} in:\n{text}");
     }
+    // Redundancy goes on at the first loss. The other three switches wait for
+    // 2 s of reports, which come about a second apart and still count across
+    // a gap of 2.5 s, so their times read 2 to 4 s.
+    let held = 2.0..=4.0;
+    let lines = |start: &str| {
+        let found: Vec<&str> = text.lines().filter(|line| line.contains(start)).collect();
+        assert!(!found.is_empty(), "no {start:?} in:\n{text}");
+        found
+    };
+    for line in lines("voice: redundancy on, a listener lost ") {
+        assert!(number_after(line, "lost ") > 0.0, "{line}");
+        assert!(
+            line.ends_with(" percent one or two frames at a time over the last 2 s"),
+            "{line}"
+        );
+    }
+    for line in lines("voice: 10 ms frames with opus repair data, a listener lost ") {
+        assert!(number_after(line, "lost ") >= 5.0, "{line}");
+        assert!(
+            held.contains(&number_after(line, "5 or more for ")),
+            "{line}"
+        );
+    }
+    for line in lines("voice: back to 5 ms frames, ") {
+        assert!(number_after(line, "frames, ") < 1.0, "{line}");
+        assert!(held.contains(&number_after(line, "under 1 for ")), "{line}");
+    }
+    for line in lines("voice: redundancy off, no scattered loss reported for ") {
+        assert!(
+            held.contains(&number_after(line, "reported for ")),
+            "{line}"
+        );
+    }
+}
+
+// The number that follows `before` in a log line.
+fn number_after(line: &str, before: &str) -> f64 {
+    line.split_once(before)
+        .and_then(|(_, rest)| rest.split(' ').next()?.parse().ok())
+        .unwrap_or_else(|| panic!("no number after {before:?} in {line:?}"))
 }
 
 fn steady_330(frame: u64, _: u16) -> f32 {
@@ -650,6 +683,10 @@ fn mute_deafen_and_release() {
     config.log = Some(ana_log.clone());
     let mut ana = Voiced::join((config, microphone, speakers), host_invite(&host.member));
     settled(&host, &[&ana]);
+    // A mute before the stream starts closes nothing that counts as a stop.
+    poll(Duration::from_secs(3), "Ana's microphone starts", || {
+        (ana.microphone.record().starts == 1).then_some(())
+    });
 
     ana.room().mute(true);
     poll(Duration::from_secs(2), "Ana's microphone closes", || {
@@ -1416,11 +1453,21 @@ fn automatic_volume_brings_a_quiet_microphone_up() {
                 talking(v, "Mara")
             });
         thread::sleep(Duration::from_secs(4));
-        let heard = amplitude(last_200_ms(&ana.heard().0), 440.0);
+        let heard = last_200_ms_amplitude(&ana.heard().0, 440.0);
         println!("automatic volume {on}: Ana hears {heard:.3} of 0.020");
         assert!(heard_at.contains(&heard), "{heard}");
         host.room().talk(false);
     }
+}
+
+// The jitter buffer grows by a frame 75 ms into the window, in the middle of
+// a block: the quiet tone of the test above still reads inside its bounds.
+#[test]
+fn level_across_buffer_step() {
+    let tone: Vec<f32> = (0..9600).map(|frame| sine(frame, 440.0, 0.02)).collect();
+    let stepped = [&tone[..3600], &tone[3360..9360]].concat();
+    let heard = last_200_ms_amplitude(&stepped, 440.0);
+    assert!((0.017..0.023).contains(&heard), "{heard}");
 }
 
 // 2.5 s into the microphone's stream a 1 kHz tone starts, late enough for
