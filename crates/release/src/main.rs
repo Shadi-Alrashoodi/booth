@@ -30,8 +30,9 @@ const USAGE: &str = "usage:
   release sign [--rehearsal] [--password-stdin] <secret key file> <public key> <file>...
       checks the key as check-key does, then writes <file>.minisig for each
       file; the key file must be outside any git repository
-  release licenses <repository folder> <output folder>
-      writes THIRD-PARTY-LICENSES.txt and the ffmpeg folder into the output folder";
+  release licenses [--store] <repository folder> <output folder>
+      writes THIRD-PARTY-LICENSES.txt and the ffmpeg folder into the output folder,
+      with --store as they go in the Microsoft Store package";
 
 // minisign takes the key's password as a String and frees it without
 // wiping it, whether it read it from the console or was handed it from a
@@ -84,7 +85,9 @@ fn main() -> ExitCode {
                 password,
             )
         }),
-        (Some("licenses"), false, 2) => collect_licenses(Path::new(&rest[0]), Path::new(&rest[1])),
+        (Some("licenses"), false, _) if let Some((root, out, layout)) = licenses_args(rest) => {
+            collect_licenses(root, out, layout)
+        }
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -189,14 +192,26 @@ fn sign(
     Ok(())
 }
 
-fn collect_licenses(root: &Path, out: &Path) -> Result<(), String> {
+fn licenses_args(rest: &[OsString]) -> Option<(&Path, &Path, ffmpeg::Layout)> {
+    match rest {
+        [store, root, out] if store == "--store" => {
+            Some((Path::new(root), Path::new(out), ffmpeg::Layout::Store))
+        }
+        [root, out] if root != "--store" => {
+            Some((Path::new(root), Path::new(out), ffmpeg::Layout::Zip))
+        }
+        _ => None,
+    }
+}
+
+fn collect_licenses(root: &Path, out: &Path, layout: ffmpeg::Layout) -> Result<(), String> {
     let metadata = licenses::cargo_metadata(root)?;
     let tree = licenses::cargo_tree(root)?;
-    let (collected, ffmpeg) = licenses::collect(root, &metadata, &tree)?;
+    let (collected, ffmpeg) = licenses::collect(root, &metadata, &tree, layout)?;
     fs::create_dir_all(out).map_err(|err| format!("could not create {}: {err}", out.display()))?;
     let file = out.join("THIRD-PARTY-LICENSES.txt");
     licenses::write_crlf(&file, &collected.file)?;
-    ffmpeg.write_folder(out)?;
+    ffmpeg.write_folder(out, layout)?;
     println!("wrote {}: {} crates", file.display(), collected.crate_count);
     println!(
         "wrote {}: {} under the LGPL {} or later",
@@ -259,5 +274,19 @@ mod tests {
         assert!(folder.join("first.minisig").is_file());
         assert_eq!(fs::read(&key_path).unwrap(), key_bytes);
         let _ = fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn store_flag_picks_layout() {
+        let args = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
+        let (root, out) = (Path::new("repository"), Path::new("out"));
+        assert_eq!(
+            licenses_args(&args(&["repository", "out"])),
+            Some((root, out, ffmpeg::Layout::Zip))
+        );
+        assert_eq!(
+            licenses_args(&args(&["--store", "repository", "out"])),
+            Some((root, out, ffmpeg::Layout::Store))
+        );
     }
 }

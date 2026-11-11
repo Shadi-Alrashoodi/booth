@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::expression;
-use crate::ffmpeg::Ffmpeg;
+use crate::ffmpeg::{Ffmpeg, Layout};
 use crate::fonts::{self, Fonts};
 use crate::json::{self, Value};
 
@@ -388,7 +388,8 @@ pub fn license_crate(package: &Package) -> Result<(Crate, Vec<String>), String> 
     }
     for (i, file) in files.iter().enumerate() {
         let notice = file.kind == Kind::Notice
-            || (matches!(file.kind, Kind::Mixed | Kind::OwnWords) && !used_files.contains(&i));
+            || (matches!(file.kind, Kind::Mixed | Kind::OwnWords) && !used_files.contains(&i))
+            || (file.kind == Kind::Text && !used_files.contains(&i) && named_notice(&file.path));
         // A crate that bundles a library often ships the library's license
         // at its top as well; the same text is printed once.
         if !notice || texts.iter().any(|t| t.body == file.text) {
@@ -448,6 +449,13 @@ fn family(license: &str) -> &str {
         .or_else(|| base.strip_suffix("-or-later"))
         .or_else(|| base.strip_suffix('+'))
         .unwrap_or(base)
+}
+
+// A NOTICE or COPYRIGHT file is kept even when the license whose text it
+// holds is not the one used.
+fn named_notice(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path).to_uppercase();
+    name.starts_with("NOTICE") || name.starts_with("COPYRIGHT")
 }
 
 struct LicenseFile {
@@ -748,7 +756,12 @@ fn leading_comment(text: &str) -> Option<String> {
     Some(normalize(&lines.join("\n"))).filter(|t| !t.is_empty())
 }
 
-pub fn collect(root: &Path, metadata: &str, tree: &str) -> Result<(Collected, Ffmpeg), String> {
+pub fn collect(
+    root: &Path,
+    metadata: &str,
+    tree: &str,
+    layout: Layout,
+) -> Result<(Collected, Ffmpeg), String> {
     let metadata = json::parse(metadata)?;
     let (version, packages) = packages_in_exe(&metadata, tree, "app")?;
     let mut crates = Vec::new();
@@ -761,7 +774,7 @@ pub fn collect(root: &Path, metadata: &str, tree: &str) -> Result<(Collected, Ff
     let copied = read_copied(root)?;
     let fonts = fonts::read(&root.join("assets").join("fonts"), &packages)?;
     let ffmpeg = Ffmpeg::read(&root.join("third_party").join("ffmpeg"))?;
-    let file = render(&version, &crates, &copied, &fonts, &ffmpeg);
+    let file = render(&version, &crates, &copied, &fonts, &ffmpeg, layout);
     Ok((
         Collected {
             file,
@@ -778,6 +791,7 @@ pub fn render(
     copied: &[CopiedCode],
     fonts: &Fonts,
     ffmpeg: &Ffmpeg,
+    layout: Layout,
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!("Third-party software in Booth {version}\n\n"));
@@ -869,7 +883,7 @@ pub fn render(
     out.push_str(&fonts.notice());
 
     heading(&mut out, "4. FFmpeg");
-    out.push_str(&ffmpeg.notice());
+    out.push_str(&ffmpeg.notice(layout));
     out
 }
 
@@ -1114,6 +1128,31 @@ mod tests {
             .collect();
         assert_eq!(texts, [("MIT", None), ("notice", Some("LICENSE-ODD"))]);
         assert!(manual.is_empty());
+    }
+
+    #[test]
+    fn notice_kept_by_name() {
+        let folder = Folder::new("notice-text")
+            .with("LICENSE-MIT", MIT_TEXT)
+            .with("NOTICE", STANDARD[0].1);
+        let (krate, _) = license_crate(&folder.package("MIT OR Apache-2.0")).unwrap();
+        assert_eq!(krate.used_under, ["MIT"]);
+        let texts: Vec<(&str, Option<&str>)> = krate
+            .texts
+            .iter()
+            .map(|t| (t.label.as_str(), t.from.as_deref()))
+            .collect();
+        assert_eq!(texts, [("MIT", None), ("notice", Some("NOTICE"))]);
+    }
+
+    #[test]
+    fn copyright_file_as_text() {
+        let folder = Folder::new("copyright-text").with("COPYRIGHT", MIT_TEXT);
+        let (krate, manual) = license_crate(&folder.package("MIT")).unwrap();
+        assert_eq!(krate.texts.len(), 1);
+        assert_eq!(krate.texts[0].label, "MIT");
+        assert_eq!(krate.texts[0].body, normalize(MIT_TEXT));
+        assert!(!krate.texts[0].standard && manual.is_empty());
     }
 
     const BSD3_TEXT: &str = "Copyright 2009 The Go Authors.\n\nRedistribution and use in source and binary forms, with or without modification, are permitted. Neither the name of Google Inc. nor the names of its contributors may be used to endorse or promote products";

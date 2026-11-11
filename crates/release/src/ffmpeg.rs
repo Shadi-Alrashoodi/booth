@@ -93,6 +93,14 @@ pub enum Lgpl {
     V3,
 }
 
+// Which package the texts go in. The zip's DLLs can be replaced; a Store
+// install's folder cannot be changed.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum Layout {
+    Zip,
+    Store,
+}
+
 pub struct Ffmpeg {
     pub dlls: Vec<String>,
     pub license: Lgpl,
@@ -197,13 +205,10 @@ impl Ffmpeg {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        let expected = match license {
-            Lgpl::V2_1 => "Version 2.1, February 1999",
-            Lgpl::V3 => "Version 3, 29 June 2007",
-        };
-        if !(flat.contains("GNU LESSER GENERAL PUBLIC LICENSE") && flat.contains(expected)) {
+        let (start, end, words) = license.known_text();
+        if !(flat.starts_with(start) && flat.ends_with(end) && flat.split(' ').count() == words) {
             return Err(format!(
-                "{} is not the LGPL {} text that the DLLs say they are under",
+                "{} is not the LGPL {} text that the DLLs say they are under; build FFmpeg again with {BUILD_FFMPEG} -Force",
                 license_path.display(),
                 license.name()
             ));
@@ -237,7 +242,7 @@ impl Ffmpeg {
     // The ffmpeg folder of the release: the license as the build shipped
     // it, byte for byte, the GPL when the LGPL is version 3, the notices of
     // the files under other licenses, and SOURCE.txt.
-    pub fn write_folder(&self, out: &Path) -> Result<(), String> {
+    pub fn write_folder(&self, out: &Path, layout: Layout) -> Result<(), String> {
         let dir = out.join("ffmpeg");
         fs::create_dir_all(&dir)
             .map_err(|err| format!("could not create {}: {err}", dir.display()))?;
@@ -250,17 +255,33 @@ impl Ffmpeg {
                 .map_err(|err| format!("could not write {}: {err}", gpl.display()))?;
         }
         write_crlf(&dir.join("NOTICES.txt"), &format!("{}\n", self.notices))?;
-        write_crlf(&dir.join("SOURCE.txt"), &self.about())
+        write_crlf(&dir.join("SOURCE.txt"), &self.about(layout))
     }
 
-    fn about(&self) -> String {
-        let mut out = wrap(
-            &format!(
-                "{} beside booth.exe are FFmpeg, built from its unmodified source as below. Booth loads them from its own folder when a viewer starts decoding; to use your own build of the same FFmpeg version, replace them with DLLs of the same names.",
-                self.dlls.join(", ")
-            ),
-            "",
+    fn about(&self, layout: Layout) -> String {
+        let loaded = format!(
+            "{} beside booth.exe are FFmpeg, built from its unmodified source as below. Booth loads them from its own folder when a viewer starts decoding",
+            self.dlls.join(", ")
         );
+        let mut out = match layout {
+            Layout::Zip => wrap(
+                &format!(
+                    "{loaded}; to use your own build of the same FFmpeg version, replace them with DLLs of the same names."
+                ),
+                "",
+            ),
+            Layout::Store => {
+                let mut text = wrap(
+                    &format!(
+                        "{loaded}. The Microsoft Store installs Booth in a folder Windows does not let you change, so they cannot be replaced in this copy. To use your own build of the same FFmpeg version, get the zip of the same version of Booth instead, where they can be replaced with DLLs of the same names. It is in Booth's releases:"
+                    ),
+                    "",
+                );
+                text.push_str(self.source_release.releases_page());
+                text.push('\n');
+                text
+            }
+        };
         out.push('\n');
         // The address on a line of its own, so nothing next to it reads as
         // part of it.
@@ -298,8 +319,8 @@ impl Ffmpeg {
         out
     }
 
-    pub fn notice(&self) -> String {
-        let mut out = self.about();
+    pub fn notice(&self, layout: Layout) -> String {
+        let mut out = self.about(layout);
         out.push('\n');
         out.push_str(&normalize(&String::from_utf8_lossy(&self.license_text)));
         out.push_str("\n\n");
@@ -315,6 +336,32 @@ impl Lgpl {
             Lgpl::V2_1 => "version 2.1",
             Lgpl::V3 => "version 3",
         }
+    }
+
+    // How FFmpeg's COPYING.LGPLv2.1 or COPYING.LGPLv3 starts and ends and how
+    // many words it has, so a copy cut short is refused.
+    fn known_text(self) -> (&'static str, &'static str, usize) {
+        match self {
+            Lgpl::V2_1 => (
+                "GNU LESSER GENERAL PUBLIC LICENSE Version 2.1, February 1999",
+                "Ty Coon, President of Vice That's all there is to it!",
+                4372,
+            ),
+            Lgpl::V3 => (
+                "GNU LESSER GENERAL PUBLIC LICENSE Version 3, 29 June 2007",
+                "permanent authorization for you to choose that version for the Library.",
+                1234,
+            ),
+        }
+    }
+}
+
+impl SourceRelease {
+    // The address ends in /tag/<name>; before that is the releases page,
+    // which has the zips too.
+    fn releases_page(&self) -> &str {
+        let tag = format!("/tag/{}", self.name);
+        self.address.strip_suffix(&tag).unwrap_or(&self.address)
     }
 }
 
@@ -587,7 +634,16 @@ mod tests {
         " in the release ffmpeg-8.1.3 at https://github.com/OWNER/booth/releases/tag/ffmpeg-8.1.3 ";
     const NOTICES: &str = "Files under a license of their own:\n\nlibavutil/adler32.c\n\n/*\n * This software is provided 'as-is'\n */\n";
     const LGPL21_HEAD: &str = "                  GNU LESSER GENERAL PUBLIC LICENSE\n                       Version 2.1, February 1999\n";
-    const LGPL3_HEAD: &str = "                   GNU LESSER GENERAL PUBLIC LICENSE\n                       Version 3, 29 June 2007\n";
+
+    // As many words as FFmpeg's text, with its start and end.
+    fn lgpl_text(license: Lgpl) -> String {
+        let (start, end, words) = license.known_text();
+        let middle = words - start.split(' ').count() - end.split(' ').count();
+        format!(
+            "   {start}\n\n{}\n\n{end}\n",
+            vec!["terms"; middle].join(" ")
+        )
+    }
 
     struct Folder(std::path::PathBuf);
 
@@ -623,7 +679,12 @@ mod tests {
         }
 
         fn lgpl21(name: &str, configure: &str) -> Folder {
-            Folder::with(name, "LGPL version 2.1 or later", LGPL21_HEAD, configure)
+            Folder::with(
+                name,
+                "LGPL version 2.1 or later",
+                &lgpl_text(Lgpl::V2_1),
+                configure,
+            )
         }
     }
 
@@ -641,11 +702,11 @@ mod tests {
         assert_eq!(ffmpeg.dlls, ["avcodec-62.dll", "avutil-60.dll"]);
         assert_eq!(ffmpeg.configure, SLIM);
         let out = folder.0.join("out");
-        ffmpeg.write_folder(&out).unwrap();
+        ffmpeg.write_folder(&out, Layout::Zip).unwrap();
         let dir = out.join("ffmpeg");
         assert_eq!(
             fs::read(dir.join("LICENSE.txt")).unwrap(),
-            LGPL21_HEAD.as_bytes()
+            lgpl_text(Lgpl::V2_1).as_bytes()
         );
         assert!(!dir.join("GPL-3.0.txt").exists());
         assert_eq!(
@@ -658,6 +719,7 @@ mod tests {
         let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
         for part in [
             "avcodec-62.dll, avutil-60.dll beside booth.exe are FFmpeg, built from its unmodified source",
+            "when a viewer starts decoding; to use your own build of the same FFmpeg version, replace them with DLLs of the same names.",
             "The exact source archive they were built from (Source) and the recipe that built them (Recipe) are in Booth's release ffmpeg-8.1.3:",
             "The source archive is also on ffmpeg.org at the Source address",
             "SHA-256 avutil-60.dll: 0961B0202A2DFD30F73C12FAD0C9B7408E2F7E3822DB6D84D9C806446F24B984",
@@ -675,18 +737,58 @@ mod tests {
         assert!(!source.contains('\u{FEFF}') && !source.contains("GPL-3.0"));
         assert!(!flat.contains("attached"), "{source}");
 
-        let notice = ffmpeg.notice();
+        let notice = ffmpeg.notice(Layout::Zip);
         assert!(notice.contains("Version 2.1, February 1999"));
         assert!(notice.contains("libavutil/adler32.c\n\n/*\n * This software is provided 'as-is'"));
     }
 
     #[test]
+    fn store_points_to_zip() {
+        let folder = Folder::lgpl21("store", SLIM);
+        let ffmpeg = Ffmpeg::read(&folder.0).unwrap();
+        let out = folder.0.join("out");
+        ffmpeg.write_folder(&out, Layout::Store).unwrap();
+        let source = fs::read_to_string(out.join("ffmpeg").join("SOURCE.txt")).unwrap();
+        let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+        for part in [
+            "when a viewer starts decoding. The Microsoft Store installs Booth in a folder Windows does not let you change, so they cannot be replaced in this copy.",
+            "get the zip of the same version of Booth instead, where they can be replaced with DLLs of the same names. It is in Booth's releases:",
+        ] {
+            assert!(flat.contains(part), "{source}");
+        }
+        assert!(
+            source.contains("releases:\r\nhttps://github.com/OWNER/booth/releases\r\n\r\n"),
+            "{source}"
+        );
+        assert!(
+            ffmpeg
+                .notice(Layout::Store)
+                .starts_with(&source.replace("\r\n", "\n"))
+        );
+    }
+
+    #[test]
+    fn part_four_follows_layout() {
+        let folder = Folder::lgpl21("part-four", SLIM);
+        let ffmpeg = Ffmpeg::read(&folder.0).unwrap();
+        let fonts = crate::fonts::Fonts {
+            files: Vec::new(),
+            license: String::new(),
+            from_crates: Vec::new(),
+        };
+        for layout in [Layout::Zip, Layout::Store] {
+            let file = crate::licenses::render("1.5.0", &[], &[], &fonts, &ffmpeg, layout);
+            assert!(file.ends_with(&ffmpeg.notice(layout)));
+        }
+    }
+
+    #[test]
     fn lgpl3_build_ships_gpl() {
-        let folder = Folder::with("v3", "LGPL version 3 or later", LGPL3_HEAD, SLIM);
+        let folder = Folder::with("v3", "LGPL version 3 or later", &lgpl_text(Lgpl::V3), SLIM);
         let ffmpeg = Ffmpeg::read(&folder.0).unwrap();
         assert_eq!(ffmpeg.license, Lgpl::V3);
         let out = folder.0.join("out");
-        ffmpeg.write_folder(&out).unwrap();
+        ffmpeg.write_folder(&out, Layout::Zip).unwrap();
         assert!(
             fs::read_to_string(out.join("ffmpeg").join("GPL-3.0.txt"))
                 .unwrap()
@@ -694,7 +796,11 @@ mod tests {
         );
         let source = fs::read_to_string(out.join("ffmpeg").join("SOURCE.txt")).unwrap();
         assert!(source.contains("version 3 or later") && source.contains("GPL-3.0.txt"));
-        assert!(ffmpeg.notice().contains("Version 3, 29 June 2007"));
+        assert!(
+            ffmpeg
+                .notice(Layout::Zip)
+                .contains("Version 3, 29 June 2007")
+        );
     }
 
     #[test]
@@ -703,7 +809,12 @@ mod tests {
         let err = Ffmpeg::read(&folder.0).err().unwrap();
         assert!(err.contains("only an LGPL build"), "{err}");
 
-        let folder = Folder::with("mismatch", "LGPL version 2.1 or later", LGPL3_HEAD, SLIM);
+        let folder = Folder::with(
+            "mismatch",
+            "LGPL version 2.1 or later",
+            &lgpl_text(Lgpl::V3),
+            SLIM,
+        );
         let err = Ffmpeg::read(&folder.0).err().unwrap();
         assert!(err.contains("is not the LGPL version 2.1 text"), "{err}");
 
@@ -720,6 +831,30 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.contains("outside libraries built in"), "{err}");
+    }
+
+    #[test]
+    fn refuses_partial_license() {
+        let folder = Folder::lgpl21("partial", SLIM);
+        let path = folder.0.join("LICENSE.txt");
+        let read = |text: &str| {
+            fs::write(&path, text).unwrap();
+            Ffmpeg::read(&folder.0).err().unwrap_or_default()
+        };
+        let full = lgpl_text(Lgpl::V2_1);
+        let cut = &full[..full.find("That's all").unwrap()];
+        let shorter = full.replacen("terms ", "", 1);
+        let renamed = full.replacen("February 1999", "March 1999", 1);
+        let ending = full.replacen("to it!", "to it.", 1);
+        for text in [LGPL21_HEAD, cut, &shorter, &renamed, &ending] {
+            let err = read(text);
+            assert!(
+                err.contains("is not the LGPL version 2.1 text") && err.ends_with(" -Force"),
+                "{err}"
+            );
+        }
+        let crlf = format!("\u{FEFF}{}", full.replace('\n', "\r\n"));
+        assert_eq!(read(&crlf), "");
     }
 
     #[test]

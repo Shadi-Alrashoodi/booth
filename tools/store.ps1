@@ -198,7 +198,7 @@ New-Item -ItemType Directory -Force $layout | Out-Null
 & (Join-Path $PSScriptRoot 'fetch-third-party.ps1')
 
 Invoke-Build 'the release tool build' @('-p', 'release') (Join-Path $target 'release\release.exe')
-Invoke-Tool 'collecting the third-party licenses' (Join-Path $target 'release\release.exe') @('licenses', $root, $layout)
+Invoke-Tool 'collecting the third-party licenses' (Join-Path $target 'release\release.exe') @('licenses', '--store', $root, $layout)
 Invoke-Build 'the store build' @('-p', 'app', '--features', 'store') (Join-Path $target 'release\booth.exe')
 Assert-OptimisedLibopus (Join-Path $target 'release\booth.exe') $target
 
