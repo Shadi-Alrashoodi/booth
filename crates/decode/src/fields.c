@@ -135,39 +135,45 @@ const int booth_refused_setup = 4;
 // is one picture of one size. The one setup before it did run.
 const int booth_refused_second_setup = 5;
 
-// FFmpeg asks each time the stream's size or profile changes (HEVC: each
-// time a different SPS takes over), and offers the software formats only
-// once d3d11va has turned the stream down. Software decode would be slow
-// and hand back CPU memory the viewer cannot present, so the stream is
-// refused instead. A refusal holds for the rest of the access unit: FFmpeg's
-// H.264 decoder asks again for each slice after it.
+// The bits above and the coded size pick_d3d11 refused as too large, which
+// a later slice of the unit can change in the context before Rust reads it.
+struct booth_choice {
+    int bits;
+    int width;
+    int height;
+};
+
+// The viewer cannot present software frames, so the stream is refused instead,
+// for the rest of the unit: FFmpeg's H.264 decoder asks again at each slice.
 static enum AVPixelFormat pick_d3d11(AVCodecContext *codec, const enum AVPixelFormat *formats)
 {
-    int *choice = codec->opaque;
-    if (*choice & ~booth_chose_d3d11) {
+    struct booth_choice *choice = codec->opaque;
+    if (choice->bits & ~booth_chose_d3d11) {
         return AV_PIX_FMT_NONE;
     }
     if (booth_too_large(codec->codec_id, codec->coded_width, codec->coded_height)) {
-        *choice |= booth_refused_too_large;
+        choice->bits |= booth_refused_too_large;
+        choice->width = codec->coded_width;
+        choice->height = codec->coded_height;
         return AV_PIX_FMT_NONE;
     }
     // FFmpeg sets it before it asks. The J format is its older name for the
     // same samples in full range.
     if (codec->sw_pix_fmt != AV_PIX_FMT_YUV420P && codec->sw_pix_fmt != AV_PIX_FMT_YUVJ420P) {
-        *choice |= booth_refused_format;
+        choice->bits |= booth_refused_format;
         return AV_PIX_FMT_NONE;
     }
     for (; *formats != AV_PIX_FMT_NONE; formats++) {
         if (*formats == AV_PIX_FMT_D3D11) {
-            if (*choice == booth_chose_d3d11) {
-                *choice |= booth_refused_second_setup;
+            if (choice->bits == booth_chose_d3d11) {
+                choice->bits |= booth_refused_second_setup;
                 return AV_PIX_FMT_NONE;
             }
-            *choice = booth_chose_d3d11;
+            choice->bits = booth_chose_d3d11;
             return AV_PIX_FMT_D3D11;
         }
     }
-    *choice = *choice == booth_chose_d3d11 ? booth_refused_setup : booth_refused_format;
+    choice->bits = choice->bits == booth_chose_d3d11 ? booth_refused_setup : booth_refused_format;
     return AV_PIX_FMT_NONE;
 }
 
@@ -183,7 +189,7 @@ static enum AVPixelFormat pick_d3d11(AVCodecContext *codec, const enum AVPixelFo
 // out of P frames with nothing at all to predict from, before the first IDR
 // or after a reset, where H.264 gives none; src/decoder.rs keeps those from
 // FFmpeg.
-void booth_codec_setup(AVCodecContext *codec, AVBufferRef *device, int *choice)
+void booth_codec_setup(AVCodecContext *codec, AVBufferRef *device, struct booth_choice *choice)
 {
     codec->hw_device_ctx = device;
     codec->get_format = pick_d3d11;

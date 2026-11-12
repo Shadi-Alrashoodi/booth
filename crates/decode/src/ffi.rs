@@ -33,6 +33,15 @@ pub(crate) struct AVDictionary {
     _opaque: [u8; 0],
 }
 
+// fields.c's struct booth_choice.
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct Choice {
+    pub(crate) bits: c_int,
+    pub(crate) width: c_int,
+    pub(crate) height: c_int,
+}
+
 unsafe extern "C" {
     pub(crate) safe static booth_avcodec_major: c_int;
     pub(crate) safe static booth_avcodec_minor: c_int;
@@ -70,7 +79,7 @@ unsafe extern "C" {
     pub(crate) fn booth_codec_setup(
         codec: *mut AVCodecContext,
         device: *mut AVBufferRef,
-        choice: *mut c_int,
+        choice: *mut Choice,
     );
     pub(crate) fn booth_codec_stream(
         codec: *const AVCodecContext,

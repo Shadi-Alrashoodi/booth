@@ -62,8 +62,8 @@ pub enum DecodeError {
     NoDecoder {
         codec: Codec,
     },
-    // From here on each is about one access unit, and the decoder stays
-    // usable after it.
+    // From here to NotOnGpu each is about one access unit, and the decoder
+    // stays usable after it. The probe gives Oversized too.
     Empty,
     TooLarge {
         size: usize,
@@ -142,7 +142,7 @@ pub enum DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-const UNZIP: &str = "Unzip Booth again with all its files";
+const UNZIP: &str = "Install or unzip Booth again with all its files";
 
 // Windows' own message for a failed load ends in a full stop and may carry
 // a %1 for the file name.
@@ -241,7 +241,7 @@ impl fmt::Display for DecodeError {
             }
             DecodeError::WrongFormat { codec, profile } => write!(
                 f,
-                "this screen share is {codec} {profile} video, which Booth does not show. Booth never shares video like that, so the sharer's Booth may be damaged: they can unzip it again"
+                "this screen share is {codec} {profile} video, which Booth does not show. Booth never shares video like that, so the sharer's Booth may be damaged: they can install or unzip it again"
             ),
             DecodeError::Oversized { width, height } => {
                 let (most_width, most_height) = LARGEST;
@@ -252,19 +252,19 @@ impl fmt::Display for DecodeError {
             }
             DecodeError::UnreadableSps => write!(
                 f,
-                "a video frame carries an HEVC sequence header (SPS) Booth cannot read, so it was dropped before decoding. Booth never sends one like that, so the sharer's Booth may be damaged: they can unzip it again"
+                "a video frame carries an HEVC sequence header (SPS) Booth cannot read, so it was dropped before decoding. Booth never sends one like that, so the sharer's Booth may be damaged: they can install or unzip it again"
             ),
             DecodeError::TooManySps { count } => write!(
                 f,
-                "a video frame carries {count} HEVC sequence headers (SPS) where a Booth stream carries one, so it was dropped before decoding. The sharer's Booth may be damaged: they can unzip it again"
+                "a video frame carries {count} HEVC sequence headers (SPS) where a Booth stream carries one, so it was dropped before decoding. The sharer's Booth may be damaged: they can install or unzip it again"
             ),
             DecodeError::Packed { .. } => write!(
                 f,
-                "a video frame is packed with far more than a screen share normally holds, so it was dropped before decoding. The sharer's Booth may be damaged: they can unzip it again"
+                "a video frame is packed with far more than a screen share normally holds, so it was dropped before decoding. The sharer's Booth may be damaged: they can install or unzip it again"
             ),
             DecodeError::ManyPictures => write!(
                 f,
-                "a video frame carries more than one picture, which no Booth stream does, so it was dropped. The sharer's Booth may be damaged: they can unzip it again"
+                "a video frame carries more than one picture, which no Booth stream does, so it was dropped. The sharer's Booth may be damaged: they can install or unzip it again"
             ),
             DecodeError::HeldBack { frames } => {
                 let held = if *frames == 1 {
@@ -329,8 +329,32 @@ mod tests {
         .to_string();
         assert_eq!(
             text,
-            "a video frame is packed with far more than a screen share normally holds, so it was dropped before decoding. The sharer's Booth may be damaged: they can unzip it again"
+            "a video frame is packed with far more than a screen share normally holds, so it was dropped before decoding. The sharer's Booth may be damaged: they can install or unzip it again"
         );
+    }
+
+    #[test]
+    fn sharer_sentences_name_both_ways() {
+        let damaged = [
+            DecodeError::WrongFormat {
+                codec: Codec::Hevc,
+                profile: "Main 10".to_string(),
+            },
+            DecodeError::UnreadableSps,
+            DecodeError::TooManySps { count: 17 },
+            DecodeError::Packed {
+                most: 1024,
+                what: "NAL units",
+            },
+            DecodeError::ManyPictures,
+        ];
+        for error in damaged {
+            let text = error.to_string();
+            assert!(
+                text.ends_with("they can install or unzip it again"),
+                "{text}"
+            );
+        }
     }
 
     #[test]

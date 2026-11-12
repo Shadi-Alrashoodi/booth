@@ -370,7 +370,17 @@ fn a_refusal_holds_for_the_unit() {
     let setups = s.decoder.setups();
     let err = s.decoder.decode(&unit).unwrap_err();
     println!("{err}");
-    assert!(matches!(err, DecodeError::Oversized { .. }), "{err:?}");
+    // The size refused, not the one the second slice moved FFmpeg to.
+    assert!(
+        matches!(
+            err,
+            DecodeError::Oversized {
+                width: 8192,
+                height: 4608
+            }
+        ),
+        "{err:?}"
+    );
     assert_eq!(s.decoder.setups(), setups, "nothing set up");
     s.whole(3);
     s.whole(4);

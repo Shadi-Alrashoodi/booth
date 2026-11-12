@@ -14,11 +14,12 @@ use windows::core::Interface;
 
 use crate::error::DecodeError;
 use crate::ffi::{
-    AVBufferRef, AVCodecContext, AVFrame, AVPacket, booth_chose_d3d11, booth_codec_clear_reorder,
-    booth_codec_forget_format, booth_codec_h264, booth_codec_hevc, booth_codec_reorder,
-    booth_codec_setup, booth_codec_stream, booth_device_fill, booth_error_again, booth_error_bare,
-    booth_frame_read, booth_hwdevice_d3d11va, booth_packet_set, booth_padding, booth_pix_fmt_d3d11,
-    booth_refused_format, booth_refused_second_setup, booth_refused_setup, booth_refused_too_large,
+    AVBufferRef, AVCodecContext, AVFrame, AVPacket, Choice, booth_chose_d3d11,
+    booth_codec_clear_reorder, booth_codec_forget_format, booth_codec_h264, booth_codec_hevc,
+    booth_codec_reorder, booth_codec_setup, booth_codec_stream, booth_device_fill,
+    booth_error_again, booth_error_bare, booth_frame_read, booth_hwdevice_d3d11va,
+    booth_packet_set, booth_padding, booth_pix_fmt_d3d11, booth_refused_format,
+    booth_refused_second_setup, booth_refused_setup, booth_refused_too_large,
 };
 use crate::guard;
 use crate::library::{Library, library};
@@ -121,7 +122,7 @@ pub struct Decoder {
     // The format callback in fields.c sets the bit booth_chose_d3d11 in it,
     // and why it turned a stream down. Cleared before every access unit. Boxed
     // so its address stays put for as long as FFmpeg has it.
-    choice: Box<Cell<c_int>>,
+    choice: Box<Cell<Choice>>,
     // The access unit copied with FFmpeg's zero padding after it, reused.
     buffer: Vec<u8>,
     sent: i64,
@@ -206,7 +207,7 @@ impl Decoder {
             packet: ptr::null_mut(),
             received: ptr::null_mut(),
             shown: ptr::null_mut(),
-            choice: Box::new(Cell::new(0)),
+            choice: Box::new(Cell::default()),
             buffer: Vec::new(),
             sent: 0,
             timing: Timing::new(device, &context, &multithread),
@@ -350,7 +351,7 @@ impl Decoder {
             self.sei_kept = 0;
         }
         self.sent += 1;
-        self.choice.set(0);
+        self.choice.set(Choice::default());
         let unit = self.sent as u64;
         if let Some(timing) = &mut self.timing {
             timing.begin(unit);
@@ -569,11 +570,11 @@ impl Decoder {
     // it did. FFmpeg may carry on past a refused slice without an error of
     // its own, so this is asked after every access unit.
     fn refusal(&self) -> Option<DecodeError> {
-        let choice = self.choice.replace(0);
-        if choice & booth_chose_d3d11 != 0 {
+        let choice = self.choice.take();
+        if choice.bits & booth_chose_d3d11 != 0 {
             self.setups.set(self.setups.get() + 1);
         }
-        let why = choice & !booth_chose_d3d11;
+        let why = choice.bits & !booth_chose_d3d11;
         if why == 0 {
             return None;
         }
@@ -592,7 +593,10 @@ impl Decoder {
         };
         let (width, height) = (width.max(0) as u32, height.max(0) as u32);
         if why == booth_refused_too_large {
-            return Some(DecodeError::Oversized { width, height });
+            return Some(DecodeError::Oversized {
+                width: choice.width.max(0) as u32,
+                height: choice.height.max(0) as u32,
+            });
         }
         if why == booth_refused_second_setup {
             return Some(DecodeError::ManyPictures);

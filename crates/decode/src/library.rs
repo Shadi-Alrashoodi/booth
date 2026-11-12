@@ -236,7 +236,7 @@ mod tests {
         println!("{text}");
         assert_eq!(
             text,
-            "the video decoder is missing: avcodec-62.dll was not found next to booth.exe. Unzip Booth again with all its files"
+            "the video decoder is missing: avcodec-62.dll was not found next to booth.exe. Install or unzip Booth again with all its files"
         );
         assert!(!text.contains(&folder.display().to_string()), "{text}");
 
@@ -262,7 +262,7 @@ mod tests {
         assert!(!text.contains(&folder.display().to_string()), "{text}");
         assert!(!text.contains('\\'), "{text}");
         assert!(
-            text.ends_with("Unzip Booth again with all its files"),
+            text.ends_with("Install or unzip Booth again with all its files"),
             "{text}"
         );
         // Nothing holds the files open, or this would fail.
@@ -279,17 +279,17 @@ mod tests {
         let older_major = check_version(AVCODEC, pack(61, 30), needed).unwrap_err();
         assert_eq!(
             older_major.to_string(),
-            "avcodec-62.dll is version 61, Booth needs 62. Unzip Booth again with all its files"
+            "avcodec-62.dll is version 61, Booth needs 62. Install or unzip Booth again with all its files"
         );
         let newer_major = check_version(AVCODEC, pack(63, 0), needed).unwrap_err();
         assert_eq!(
             newer_major.to_string(),
-            "avcodec-62.dll is version 63, Booth needs 62. Unzip Booth again with all its files"
+            "avcodec-62.dll is version 63, Booth needs 62. Install or unzip Booth again with all its files"
         );
         let older_minor = check_version(AVCODEC, pack(62, 3), needed).unwrap_err();
         assert_eq!(
             older_minor.to_string(),
-            "avcodec-62.dll is version 62.3, Booth needs 62.28 or newer. Unzip Booth again with all its files"
+            "avcodec-62.dll is version 62.3, Booth needs 62.28 or newer. Install or unzip Booth again with all its files"
         );
     }
 
