@@ -106,9 +106,13 @@ pub(crate) fn open<T>(
     text: &str,
     parse: impl FnOnce(&[u8]) -> Option<T>,
 ) -> Result<T, CodeError> {
-    let (compact, too_long) = compact(text);
+    let (mut compact, mut too_long) = compact(text);
     if compact.is_empty() {
         return Err(CodeError::Empty);
+    }
+    if let Some(len) = copy_len(text, &compact) {
+        compact.truncate(len);
+        too_long = false;
     }
     let linked = strip_prefix_ignore_case(&compact, crate::LINK_PREFIX.as_bytes());
     let (kind, data) = split_prefix(linked.unwrap_or(&compact))?;
@@ -184,20 +188,38 @@ fn preamble(rest: &[u8]) -> Option<(u16, Version, &[u8])> {
 // them are in the base32 alphabet, and this can never eat part of a code. Every other character
 // outside ASCII becomes '?', which nothing accepts, and the rest works on bytes.
 fn compact(text: &str) -> (SecretBuf, bool) {
-    let trimmed = text
-        .trim_start_matches(|c| invisible(c) || wrapper(c))
-        .trim_end_matches(|c| invisible(c) || wrapper(c) || matches!(c, '.' | ',' | ';'));
     let mut out = SecretBuf::with_capacity(TEXT_LIMIT);
-    for c in trimmed.chars().filter(|&c| !invisible(c)) {
-        let byte = match c {
-            '\u{2010}' | '\u{2011}' => b'-',
-            c => u8::try_from(c).ok().filter(u8::is_ascii).unwrap_or(b'?'),
-        };
+    for byte in kept(text) {
         if out.len() >= TEXT_LIMIT || out.push(byte).is_none() {
             return (out, true);
         }
     }
     (out, false)
+}
+
+fn kept(text: &str) -> impl Iterator<Item = u8> {
+    text.trim_start_matches(|c| invisible(c) || wrapper(c))
+        .trim_end_matches(|c| invisible(c) || wrapper(c) || matches!(c, '.' | ',' | ';'))
+        .chars()
+        .filter(|&c| !invisible(c))
+        .map(|c| match c {
+            '\u{2010}' | '\u{2011}' => b'-',
+            c => u8::try_from(c).ok().filter(u8::is_ascii).unwrap_or(b'?'),
+        })
+}
+
+// A code pasted twice or more, with or without whitespace between, opens as one copy. Text past
+// what compact holds is compared as it is read and never stored.
+fn copy_len(text: &str, held: &[u8]) -> Option<usize> {
+    let total = kept(text).count();
+    (1..=held.len().min(total / 2)).find(|&len| {
+        total.is_multiple_of(len)
+            && held[len..] == held[..held.len() - len]
+            && kept(text)
+                .enumerate()
+                .skip(held.len())
+                .all(|(at, byte)| byte == held[at % len])
+    })
 }
 
 // Soft hyphen, zero-width characters, word joiner and byte order mark, plus the direction marks

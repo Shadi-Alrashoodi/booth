@@ -308,6 +308,10 @@ impl SecretBuf {
         self.0.push(byte);
         Some(())
     }
+
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.0.truncate(len);
+    }
 }
 
 impl Deref for SecretBuf {

@@ -469,6 +469,94 @@ fn noise_inside_the_code_is_damage() {
 }
 
 #[test]
+fn code_pasted_twice() {
+    let text = fixed_invite().encode();
+    let link = invite::link(&text);
+    for twice in [
+        format!("{text} {text}"),
+        format!("{text}\r\n{text}\r\n"),
+        format!("{text}{text}"),
+        format!("{link}\n{link}"),
+        format!("{link}{link}"),
+        format!("{text}\n{text}\n{text}"),
+    ] {
+        assert_eq!(Invite::decode(&twice), Ok(fixed_invite()), "{twice:?}");
+    }
+    let reply = fixed_reply().encode();
+    for twice in [
+        format!("{reply} {reply}"),
+        format!("{reply}\n{reply}"),
+        format!("{reply}{reply}"),
+    ] {
+        assert_eq!(ReplyCode::decode(&twice), Ok(fixed_reply()), "{twice:?}");
+    }
+}
+
+#[test]
+fn two_different_codes() {
+    let text = fixed_invite().encode();
+    let mut other = fixed_invite();
+    other.secret = [0xcd; 16];
+    for pasted in [
+        format!("{text} {}", other.encode()),
+        format!("{text}\n{}", invite::link(&text)),
+        format!("{text} {}", &text[..text.len() - 1]),
+        format!("{text}\n{text}\n{}", &text[..text.len() - 1]),
+    ] {
+        assert_eq!(
+            Invite::decode(&pasted),
+            Err(CodeError::Damaged),
+            "{pasted:?}"
+        );
+    }
+    let mut code = fixed_reply();
+    code.client_key = [8; 32];
+    assert_eq!(
+        ReplyCode::decode(&format!("{} {}", fixed_reply().encode(), code.encode())),
+        Err(CodeError::Damaged)
+    );
+}
+
+// Two copies of the largest invite are more than decode holds at once.
+#[test]
+fn largest_invite_pasted_twice() {
+    let candidates = (1..=invite::MAX_CANDIDATES)
+        .map(|i| candidate(CandidateKind::Ipv6, v6(&format!("2a02::{i:x}"), 41000)))
+        .collect();
+    let label = "a".repeat(63);
+    let hostname = format!("{label}.{label}.{label}.{}", "b".repeat(61));
+    let largest = Invite::new(
+        [1; 32],
+        candidates,
+        Mapping::Hard,
+        false,
+        false,
+        false,
+        Some(hostname),
+        true,
+        NOW,
+    )
+    .unwrap();
+    let text = largest.encode();
+    let link = invite::link(&text);
+    for twice in [
+        format!("{text}\n{text}"),
+        format!("{link} {link}"),
+        format!("{text}\n{text}\n{text}"),
+    ] {
+        assert_eq!(Invite::decode(&twice).as_ref(), Ok(&largest));
+    }
+    let mut changed = format!("{text}\n{text}");
+    let last = changed.pop().unwrap();
+    changed.push(if last == 'a' { 'b' } else { 'a' });
+    assert_eq!(Invite::decode(&changed), Err(CodeError::Damaged));
+    assert_eq!(
+        Invite::decode(&format!("{text}\n{}", &text[..text.len() - 1])),
+        Err(CodeError::Damaged)
+    );
+}
+
+#[test]
 fn code_in_the_wrong_field() {
     let invite = fixed_invite().encode();
     let reply = fixed_reply().encode();
