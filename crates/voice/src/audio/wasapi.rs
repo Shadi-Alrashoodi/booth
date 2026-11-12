@@ -8,7 +8,7 @@ use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::ptr;
 use std::slice;
-use std::sync::atomic::{AtomicU32, Ordering, fence};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering, fence};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -419,14 +419,17 @@ impl Session {
         Ok(Registration {
             enumerator: self.enumerator.clone(),
             client,
+            listening: Some(LEARNED.listen(&LISTENING)),
         })
     }
 }
 
 // What the run has learned of each microphone asked for echo cancellation,
-// by endpoint id. It lasts until Booth closes, so a microphone that gains
-// Windows' canceller meanwhile is opened without it until then.
+// by endpoint id, until Windows says a property of that microphone changed.
+// Windows tells only the registrations live then, so the first one made
+// after a time with none forgets every microphone.
 static LEARNED: Learned = Learned(Mutex::new(Vec::new()));
+static LISTENING: AtomicUsize = AtomicUsize::new(0);
 
 struct Learned(Mutex<Vec<(String, Canceller)>>);
 
@@ -465,6 +468,30 @@ impl Learned {
             Some(entry) => entry.1 = canceller,
             None => known.push((id.to_owned(), canceller)),
         }
+    }
+
+    fn forget(&self, id: &str) {
+        let mut known = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        known.retain(|(known, _)| known != id);
+    }
+
+    // Called once a registration is live, which `listening` counts until the
+    // result is dropped. The count moves under the lock, so a registration
+    // made with the first finds the list already cleared.
+    fn listen<'a>(&self, listening: &'a AtomicUsize) -> Listening<'a> {
+        let mut known = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if listening.fetch_add(1, Ordering::AcqRel) == 0 {
+            known.clear();
+        }
+        Listening(listening)
+    }
+}
+
+struct Listening<'a>(&'a AtomicUsize);
+
+impl Drop for Listening<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -1319,7 +1346,8 @@ fn notification_client(notify: Box<dyn Fn(Notice) + Send + Sync>) -> IMMNotifica
 // The functions below are called by Windows, on its own threads, only
 // through a pointer notification_client made, and each call holds a
 // reference while it runs, so the object is alive for its length. None of
-// them blocks: each one only passes a message on.
+// them blocks: each one only passes a message on or forgets an entry of
+// LEARNED, whose lock is held only to look through its list.
 
 // SAFETY (caller): `this` is a pointer notification_client made, with a
 // reference held for as long as the result is used.
@@ -1422,9 +1450,18 @@ unsafe extern "system" fn default_device_changed(
 
 unsafe extern "system" fn property_value_changed(
     this: *mut c_void,
-    _: PCWSTR,
+    id: PCWSTR,
     key: PROPERTYKEY,
 ) -> HRESULT {
+    // No one property says reliably that a microphone's effects changed, so
+    // any change has its next open ask Windows again.
+    if !id.is_null() {
+        // SAFETY: Windows passes a NUL-terminated id that lives for the
+        // length of this call.
+        if let Ok(id) = unsafe { id.to_string() } {
+            LEARNED.forget(&id);
+        }
+    }
     // Drivers change other properties often; only a new name matters here.
     if key == PKEY_Device_FriendlyName {
         // SAFETY: see the note above object.
@@ -1436,10 +1473,13 @@ unsafe extern "system" fn property_value_changed(
 pub(crate) struct Registration {
     enumerator: IMMDeviceEnumerator,
     client: IMMNotificationClient,
+    listening: Option<Listening<'static>>,
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
+        // First, so the count is never above the registrations Windows tells.
+        drop(self.listening.take());
         // SAFETY: registered in Session::watch on this enumerator. Windows
         // waits for any call in progress before this returns.
         let _ = unsafe {
@@ -1532,6 +1572,10 @@ fn qpc_frequency() -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use windows::Win32::Media::Audio::{
+        PKEY_AudioEndpoint_Disable_SysFx, PKEY_AudioEngine_DeviceFormat,
+    };
+
     use super::super::format::Sample;
     use super::*;
 
@@ -1944,6 +1988,94 @@ mod tests {
             unmute(&learned, None, microphone(false, true, true)),
             (vec![false, true], windows_default())
         );
+    }
+
+    // Windows' effects turned on during the run.
+    #[test]
+    fn property_change_asks_again() {
+        let windows = || microphone(false, true, false);
+        let other = "{0.0.1.00000000}.{other}";
+        LEARNED.learn(MICROPHONE, Canceller::Missing);
+        LEARNED.learn(other, Canceller::Missing);
+        assert_eq!(
+            unmute(&LEARNED, None, windows()),
+            (vec![false], Echo::Missing)
+        );
+        let notices = notification_client(Box::new(|_| {}));
+        let changed = |key: PROPERTYKEY| {
+            let id: Vec<u16> = MICROPHONE.encode_utf16().chain([0]).collect();
+            // SAFETY: a client notification_client made and a NUL-terminated
+            // id, both alive for the call, as Windows passes them.
+            unsafe { property_value_changed(notices.as_raw(), PCWSTR(id.as_ptr()), key) }
+        };
+        assert_eq!(changed(PKEY_AudioEndpoint_Disable_SysFx), S_OK);
+        assert_eq!(LEARNED.of(other), Some(Canceller::Missing));
+        assert_eq!(
+            unmute(&LEARNED, None, windows()),
+            (vec![false, true], windows_default())
+        );
+        // Any other property of it as well.
+        assert_eq!(changed(PKEY_AudioEngine_DeviceFormat), S_OK);
+        assert_eq!(
+            unmute(&LEARNED, None, windows()),
+            (vec![false, true], windows_default())
+        );
+    }
+
+    // Windows' effects turned on while nothing listened, as between two rooms.
+    #[test]
+    fn unheard_change_asks_again() {
+        let learned = Learned(Mutex::new(Vec::new()));
+        let listening = AtomicUsize::new(0);
+        let windows = || microphone(false, true, false);
+        // The speakers' registration, then the microphone's at an Unmute.
+        let speakers = learned.listen(&listening);
+        learned.learn(MICROPHONE, Canceller::Missing);
+        let unmuted = learned.listen(&listening);
+        assert_eq!(
+            unmute(&learned, None, windows()),
+            (vec![false], Echo::Missing)
+        );
+        // Mute and Unmute while the speakers listen.
+        drop(unmuted);
+        let unmuted = learned.listen(&listening);
+        assert_eq!(
+            unmute(&learned, None, windows()),
+            (vec![false], Echo::Missing)
+        );
+        // Both dropped as the room ends, then the next room's first.
+        drop((unmuted, speakers));
+        let _next = learned.listen(&listening);
+        assert_eq!(
+            unmute(&learned, None, windows()),
+            (vec![false, true], windows_default())
+        );
+    }
+
+    // The speakers' and the microphone's registrations made at once, as at a
+    // room's start, with the first held before its clear.
+    #[test]
+    fn second_registration_waits() {
+        let learned = Learned(Mutex::new(Vec::new()));
+        learned.learn(MICROPHONE, Canceller::Missing);
+        let listening = AtomicUsize::new(0);
+        let (went_on, heard) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let held = learned.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let first = scope.spawn(|| learned.listen(&listening));
+            std::thread::sleep(Duration::from_millis(50));
+            let second = scope.spawn(|| {
+                let counted = learned.listen(&listening);
+                let _ = went_on.send(());
+                (counted, learned.of(MICROPHONE))
+            });
+            assert!(heard.recv_timeout(Duration::from_millis(50)).is_err());
+            drop(held);
+            let _first = first.join().expect("first");
+            let (_second, known) = second.join().expect("second");
+            assert_eq!(known, None);
+        });
+        assert_eq!(listening.load(Ordering::Acquire), 0);
     }
 
     // The performance counter now, in the 100 ns units GetBuffer uses.

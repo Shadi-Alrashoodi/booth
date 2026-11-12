@@ -59,22 +59,36 @@ pub struct StreamStats {
     top: Option<i64>,
     // Bit i set: top - i has arrived.
     seen: u128,
+    // The lowest number placed since counting began, or began again.
+    oldest: i64,
     events: VecDeque<Event>,
     jitter: Jitter,
     // The last packet too far behind to place. If the very next one follows
     // it closely, the sender has started counting again and we follow, as
     // RFC 3550 appendix A.1 does with bad_seq.
     stray: Option<u16>,
+    // Where counting was before a restart, kept for SEEN packets placed and
+    // through a second one: two very late packets look like a restart too,
+    // and voice can pause for seconds before the old run goes on.
+    restarted_from: Option<Restart>,
 }
 
-// One packet that arrived, and the numbers skipped just before it that are
-// still missing.
+// One packet that arrived, and how many of the numbers it showed as
+// skipped, missing_from..seq, are still missing.
 #[derive(Debug, Clone, Copy)]
 struct Event {
     at: Instant,
     seq: i64,
     missing_from: i64,
     missing: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Restart {
+    top: i64,
+    seen: u128,
+    // Events pushed since, counted from the new top.
+    pushed: usize,
 }
 
 enum Place {
@@ -93,11 +107,9 @@ impl StreamStats {
         StreamStats::default()
     }
 
-    /// `sent_us` is when the packet's content was captured and `arrived_us`
-    /// when it arrived, both in microseconds, None when the send time cannot
-    /// be told yet. Only differences are used, so the two need not share a
-    /// clock and either may wrap. `at` is the arrival on the monotonic clock,
-    /// for the window.
+    /// `sent_us` is the sender's time for the packet and `arrived_us` ours, in
+    /// microseconds. Only differences are used, so the clocks need not agree
+    /// and either may wrap.
     pub fn record(&mut self, seq: u16, sent_us: Option<u64>, arrived_us: u64, at: Instant) {
         self.forget_before(at);
         let stray = self.stray.take();
@@ -112,15 +124,34 @@ impl StreamStats {
                 missing_from,
                 missing,
             },
+            // Older than anything placed: the numbers between went missing.
+            Place::Filled(seq) if seq < self.oldest => {
+                let event = Event {
+                    at,
+                    seq: self.oldest,
+                    missing_from: seq + 1,
+                    missing: (self.oldest - seq - 1) as u32,
+                };
+                self.oldest = seq;
+                event
+            }
             Place::Filled(seq) => {
                 self.fill(seq);
                 Event::received(at, seq)
             }
             Place::Known => return,
+            // Late, but the gap it was counted in is still in the window.
+            Place::FarBehind(extended) if self.fill(extended) => Event::received(at, extended),
             Place::FarBehind(extended) => match stray {
                 Some(earlier) if follows(earlier, seq) => {
+                    self.restarted_from = self.restarted_from.or(self.top.map(|top| Restart {
+                        top,
+                        seen: self.seen,
+                        pushed: 0,
+                    }));
                     self.top = Some(extended);
                     self.seen = 1;
+                    self.oldest = extended - i64::from(seq.wrapping_sub(earlier));
                     Event::received(at, extended)
                 }
                 _ => {
@@ -133,6 +164,12 @@ impl StreamStats {
             self.events.pop_front();
         }
         self.events.push_back(event);
+        if let Some(restart) = &mut self.restarted_from {
+            restart.pushed += 1;
+            if restart.pushed >= SEEN as usize {
+                self.restarted_from = None;
+            }
+        }
         if let Some(sent_us) = sent_us {
             self.jitter.add(Arrival {
                 sent_us,
@@ -162,10 +199,11 @@ impl StreamStats {
     }
 
     fn place(&mut self, seq: u16) -> Place {
-        let Some(top) = self.top else {
+        let Some(mut top) = self.top else {
             let seq = i64::from(seq);
             self.top = Some(seq);
             self.seen = 1;
+            self.oldest = seq;
             return Place::Ahead {
                 seq,
                 missing_from: seq,
@@ -173,11 +211,30 @@ impl StreamStats {
             };
         };
         let extended = top + i64::from(seq.wrapping_sub(top as u16) as i16);
+        if let Some(restart) = self.restarted_from {
+            if restart.top - top < SEEN {
+                // Its run came up to the old top: the sender did count again.
+                self.restarted_from = None;
+            } else if extended - top >= SEEN && extended > restart.top - SEEN {
+                // A jump back near the old top: the restart was very late
+                // packets, and the gaps counted since were counted before.
+                self.restarted_from = None;
+                top = restart.top;
+                self.top = Some(top);
+                self.seen = restart.seen;
+                for event in self.events.iter_mut().rev().take(restart.pushed) {
+                    event.missing = 0;
+                }
+            }
+        }
         let ahead = extended - top;
         if ahead > 0 {
             let kept = if ahead >= SEEN { 0 } else { self.seen << ahead };
             self.seen = kept | 1;
             self.top = Some(extended);
+            if ahead > MAX_GAP {
+                self.oldest = extended;
+            }
             let missing = if ahead <= MAX_GAP { ahead - 1 } else { 0 };
             return Place::Ahead {
                 seq: extended,
@@ -199,7 +256,7 @@ impl StreamStats {
 
     // A late packet: the gap it was counted in, if still in the window, has
     // one fewer missing.
-    fn fill(&mut self, seq: i64) {
+    fn fill(&mut self, seq: i64) -> bool {
         if let Some(event) = self
             .events
             .iter_mut()
@@ -207,7 +264,9 @@ impl StreamStats {
             .find(|event| event.missing > 0 && (event.missing_from..event.seq).contains(&seq))
         {
             event.missing -= 1;
+            return true;
         }
+        false
     }
 
     fn forget_before(&mut self, now: Instant) {

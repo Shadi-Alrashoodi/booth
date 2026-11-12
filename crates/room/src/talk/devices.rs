@@ -627,8 +627,8 @@ fn open_microphone(
             processor.restart();
             mouth.restart();
         }
-        let (samples, at) = processor.run(samples, at);
-        mouth.hear(samples, at);
+        let (samples, marks, at) = processor.run_marked(samples, at);
+        mouth.hear(samples, marks, at);
     };
     let mut said = on_event(Arc::clone(shared), log.clone(), Side::Microphone, None);
     let away = Arc::clone(shared);
@@ -814,7 +814,7 @@ fn opened(info: &StreamInfo) -> String {
         Direction::Output => String::new(),
     };
     format!(
-        "opened: {}, period {:.2} ms ({} frames), engine {} Hz, resampled by windows {}, bluetooth hands-free {}, small period {}, pro audio {}, stream ({}), stream latency {:.2} ms{processing}{refused}",
+        "opened: {}, period {:.2} ms ({} frames), engine {} Hz, resampled by windows {}, bluetooth hands-free {}, small period {}, pro audio {}, stream ({}), stream latency {:.2} ms, opened in {:.1} ms{processing}{refused}",
         crate::log::quoted(&info.device),
         info.period_ms(),
         info.period_frames,
@@ -824,7 +824,8 @@ fn opened(info: &StreamInfo) -> String {
         yes_no(info.small_period),
         yes_no(info.pro_audio),
         info.format,
-        info.stream_latency.as_secs_f64() * 1000.0
+        info.stream_latency.as_secs_f64() * 1000.0,
+        info.opened_in.as_secs_f64() * 1000.0
     )
 }
 
@@ -885,7 +886,7 @@ mod tests {
         config.automatic_volume = true;
         shared.set_voice(&config);
         for _ in 0..100 {
-            processor.run(&[0.0001; 480], at);
+            processor.run(&[0.0003; 480], at);
         }
         for _ in 0..100 {
             processor.run(&samples, at);

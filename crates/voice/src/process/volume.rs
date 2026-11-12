@@ -4,6 +4,7 @@
 // out at once, at the gain the blocks before it set, through the mixer's
 // soft limiter so a word louder than the last never clips.
 
+use super::{Mark, SILENT_RUN};
 use crate::mix::limit;
 
 // 5 ms, the open mic gate's blocks.
@@ -17,15 +18,12 @@ const LEAST_DB: f32 = -10.0;
 const UP_DB: f32 = 6.0 / BLOCKS_PER_SECOND as f32;
 const DOWN_DB: f32 = 12.0 / BLOCKS_PER_SECOND as f32;
 // A block is voice when it is over this, and this far over the room's floor:
-// the quietest block of the last second of sound, digital silence left out,
+// the quietest block of the last second of sound, near silence left out,
 // rising no faster than FLOOR_RISE_DB a block, as the open mic gate keeps it.
 const QUIETEST_DB: f32 = -55.0;
 const OVER_FLOOR_DB: f32 = 10.0;
 const FLOOR_RISE_DB: f32 = 3.0 / BLOCKS_PER_SECOND as f32;
 const SILENCE_DB: f32 = -100.0;
-// Exact zeros this many in a row, a millisecond, are digital silence: no
-// room's own noise stays that still.
-const SILENT_RUN: usize = 48;
 
 pub(super) struct Volume {
     gain_db: f32,
@@ -37,7 +35,7 @@ pub(super) struct Volume {
     squares: f32,
     count: usize,
     // Exact zeros in a row so far in this block, and whether SILENT_RUN of
-    // them came.
+    // them or a marked sample came.
     zeros: usize,
     silent: bool,
 }
@@ -62,13 +60,18 @@ impl Volume {
         self.gain_db
     }
 
-    pub(super) fn run(&mut self, samples: &mut [f32]) {
-        for sample in samples {
+    pub(super) fn floor_db(&self) -> f32 {
+        self.floor
+    }
+
+    pub(super) fn run(&mut self, samples: &mut [f32], marks: &[Mark]) {
+        debug_assert_eq!(samples.len(), marks.len());
+        for (sample, &mark) in samples.iter_mut().zip(marks) {
             let heard = *sample;
             self.squares += heard * heard;
             self.count += 1;
             self.zeros = if heard == 0.0 { self.zeros + 1 } else { 0 };
-            self.silent |= self.zeros >= SILENT_RUN;
+            self.silent |= self.zeros >= SILENT_RUN || mark != Mark::Room;
             *sample = limit(heard * self.gain);
             if self.count == BLOCK {
                 self.block();
@@ -88,11 +91,8 @@ impl Volume {
         self.count = 0;
         self.zeros = 0;
         self.silent = false;
-        // Digital silence, a packet Windows marks silent or a microphone's
-        // own mute, is not the room. As the floor it would make the room's
-        // noise after it a voice, and pump it up. A block it starts or ends
-        // in is left out too: its zeros pull the block's level under the
-        // room's.
+        // Near silence, or noise suppression's output around it, is not the
+        // room: as the floor it would make the room after it a voice to pump up.
         if level <= SILENCE_DB || silent {
             return;
         }

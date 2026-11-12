@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use channels::Channel;
 use voice::codec::{CodecError, Encoder, MAX_FRAME, MAX_PACKET, Mode, SAMPLE_RATE};
+use voice::process::Mark;
 
 use super::detect::Detector;
 use super::wire::{Frame, MAX_VOICE};
@@ -33,6 +34,7 @@ pub(crate) struct Mouth {
     sensitivity_db: i8,
     constant_rate: bool,
     pcm: [f32; MAX_FRAME],
+    marks: [Mark; MAX_FRAME],
     filled: usize,
     // When the first sample in `pcm` was captured.
     first: Option<Instant>,
@@ -63,6 +65,7 @@ impl Mouth {
             sensitivity_db,
             constant_rate,
             pcm: [0.0; MAX_FRAME],
+            marks: [Mark::Room; MAX_FRAME],
             filled: 0,
             first: None,
             sending: false,
@@ -79,8 +82,10 @@ impl Mouth {
     }
 
     // The capture callback: `samples` is one device period of mono 48 kHz,
-    // the first of it captured at `captured`.
-    pub(crate) fn hear(&mut self, samples: &[f32], captured: Instant) {
+    // the first of it captured at `captured`, and `marks` what each sample
+    // is to the open mic floor.
+    pub(crate) fn hear(&mut self, samples: &[f32], marks: &[Mark], captured: Instant) {
+        debug_assert_eq!(samples.len(), marks.len());
         let began = Instant::now();
         let mut at = 0;
         while at < samples.len() {
@@ -90,6 +95,7 @@ impl Mouth {
             let frame = self.mode.frame_samples();
             let take = (frame - self.filled).min(samples.len() - at);
             self.pcm[self.filled..self.filled + take].copy_from_slice(&samples[at..at + take]);
+            self.marks[self.filled..self.filled + take].copy_from_slice(&marks[at..at + take]);
             self.filled += take;
             at += take;
             if self.filled == frame {
@@ -143,7 +149,9 @@ impl Mouth {
             TalkMode::PushToTalk => self.shared.held.load(Ordering::Relaxed),
             // The detector hears every frame, sent or not, so its floor is
             // the room's and not only the voice's.
-            TalkMode::OpenMic => self.detector.wanted(&self.pcm[..frame]),
+            TalkMode::OpenMic => self
+                .detector
+                .wanted(&self.pcm[..frame], &self.marks[..frame]),
         };
         let wanted = heard && self.shared.microphone_wanted();
         if !wanted && !self.sending {
@@ -306,6 +314,7 @@ fn samples_to_time(samples: usize) -> Duration {
 mod tests {
     use super::*;
     use crate::talk::{VoiceConfig, read_relayed, read_spoken};
+    use voice::process::{Processor, Switches};
 
     fn mouth(talk: TalkMode, constant_rate: bool, host: bool) -> (Mouth, Arc<Shared>) {
         let config = VoiceConfig {
@@ -326,7 +335,7 @@ mod tests {
         for _ in 0..periods {
             let before = mouth.shared.frames_sent.load(Ordering::Relaxed);
             let samples = [signal; 128];
-            mouth.hear(&samples, *at);
+            mouth.hear(&samples, &[Mark::Room; 128], *at);
             *at += samples_to_time(128);
             if mouth.shared.frames_sent.load(Ordering::Relaxed) != before {
                 out.push(mouth.payload.clone());
@@ -467,7 +476,7 @@ mod tests {
         // One 240-sample period a frame, so the frame sent is still in pcm.
         let mut frame = |mouth: &mut Mouth| {
             let before = mouth.shared.frames_sent.load(Ordering::Relaxed);
-            mouth.hear(&[0.2; 240], at);
+            mouth.hear(&[0.2; 240], &[Mark::Room; 240], at);
             at += samples_to_time(240);
             assert_eq!(mouth.shared.frames_sent.load(Ordering::Relaxed), before + 1);
             read_spoken(&mouth.payload).unwrap().last
@@ -547,6 +556,201 @@ mod tests {
         assert!(run(&mut mouth, &mut at, 750, 0.0003).is_empty());
         assert!(run(&mut mouth, &mut at, 50, 0.01).is_empty());
         assert!(!run(&mut mouth, &mut at, 10, 0.1).is_empty());
+    }
+
+    // White noise at `db` dBFS RMS, a fan or a room, for `samples` samples.
+    fn room(samples: usize, db: f32, seed: &mut u32) -> Vec<f32> {
+        let amplitude = 10f32.powf(db / 20.0) * 3f32.sqrt();
+        (0..samples)
+            .map(|_| {
+                *seed ^= *seed << 13;
+                *seed ^= *seed >> 17;
+                *seed ^= *seed << 5;
+                amplitude * (*seed as f32 / u32::MAX as f32 * 2.0 - 1.0)
+            })
+            .collect()
+    }
+
+    // `signal` through the microphone's processing into the mouth, in the
+    // usual 128-sample periods, as the capture callback does.
+    fn speak(mouth: &mut Mouth, processor: &mut Processor, signal: &[f32], at: &mut Instant) {
+        for period in signal.chunks(128) {
+            let (samples, marks, captured) = processor.run_marked(period, *at);
+            mouth.hear(samples, marks, captured);
+            *at += samples_to_time(period.len());
+        }
+    }
+
+    fn sent(mouth: &Mouth) -> u64 {
+        mouth.shared.frames_sent.load(Ordering::Relaxed)
+    }
+
+    // A mute that leaves dither at -90 dBFS sends none of the room after it:
+    // a block of it on the blocks or 8 samples off them, 2 s of it, or 2 s
+    // of it while automatic volume holds a quiet microphone at +20 dB.
+    #[test]
+    fn dither_mute_sends_nothing() {
+        let mut seed = 0x2545_f491;
+        for (before, dither) in [(96_000, 240), (96_008, 240), (96_000, 96_000)] {
+            let mut signal = room(before, -45.0, &mut seed);
+            signal.extend(room(dither, -90.0, &mut seed));
+            signal.extend(room(5 * 48_000, -45.0, &mut seed));
+            let (mut talker, _) = mouth(TalkMode::OpenMic, true, false);
+            let mut processor = Processor::new(Arc::new(Switches::new(false, true)));
+            speak(&mut talker, &mut processor, &signal, &mut Instant::now());
+            assert_eq!(
+                sent(&talker),
+                0,
+                "{dither} samples of dither after {before}"
+            );
+        }
+
+        let mut seed = 0x1234_5678;
+        let mut signal = room(6 * 48_000, -65.0, &mut seed);
+        let words = 10f32.powf(-40.0 / 20.0) * 2f32.sqrt();
+        for (n, sample) in signal.iter_mut().enumerate() {
+            if n % 28_800 < 19_200 {
+                *sample += words * (std::f32::consts::TAU * 440.0 * n as f32 / 48_000.0).sin();
+            }
+        }
+        signal.extend(room(5 * 48_000, -65.0, &mut seed));
+        let (mut talker, _) = mouth(TalkMode::OpenMic, true, false);
+        let mut processor = Processor::new(Arc::new(Switches::new(false, true)));
+        let mut at = Instant::now();
+        speak(&mut talker, &mut processor, &signal, &mut at);
+        assert!(processor.gain_db() > 15.0, "{} dB", processor.gain_db());
+        let before = sent(&talker);
+        let mut after = room(2 * 48_000, -90.0, &mut seed);
+        after.extend(room(10 * 48_000, -65.0, &mut seed));
+        speak(&mut talker, &mut processor, &after, &mut at);
+        assert_eq!(sent(&talker), before);
+    }
+
+    // Opened on a mute, open mic has learnt no floor when the room comes
+    // back, and the block the unmute falls in is no voice: after dither,
+    // after zeros that end early in a block, and with noise suppression on
+    // after zeros at the open or a mute of 2 s.
+    #[test]
+    fn mute_first_sends_nothing() {
+        let mut sends = Vec::new();
+        for (zeros, len, suppressing, db) in [
+            (false, 2 * 48_000 + 100, false, -45.0),
+            (true, 256, false, -45.0),
+            (true, 128, true, -45.0),
+            (true, 2 * 48_000 + 100, true, -45.0),
+            (false, 2 * 48_000 + 300, true, -40.0),
+        ] {
+            let mut signal = if zeros {
+                vec![0.0; len]
+            } else {
+                room(len, -90.0, &mut 0x51ed_270b)
+            };
+            signal.extend(room(3 * 48_000, db, &mut 0x2545_f491));
+            let (mut talker, _) = mouth(TalkMode::OpenMic, true, false);
+            let mut processor = Processor::new(Arc::new(Switches::new(suppressing, true)));
+            speak(&mut talker, &mut processor, &signal, &mut Instant::now());
+            sends.push(sent(&talker));
+        }
+        assert_eq!(sends, [0; 5]);
+    }
+
+    // A microphone with its own gate gives exact zeros until a word, and the
+    // block the first word starts in still starts a spell.
+    #[test]
+    fn gate_first_word_sent() {
+        let mut signal = vec![0.0; 48_000 + 100];
+        let word = |n: usize| 0.1 * (std::f32::consts::TAU * 300.0 * n as f32 / 48_000.0).sin();
+        signal.extend((0..12_000).map(word));
+        signal.extend(vec![0.0; 12_000]);
+        let (mut talker, _) = mouth(TalkMode::OpenMic, true, false);
+        let mut processor = Processor::new(Arc::new(Switches::new(false, true)));
+        speak(&mut talker, &mut processor, &signal, &mut Instant::now());
+        assert!(sent(&talker) > 0);
+    }
+
+    // With noise suppression on, its fades into a mute and out of it, and
+    // RNNoise's unsettled blocks after, are not the open mic floor: the room
+    // after a mute sends no more than the same room with no mute in it.
+    #[test]
+    fn suppression_fades_send_nothing() {
+        let mut seed = 0x2545_f491;
+        let plain = room(6 * 48_000, -40.0, &mut seed);
+        let dither = room(4_800, -90.0, &mut 0x51ed_270b);
+        for (at, dithered) in [
+            (96_000, false),
+            (96_312, false),
+            (96_000, true),
+            (96_096, true),
+        ] {
+            let mut muted = plain.clone();
+            if dithered {
+                muted[at..at + 4_800].copy_from_slice(&dither);
+            } else {
+                muted[at..at + 4_800].fill(0.0);
+            }
+            let switches = Arc::new(Switches::new(true, false));
+            let (mut talker, _) = mouth(TalkMode::OpenMic, true, false);
+            let (mut control, _) = mouth(TalkMode::OpenMic, true, false);
+            talker.detector = Detector::with_random(|| 0);
+            control.detector = Detector::with_random(|| 0);
+            let mut processor = Processor::new(Arc::clone(&switches));
+            let mut control_processor = Processor::new(switches);
+            let (mut at_talker, mut at_control) = (Instant::now(), Instant::now());
+            let (mut fed, mut worst, mut from) = (0, 0.0f32, None);
+            for (period, same) in muted.chunks(128).zip(plain.chunks(128)) {
+                if fed + period.len() > at {
+                    from.get_or_insert((sent(&talker), sent(&control)));
+                }
+                speak(&mut talker, &mut processor, period, &mut at_talker);
+                speak(&mut control, &mut control_processor, same, &mut at_control);
+                fed += period.len();
+                if (at..at + 2 * 48_000).contains(&fed) {
+                    worst = worst.min(talker.detector.floor_db() - control.detector.floor_db());
+                }
+            }
+            let (from, from_control) = from.unwrap();
+            let (more, more_control) = (sent(&talker) - from, sent(&control) - from_control);
+            let what = format!("{} at {at}", if dithered { "dither" } else { "zeros" });
+            println!(
+                "{what}: floor at worst {worst:.1} dB from the control's, {more} frames sent against {more_control}"
+            );
+            assert!(worst >= -3.0, "{what}: {worst} dB");
+            assert!(more <= more_control, "{what}: {more} frames");
+        }
+    }
+
+    // Nothing of the room goes out while noise suppression settles: from the
+    // first sample, after a reopen, or once it is turned on.
+    #[test]
+    fn suppression_start_sends_nothing() {
+        let mut seed = 0x2545_f491;
+        let mut next = |seconds: usize, db| room(seconds * 48_000, db, &mut seed);
+        let switches = Arc::new(Switches::new(true, true));
+        let mut at = Instant::now();
+        let (mut talker, _) = mouth(TalkMode::OpenMic, true, false);
+        let mut processor = Processor::new(Arc::clone(&switches));
+        speak(&mut talker, &mut processor, &next(2, -40.0), &mut at);
+        let first = (sent(&talker), processor.gain_db());
+        assert_eq!(first, (0, 0.0), "from the first sample");
+
+        let (mut talker, _) = mouth(TalkMode::OpenMic, true, false);
+        let mut processor = Processor::new(Arc::clone(&switches));
+        speak(&mut talker, &mut processor, &next(2, -60.0), &mut at);
+        processor.restart();
+        talker.restart();
+        let before = sent(&talker);
+        speak(&mut talker, &mut processor, &next(4, -40.0), &mut at);
+        let reopened = (sent(&talker) - before, processor.gain_db());
+        assert_eq!(reopened, (0, 0.0), "after a reopen");
+
+        switches.noise_suppression.store(false, Ordering::Relaxed);
+        let (mut talker, _) = mouth(TalkMode::OpenMic, true, false);
+        let mut processor = Processor::new(Arc::clone(&switches));
+        speak(&mut talker, &mut processor, &next(2, -40.0), &mut at);
+        switches.noise_suppression.store(true, Ordering::Relaxed);
+        speak(&mut talker, &mut processor, &next(2, -40.0), &mut at);
+        let turned_on = (sent(&talker), processor.gain_db());
+        assert_eq!(turned_on, (0, 0.0), "turned on");
     }
 
     #[test]
@@ -699,7 +903,11 @@ mod tests {
                 })
                 .collect();
             let before = shared.frames_sent.load(Ordering::Relaxed);
-            mouth.hear(&samples, start + samples_to_time(n * 128));
+            mouth.hear(
+                &samples,
+                &[Mark::Room; 128],
+                start + samples_to_time(n * 128),
+            );
             if shared.frames_sent.load(Ordering::Relaxed) != before {
                 sent.push(mouth.payload.clone());
             }

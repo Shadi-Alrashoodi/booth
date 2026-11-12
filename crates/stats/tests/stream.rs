@@ -113,6 +113,23 @@ fn jitter_follows_rfc_3550_in_arrival_order() {
     steady(&mut stats, start, 7, 0..5, &[], |i| transit[usize::from(i)]);
     let jitter = stats.jitter_ms().unwrap();
     assert!((jitter - 0.258_300_78).abs() < 1e-5, "{jitter}");
+
+    // Arriving as 0, 2, 1: D = 0, then 1000000 us for 1 against 2, the one
+    // before it in arrival, so J = 62.5 ms.
+    let mut stats = StreamStats::new();
+    for (seq, sent, arrived) in [
+        (0, 0, 1_000),
+        (2, 200_000, 201_000),
+        (1, 100_000, 1_101_000),
+    ] {
+        stats.record(
+            seq,
+            Some(SENDER_CLOCK + sent),
+            OUR_CLOCK + arrived,
+            start + Duration::from_micros(arrived),
+        );
+    }
+    assert_eq!(stats.jitter_ms(), Some(62.5));
 }
 
 #[test]
@@ -145,6 +162,172 @@ fn sender_counting_again_is_followed() {
             expected: 106
         })
     );
+}
+
+#[test]
+fn far_late_frames_fill_gap() {
+    let start = Instant::now();
+    let mut stats = StreamStats::new();
+    steady(&mut stats, start, 0, 0..300, &[100, 101], |_| 1_000);
+    // 1 s late, far behind the newest, and their gap still in the window.
+    let late = at_ms(start, 1_498);
+    stats.record(100, None, OUR_CLOCK, late);
+    stats.record(101, None, OUR_CLOCK, late);
+    steady(&mut stats, start, 0, 300..310, &[], |_| 1_000);
+    assert_eq!(
+        stats.loss(at_ms(start, 1_600)),
+        Some(StreamLoss {
+            lost: 0,
+            expected: 310
+        })
+    );
+}
+
+#[test]
+fn run_after_stale_pair() {
+    let start = Instant::now();
+    let mut stats = StreamStats::new();
+    steady(&mut stats, start, 0, 0..600, &[100, 101], |_| 1_000);
+    // Over 2 s late, after their gap aged out, so placement restarts at
+    // them. The run going on is not loss.
+    let late = at_ms(start, 2_998);
+    stats.record(100, None, OUR_CLOCK, late);
+    stats.record(101, None, OUR_CLOCK, late);
+    steady(&mut stats, start, 0, 600..700, &[], |_| 1_000);
+    let end = at_ms(start, 3_500);
+    let loss = stats.loss(end);
+    assert_eq!(loss.unwrap().lost, 0);
+    // What arrived before the pair is still known.
+    stats.record(598, None, OUR_CLOCK, end);
+    assert_eq!(stats.loss(end), loss);
+
+    // Nor when 598 comes late or 599 twice right after the pair, or one
+    // more stale packet comes from below it.
+    for (lost, then) in [
+        (&[100, 101, 598][..], &[100, 101, 598][..]),
+        (&[100, 101], &[100, 101, 599]),
+        (&[100, 110, 111], &[110, 111, 100]),
+    ] {
+        let mut stats = StreamStats::new();
+        steady(&mut stats, start, 0, 0..600, lost, |_| 1_000);
+        for &seq in then {
+            stats.record(seq, None, OUR_CLOCK, late);
+        }
+        steady(&mut stats, start, 0, 600..700, &[], |_| 1_000);
+        assert_eq!(stats.loss(end).unwrap().lost, 0, "{then:?}");
+    }
+
+    // Nor when the talker pauses for 2.5 s after the pair.
+    let mut stats = StreamStats::new();
+    steady(&mut stats, start, 0, 0..600, &[100, 101], |_| 1_000);
+    stats.record(100, None, OUR_CLOCK, late);
+    stats.record(101, None, OUR_CLOCK, late);
+    steady(&mut stats, at_ms(start, 2_500), 0, 600..700, &[], |_| 1_000);
+    assert_eq!(stats.loss(at_ms(start, 6_000)).unwrap().lost, 0);
+
+    // A gap counted before the pair still counts.
+    let mut stats = StreamStats::new();
+    steady(&mut stats, start, 0, 0..600, &[100, 101, 500], |_| 1_000);
+    stats.record(100, None, OUR_CLOCK, late);
+    stats.record(101, None, OUR_CLOCK, late);
+    steady(&mut stats, start, 0, 600..700, &[], |_| 1_000);
+    assert_eq!(stats.loss(end).unwrap().lost, 1);
+}
+
+#[test]
+fn stale_pairs_then_gap() {
+    let start = Instant::now();
+    let mut stats = StreamStats::new();
+    steady(&mut stats, start, 0, 0..600, &[20, 21, 160, 161], |_| 1_000);
+    // Two stale pairs, the second far behind the first, then the run goes
+    // on with 600 to 602 lost.
+    let late = at_ms(start, 2_998);
+    for seq in [160, 161, 20, 21] {
+        stats.record(seq, None, OUR_CLOCK, late);
+    }
+    steady(&mut stats, start, 0, 603..700, &[], |_| 1_000);
+    assert_eq!(stats.loss(at_ms(start, 3_500)).unwrap().lost, 3);
+}
+
+#[test]
+fn stale_pair_after_restart() {
+    let start = Instant::now();
+    let mut stats = StreamStats::new();
+    // Counting again 10100 lower, then a stale pair of the new run 3 s on.
+    steady(&mut stats, start, 30_000, 0..100, &[], |_| 1_000);
+    steady(&mut stats, start, 19_900, 100..700, &[200, 201], |_| 1_000);
+    let late = at_ms(start, 3_500);
+    stats.record(20_100, None, OUR_CLOCK, late);
+    stats.record(20_101, None, OUR_CLOCK, late);
+    steady(&mut stats, start, 19_900, 700..800, &[], |_| 1_000);
+    assert_eq!(stats.loss(at_ms(start, 4_000)).unwrap().lost, 0);
+
+    // Counting again twice, 2.5 s apart: the second jump is too far ahead
+    // of the newest to be loss.
+    let mut stats = StreamStats::new();
+    steady(&mut stats, start, 30_000, 0..100, &[], |_| 1_000);
+    steady(&mut stats, start, 19_900, 100..600, &[], |_| 1_000);
+    steady(&mut stats, start, 30_000, 600..700, &[], |_| 1_000);
+    assert_eq!(stats.loss(at_ms(start, 3_500)).unwrap().lost, 0);
+}
+
+#[test]
+fn restart_past_old_top() {
+    let start = Instant::now();
+    let mut stats = StreamStats::new();
+    steady(&mut stats, start, 0, 0..600, &[], |_| 1_000);
+    // Counting again 129 lower, past the old top, then 611 to 749 lost.
+    let first = 470u16.wrapping_sub(600);
+    let lost: Vec<u16> = (741..880).collect();
+    steady(&mut stats, start, first, 600..881, &lost, |_| 1_000);
+    assert_eq!(
+        stats.loss(at_ms(start, 4_500)),
+        Some(StreamLoss {
+            lost: 139,
+            expected: 380
+        })
+    );
+}
+
+#[test]
+fn gap_before_first_frame() {
+    let start = Instant::now();
+    let mut stats = StreamStats::new();
+    for seq in [5, 2, 4] {
+        stats.record(seq, None, OUR_CLOCK, start);
+    }
+    assert_eq!(
+        stats.loss(start),
+        Some(StreamLoss {
+            lost: 1,
+            expected: 4
+        })
+    );
+    stats.record(3, None, OUR_CLOCK, start);
+    assert_eq!(
+        stats.loss(start),
+        Some(StreamLoss {
+            lost: 0,
+            expected: 4
+        })
+    );
+}
+
+#[test]
+fn gap_before_counting_again() {
+    let start = Instant::now();
+    let mut stats = StreamStats::new();
+    steady(&mut stats, start, 0, 0..100, &[], |_| 1_000);
+    let later = at_ms(start, 600);
+    // A jump far ahead, then one from just before it: 4998 and 4999 lost.
+    stats.record(5_000, None, OUR_CLOCK, later);
+    stats.record(4_997, None, OUR_CLOCK, later);
+    assert_eq!(stats.loss(later).unwrap().lost, 2);
+    // A restart from far behind, then one from before the pair: 2999 lost.
+    stats.record(3_000, None, OUR_CLOCK, later);
+    stats.record(3_001, None, OUR_CLOCK, later);
+    stats.record(2_998, None, OUR_CLOCK, later);
+    assert_eq!(stats.loss(later).unwrap().lost, 3);
 }
 
 #[test]

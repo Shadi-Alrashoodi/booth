@@ -209,10 +209,10 @@ impl fmt::Display for FormatError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             FormatError::Short(len) => {
-                write!(f, "the format description is cut short at {len} bytes")
+                write!(f, "a format description cut short at {len} bytes")
             }
-            FormatError::Tag(tag) => write!(f, "format tag {tag:#06x} is not PCM or float"),
-            FormatError::SubFormat(guid) => write!(f, "sub-format {guid} is not PCM or float"),
+            FormatError::Tag(tag) => write!(f, "format tag {tag:#06x}"),
+            FormatError::SubFormat(guid) => write!(f, "sub-format {guid}"),
             FormatError::Bits { bits, float: true } => write!(f, "{bits}-bit float samples"),
             FormatError::Bits { bits, float: false } => write!(f, "{bits}-bit integer samples"),
             FormatError::Channels(n) => write!(f, "{n} channels"),
@@ -223,7 +223,7 @@ impl fmt::Display for FormatError {
                 bits,
             } => write!(
                 f,
-                "a block of {block_align} bytes does not hold {channels} channels of {bits} bits"
+                "a block of {block_align} bytes for {channels} channels of {bits} bits"
             ),
         }
     }
@@ -231,8 +231,9 @@ impl fmt::Display for FormatError {
 
 impl std::error::Error for FormatError {}
 
-// Appends one sample per frame, the average of the frame's channels.
-// Anything after the last whole frame is left out.
+// Appends one sample per frame, the average of the frame's channels. A frame
+// with a sample that is not a number comes out as silence. Anything after
+// the last whole frame is left out.
 pub fn to_mono(data: &[u8], format: &Format, out: &mut Vec<f32>) {
     let frame_bytes = format.frame_bytes();
     let channels = usize::from(format.channels);
@@ -244,7 +245,7 @@ pub fn to_mono(data: &[u8], format: &Format, out: &mut Vec<f32>) {
             .chunks_exact(size)
             .map(|bytes| read(bytes, format.sample))
             .sum();
-        out.push(sum * scale);
+        out.push(if sum.is_finite() { sum * scale } else { 0.0 });
     }
 }
 

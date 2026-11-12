@@ -1348,9 +1348,9 @@ fn a_volume_for_each_person() {
 fn noisy_voice(frame: u64, _: u16) -> f32 {
     let t = frame as f64 / RATE as f64;
     let phase = t % 0.4;
-    let pitch = 150.0 + 8.0 * (TAU * 5.0 * t).sin();
+    let cycles = 150.0 * t + 8.0 / (TAU * 5.0) * (1.0 - (TAU * 5.0 * t).cos());
     let voice: f64 = (1..20)
-        .map(|h| (TAU * pitch * f64::from(h) * t).sin() / f64::from(h))
+        .map(|h| (TAU * f64::from(h) * cycles).sin() / f64::from(h))
         .sum();
     let envelope = if phase < 0.25 {
         (TAU * phase / 0.5).sin()

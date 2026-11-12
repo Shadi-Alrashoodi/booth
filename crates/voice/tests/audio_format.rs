@@ -1,5 +1,6 @@
 use voice::audio::{
-    Format, FormatError, Sample, from_mono, from_stereo, interleaved, plan, to_mono,
+    AudioError, Direction, Format, FormatError, Sample, from_mono, from_stereo, interleaved, plan,
+    to_mono,
 };
 
 // WAVEFORMATEX, then for the extensible form: valid bits, channel mask and
@@ -105,10 +106,58 @@ fn refuses_what_it_cannot_read() {
     for (bytes, expected) in cases {
         assert_eq!(Format::parse(bytes), Err(expected.clone()), "{expected}");
     }
-    assert_eq!(
-        FormatError::Tag(2).to_string(),
-        "format tag 0x0002 is not PCM or float"
-    );
+    assert_eq!(FormatError::Tag(2).to_string(), "format tag 0x0002");
+}
+
+#[test]
+fn format_error_sentences() {
+    for (error, words) in [
+        (
+            FormatError::Short(18),
+            "a format description cut short at 18 bytes",
+        ),
+        (FormatError::Tag(0x55), "format tag 0x0055"),
+        (
+            FormatError::SubFormat(String::from("{00000003-0000-0010-8000-00aa00389b00}")),
+            "sub-format {00000003-0000-0010-8000-00aa00389b00}",
+        ),
+        (
+            FormatError::Bits {
+                bits: 8,
+                float: false,
+            },
+            "8-bit integer samples",
+        ),
+        (
+            FormatError::Bits {
+                bits: 64,
+                float: true,
+            },
+            "64-bit float samples",
+        ),
+        (FormatError::Channels(0), "0 channels"),
+        (FormatError::Rate, "a sample rate of 0"),
+        (
+            FormatError::BlockAlign {
+                block_align: 3,
+                channels: 2,
+                bits: 16,
+            },
+            "a block of 3 bytes for 2 channels of 16 bits",
+        ),
+    ] {
+        let error = AudioError::Format {
+            direction: Direction::Input,
+            name: String::from("Headset"),
+            error,
+        };
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "could not open the microphone: Headset uses {words}, which Booth cannot read. Choose another format for it in the Windows sound settings"
+            )
+        );
+    }
 }
 
 #[test]
@@ -168,6 +217,18 @@ fn stereo_becomes_mono_by_averaging() {
     let mut mono = Vec::new();
     to_mono(&data[..data.len() - 1], &format, &mut mono);
     assert_eq!(mono.len(), 3);
+    // A frame with a sample that is not a number is silence, and so is one
+    // whose channels add up to more than a float holds.
+    let data = f32_frames(&[
+        &[f32::NAN, 0.5],
+        &[0.25, f32::INFINITY],
+        &[f32::NEG_INFINITY, f32::INFINITY],
+        &[f32::MAX, f32::MAX],
+        &[0.5, 0.25],
+    ]);
+    let mut mono = Vec::new();
+    to_mono(&data, &format, &mut mono);
+    assert_eq!(mono, [0.0, 0.0, 0.0, 0.0, 0.375]);
 }
 
 const LAYOUTS: [(u16, u32); 11] = [

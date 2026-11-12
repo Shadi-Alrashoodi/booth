@@ -1,6 +1,6 @@
 // Open mic: whether to send, from the sound itself. Each 5 ms block's level
 // is held against the room's noise floor, the quietest block of the last
-// second of sound, digital silence left out; a voice is well above it, the
+// second of sound, near silence left out; a voice is well above it, the
 // fan and the keyboard are not. After the voice stops, sending goes on for a
 // random 200 to 800 ms (RFC 6562), so the moments sending stops do not trace
 // the pauses in the speech. That tail also carries a talker across the gaps
@@ -9,6 +9,7 @@
 use std::time::Duration;
 
 use voice::codec::SAMPLE_RATE;
+use voice::process::{Mark, SILENT_RUN};
 
 // 5 ms, the smaller frame, so both frame sizes are whole blocks.
 const BLOCK: usize = 240;
@@ -26,13 +27,10 @@ const HOLD_DB: f32 = 6.0;
 // breath is well over the floor.
 pub const QUIETEST_VOICE_DB: i8 = -50;
 // The floor follows a quieter room at once and a louder one no faster than
-// this, so a voice that goes on for more than a second, or music, does not
-// become the floor and cut itself off.
+// this. The pauses in speech hold it down; a sound with none, a fan or a held
+// note, becomes the floor within seconds.
 const FLOOR_RISE_DB_PER_S: f32 = 3.0;
 const SILENCE_DB: f32 = -100.0;
-// Exact zeros this many in a row, a millisecond, are digital silence: no
-// room's own noise stays that still.
-const SILENT_RUN: usize = 48;
 
 pub(crate) const TAIL_SHORTEST: Duration = Duration::from_millis(200);
 pub(crate) const TAIL_LONGEST: Duration = Duration::from_millis(800);
@@ -84,11 +82,14 @@ impl Detector {
         self.quietest_db = f32::from(db);
     }
 
-    // One frame, 5 or 10 ms. True when this frame goes out.
-    pub(crate) fn wanted(&mut self, frame: &[f32]) -> bool {
+    // One frame, 5 or 10 ms, and its samples' marks. True when this frame
+    // goes out.
+    pub(crate) fn wanted(&mut self, frame: &[f32], marks: &[Mark]) -> bool {
+        debug_assert_eq!(frame.len(), marks.len());
         let mut wanted = false;
-        for block in frame.chunks(BLOCK) {
-            wanted = self.block(block);
+        for (block, marks) in frame.chunks(BLOCK).zip(marks.chunks(BLOCK)) {
+            let mark = marks.iter().copied().max().unwrap_or(Mark::Room);
+            wanted = self.block(block, mark);
         }
         wanted
     }
@@ -98,14 +99,10 @@ impl Detector {
         self.floor
     }
 
-    fn block(&mut self, block: &[f32]) -> bool {
+    fn block(&mut self, block: &[f32], mark: Mark) -> bool {
         let level = level_db(block);
-        // Digital silence, a packet Windows marks silent or a microphone's
-        // own mute, is not the room. As the floor it would let the room's
-        // noise after it pass for a voice until the floor climbed back. A
-        // block it starts or ends in is left out too: its zeros pull the
-        // block's level under the room's.
-        if level > SILENCE_DB && !digital_silence(block) {
+        // A mute, and what noise suppression made of it, is not the room.
+        if mark == Mark::Room && level > SILENCE_DB && !digital_silence(block) {
             self.levels[self.next] = level;
             self.next = (self.next + 1) % BLOCKS_PER_SECOND;
             self.heard = (self.heard + 1).min(BLOCKS_PER_SECOND);
@@ -121,8 +118,16 @@ impl Detector {
             };
         }
 
+        // While noise suppression settles nothing is a voice. Before the room
+        // is learnt, near silence and the room after it are no voice either,
+        // unless that is digital silence: a gate's zeros, then a word.
+        let may_be_voice = match mark {
+            Mark::Room => true,
+            Mark::Quiet => self.heard > 0 || digital_silence(block),
+            Mark::Settling => false,
+        };
         let over = if self.voice { HOLD_DB } else { ONSET_DB };
-        let voice = level >= self.quietest_db && level >= self.floor + over;
+        let voice = may_be_voice && level >= self.quietest_db && level >= self.floor + over;
         if voice {
             self.voice = true;
             self.tail = 0;
@@ -213,9 +218,13 @@ mod tests {
 
     // Whether each 5 ms frame went out.
     fn run(detector: &mut Detector, signal: &[f32]) -> Vec<bool> {
+        run_as(detector, signal, Mark::Room)
+    }
+
+    fn run_as(detector: &mut Detector, signal: &[f32], mark: Mark) -> Vec<bool> {
         signal
             .chunks(BLOCK)
-            .map(|frame| detector.wanted(frame))
+            .map(|frame| detector.wanted(frame, &[mark; BLOCK][..frame.len()]))
             .collect()
     }
 
@@ -343,6 +352,27 @@ mod tests {
         signal.extend((0..BLOCK).map(|i| if i % 2 == 0 { 1e-6 } else { -1e-6 }));
         signal.extend(noise(20_000, -45.0, &mut seed));
         assert!(run(&mut detector, &signal).iter().all(|&on| !on));
+    }
+
+    // A block marked Quiet teaches the floor nothing and can still be a
+    // voice; one marked Settling is no voice at all.
+    #[test]
+    fn marked_blocks_not_learnt() {
+        let mut seed = 29;
+        let mut detector = Detector::with_random(|| 0);
+        let fan = run(&mut detector, &noise(2000, -45.0, &mut seed));
+        assert!(fan.iter().all(|&on| !on));
+        let floor = detector.floor_db();
+        let quiet = run_as(&mut detector, &noise(1000, -66.0, &mut seed), Mark::Quiet);
+        assert!(quiet.iter().all(|&on| !on));
+        let moved = (detector.floor_db() - floor).abs();
+        assert!(moved < 1.0, "{moved} dB");
+        let fan = run(&mut detector, &noise(3000, -45.0, &mut seed));
+        assert!(fan.iter().all(|&on| !on));
+        let settling = run_as(&mut detector, &tone(300, 0.1, 0), Mark::Settling);
+        assert!(settling.iter().all(|&on| !on));
+        let voice = run_as(&mut detector, &tone(300, 0.1, 0), Mark::Quiet);
+        assert!(voice.iter().all(|&on| on));
     }
 
     // Digital silence after a voice is no voice either, so the spell ends
