@@ -28,7 +28,7 @@ use windows::core::{BOOL, HSTRING, PCWSTR, PWSTR, w};
 
 use crate::error::CaptureError;
 use crate::pointer::frame_bounds;
-use crate::window::{WindowId, keep_apartment};
+use crate::window::{WindowId, captures_windows, keep_apartment};
 
 // Longer titles are cut here; the picker cuts them shorter still.
 const LONGEST_TITLE: usize = 256;
@@ -59,7 +59,7 @@ impl fmt::Debug for TopWindow {
 // PC whose Windows cannot capture a single window.
 pub fn top_windows() -> Result<Vec<TopWindow>, CaptureError> {
     keep_apartment();
-    if !GraphicsCaptureSession::IsSupported().unwrap_or(false) {
+    if !captures_windows(GraphicsCaptureSession::IsSupported())? {
         return Ok(Vec::new());
     }
     let mut handles: Vec<HWND> = Vec::new();

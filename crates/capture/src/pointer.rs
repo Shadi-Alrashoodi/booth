@@ -39,6 +39,9 @@ pub(crate) const HIDDEN_AGAIN: Duration = Duration::from_secs(1);
 // The shape goes again for a new scale only once the scale held this long:
 // each step of a window being dragged has its own, and shapes are big.
 const SCALE_SETTLES: Duration = Duration::from_millis(200);
+// A cursor keeps its handle when its size is changed in Windows' settings,
+// so the shape is read again this often while the pointer shows.
+const SHAPE_AGAIN: Duration = Duration::from_secs(1);
 
 thread_local! {
     static PHYSICAL: Cell<bool> = const { Cell::new(false) };
@@ -159,6 +162,7 @@ pub(crate) struct Pointer {
     // The handle read last and the shape it had, kept when a read fails so
     // a broken cursor costs no reads every look.
     read: Option<(isize, Option<CursorShape>)>,
+    read_again: Instant,
     sent: Option<Sent>,
     again_at: Option<Instant>,
     // A scale the shape has not gone with yet, and since when.
@@ -171,6 +175,7 @@ impl Pointer {
             hwnd,
             due: Instant::now(),
             read: None,
+            read_again: Instant::now(),
             sent: None,
             again_at: None,
             new_scale: None,
@@ -185,21 +190,32 @@ impl Pointer {
     pub(crate) fn poll(&mut self, plan: &Plan) -> Option<CursorUpdate> {
         let now = Instant::now();
         self.due = now + POINTER_EVERY;
-        let seen = seen(self.hwnd);
+        self.look(&seen(self.hwnd), plan, now, shape)
+    }
+
+    fn look(
+        &mut self,
+        seen: &Seen,
+        plan: &Plan,
+        now: Instant,
+        shape_of: impl FnOnce(isize) -> Option<CursorShape>,
+    ) -> Option<CursorUpdate> {
         if seen.showing
-            && self
-                .read
-                .as_ref()
-                .is_none_or(|(handle, _)| *handle != seen.cursor)
+            && (now >= self.read_again
+                || self
+                    .read
+                    .as_ref()
+                    .is_none_or(|(handle, _)| *handle != seen.cursor))
         {
             let old = self.read.take().and_then(|(_, shape)| shape);
-            self.read = Some((seen.cursor, shape(seen.cursor).or(old)));
+            self.read = Some((seen.cursor, shape_of(seen.cursor).or(old)));
+            self.read_again = now + SHAPE_AGAIN;
         }
         let read = self.read.as_ref().and_then(|(_, shape)| shape.clone());
         let hotspot = read
             .as_ref()
             .map_or((0, 0), |shape| (shape.hotspot_x, shape.hotspot_y));
-        let placed = place(&seen, plan, hotspot);
+        let placed = place(seen, plan, hotspot);
         self.update(placed, plan.scale().0, read, now)
     }
 
@@ -641,6 +657,59 @@ mod tests {
         let hidden = pointer.update(None, 0.5, None, at(4000)).unwrap();
         assert_eq!((hidden.x, hidden.y, hidden.visible), (11, 20, false));
         assert_eq!(pointer.update(None, 0.5, None, at(4010)), None);
+    }
+
+    // New bits under the same handle go within a second; the same bits
+    // read again do not.
+    #[test]
+    fn resized_cursor_goes_out() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let plan = Plan::new(640, 360, crate::Rotation::Identity, 4096, 1440);
+        let seen = seen_at((300, 150), (100, 50, 740, 410));
+        let bigger = CursorShape {
+            width: 4,
+            height: 4,
+            pitch: 16,
+            bytes: vec![255; 64],
+            ..arrow()
+        };
+        let reads = Cell::new(0);
+        let mut pointer = Pointer::new(0);
+        let mut look = |ms, shape: &CursorShape| {
+            pointer
+                .look(&seen, &plan, at(ms), |_| {
+                    reads.set(reads.get() + 1);
+                    Some(shape.clone())
+                })
+                .and_then(|update| update.shape)
+        };
+        assert_eq!(look(0, &arrow()), Some(arrow()));
+        for ms in (4..1000).step_by(4) {
+            assert_eq!(look(ms, &bigger), None, "{ms} ms");
+        }
+        assert_eq!(look(1000, &bigger), Some(bigger.clone()));
+        for ms in (1004..=2100).step_by(4) {
+            assert_eq!(look(ms, &bigger), None, "{ms} ms");
+        }
+        assert_eq!(reads.get(), 3);
+        // Not while it hides.
+        let hidden = Seen {
+            showing: false,
+            ..seen
+        };
+        let mut read = |ms, seen: &Seen| {
+            pointer.look(seen, &plan, at(ms), |_| {
+                reads.set(reads.get() + 1);
+                None
+            });
+        };
+        for ms in (3000..=3100).step_by(4) {
+            read(ms, &hidden);
+        }
+        assert_eq!(reads.get(), 3);
+        read(3104, &seen);
+        assert_eq!(reads.get(), 4);
     }
 
     // One look at the pointer is a few system calls, done up to 250 times a

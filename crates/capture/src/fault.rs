@@ -3,6 +3,7 @@
 //! goes on using the desktop cannot bring up the lock screen, so it says
 //! what a look at the desktop finds instead.
 
+use std::cell::Cell;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -119,4 +120,20 @@ pub fn starts_over(window: isize) -> usize {
 pub(crate) fn count_start_over(window: isize) {
     let mut all = STARTS_OVER.lock().unwrap_or_else(|p| p.into_inner());
     all.push(window);
+}
+
+thread_local! {
+    static SUPPORT_ANSWER: Cell<Option<windows::core::Result<bool>>> = const { Cell::new(None) };
+}
+
+/// The next time this thread asks whether Windows can capture a single
+/// window, IsSupported gives `answer`, once: an error, as it can while
+/// Windows' capture stalls, or a no. Only this thread's, since capture's
+/// window tests run side by side.
+pub fn set_support_answer(answer: windows::core::Result<bool>) {
+    SUPPORT_ANSWER.set(Some(answer));
+}
+
+pub(crate) fn support_answer(answer: windows::core::Result<bool>) -> windows::core::Result<bool> {
+    SUPPORT_ANSWER.take().unwrap_or(answer)
 }

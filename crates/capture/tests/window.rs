@@ -229,6 +229,57 @@ fn a_closed_window_does_not_open() {
     assert_eq!(err.to_string(), WINDOW_GONE);
 }
 
+// IsSupported can fail while Windows' capture stalls, which is no answer:
+// the open and the window list say to try again, not to share a monitor.
+#[cfg(feature = "fault")]
+#[test]
+fn support_error_says_try_again() {
+    use windows::Win32::Foundation::CO_E_SERVER_EXEC_FAILURE;
+
+    let _turn = ALONE.read().unwrap_or_else(|p| p.into_inner());
+    let Some(adapter) = adapter() else { return };
+    let window = Window::open(320, 240);
+    capture::fault::set_support_answer(Err(CO_E_SERVER_EXEC_FAILURE.into()));
+    let Err(opened) = WindowCapture::open(window.id(), &adapter, Options::default()) else {
+        panic!("the capture opened");
+    };
+    capture::fault::set_support_answer(Err(CO_E_SERVER_EXEC_FAILURE.into()));
+    let Err(listed) = capture::top_windows() else {
+        panic!("the windows were listed");
+    };
+    for err in [opened, listed] {
+        let text = err.to_string();
+        assert!(
+            text.starts_with("could not start window capture: "),
+            "{text}"
+        );
+        assert!(!text.contains("cannot capture a single window"), "{text}");
+    }
+}
+
+// A plain no keeps its sentence, and the window list is empty, not an error.
+#[cfg(feature = "fault")]
+#[test]
+fn unsupported_says_share_monitor() {
+    use windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
+
+    let _turn = ALONE.read().unwrap_or_else(|p| p.into_inner());
+    let Some(adapter) = adapter() else { return };
+    // SAFETY: a plain query with no arguments. The no turns this window away
+    // before any capture starts.
+    let desktop = WindowId::of(unsafe { GetDesktopWindow() }.0 as isize).unwrap();
+    capture::fault::set_support_answer(Ok(false));
+    let Err(opened) = WindowCapture::open(desktop, &adapter, Options::default()) else {
+        panic!("the capture opened");
+    };
+    assert_eq!(
+        opened.to_string(),
+        "this Windows cannot capture a single window. Share a monitor instead"
+    );
+    capture::fault::set_support_answer(Ok(false));
+    assert!(capture::top_windows().unwrap().is_empty());
+}
+
 #[test]
 fn a_window_scaled_down_into_the_box() {
     let _turn = ALONE.read().unwrap_or_else(|p| p.into_inner());

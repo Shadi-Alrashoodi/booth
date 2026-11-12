@@ -575,6 +575,8 @@ pub const REGION_FAILED: &str = "Could not open the region picker. Press Share t
 
 pub const LIST_FAILED: &str = "Could not open the share list. Press Share to try again.";
 
+pub const WINDOW_LIST_FAILED: &str = "Could not list the windows. Press Share twice to try again.";
+
 pub fn region_too_small(width: u32, height: u32) -> String {
     let least = share::SMALLEST_REGION;
     format!("{width}x{height}: smaller than {least} by {least}. Drag a bigger one.")
@@ -1663,6 +1665,7 @@ mod tests {
             assert_sentences(line);
             assert!(line.ends_with("Press Share to try again."), "{line}");
         }
+        assert_sentences(WINDOW_LIST_FAILED);
     }
 
     // A failed join, one test for each of its four cases: each line names the

@@ -75,15 +75,17 @@ pub struct InRoom {
     // Whether the panel offers remote control at all (control.rs).
     control_offered: bool,
     // The monitors Share offered, while the list under the title row is
-    // open, and the windows under them.
+    // open, and the windows under them, None when they cannot be listed.
     monitors: Option<Vec<Pick>>,
-    windows: Vec<WindowPick>,
+    windows: Option<Vec<WindowPick>>,
     list_room: ListRoom,
     // The region picker's answer, while it is open.
     region_pick: Option<Receiver<Result<Option<Picked>, String>>>,
     // Why Region brought no picker or the share key no list, until the list
     // opens again or Share goes away. The reason itself goes to the log.
     pick_error: Option<&'static str>,
+    // Why the windows could not be listed, for take_log.
+    to_log: Option<String>,
     panic: PanicKey,
     allow_wait: AllowWait,
     block_wait: BlockWait,
@@ -219,7 +221,8 @@ impl InRoom {
             monitors: None,
             region_pick: None,
             pick_error: None,
-            windows: Vec::new(),
+            to_log: None,
+            windows: Some(Vec::new()),
             list_room: ListRoom::default(),
             panic,
             allow_wait: AllowWait::default(),
@@ -260,11 +263,12 @@ impl InRoom {
     }
 
     // The volume files' log lines since the last frame, with the paths their
-    // line leaves out.
+    // line leaves out, and why the windows could not be listed.
     pub fn take_log(&mut self) -> Vec<String> {
         [&mut self.volumes, &mut self.sound_volumes]
             .into_iter()
             .filter_map(Volumes::take_log)
+            .chain(self.to_log.take())
             .collect()
     }
 
@@ -319,7 +323,7 @@ impl InRoom {
             self.list_room.refilled(Instant::now());
         }
         self.monitors = Some(monitors::picks(&list));
-        self.windows = window_picks();
+        self.take_windows(window_picks());
         Ok(())
     }
 
@@ -439,7 +443,7 @@ impl InRoom {
         }
         if let Some(picks) = &self.monitors {
             block = true;
-            let picked = share_list(ui, picks, &self.windows);
+            let picked = share_list(ui, picks, self.windows.as_deref());
             if let Some((room, left)) = self.list_room.refill_room(now) {
                 keep_room(ui, top, room);
                 ui.ctx().request_repaint_after(left);
@@ -586,7 +590,7 @@ impl InRoom {
                 self.pick_region(monitors::list(), ctx)
             }
             RowPick::Window(i) => {
-                let id = self.windows[i].id;
+                let id = self.windows.as_ref()?[i].id;
                 if id.exists() {
                     let fps = room::window_monitor(id).map_or(monitors::MOST_FPS, |monitor| {
                         monitors::fps(monitor.refresh_hz)
@@ -597,7 +601,7 @@ impl InRoom {
                 } else {
                     // Closed since the list was taken: a list as it is
                     // now, rather than a share that cannot start.
-                    self.windows = window_picks();
+                    self.take_windows(window_picks());
                     self.list_room.refilled(now);
                     None
                 }
@@ -617,7 +621,7 @@ impl InRoom {
             Some(ShareVerb::Share) => match monitors::list() {
                 Ok(list) if !list.is_empty() => {
                     self.monitors = Some(monitors::picks(&list));
-                    self.windows = window_picks();
+                    self.take_windows(window_picks());
                 }
                 // The room tries the primary monitor, and when that cannot
                 // open either, its problem line in the chat says why.
@@ -1281,21 +1285,15 @@ impl From<room::TopWindow> for WindowPick {
     }
 }
 
-// The windows as they are now; none when they cannot be listed.
-fn window_picks() -> Vec<WindowPick> {
-    room::top_windows()
-        .unwrap_or_default()
-        .into_iter()
-        .map(WindowPick::from)
-        .collect()
+// The windows as they are now, or why they cannot be listed.
+fn window_picks() -> Result<Vec<WindowPick>, String> {
+    let windows = room::top_windows().map_err(|err| format!("window list: {err}"))?;
+    Ok(windows.into_iter().map(WindowPick::from).collect())
 }
 
-// Share opens a one-line list of the monitors by size and position under the
-// title row, with Region last, and the windows under it, one row each, and
-// one click starts the share or the region picker. At the narrowest window
-// three monitors wrap onto a second line. The windows scroll on their own
-// once they would take more than half the panel.
-fn share_list(ui: &mut Ui, picks: &[Pick], windows: &[WindowPick]) -> Option<RowPick> {
+// The windows scroll on their own once they would take more than half the
+// panel, so what is under the list stays in view.
+fn share_list(ui: &mut Ui, picks: &[Pick], windows: Option<&[WindowPick]>) -> Option<RowPick> {
     let mut pressed = None;
     controls::region(ui, |ui| {
         controls::text(ui, "Screen", theme::body(), ASH);
@@ -1316,6 +1314,11 @@ fn share_list(ui: &mut Ui, picks: &[Pick], windows: &[WindowPick]) -> Option<Row
                 pressed = Some(RowPick::Region);
             }
         });
+        let Some(windows) = windows else {
+            ui.add_space(FIELD_GAP);
+            controls::text(ui, messages::WINDOW_LIST_FAILED, theme::caption(), BAD);
+            return;
+        };
         if windows.is_empty() {
             return;
         }
@@ -1455,6 +1458,18 @@ impl InRoom {
     fn pick_failed(&mut self, why: String) -> Step {
         self.pick_error = Some(messages::REGION_FAILED);
         Step::Log(why)
+    }
+
+    // Windows that cannot be listed get a line in the list, and the log has
+    // why.
+    fn take_windows(&mut self, listed: Result<Vec<WindowPick>, String>) {
+        match listed {
+            Ok(windows) => self.windows = Some(windows),
+            Err(why) => {
+                self.windows = None;
+                self.to_log = Some(why);
+            }
+        }
     }
 }
 
@@ -3542,17 +3557,17 @@ pub(crate) mod tests {
 
         // Closed since the list was taken.
         in_room.monitors = Some(Vec::new());
-        in_room.windows = vec![window(room::WindowId {
+        in_room.windows = Some(vec![window(room::WindowId {
             hwnd: 0,
             process: 0,
-        })];
+        })]);
         assert!(in_room.row_picked(RowPick::Window(0), now, &ctx).is_none());
         assert!(in_room.monitors.is_some());
         shares(false);
 
         // SAFETY: a plain query with no arguments.
         let desktop = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetDesktopWindow() };
-        in_room.windows = vec![window(room::WindowId::of(desktop as isize).unwrap())];
+        in_room.windows = Some(vec![window(room::WindowId::of(desktop as isize).unwrap())]);
         let step = in_room.row_picked(RowPick::Window(0), now, &ctx);
         assert!(matches!(step, Some(Step::ListNext)));
         assert!(in_room.monitors.is_none());
@@ -3633,6 +3648,58 @@ pub(crate) mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         share_goes(&mut in_room, &room.view());
+
+        drop(in_room);
+        target.leave();
+        hotkeys::leave(room);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // Windows that cannot be listed leave the monitors and Region as they
+    // are, with a line in the windows' place, and the log has why once.
+    #[test]
+    fn window_list_failure_says_so() {
+        let data_dir =
+            std::env::temp_dir().join(format!("booth-app-unlisted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let room = Arc::new(test_room(&data_dir));
+        let target = Target::default();
+        target.enter(Arc::clone(&room));
+        let mut in_room = test_in_room(&room, &target);
+        let ctx = accessible_panel();
+        let view = room.view();
+        let picks = monitors::picks(&[crate::monitors::tests::monitor(r"\\.\DISPLAY1", 0, true)]);
+        let spoken = picks[0].spoken.clone();
+        // What a frame logs, and whether the line, the monitor and Region
+        // are on it.
+        let frame = |in_room: &mut InRoom| {
+            let (_, output) = crate::controls::tests::frame(&ctx, Vec::new(), |ui| {
+                in_room.show(ui, &view, false, hotkeys::State::default(), false, None)
+            });
+            let update = output.accesskit_update.expect("accesskit is on");
+            let shown = |line: &str| {
+                update
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| [node.label(), node.value()].contains(&Some(line)))
+            };
+            let lines = [
+                messages::WINDOW_LIST_FAILED,
+                spoken.as_str(),
+                "Share a region of a monitor",
+            ];
+            (in_room.take_log(), lines.map(shown))
+        };
+
+        in_room.monitors = Some(picks);
+        in_room.take_windows(Err(String::from("window list: no answer")));
+        let logged = vec![String::from("window list: no answer")];
+        assert_eq!(frame(&mut in_room), (logged, [true; 3]));
+        assert_eq!(frame(&mut in_room), (Vec::new(), [true; 3]));
+
+        in_room.take_windows(Ok(Vec::new()));
+        assert_eq!(frame(&mut in_room), (Vec::new(), [false, true, true]));
 
         drop(in_room);
         target.leave();
@@ -5654,7 +5721,7 @@ pub(crate) mod tests {
         for windows in [&[][..], std::slice::from_ref(&row)] {
             let mut bottom = 0.0;
             let output = painted_share_frame(&ctx, vec2(360.0, 640.0), Vec::new(), |ui| {
-                share_list(ui, &[], windows);
+                share_list(ui, &[], Some(windows));
                 bottom = ui.cursor().top();
             });
             let bounds = |label| {
@@ -5693,6 +5760,13 @@ pub(crate) mod tests {
             }
             output.drop_without_applying_deltas();
         }
+        let output = painted_share_frame(&ctx, vec2(360.0, 640.0), Vec::new(), |ui| {
+            share_list(ui, &[], None);
+        });
+        let (_, line) = painted_share_text(&output, messages::WINDOW_LIST_FAILED);
+        assert_eq!(line.galley.job.sections[0].format.font_id, theme::caption());
+        assert_eq!(line.galley.job.sections[0].format.color, BAD);
+        output.drop_without_applying_deltas();
     }
 
     #[test]
@@ -5734,7 +5808,7 @@ pub(crate) mod tests {
                     } else {
                         0.0
                     };
-                    share_list(ui, &[], &windows);
+                    share_list(ui, &[], Some(&windows));
                 };
                 let screen = vec2(width, height);
                 let first_output = painted_share_frame(&ctx, screen, Vec::new(), &mut draw);
@@ -5856,7 +5930,7 @@ pub(crate) mod tests {
                         },
                     ];
                     let list = |ui: &mut Ui| {
-                        share_list(ui, &[], &windows);
+                        share_list(ui, &[], Some(&windows));
                     };
                     let turned = painted_share_frame(&ctx, screen, wheel, list);
                     let scrolled = painted_share_frame(&ctx, screen, Vec::new(), list);
@@ -5945,21 +6019,23 @@ pub(crate) mod tests {
         let picks = picks();
         let row_top = SIDE + controls::line_height(&theme::body()) + STEP;
         let (second, _) = frame(&ctx, Vec::new(), |ui| {
-            assert_eq!(share_list(ui, &picks, &[]), None);
+            assert_eq!(share_list(ui, &picks, Some(&[])), None);
             let first = Button::new(&picks[0].text).width(ui);
             let gap = ui.spacing().item_spacing.x;
             pos2(SIDE + first + gap + 10.0, row_top + CONTROL_HEIGHT / 2.0)
         });
-        frame(&ctx, press(second), |ui| share_list(ui, &picks, &[]));
-        let (pressed, _) = frame(&ctx, release(second), |ui| share_list(ui, &picks, &[]));
+        frame(&ctx, press(second), |ui| share_list(ui, &picks, Some(&[])));
+        let (pressed, _) = frame(&ctx, release(second), |ui| {
+            share_list(ui, &picks, Some(&[]))
+        });
         assert_eq!(pressed, Some(RowPick::Monitor(1)));
         let first = pos2(SIDE + 10.0, row_top + CONTROL_HEIGHT / 2.0);
-        frame(&ctx, press(first), |ui| share_list(ui, &picks, &[]));
-        let (pressed, _) = frame(&ctx, release(first), |ui| share_list(ui, &picks, &[]));
+        frame(&ctx, press(first), |ui| share_list(ui, &picks, Some(&[])));
+        let (pressed, _) = frame(&ctx, release(first), |ui| share_list(ui, &picks, Some(&[])));
         assert_eq!(pressed, Some(RowPick::Monitor(0)));
         // Alone in the row, so it is where the first monitor was.
-        frame(&ctx, press(first), |ui| share_list(ui, &[], &[]));
-        let (pressed, _) = frame(&ctx, release(first), |ui| share_list(ui, &[], &[]));
+        frame(&ctx, press(first), |ui| share_list(ui, &[], Some(&[])));
+        let (pressed, _) = frame(&ctx, release(first), |ui| share_list(ui, &[], Some(&[])));
         assert_eq!(pressed, Some(RowPick::Region));
     }
 
@@ -5972,15 +6048,19 @@ pub(crate) mod tests {
         theme::apply(&ctx);
         let windows = [window(1, "Notes"), window(2, "Game")];
         let (second, _) = frame(&ctx, Vec::new(), |ui| {
-            assert_eq!(share_list(ui, &[], &windows), None);
+            assert_eq!(share_list(ui, &[], Some(&windows)), None);
             let below = SIDE
                 + 2.0 * (controls::line_height(&theme::body()) + STEP)
                 + CONTROL_HEIGHT
                 + FIELD_GAP;
             pos2(SIDE + 10.0, below + ROW_HEIGHT * 1.5)
         });
-        frame(&ctx, press(second), |ui| share_list(ui, &[], &windows));
-        let (pressed, _) = frame(&ctx, release(second), |ui| share_list(ui, &[], &windows));
+        frame(&ctx, press(second), |ui| {
+            share_list(ui, &[], Some(&windows))
+        });
+        let (pressed, _) = frame(&ctx, release(second), |ui| {
+            share_list(ui, &[], Some(&windows))
+        });
         assert_eq!(pressed, Some(RowPick::Window(1)));
     }
 
@@ -6013,7 +6093,7 @@ pub(crate) mod tests {
         let windows = [window(1, "Notes"), window(2, "Game")];
         let draw = |events| {
             painted_share_frame(&ctx, vec2(360.0, 640.0), events, |ui| {
-                share_list(ui, &picks, &windows);
+                share_list(ui, &picks, Some(&windows));
             })
         };
         let fills = |output: &FullOutput, rect: Rect| {
@@ -6115,7 +6195,7 @@ pub(crate) mod tests {
             let draw = |events| {
                 painted_share_frame(&ctx, vec2(360.0, 640.0), events, |ui| {
                     controls::note_focus_source(ui.ctx());
-                    share_list(ui, &picks, &windows);
+                    share_list(ui, &picks, Some(&windows));
                 })
             };
             let order: Vec<&str> = picks
@@ -6164,7 +6244,7 @@ pub(crate) mod tests {
         for chosen in [Key::Enter, Key::Space] {
             let ctx = Context::default();
             theme::apply(&ctx);
-            let draw = |events| frame(&ctx, events, |ui| share_list(ui, &picks, &windows)).0;
+            let draw = |events| frame(&ctx, events, |ui| share_list(ui, &picks, Some(&windows))).0;
             assert_eq!(draw(Vec::new()), None);
             // Two monitors, Region, then the first two windows.
             for _ in 0..5 {
@@ -6337,7 +6417,7 @@ pub(crate) mod tests {
                 let top = ui.cursor().top();
                 let mut picked = None;
                 if panel.open {
-                    picked = share_list(ui, &picks, &windows);
+                    picked = share_list(ui, &picks, Some(&windows));
                     panel.list.measured(ui.cursor().top() - top);
                     panel.open = picked.is_none();
                 }
@@ -6502,7 +6582,7 @@ pub(crate) mod tests {
         let draw = |list: &mut ListRoom, windows: &[WindowPick], events: Vec<Event>, now| {
             frame(&ctx, events, |ui| {
                 let top = ui.cursor().top();
-                let picked = share_list(ui, &picks, windows);
+                let picked = share_list(ui, &picks, Some(windows));
                 if let Some((room, _)) = list.refill_room(now) {
                     keep_room(ui, top, room);
                 }

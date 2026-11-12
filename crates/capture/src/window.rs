@@ -51,7 +51,7 @@ use crate::cap::{Decision, FpsCap};
 use crate::convert::{Converter, Layout, Plan, Target};
 use crate::device::device_on;
 use crate::duplication::{IDLE_WAIT, present_instant, qpc};
-use crate::error::CaptureError;
+use crate::error::{CaptureError, windows_words};
 use crate::monitors::{Adapter, Rotation};
 use crate::pointer::Pointer;
 use crate::timer::Timer;
@@ -289,7 +289,7 @@ impl WindowCapture {
         }
         keep_apartment();
         WINRT.with(|_| {});
-        if !GraphicsCaptureSession::IsSupported().unwrap_or(false) {
+        if !captures_windows(GraphicsCaptureSession::IsSupported())? {
             return Err(CaptureError::other(
                 "this Windows cannot capture a single window. Share a monitor instead",
             ));
@@ -1141,6 +1141,19 @@ fn refused(window: WindowId, err: &windows::core::Error) -> CaptureError {
     }
 }
 
+// Whether this Windows can capture a single window, as IsSupported answers.
+// A failed call is not a no: it can fail while Windows' capture stalls.
+pub(crate) fn captures_windows(answer: windows::core::Result<bool>) -> Result<bool, CaptureError> {
+    #[cfg(feature = "fault")]
+    let answer = crate::fault::support_answer(answer);
+    answer.map_err(|err| {
+        CaptureError::other(format!(
+            "could not start window capture: {}. Try again",
+            windows_words(&err)
+        ))
+    })
+}
+
 // The capture stops when this is dropped, as a paused share needs: closing
 // the session and the pool ends Windows' part at once.
 impl Drop for WindowCapture {
@@ -1151,5 +1164,28 @@ impl Drop for WindowCapture {
         }
         let _ = self.session.Close();
         let _ = self.pool.Close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use windows::Win32::Foundation::CO_E_SERVER_EXEC_FAILURE;
+
+    use super::*;
+
+    #[test]
+    fn support_error_is_not_false() {
+        assert_eq!(captures_windows(Ok(true)), Ok(true));
+        assert_eq!(captures_windows(Ok(false)), Ok(false));
+        let err = captures_windows(Err(CO_E_SERVER_EXEC_FAILURE.into())).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.starts_with("could not start window capture: "),
+            "{text}"
+        );
+        assert!(
+            text.contains("0x80080005") && text.ends_with(". Try again"),
+            "{text}"
+        );
     }
 }
