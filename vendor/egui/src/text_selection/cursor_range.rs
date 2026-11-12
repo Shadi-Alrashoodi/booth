@@ -119,7 +119,9 @@ impl CCursorRange {
             }
 
             Key::ArrowLeft | Key::ArrowRight if modifiers.is_none() && !self.is_empty() => {
-                if key == Key::ArrowLeft {
+                // In a right-to-left paragraph the selection's end is its left.
+                let to_start = (key == Key::ArrowLeft) != galley.is_rtl_paragraph_at(&self.primary);
+                if to_start {
                     *self = Self::one(self.sorted_cursors()[0]);
                 } else {
                     *self = Self::one(self.sorted_cursors()[1]);
@@ -277,21 +279,21 @@ fn move_single_cursor(
                 Key::ArrowLeft => {
                     if modifiers.alt || modifiers.ctrl {
                         // alt on mac, ctrl on windows
-                        (ccursor_previous_word(galley, *cursor), None)
+                        (word_on_screen(galley, *cursor, true), None)
                     } else if modifiers.mac_cmd {
                         (galley.cursor_begin_of_row(cursor), None)
                     } else {
-                        (galley.cursor_left_one_character(cursor), None)
+                        (galley.cursor_left_on_screen(cursor), None)
                     }
                 }
                 Key::ArrowRight => {
                     if modifiers.alt || modifiers.ctrl {
                         // alt on mac, ctrl on windows
-                        (ccursor_next_word(galley, *cursor), None)
+                        (word_on_screen(galley, *cursor, false), None)
                     } else if modifiers.mac_cmd {
                         (galley.cursor_end_of_row(cursor), None)
                     } else {
-                        (galley.cursor_right_one_character(cursor), None)
+                        (galley.cursor_right_on_screen(cursor), None)
                     }
                 }
                 Key::ArrowUp => {
@@ -334,4 +336,14 @@ fn move_single_cursor(
 
     *cursor = new_cursor;
     *h_pos = new_h_pos;
+}
+
+/// A word step to the left or the right on screen: back through the text in
+/// a left-to-right paragraph, on through it in a right-to-left one.
+fn word_on_screen(galley: &Galley, cursor: CCursor, leftwards: bool) -> CCursor {
+    if leftwards == galley.is_rtl_paragraph_at(&cursor) {
+        ccursor_next_word(galley, cursor)
+    } else {
+        ccursor_previous_word(galley, cursor)
+    }
 }

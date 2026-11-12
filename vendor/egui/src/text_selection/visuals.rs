@@ -83,10 +83,11 @@ pub fn paint_text_selection(
         let placed_row = &mut galley.rows[ri];
         let row = Arc::make_mut(&mut placed_row.row);
 
+        // An aligned row hangs the spaces it starts with left of x 0.
         let left = if ri == min.row {
             row.x_offset(min.column)
         } else {
-            0.0
+            row.x_offset(CharIndex(0)).min(0.0)
         };
         let right = if ri == max.row {
             row.x_offset(max.column)

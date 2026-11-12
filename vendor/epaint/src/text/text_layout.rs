@@ -18,7 +18,7 @@ use crate::{
 use super::{
     ByteRangeExt as _, FontsImpl, Galley, Glyph, LayoutJob, LayoutSection, PlacedRow, Row,
     RowVisuals, VariationCoords,
-    font::{Font, FontFace, ShapedGlyph},
+    font::{ClusterGlyph, Font, FontFace, ShapedGlyph},
     text_layout_types::joins_previous,
 };
 
@@ -278,6 +278,11 @@ struct TextRun {
 /// characters so that `glyphs.len() == char_count` — an invariant that all
 /// cursor and selection code relies on.
 ///
+/// A cluster with more glyphs than characters, a letter the font builds from
+/// a base and its accents, is one glyph drawn from one bitmap of them all,
+/// unless it has more than [`MOST_CLUSTER_GLYPHS`] glyphs or its face keeps
+/// no more such bitmaps (see [`FontFace::allocate_cluster`]).
+///
 /// The glyphs are emitted in _logical_ order with increasing x, whatever the
 /// run's direction; a right-to-left row is put in visual order later, by
 /// [`reorder_row_visually`], once the rows are known.
@@ -316,6 +321,8 @@ fn layout_shaped_run(
     // the base walked just before it: in the shaper's order it came first and
     // shared that pen, and its offset is relative to it.
     let mut base_pen_px = paragraph.cursor_x_px;
+
+    let mut whole_cluster = false;
 
     for k in 0..infos.len() {
         let (info, pos) = (&infos[glyph_index(k)], &positions[glyph_index(k)]);
@@ -359,6 +366,49 @@ fn layout_shaped_run(
             .and_then(|s| s.chars().nth(cluster_glyph_count))
             .or_else(|| run_text.get(cluster as usize..)?.chars().next())
             .unwrap_or('\u{FFFD}'); // Unicode Replacement Character
+
+        if is_new_cluster {
+            whole_cluster = false;
+            let chars = run_text
+                .get(cluster_start_byte..cluster_end_byte)
+                .map_or(0, |s| s.chars().count());
+            let count = (k..infos.len())
+                .take_while(|&next| infos[glyph_index(next)].cluster == cluster)
+                .count();
+            if chars < count && count <= MOST_CLUSTER_GLYPHS {
+                let shaped = if rtl {
+                    infos.len() - k - count..infos.len() - k
+                } else {
+                    k..k + count
+                };
+                if let Some((glyphs, advance_px)) =
+                    cluster_glyphs(&infos[shaped.clone()], &positions[shaped], px_scale)
+                    && let Some(face) = font.fonts_by_id.get_mut(&run.font_key)
+                    && let Some((glyph_alloc, physical_x)) = face.allocate_cluster(
+                        font.atlas,
+                        face_metrics,
+                        &glyphs,
+                        paragraph.cursor_x_px,
+                        is_cjk(chr),
+                    )
+                {
+                    base_pen_px = paragraph.cursor_x_px;
+                    paragraph.cursor_x_px += advance_px;
+                    paragraph.glyphs.push(ctx.glyph(
+                        chr,
+                        physical_x,
+                        advance_px,
+                        face_metrics,
+                        glyph_alloc.uv_rect,
+                    ));
+                    cluster_glyph_count = 1;
+                    whole_cluster = true;
+                }
+            }
+        }
+        if whole_cluster {
+            continue;
+        }
 
         // Tab is a layout concept, not a glyph — the shaper doesn't know about tab stops.
         // Override the advance width using the font's configured tab size.
@@ -515,6 +565,38 @@ fn emit_continuation_glyphs(
             .glyphs
             .push(ctx.glyph(chr, physical_x, 0.0, face_metrics, UvRect::default()));
     }
+}
+
+/// The most glyphs a cluster drawn as one bitmap has: a built letter with a
+/// few marks on it. A longer one, a letter under a pile of marks, is laid out
+/// glyph by glyph, so no bitmap is much taller than a letter.
+const MOST_CLUSTER_GLYPHS: usize = 8;
+
+/// A cluster's glyphs in the shaper's order, each where the shaper puts it
+/// from the cluster's origin, and the cluster's advance, in pixels. `None`
+/// when the font has no glyph for one of them.
+fn cluster_glyphs(
+    infos: &[harfrust::GlyphInfo],
+    positions: &[harfrust::GlyphPosition],
+    px_scale: f32,
+) -> Option<(Vec<ClusterGlyph>, f32)> {
+    let mut advance_px = 0.0;
+    let mut glyphs = Vec::with_capacity(infos.len());
+    for (info, pos) in infos.iter().zip(positions) {
+        let glyph_id = skrifa::GlyphId::new(info.glyph_id);
+        if glyph_id == skrifa::GlyphId::NOTDEF {
+            return None;
+        }
+        glyphs.push(ClusterGlyph {
+            glyph_id,
+            offset_px: vec2(
+                advance_px + pos.x_offset as f32 * px_scale,
+                -(pos.y_offset as f32 * px_scale),
+            ),
+        });
+        advance_px += pos.x_advance as f32 * px_scale;
+    }
+    Some((glyphs, advance_px))
 }
 
 // Ignores the Y coordinate.
@@ -1025,6 +1107,10 @@ fn halign_and_justify_row(
     let num_glyphs_in_range = glyph_range.1 - glyph_range.0;
     assert!(num_glyphs_in_range > 0, "Should have at least one glyph");
 
+    if !justify {
+        fit_mirrored_row(point_scale, row, glyph_range.0..glyph_range.1, wrap_width);
+    }
+
     // Glyphs are indexed in logical order but placed in visual order
     // (see `reorder_row_visually`), so measure and shift them by x:
     let order = visual_order(row);
@@ -1116,6 +1202,47 @@ fn halign_and_justify_row(
 
     // Note we ignore the leading/trailing whitespace here!
     row.size.x = target_max_x - target_min_x;
+}
+
+/// Put on whole pixels in visual order, a row with right-to-left text can
+/// come out wider than its line. The widest spaces among its `kept` glyphs
+/// give up the extra, a pixel each so no two words close up, and the row
+/// then fits the whole pixels of its line and gets its box.
+fn fit_mirrored_row(point_scale: PointScale, row: &mut Row, kept: Range<usize>, line: f32) {
+    let glyphs = &mut row.glyphs;
+    if !glyphs.iter().any(Glyph::is_rtl) {
+        return;
+    }
+    let (min_x, max_x) = glyphs[kept.clone()].iter().fold(
+        (f32::INFINITY, f32::NEG_INFINITY),
+        |(min_x, max_x), glyph| (min_x.min(glyph.pos.x), max_x.max(glyph.max_x())),
+    );
+    if max_x - min_x <= line {
+        return;
+    }
+    let pixel = 1.0 / point_scale.pixels_per_point;
+    let extra = max_x - min_x - point_scale.floor_to_pixel(line);
+    let pixels = (extra * point_scale.pixels_per_point).ceil() as usize;
+    let mut spaces: Vec<usize> = kept
+        .filter(|&i| {
+            glyphs[i].chr == ' '
+                && pixel < glyphs[i].advance_width
+                && !joins_previous(glyphs, i + 1)
+        })
+        .collect();
+    if spaces.len() < pixels {
+        return;
+    }
+    spaces.sort_by(|&a, &b| glyphs[b].advance_width.total_cmp(&glyphs[a].advance_width));
+    for &space in &spaces[..pixels] {
+        let x = glyphs[space].pos.x;
+        for glyph in glyphs.iter_mut() {
+            if x < glyph.pos.x {
+                glyph.pos.x -= pixel;
+            }
+        }
+        glyphs[space].advance_width -= pixel;
+    }
 }
 
 /// Calculate the Y positions and tessellate the text.
@@ -2693,6 +2820,407 @@ mod tests {
         }
     }
 
+    // Plex Sans has no glyph of its own for ḥ, ǧ or Ȟ and builds each from a
+    // letter and an accent. Each is one glyph for its char, from a bitmap of
+    // its own, never one cached for a single glyph, and every cursor position
+    // round-trips through x.
+    #[test]
+    fn built_letters_are_one_glyph() {
+        let mut fonts = plex_fonts();
+        let h_before = layout_simple(&mut fonts, "h");
+        let text = "Mu\u{1E25}ammad \u{1E7} \u{21E}";
+        let galley = layout_simple(&mut fonts, text);
+        let h_after = layout_simple(&mut fonts, "h");
+        let row = &galley.rows[0].row;
+        assert_eq!(row.glyphs.len(), text.chars().count());
+        assert_eq!(row.text(), text);
+        assert_eq!(galley.end().index.0, text.chars().count());
+
+        let built = &row.glyphs[2];
+        assert_eq!(built.chr, '\u{1E25}');
+        for plain in [&h_before.rows[0].glyphs[0], &h_after.rows[0].glyphs[0]] {
+            assert_eq!(built.advance_width, plain.advance_width);
+            assert_ne!(built.uv_rect.min, plain.uv_rect.min);
+            assert!(plain.uv_rect.size.y < built.uv_rect.size.y, "the dot below");
+        }
+
+        for i in 0..=row.glyphs.len() {
+            let cursor = CCursor {
+                index: CharIndex(i),
+                prefer_next_row: false,
+            };
+            let rect = galley.pos_from_cursor(cursor);
+            let back = galley.cursor_from_pos(rect.center().to_vec2());
+            assert_eq!(back.index.0, i, "cursor round-trip at {i}");
+        }
+
+        // Ǡ is three glyphs, and four accents on it make a cluster of seven.
+        let text = "\u{1E0}\u{301}\u{300}\u{302}\u{304}";
+        let galley = layout_simple(&mut fonts, text);
+        assert_eq!(galley.rows[0].glyphs.len(), text.chars().count());
+        assert_eq!(galley.rows[0].row.text(), text);
+
+        // The one such cluster Plex Sans Arabic makes: a letter with the Greek
+        // dialytika tonos, which the shaper takes apart into two marks.
+        let galley = layout_simple(&mut fonts, "\u{628}\u{344}");
+        let arabic = layout_simple(&mut fonts, "\u{628}");
+        let glyphs = &galley.rows[0].glyphs;
+        assert_eq!(glyphs.len(), 2);
+        let letter = &arabic.rows[0].glyphs[0];
+        assert!(
+            glyphs[0].uv_rect.offset.y < letter.uv_rect.offset.y,
+            "the marks above"
+        );
+        assert_eq!(glyphs[0].advance_width, letter.advance_width);
+    }
+
+    // ḥ from one bitmap has the pixels of h and the dot below drawn one by
+    // one, at a size where the dot, 287 units right of h's origin, falls on
+    // whole pixels. Ȟ's caron is raised off the pixel grid, so it only has to
+    // match to within a pixel.
+    #[test]
+    fn built_letter_pixels() {
+        let mut fonts = plex_fonts();
+        let mut lay = |text: &str, size: f32| {
+            let job = LayoutJob::simple(
+                text.to_owned(),
+                FontId::proportional(size),
+                Color32::WHITE,
+                f32::INFINITY,
+            );
+            layout(&mut fonts, 1.0, job.into())
+        };
+        let size = 4000.0 / 287.0;
+        let galleys = [
+            lay("\u{1E25}", size),
+            lay("h\u{323}", size),
+            lay("\u{21E}", 13.0),
+            lay("H\u{30C}", 13.0),
+        ];
+        let glyphs: Vec<usize> = galleys.iter().map(|g| g.rows[0].glyphs.len()).collect();
+        assert_eq!(glyphs, [1, 2, 1, 2]);
+        let font = fonts.font(&FontFamily::Proportional);
+        let image = font.atlas.image();
+        let ink = |galley: &Galley| {
+            let mut ink = std::collections::BTreeMap::new();
+            for glyph in &galley.rows[0].glyphs {
+                let left = (glyph.pos.x + glyph.uv_rect.offset.x).round() as i32;
+                let top = glyph.uv_rect.offset.y.round() as i32;
+                let [x0, y0] = glyph.uv_rect.min.map(usize::from);
+                let [x1, y1] = glyph.uv_rect.max.map(usize::from);
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let at = (left + (x - x0) as i32, top + (y - y0) as i32);
+                        *ink.entry(at).or_insert(0) += u32::from(image[(x, y)].a());
+                    }
+                }
+            }
+            ink.retain(|_, a| *a != 0);
+            ink
+        };
+        let [one, two, caron_one, caron_two] = galleys.each_ref().map(ink);
+        assert!(two.keys().any(|&(_, y)| 0 < y), "the dot is drawn");
+        assert_eq!(one, two);
+
+        let bounds = |ink: &std::collections::BTreeMap<(i32, i32), u32>| {
+            let xs = ink.keys().map(|&(x, _)| x);
+            let ys = ink.keys().map(|&(_, y)| y);
+            [xs.clone().min(), xs.max(), ys.clone().min(), ys.max()].map(Option::unwrap)
+        };
+        let (a, b) = (bounds(&caron_one), bounds(&caron_two));
+        assert!(
+            a.iter().zip(&b).all(|(a, b)| (a - b).abs() <= 1),
+            "{a:?} {b:?}"
+        );
+        let total = |ink: &std::collections::BTreeMap<(i32, i32), u32>| ink.values().sum::<u32>();
+        let (a, b) = (total(&caron_one) as f32, total(&caron_two) as f32);
+        assert!((a - b).abs() <= 0.05 * b, "{a} {b}");
+    }
+
+    // Plex Sans Arabic stacks marks on marks. A letter under a pile of them is
+    // laid out glyph by glyph, so no bitmap is much taller than a letter.
+    #[test]
+    fn marks_pile_not_one_bitmap() {
+        let mut fonts = plex_fonts();
+        let text = format!("\u{628}\u{344}{}", "\u{64F}".repeat(300));
+        let galley = layout_simple(&mut fonts, &text);
+        for glyph in &galley.rows[0].glyphs {
+            assert!(glyph.uv_rect.size.y < 40.0, "{:?}", glyph.uv_rect);
+        }
+        let font = fonts.font(&FontFamily::Proportional);
+        assert!(font.atlas.fill_ratio() < 0.1, "{}", font.atlas.fill_ratio());
+    }
+
+    // Past the bitmaps a face keeps, a new built letter is laid out glyph by
+    // glyph, and one it keeps is still one glyph.
+    #[test]
+    fn cluster_cache_bounded() {
+        let mut fonts = plex_fonts();
+        let mut glyphs_at = |size: f32| {
+            let job = LayoutJob::simple(
+                "\u{1E25}".to_owned(),
+                FontId::proportional(size),
+                Color32::WHITE,
+                f32::INFINITY,
+            );
+            layout(&mut fonts, 1.0, job.into()).rows[0].glyphs.len()
+        };
+        let most = crate::text::font::MOST_CLUSTERS;
+        let sizes: Vec<f32> = (0..=most).map(|i| 4.0 + i as f32 / 512.0).collect();
+        let glyphs: Vec<usize> = sizes.iter().map(|&size| glyphs_at(size)).collect();
+        assert!(glyphs[..most].iter().all(|&count| count == 1));
+        assert_eq!(glyphs[most], 2);
+        assert_eq!(glyphs_at(sizes[0]), 1);
+    }
+
+    // Left and Right take the cursor positions of a row in the order they are
+    // drawn: every step goes to the next one on that side, never more than a
+    // pixel back where a letter's far edge and the next letter's near edge
+    // meet, and every position comes once. Only the keyboard reaches the
+    // positions between a letter and its marks, which share an x.
+    #[test]
+    fn arrows_screen_order() {
+        let mut fonts = plex_fonts();
+        for text in [
+            "مرحبا hello 123 عالم",
+            "abc مرحبا def",
+            "بِسْمِ اللَّهِ",
+            "(مرحبا) [1, 2]",
+            "لا شكراً 12.5%",
+            "عالم abc\u{200F}def",
+            "hello مرحبا\u{200D}",
+            "عالم\u{200E}مرحبا",
+        ] {
+            let galley = layout_simple(&mut fonts, text);
+            let row = &galley.rows[0].row;
+            let x = |cursor: &CCursor| row.x_offset(cursor.index);
+            let mut cursor = galley.begin();
+            loop {
+                let next = galley.cursor_left_on_screen(&cursor);
+                if next.index == cursor.index {
+                    break;
+                }
+                cursor = next;
+            }
+            let mut walked = vec![cursor.index.0];
+            loop {
+                let next = galley.cursor_right_on_screen(&cursor);
+                if next.index == cursor.index {
+                    break;
+                }
+                assert!(
+                    x(&cursor) - 1.0 <= x(&next),
+                    "{text:?} {cursor:?} to {next:?}"
+                );
+                cursor = next;
+                walked.push(cursor.index.0);
+            }
+            let mut sorted = walked.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted,
+                (0..=row.glyphs.len()).collect::<Vec<_>>(),
+                "{text:?}"
+            );
+            let mut back = vec![cursor.index.0];
+            while back.len() < walked.len() {
+                cursor = galley.cursor_left_on_screen(&cursor);
+                back.push(cursor.index.0);
+            }
+            back.reverse();
+            assert_eq!(back, walked, "{text:?}");
+        }
+
+        // Inside Arabic, Left goes on through the text.
+        let galley = layout_simple(&mut fonts, "مرحبا");
+        let mut cursor = galley.begin();
+        for i in 1..=5 {
+            cursor = galley.cursor_left_on_screen(&cursor);
+            assert_eq!(cursor.index.0, i);
+        }
+        assert_eq!(galley.cursor_left_on_screen(&cursor).index.0, 5);
+        assert_eq!(galley.cursor_right_on_screen(&galley.begin()).index.0, 0);
+    }
+
+    // Past the left end of a right-to-left row Left goes on to the row below,
+    // at its right end, and Right comes back. The end of the first row is the
+    // start of the second, so Left from there goes one further.
+    #[test]
+    fn arrows_cross_rows() {
+        let mut fonts = plex_fonts();
+        let job = LayoutJob::simple(
+            "مرحبا بكم في الغرفة".to_owned(),
+            FontId::proportional(13.0),
+            Color32::WHITE,
+            61.0,
+        );
+        let galley = layout(&mut fonts, 1.0, job.into());
+        assert_eq!(galley.rows[0].glyphs.len(), 13);
+        let at = |index: usize, prefer_next_row: bool| CCursor {
+            index: CharIndex(index),
+            prefer_next_row,
+        };
+        let row_of = |cursor: CCursor| galley.layout_from_cursor(cursor).row;
+
+        let left = galley.cursor_left_on_screen(&at(12, true));
+        assert_eq!((left.index.0, row_of(left)), (13, 0));
+        let left = galley.cursor_left_on_screen(&left);
+        assert_eq!((left.index.0, row_of(left)), (14, 1));
+        assert_eq!(galley.cursor_left_on_screen(&at(13, false)).index.0, 14);
+
+        let right = galley.cursor_right_on_screen(&at(14, true));
+        assert_eq!((right.index.0, row_of(right)), (13, 1));
+        let right = galley.cursor_right_on_screen(&right);
+        assert_eq!((right.index.0, row_of(right)), (12, 0));
+    }
+
+    // Held down, Left or Right walks wrapped rows that mix directions in the
+    // order they are drawn, reaching every char and stopping at the far end,
+    // and the other key walks back the same way.
+    #[test]
+    fn arrows_mixed_wrapped_rows() {
+        let mut fonts = plex_fonts();
+        for (first, second) in [
+            ("see you at the room", "مرحبا بكم"),
+            ("بكرة نلعب في الغرفة مع الشباب", "valorant الساعة ٩"),
+        ] {
+            let width = layout_simple(&mut fonts, &format!("{first} x")).size().x;
+            let text = format!("{first} {second}");
+            let job = LayoutJob::simple(
+                text.clone(),
+                FontId::proportional(13.0),
+                Color32::WHITE,
+                width,
+            );
+            let galley = layout(&mut fonts, 1.0, job.into());
+            assert_eq!(galley.rows.len(), 2, "{text:?}");
+            assert_eq!(galley.rows[0].glyphs.len(), first.chars().count() + 1);
+
+            let rtl = galley.is_rtl_paragraph_at(&galley.begin());
+            let walk = |from: CCursor, leftwards: bool| {
+                let mut walked = vec![from];
+                loop {
+                    let cursor = walked[walked.len() - 1];
+                    let next = if leftwards {
+                        galley.cursor_left_on_screen(&cursor)
+                    } else {
+                        galley.cursor_right_on_screen(&cursor)
+                    };
+                    if next.index == cursor.index {
+                        return walked;
+                    }
+                    let (row, next_row) = (
+                        galley.layout_from_cursor(cursor).row,
+                        galley.layout_from_cursor(next).row,
+                    );
+                    if row == next_row {
+                        let x = galley.pos_from_cursor(cursor).min.x;
+                        let next_x = galley.pos_from_cursor(next).min.x;
+                        let step = if leftwards { x - next_x } else { next_x - x };
+                        assert!(-1.0 <= step, "{text:?} {cursor:?} to {next:?}");
+                    } else {
+                        let down = leftwards == rtl;
+                        let expected = if down {
+                            Some(row + 1)
+                        } else {
+                            row.checked_sub(1)
+                        };
+                        assert_eq!(Some(next_row), expected, "{text:?} {cursor:?} to {next:?}");
+                    }
+                    assert!(walked.len() <= 2 * text.len(), "{text:?} goes round");
+                    walked.push(next);
+                }
+            };
+            let indexes = |walked: &[CCursor]| walked.iter().map(|c| c.index.0).collect::<Vec<_>>();
+            let on = walk(galley.begin(), rtl);
+            let mut reached = indexes(&on);
+            reached.sort_unstable();
+            reached.dedup();
+            assert_eq!(
+                reached,
+                (0..=text.chars().count()).collect::<Vec<_>>(),
+                "{text:?}"
+            );
+            let mut back = indexes(&walk(on[on.len() - 1], !rtl));
+            back.reverse();
+            assert_eq!(back, indexes(&on), "{text:?}");
+        }
+    }
+
+    // Across a newline Left and Right go to the char next to it, whichever way
+    // each paragraph reads, so a held key never jumps from one end of the text
+    // to the other.
+    #[test]
+    fn arrows_cross_paragraphs() {
+        let mut fonts = plex_fonts();
+        let at = |index: usize, prefer_next_row: bool| CCursor {
+            index: CharIndex(index),
+            prefer_next_row,
+        };
+        for text in [
+            "مرحبا\nhello",
+            "hello\nمرحبا",
+            "مرحبا\n\nhello",
+            "hello\n\nمرحبا",
+            "مرحبا\nبكم",
+        ] {
+            let galley = layout_simple(&mut fonts, text);
+            let paragraph = |index: usize| text.chars().take(index).filter(|&c| c == '\n').count();
+            for index in 0..=text.chars().count() {
+                for prefer_next_row in [false, true] {
+                    let cursor = at(index, prefer_next_row);
+                    for next in [
+                        galley.cursor_left_on_screen(&cursor),
+                        galley.cursor_right_on_screen(&cursor),
+                    ] {
+                        if paragraph(next.index.0) != paragraph(index) {
+                            assert_eq!(
+                                next.index.0.abs_diff(index),
+                                1,
+                                "{text:?} {cursor:?} to {next:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let galley = layout_simple(&mut fonts, "مرحبا\nhello");
+        assert_eq!(galley.cursor_left_on_screen(&at(6, true)).index.0, 5);
+        let galley = layout_simple(&mut fonts, "hello\nمرحبا");
+        assert_eq!(galley.cursor_right_on_screen(&at(5, false)).index.0, 6);
+    }
+
+    // With no right-to-left text the arrows step by char as in 0.36.2.
+    #[test]
+    fn arrows_latin_unchanged() {
+        let mut fonts = plex_fonts();
+        let job = LayoutJob::simple(
+            "see you in there\nat nine".to_owned(),
+            FontId::proportional(13.0),
+            Color32::WHITE,
+            40.0,
+        );
+        let galley = layout(&mut fonts, 1.0, job.into());
+        assert!(2 < galley.rows.len());
+        for index in 0..=galley.end().index.0 + 1 {
+            for prefer_next_row in [false, true] {
+                let cursor = CCursor {
+                    index: CharIndex(index),
+                    prefer_next_row,
+                };
+                assert_eq!(
+                    galley.cursor_left_on_screen(&cursor),
+                    galley.cursor_left_one_character(&cursor)
+                );
+                assert_eq!(
+                    galley.cursor_right_on_screen(&cursor),
+                    galley.cursor_right_one_character(&cursor)
+                );
+            }
+        }
+    }
+
     // A mark sorts after its letter and has no width. A background or a line
     // ending on the mark's right edge stops short of the letter's.
     #[test]
@@ -3058,21 +3586,16 @@ mod tests {
         assert_eq!(first.max_x(), rightmost);
     }
 
-    // Placed on whole pixels in visual order, a right-to-left row can reach a
-    // fraction of a point past the line it was broken to fit; this one ends
-    // up 300.24 wide on a line 300 wide. Its box was rounded out to 301, and
-    // egui's rounding of the galley cut the galley's rect back to 300 on the
-    // right, so the rect ended a pixel short of the edge the row is aligned
-    // to, where a right-aligned label puts its own right edge: the row's last
-    // letter started a pixel left of the label. The box now stays as wide as
-    // the glyphs, and the rect runs from where the row starts to that edge.
+    // This word has no space to give up the extra and comes out a fraction of
+    // a point wider than its line. Its box rounded out to 41 was cut back by
+    // egui's rounding, which put the row a pixel left of a right-aligned label.
     #[test]
     fn a_rtl_row_past_its_line_starts_where_the_galley_does() {
         let mut fonts = plex_fonts();
-        let text = "خمس بعد اللَّهِ بَعْدَ الرَّحْمَنِ 1440p 9:30 ok بعد تتأخروا مرحبا";
+        let text = "خمسفي";
         for halign in [Align::LEFT, Align::Center, Align::RIGHT] {
             for pixels_per_point in [1.0, 1.25, 1.5, 2.0] {
-                for width in [300.0, 299.5, 160.0] {
+                for width in [40.0, 39.5, 20.0] {
                     let galley =
                         layout_unrounded(&mut fonts, text, width, halign, pixels_per_point);
                     let case = format!("{halign:?} {width} at {pixels_per_point}");
@@ -3085,7 +3608,7 @@ mod tests {
             text.to_owned(),
             FontId::proportional(13.0),
             Color32::WHITE,
-            300.0,
+            40.0,
         );
         job.halign = Align::RIGHT;
         let galley = layout(&mut fonts, 1.0, job.into());
@@ -3098,11 +3621,257 @@ mod tests {
             .fold(f32::INFINITY, f32::min);
         let right = placed.glyphs.iter().map(Glyph::max_x).fold(0.0, f32::max);
         assert!(
-            300.0 < right - left && right - left < 300.5,
+            40.0 < right - left && right - left < 40.5,
             "{left}..{right}"
         );
-        assert_eq!((galley.rect.left(), galley.rect.right()), (-300.0, 0.0));
+        assert_eq!((galley.rect.left(), galley.rect.right()), (-40.0, 0.0));
         assert_eq!(placed.pos.x + left, galley.rect.left());
+    }
+
+    // Put on whole pixels in visual order, these rows come out wider than
+    // their line, the second by more than a point. Their spaces give up the
+    // extra, a pixel each, so each row fits the whole pixels of its line and
+    // gets its box.
+    #[test]
+    fn spaces_give_up_extra() {
+        let mut fonts = plex_fonts();
+        let text = "خمس بعد اللَّهِ بَعْدَ الرَّحْمَنِ 1440p 9:30 ok بعد تتأخروا مرحبا";
+        let wide = "نعم وين بِسْمِ مساء الغرفة سَنَبْدَأُ حالكم أنتم التاسعة شُكْراً علينا";
+        for halign in [Align::LEFT, Align::Center, Align::RIGHT] {
+            for pixels_per_point in [1.0, 1.25, 1.5, 2.0] {
+                for width in [300.0, 299.5, 160.0] {
+                    for text in [text, wide] {
+                        let galley =
+                            layout_unrounded(&mut fonts, text, width, halign, pixels_per_point);
+                        let case = format!("{text} {halign:?} {width} at {pixels_per_point}");
+                        assert_rows_cover_their_glyphs(&galley, &case);
+                    }
+                }
+            }
+        }
+
+        let mut lay_out = |text: &str, width: f32, halign: Align, pixels_per_point: f32| {
+            let mut job = LayoutJob::simple(
+                text.to_owned(),
+                FontId::proportional(13.0),
+                Color32::WHITE,
+                width,
+            );
+            job.halign = halign;
+            layout(&mut fonts, pixels_per_point, job.into())
+        };
+        let reach = |glyphs: &[Glyph]| {
+            let left = glyphs.iter().map(|g| g.pos.x).fold(f32::INFINITY, f32::min);
+            glyphs.iter().map(Glyph::max_x).fold(0.0, f32::max) - left
+        };
+        let past = reach(&lay_out(wide, 300.0, Align::LEFT, 1.0).rows[0].glyphs) - 300.0;
+        assert!(1.0 < past, "{past}");
+        for (text, width, pixels_per_point) in [
+            (text, 300.0, 1.0),
+            (text, 299.5, 1.0),
+            (wide, 300.0, 1.0),
+            (text, 299.25, 1.25),
+            (wide, 300.0, 1.25),
+            (text, 299.25, 1.5),
+            (text, 299.25, 2.0),
+            (wide, 299.75, 2.0),
+        ] {
+            let line = PointScale::new(pixels_per_point).floor_to_pixel(width);
+            let left = lay_out(text, width, Align::LEFT, pixels_per_point);
+            let unfitted = reach(&left.rows[0].glyphs);
+            assert!(width < unfitted, "{text} {width} at {pixels_per_point}");
+            let pixels = ((unfitted - line) * pixels_per_point).ceil() as usize;
+            let roomy = lay_out(text, 400.0, Align::RIGHT, pixels_per_point);
+            for halign in [Align::Center, Align::RIGHT] {
+                let galley = lay_out(text, width, halign, pixels_per_point);
+                let case = format!("{text} {width} {halign:?} at {pixels_per_point}");
+                assert_eq!(galley.rows.len(), 1, "{case}");
+                let placed = &galley.rows[0];
+                assert!(reach(&placed.glyphs) <= line, "{case}");
+                assert_eq!(placed.size.x, line.round_ui(), "{case}");
+                let narrowed: Vec<(char, f32)> = placed
+                    .glyphs
+                    .iter()
+                    .zip(&roomy.rows[0].glyphs)
+                    .filter(|(glyph, wide)| glyph.advance_width != wide.advance_width)
+                    .map(|(glyph, wide)| {
+                        let given = wide.advance_width - glyph.advance_width;
+                        (glyph.chr, given * pixels_per_point)
+                    })
+                    .collect();
+                assert_eq!(narrowed.len(), pixels, "{case}: {narrowed:?}");
+                for (chr, given) in narrowed {
+                    assert!(
+                        chr == ' ' && (given - 1.0).abs() < 1e-4,
+                        "{case}: {chr:?} {given}"
+                    );
+                }
+            }
+
+            // Right-aligned, its first letter ends at most a pixel short of the edge.
+            let galley = lay_out(text, width, Align::RIGHT, pixels_per_point);
+            let placed = &galley.rows[0];
+            let end = placed.pos.x + placed.glyphs[0].max_x();
+            let case = format!("{text} {width} at {pixels_per_point}: {end}");
+            assert!(-1.0 / pixels_per_point < end && end <= 0.0, "{case}");
+            let rect = (galley.rect.left(), galley.rect.right());
+            assert_eq!(rect, (-line.round_ui(), 0.0), "{case}");
+        }
+
+        // Justified, the row keeps its spaces, as 0.36.2 justifies it.
+        let roomy = lay_out(text, 400.0, Align::RIGHT, 1.0);
+        let mut job = LayoutJob::simple(
+            format!("{text} مرحبا"),
+            FontId::proportional(13.0),
+            Color32::WHITE,
+            300.0,
+        );
+        job.justify = true;
+        job.wrap.break_anywhere = true;
+        let galley = layout(&mut fonts, 1.0, job.into());
+        assert_eq!(galley.rows[0].text(), text);
+        for (glyph, wide) in galley.rows[0].glyphs.iter().zip(&roomy.rows[0].glyphs) {
+            assert_eq!(glyph.advance_width, wide.advance_width, "{:?}", glyph.chr);
+        }
+    }
+
+    // Of a row past its line, only plain spaces no mark sits on give up the
+    // extra: the widest first, a pixel each, and only spaces wider than a
+    // pixel. The spaces a row starts or ends with neither count toward its
+    // width nor give. A row without one for each pixel it needs keeps its
+    // width.
+    #[test]
+    fn which_spaces_narrow() {
+        let mut fonts = plex_fonts();
+        let text = "خمس بعد اللَّهِ بَعْدَ الرَّحْمَنِ";
+        let font = |size| TextFormat::simple(FontId::proportional(size), Color32::WHITE);
+        let one = |text: &str| LayoutJob::single_section(text.to_owned(), font(13.0));
+        let mut space = |size| {
+            let job = LayoutJob::single_section(text.to_owned(), font(size));
+            layout(&mut fonts, 1.0, job.into()).rows[0]
+                .glyphs
+                .iter()
+                .filter(|g| g.chr == ' ')
+                .map(|g| g.advance_width)
+                .fold(0.0, f32::max)
+        };
+        let (narrow, wide) = (space(13.0), space(17.0));
+        assert!(narrow < wide, "{narrow} {wide}");
+
+        // The job's row fitted to a line `pixels` whole pixels short of the
+        // glyphs it keeps, all but the spaces it starts and ends with: the
+        // chars that gave up width, with how wide they were. Each moves the
+        // glyphs right of it a pixel left, and then the kept glyphs fit.
+        let mut fit = |job: LayoutJob, pixels: f32| {
+            let galley = layout(&mut fonts, 1.0, job.into());
+            let row = &galley.rows[0].row;
+            let blank = |g: &&Glyph| g.chr.is_whitespace();
+            let start = row.glyphs.iter().take_while(blank).count();
+            let end = row.glyphs.len() - row.glyphs.iter().rev().take_while(blank).count();
+            let reach = |glyphs: &[Glyph]| {
+                let left = glyphs.iter().map(|g| g.pos.x).fold(f32::INFINITY, f32::min);
+                glyphs.iter().map(Glyph::max_x).fold(0.0, f32::max) - left
+            };
+            let kept = reach(&row.glyphs[start..end]);
+            assert!(0.0 < kept.fract(), "{kept}");
+            let mut fitted = Row::clone(row);
+            let line = kept.floor() + 1.0 - pixels;
+            fit_mirrored_row(PointScale::new(1.0), &mut fitted, start..end, line);
+            let narrowed: Vec<&Glyph> = fitted
+                .glyphs
+                .iter()
+                .zip(&row.glyphs)
+                .filter(|(glyph, was)| glyph.advance_width != was.advance_width)
+                .map(|(_, was)| was)
+                .collect();
+            for (glyph, was) in fitted.glyphs.iter().zip(&row.glyphs) {
+                let moved = narrowed.iter().filter(|g| g.pos.x < was.pos.x).count();
+                assert_eq!(glyph.pos.x, was.pos.x - moved as f32, "{:?}", glyph.chr);
+            }
+            if !narrowed.is_empty() {
+                assert!(reach(&fitted.glyphs[start..end]) <= line);
+            }
+            narrowed
+                .iter()
+                .map(|g| (g.chr, g.advance_width))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fit(one(text), 1.0), [(' ', narrow)]);
+        assert_eq!(fit(one(text), 4.0), [(' ', narrow); 4]);
+        assert!(fit(one(text), 5.0).is_empty());
+        assert!(fit(one(&text.replace(' ', "\u{a0}")), 1.0).is_empty());
+        assert!(fit(one(&text.replace(' ', " \u{64e}")), 1.0).is_empty());
+
+        let (leading, trailing) = (format!(" {text}"), format!("{text} "));
+        assert_eq!(fit(one(&leading), 1.0), [(' ', narrow)]);
+        assert!(fit(one(&leading), 5.0).is_empty());
+        assert!(fit(one(&trailing), 0.0).is_empty());
+
+        let mut sections = LayoutJob::default();
+        sections.append("خمس ", 0.0, font(13.0));
+        sections.append("بعد اللَّهِ ", 0.0, font(17.0));
+        sections.append("بَعْدَ الرَّحْمَنِ", 0.0, font(13.0));
+        assert_eq!(fit(sections.clone(), 1.0), [(' ', wide)]);
+        assert_eq!(fit(sections.clone(), 2.0), [(' ', wide); 2]);
+        assert_eq!(
+            fit(sections, 3.0),
+            [(' ', narrow), (' ', wide), (' ', wide)]
+        );
+
+        let mut tiny = LayoutJob::default();
+        tiny.append("خمس", 0.0, font(13.0));
+        tiny.append(" ", 0.0, font(2.0));
+        tiny.append("بعد", 0.0, font(13.0));
+        assert!(fit(tiny, 1.0).is_empty());
+    }
+
+    // An English row a fraction of a point past its line, as the line breaker
+    // allows, comes out as on a wider line. A wrapped Arabic row whose
+    // letters fit its line keeps its spaces, though the space it wraps at,
+    // put at its left end, reaches past the line.
+    #[test]
+    fn latin_and_fitting_rows_kept() {
+        let mut fonts = plex_fonts();
+        let mut lay_out = |text: &str, width: f32, halign: Align| {
+            let mut job = LayoutJob::simple(
+                text.to_owned(),
+                FontId::proportional(13.0),
+                Color32::WHITE,
+                width,
+            );
+            job.halign = halign;
+            layout(&mut fonts, 1.0, job.into())
+        };
+        let reach = |glyphs: &[Glyph]| {
+            let left = glyphs.iter().map(|g| g.pos.x).fold(f32::INFINITY, f32::min);
+            glyphs.iter().map(Glyph::max_x).fold(0.0, f32::max) - left
+        };
+        let advances =
+            |glyphs: &[Glyph]| glyphs.iter().map(|g| g.advance_width).collect::<Vec<_>>();
+
+        let text = "see you in there";
+        let past = reach(&lay_out(text, 92.0, Align::LEFT).rows[0].glyphs) - 92.0;
+        assert!(0.0 < past && past < 0.5, "{past}");
+        for halign in [Align::Center, Align::RIGHT] {
+            let galley = lay_out(text, 92.0, halign);
+            assert_eq!(galley.rows, lay_out(text, 400.0, halign).rows, "{halign:?}");
+        }
+
+        let text = "مرحبا بكم في الغرفة";
+        let wrapped = lay_out(text, 61.0, Align::LEFT);
+        let glyphs = &wrapped.rows[0].glyphs;
+        let (last, letters) = glyphs.split_last().unwrap();
+        assert_eq!(last.chr, ' ');
+        let all = reach(glyphs);
+        assert!(reach(letters) <= 61.0 && 61.0 < all, "{all}");
+        for halign in [Align::Center, Align::RIGHT] {
+            let galley = lay_out(text, 61.0, halign);
+            assert_eq!(
+                advances(&galley.rows[0].glyphs),
+                advances(glyphs),
+                "{halign:?}"
+            );
+        }
     }
 
     // English then Arabic with marks on one line: the Arabic is mirrored

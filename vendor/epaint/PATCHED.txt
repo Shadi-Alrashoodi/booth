@@ -24,24 +24,27 @@ TextRun::raster:
 - its three tests, run on IBM Plex Sans and Plex Sans Arabic from
   assets/fonts instead of egui's default fonts
 
-Not taken: commit c93e8863e958507056415e2a6dace56e23ba5f3a, which draws a
-cluster with more glyphs than chars as one bitmap. IBM Plex Sans Arabic, the
-only right-to-left font Booth ships, shapes no character into more glyphs
-than characters. Checked on 2026-09-30: every character in its cmap, alone
-and in its joining forms, letters with vowel marks, and every code point up
-to U+2FFFF alone, after a Latin letter and after an Arabic one, with Plex
-Sans first as the app has it; nothing in the Arabic blocks. The dotted
-circle the shaper adds under a mark with no letter before it is turned off
-instead (below). Nor the pull request's change to egui's selection painter:
-egui-wgpu draws the flipped rectangle anyway.
+Taken from commit c93e8863e958507056415e2a6dace56e23ba5f3a of the same pull
+request, adapted to 0.36.2, which draws glyphs in font.rs where the commit
+has font_face.rs and glyph_atlas.rs: a cluster the shaper makes from more
+glyphs than chars is one glyph for its first char, drawn from one bitmap of
+all its glyphs where the shaper puts them, with the cluster's whole
+advance. Its other chars get zero-width continuation glyphs, as a
+ligature's do. A cluster with a glyph the font does not have is laid out
+glyph by glyph, as before. Plex Sans, the Latin face, makes such a cluster
+for 179 letters it has no glyph of its own for, which the shaper builds
+from a letter and its accents: among them the dotted letters of Arabic
+transliteration (for example U+1E25, U+1E63, U+1E0D), U+01E7 and U+021E,
+some Cyrillic, and polytonic Greek. In 0.36.2 the caret, the selection and
+the copied text after such a letter were one or two places off. IBM Plex
+Sans Arabic, the only right-to-left font Booth ships, makes one only for an
+Arabic letter with U+0344 on it, a Greek mark the shaper takes apart into
+two. Every other code point up to U+2FFFF, alone, after a Latin letter and
+after an Arabic one, is laid out and drawn as before, glyph for glyph and
+pixel for pixel.
 
-Plex Sans, the Latin face, does give more glyphs than chars for 179 letters
-it has no glyph of its own for, which the shaper builds from a letter and
-its accents: among them the dotted letters of Arabic transliteration (for
-example U+1E25, U+1E63, U+1E0D), U+01E7 and U+021E, some Cyrillic, and
-polytonic Greek. That is 0.36.2's behaviour and is left as it is here; the
-caret, the selection and the copied text after such a letter are one place
-off. Commit c93e886 is what fixes it.
+Not taken: the pull request's change to egui's selection painter:
+egui-wgpu draws the flipped rectangle anyway.
 
 Changed from the pull request
 - A right-to-left run is walked from the end of the shaper's output. The
@@ -102,31 +105,65 @@ Changed from the pull request
   change: 300.24 on a line of 300. Rounded out to 301, the galley's rect
   was cut back to 300 on the right when the galley was rounded, a pixel
   short of the edge the row is aligned to, and a right-aligned label drew
-  the row a pixel left of itself. Such a row keeps its own width and is
-  placed as 0.36.2 places any row wider than its line: right-aligned, it
-  ends up to half a pixel past its edge, or, when it is half a pixel or
-  more too wide, its rect is cut back the same way and its last letter
-  starts up to a point left of its label.
+  the row a pixel left of itself. An aligned row too wide, unless it is
+  justified, takes the extra from the widest spaces it keeps, a pixel from
+  each so no two words close up, and then fits the whole pixels of its
+  line and gets its box. One without a space wider than a pixel for each
+  pixel it needs keeps its own width and is placed as 0.36.2 places any
+  row wider than its line: right-aligned, it ends up to half a pixel past
+  its edge, or, when it is half a pixel or more too wide, its rect is cut
+  back the same way and its last letter starts up to a point left of its
+  label.
   PlacedRow::rect_without_leading_space starts such a row at its leftmost
   glyph instead of its first, which can be on the right.
 - The overflow character that ends a cut row goes where the last letter
   ends when the char before it is a right-to-left mark. It went where the
   mark is, over the letter, and mirroring the row then put letters over
   each other, as when the room panel cuts a long name short.
-- Fifteen more tests: the caret at the end of a line ending in digits,
+- A cluster's bitmap is cached in a map of its own, keyed by every glyph
+  and offset in it as they are rather than by their hash as commit c93e886
+  does, so it is never found for a single glyph or for another cluster.
+  Its glyphs are found as the run is walked, from the end in a
+  right-to-left run, and drawn in the shaper's order.
+- A cluster is drawn as one bitmap only up to eight glyphs, and a face
+  keeps at most 2048 such bitmaps (MOST_CLUSTERS in font.rs). A longer
+  cluster, a letter under a pile of marks, and a new one past that are
+  laid out glyph by glyph as in 0.36.2, so text can neither draw a bitmap
+  far taller than a letter nor keep filling the atlas with them.
+- Galley::cursor_left_on_screen and cursor_right_on_screen, for the arrow
+  keys in vendor/egui. In a galley with right-to-left text the cursor
+  takes the positions of its row in the order they are drawn: block by
+  block in x order and, between a letter and its marks, where positions
+  share an x, in the order the text reads. Past the left end of a row Left
+  goes on to the row its paragraph goes on to that way, below in a
+  right-to-left paragraph and above in a left-to-right one, at that row's
+  right end, one position further where a wrapped row's end and the next
+  row's start are one char. Right mirrors it. A position at a wrapped row's
+  end stays on that row. Across a newline the cursor goes to the char next
+  to it instead, as the next paragraph may read the other way.
+  Galley::is_rtl_paragraph_at says which way a paragraph reads, from its
+  lowest bidi level. A galley with no right-to-left text steps by char as
+  0.36.2 does.
+- Twenty-seven more tests: the caret at the end of a line ending in digits,
   the caret staying with the run it was typed into, marks on their letters
-  and joins, caret places round-tripping through x, a click staying out of
-  a letter and its marks, the order unicode-bidi gives, Arabic words in one
+  and joins, caret places round-tripping through x, a click staying out of a
+  letter and its marks, letters Plex Sans builds from two glyphs as one
+  glyph each and with the pixels of their two glyphs, a pile of marks and a
+  face's bitmaps past the bounds laid out glyph by glyph, the arrow keys
+  taking positions in the order they are drawn, going on to the next row,
+  through wrapped rows that mix directions, across a newline, and stepping
+  by char in Latin text, the order unicode-bidi gives, Arabic words in one
   run, the space where a line wraps, a section's leading space, zero-width
   chars taking no room, a right-to-left row as wide as its first letter with
-  a mark on it, one a little past its line starting where the galley does,
-  English then Arabic with marks as wide as its letters, an ellipsis after
-  a mark, and a background and a line reaching the end of a marked letter.
+  a mark on it, one a little past its line with no space starting where the
+  galley does, one its spaces bring back inside its line, which spaces those
+  are, English rows and rows whose letters fit left as they are, English
+  then Arabic with marks as wide as its letters, an ellipsis after a mark,
+  and a background and a line reaching the end of a marked letter.
 
 Still as in 0.36.2
-The arrow keys move by char index, in logical order, so Left moves right
-inside Arabic. The selection highlight is drawn by egui, not here; the
-vendored egui next to this crate draws it per run of selected letters (see
+The selection highlight is drawn by egui, not here; the vendored egui next
+to this crate draws it per run of selected letters (see
 vendor/egui/PATCHED.txt).
 
 Other changes to the crate

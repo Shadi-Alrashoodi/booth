@@ -214,28 +214,21 @@ fn arabic_english_and_mixed_messages_sit_in_reading_order() {
 // clicks to select the message. Every letter now lies inside both, and the
 // first one ends at the column's edge.
 //
-// The last message comes out 300.24 wide once its letters are put on whole
-// pixels in visual order, so it cannot fit the column. Its first letter may
-// end up to half a pixel past the right edge, as it always could, but its
-// last letter must not start a pixel left of the column, which it did while
-// the row was rounded out to 301.
+// The last message comes out a fraction of a point wider than the column
+// once its letters are put on whole pixels in visual order. A space between
+// its words gives up the extra, so it fits too.
 #[test]
 fn a_right_aligned_arabic_message_stays_inside_the_column() {
     let ctx = Context::default();
     theme::apply(&ctx);
     let right = SIDE + COLUMN;
-    for (text, rows, past_right) in [
-        ("بِسْمِ اللَّهِ الرَّحْمَنِ", 1, 0.0),
+    for (text, rows) in [
+        ("بِسْمِ اللَّهِ الرَّحْمَنِ", 1),
         (
             "بِسْمِ اللَّهِ الرَّحْمَنِ الرَّحِيمِ، سَنَبْدَأُ اللَّعِبَ بَعْدَ خَمْسِ دَقَائِقَ فَلَا تَتَأَخَّرُوا",
             2,
-            0.0,
         ),
-        (
-            "خمس بعد اللَّهِ بَعْدَ الرَّحْمَنِ 1440p 9:30 ok بعد تتأخروا مرحبا",
-            1,
-            0.5,
-        ),
+        ("خمس بعد اللَّهِ بَعْدَ الرَّحْمَنِ 1440p 9:30 ok بعد تتأخروا مرحبا", 1),
     ] {
         let show = |ui: &mut Ui| (message(ui, text), body_galley(ui, text, COLUMN));
         let ((response, galley), _, _) = frame(&ctx, Vec::new(), Modifiers::NONE, show);
@@ -251,12 +244,12 @@ fn a_right_aligned_arabic_message_stays_inside_the_column() {
                 let left = origin.x + placed.pos.x + glyph.pos.x;
                 let end = origin.x + placed.pos.x + glyph.max_x();
                 assert!(
-                    SIDE <= left && end <= right + past_right,
+                    SIDE <= left && end <= right,
                     "{text}: {:?} at {left}..{end} is outside the column",
                     glyph.chr
                 );
                 assert!(
-                    clickable.left() <= left && end <= clickable.right() + past_right,
+                    clickable.left() <= left && end <= clickable.right(),
                     "{text}: {:?} at {left}..{end} is outside the label, {clickable:?}",
                     glyph.chr
                 );
@@ -266,7 +259,7 @@ fn a_right_aligned_arabic_message_stays_inside_the_column() {
         assert_eq!(Some(first.chr), text.chars().next());
         let first_end = origin.x + galley.rows[0].pos.x + first.max_x();
         assert!(
-            right - 1.0 < first_end && first_end <= right + past_right,
+            right - 1.0 < first_end && first_end <= right,
             "{text}: {first_end}"
         );
     }
@@ -646,6 +639,29 @@ fn selection_arabic_into_english() {
     assert_eq!(highlight(english)[0].left(), 0.0);
 }
 
+// An English line that starts with a space, under an Arabic one: the row is
+// right-aligned, and the layout hangs the space left of where it starts. A
+// selection on through the row highlights the space, and one that ends where
+// the row starts lays nothing over it.
+#[test]
+fn hung_space_highlighted() {
+    let ctx = Context::default();
+    theme::apply(&ctx);
+    let text = format!("{ARABIC}\n hi");
+    let (galley, _, _) = frame(&ctx, Vec::new(), Modifiers::NONE, |ui| {
+        body_galley(ui, &text, COLUMN)
+    });
+    assert_eq!(galley.rows.len(), 2);
+    let space = &galley.rows[1].glyphs[0];
+    assert!(space.chr == ' ' && space.pos.x < -PIXEL, "{space:?}");
+    let row_start = galley.rows[0].char_count_including_newline().0;
+    let end = text.chars().count();
+    for (selected, rects) in [(3..end, [1, 1]), (3..row_start, [1, 0])] {
+        let (now, _) = paint_both(&ctx, &galley, &selected);
+        assert_eq!(check_highlight(&now, &selected), rects, "{selected:?}");
+    }
+}
+
 // An English line that ends in Arabic with vowel marks, selected on into
 // the line under it. The selected newline shows past the right end of the
 // letters, and never over the unselected بِسْمِ.
@@ -716,7 +732,8 @@ fn a_selection_over_two_arabic_rows_highlights_both() {
 // On rows with no right-to-left letter, the highlight, the ink and the
 // rectangles handed back are exactly 0.36.2's, for every selection of a set
 // of texts at two widths, and on the left-to-right rows of messages that
-// also have Arabic ones.
+// also have Arabic ones. A row that hangs a space left of x 0 differs only
+// in where its highlight starts.
 #[test]
 fn left_to_right_rows_as_in_0_36_2() {
     let ctx = Context::default();
@@ -733,6 +750,7 @@ fn left_to_right_rows_as_in_0_36_2() {
         "",
         "مرحبا بكم\nsee you in there\nعالم",
         "hello\nمرحبا\n123",
+        "مرحبا\n hi",
     ];
     let mut compared = 0;
     for text in texts {
@@ -754,11 +772,28 @@ fn left_to_right_rows_as_in_0_36_2() {
             }
         }
     }
+
+    // A section's leading space starts the second row right of x 0.
+    let format = TextFormat::simple(theme::body(), CHALK);
+    let mut job = LayoutJob::default();
+    job.append("hello\n", 0.0, format.clone());
+    job.append("there", 20.0, format);
+    let (galley, _, _) = frame(&ctx, Vec::new(), Modifiers::NONE, |ui| {
+        ui.painter().layout_job(job)
+    });
+    assert_eq!(galley.rows[1].glyphs[0].pos.x, 20.0);
+    for to in 6..=11 {
+        let range = CCursorRange::two(CCursor::new(3), CCursor::new(to));
+        compared += compare_left_to_right_rows(&galley, &visuals, &range, &format!("3..{to}"));
+    }
     assert!(compared > 10_000, "{compared}");
 }
 
 // Paints `range` with this egui and with 0.36.2 and checks that every row
-// with no right-to-left letter came out the same. Returns how many did.
+// with no right-to-left letter came out the same, but for where the
+// rectangle starts on a row below the one the selection starts on that
+// hangs a space left of x 0: 0.36.2 starts it at 0, this egui at the space.
+// Returns how many did.
 fn compare_left_to_right_rows(
     galley: &Arc<Galley>,
     visuals: &Visuals,
@@ -767,6 +802,7 @@ fn compare_left_to_right_rows(
 ) -> usize {
     let (now, now_rects) = paint_with(paint_text_selection, galley, visuals, range);
     let (before, before_rects) = paint_with(paint_text_selection_0_36_2, galley, visuals, range);
+    let first_row = galley.layout_from_cursor(range.sorted_cursors()[0]).row;
     let mut compared = 0;
     for (ri, (row, old)) in now.rows.iter().zip(&before.rows).enumerate() {
         if row.glyphs.iter().any(Glyph::is_rtl) {
@@ -779,7 +815,21 @@ fn compare_left_to_right_rows(
                 .copied()
                 .collect::<Vec<_>>()
         };
-        assert_eq!(row, old, "{case}");
+        let mut old = old.clone();
+        let hung = row
+            .glyphs
+            .first()
+            .filter(|glyph| first_row < ri && glyph.pos.x < 0.0);
+        if let Some(glyph) = hung {
+            let old_row = Arc::make_mut(&mut old.row);
+            let mesh = &mut old_row.visuals.mesh;
+            for (_, [left_top, _, left_bottom, ..]) in on_row(&before_rects) {
+                mesh.vertices[left_top as usize].pos.x = glyph.pos.x;
+                mesh.vertices[left_bottom as usize].pos.x = glyph.pos.x;
+            }
+            old_row.visuals.mesh_bounds = old_row.visuals.mesh.calc_bounds();
+        }
+        assert_eq!(row, &old, "{case}");
         assert_eq!(on_row(&now_rects), on_row(&before_rects), "{case}");
         compared += 1;
     }
@@ -1067,7 +1117,7 @@ fn the_composer_highlights_what_is_selected() {
     }
 }
 
-// Shift+Right from between ب and its kasra selects the kasra alone, which
+// Shift+Left from between ب and its kasra selects the kasra alone, which
 // only the keyboard can do. The kasra turns ink like any selected char, so
 // the highlight goes under ب, which it is drawn on, or it would vanish on
 // the panel.
@@ -1079,10 +1129,10 @@ fn mark_highlighted_on_its_letter() {
     composer(&ctx, &mut draft, Vec::new(), Modifiers::NONE);
     let to_kasra = vec![
         key(Key::Home, Modifiers::NONE),
-        key(Key::ArrowRight, Modifiers::NONE),
+        key(Key::ArrowLeft, Modifiers::NONE),
     ];
     composer(&ctx, &mut draft, to_kasra, Modifiers::NONE);
-    let over_kasra = vec![key(Key::ArrowRight, Modifiers::SHIFT)];
+    let over_kasra = vec![key(Key::ArrowLeft, Modifiers::SHIFT)];
     composer(&ctx, &mut draft, over_kasra, Modifiers::SHIFT);
     let (_, painted, output) = composer(&ctx, &mut draft, vec![Event::Copy], Modifiers::NONE);
     assert_eq!(copied(&output), Some("\u{650}"));
@@ -1092,24 +1142,126 @@ fn mark_highlighted_on_its_letter() {
     assert!(covers(&highlight(row)[0], &row.glyphs[0]));
 }
 
-// Plex builds ḥ from two glyphs, so End puts the caret a place past the last
-// char. Nothing is left to delete there, and this used to panic and end the
-// app; a step by a word stays where it is too.
+// The composer's caret after each key, and its x on screen.
+fn press_keys(ctx: &Context, draft: &mut String, keys: &[(Key, Modifiers)]) -> Vec<(usize, f32)> {
+    let mut carets = Vec::new();
+    for &(pressed, modifiers) in keys {
+        composer(ctx, draft, vec![key(pressed, modifiers)], modifiers);
+        let (response, painted, _) = composer(ctx, draft, Vec::new(), Modifiers::NONE);
+        let (pos, galley) = typed(&painted, draft);
+        let index = caret(ctx, &response);
+        let state = TextEditState::load(ctx, response.id).expect("the composer has state");
+        let cursor = state.cursor.char_range().expect("a caret").primary;
+        carets.push((index, pos.x + galley.pos_from_cursor(cursor).min.x));
+    }
+    carets
+}
+
+// Left and Right go by what is on screen: inside Arabic Left goes on to the
+// next letter, and across a mixed row each press goes to the next caret
+// place on that side.
 #[test]
-fn word_keys_past_the_last_char() {
+fn arrows_follow_screen() {
+    let ctx = Context::default();
+    theme::apply(&ctx);
+    let none = Modifiers::NONE;
+
+    let mut draft = String::from("مرحبا بكم");
+    composer(&ctx, &mut draft, Vec::new(), none);
+    press_keys(&ctx, &mut draft, &[(Key::Home, none)]);
+    let carets = press_keys(&ctx, &mut draft, &[(Key::ArrowLeft, none); 3]);
+    assert_eq!(carets.iter().map(|c| c.0).collect::<Vec<_>>(), [1, 2, 3]);
+    let back = press_keys(&ctx, &mut draft, &[(Key::ArrowRight, none)]);
+    assert_eq!(back[0].0, 2);
+
+    let mut draft = String::from("abc مرحبا def");
+    composer(&ctx, &mut draft, Vec::new(), none);
+    let len = draft.chars().count();
+    let end = press_keys(&ctx, &mut draft, &[(Key::End, none)]);
+    let left = press_keys(&ctx, &mut draft, &vec![(Key::ArrowLeft, none); len]);
+    let walked: Vec<usize> = left.iter().map(|c| c.0).collect();
+    assert_eq!(walked, [12, 11, 10, 4, 5, 6, 7, 8, 9, 3, 2, 1, 0]);
+    let mut x = end[0].1;
+    for &(index, at) in &left {
+        assert!(at < x, "{index} at {at}, not left of {x}");
+        x = at;
+    }
+    let right = press_keys(&ctx, &mut draft, &vec![(Key::ArrowRight, none); len]);
+    let mut back: Vec<usize> = right.iter().map(|c| c.0).collect();
+    back.reverse();
+    assert_eq!(back[1..], walked[..len - 1]);
+}
+
+// Ctrl+Left goes on to the next word in Arabic, and Left and Right with a
+// selection leave the caret at its left and right ends.
+#[test]
+fn word_and_selection_keys() {
+    let ctx = Context::default();
+    theme::apply(&ctx);
+    let mut draft = String::from("مرحبا بكم");
+    composer(&ctx, &mut draft, Vec::new(), Modifiers::NONE);
+    press_keys(&ctx, &mut draft, &[(Key::Home, Modifiers::NONE)]);
+    let word = press_keys(&ctx, &mut draft, &[(Key::ArrowLeft, Modifiers::CTRL)]);
+    assert_eq!(word[0].0, 5);
+    let back = press_keys(&ctx, &mut draft, &[(Key::ArrowRight, Modifiers::CTRL)]);
+    assert_eq!(back[0].0, 0);
+
+    let select = [(Key::ArrowLeft, Modifiers::SHIFT); 2];
+    press_keys(&ctx, &mut draft, &select);
+    let left = press_keys(&ctx, &mut draft, &[(Key::ArrowLeft, Modifiers::NONE)]);
+    assert_eq!(left[0].0, 2);
+    press_keys(&ctx, &mut draft, &select);
+    let right = press_keys(&ctx, &mut draft, &[(Key::ArrowRight, Modifiers::NONE)]);
+    assert_eq!(right[0].0, 2);
+}
+
+// Plex builds ḥ from h and a dot below. Drawn as one glyph it takes one
+// caret place, so a selection after it copies the letters it covers.
+#[test]
+fn copy_after_built_letter() {
+    let ctx = Context::default();
+    theme::apply(&ctx);
+    let mut draft = String::from("Mu\u{1E25}ammad");
+    composer(&ctx, &mut draft, Vec::new(), Modifiers::NONE);
+    let (_, painted, _) = composer(&ctx, &mut draft, Vec::new(), Modifiers::NONE);
+    let (pos, galley) = typed(&painted, &draft);
+    let row = &galley.rows[0];
+    assert_eq!(row.glyphs.len(), 8);
+    let before = |chr: char| {
+        let glyph = row
+            .glyphs
+            .iter()
+            .find(|g| g.chr == chr)
+            .expect("the letter");
+        pos2(
+            pos.x + row.pos.x + glyph.pos.x,
+            pos.y + row.pos.y + row.height() / 2.0,
+        )
+    };
+    assert_eq!(
+        select_and_copy(&ctx, &mut draft, before('a'), before('d')).as_deref(),
+        Some("amma")
+    );
+}
+
+// At the end of the text a word key has nothing to delete and nowhere to go.
+// Plex builds ḥ from two glyphs, which once gave the galley a place past the
+// last char, where Ctrl+Delete panicked and ended the app.
+#[test]
+fn word_keys_at_end() {
     let ctx = Context::default();
     theme::apply(&ctx);
     let mut draft = String::from("\u{1E25}asan");
     composer(&ctx, &mut draft, Vec::new(), Modifiers::NONE);
     let to_end = vec![key(Key::End, Modifiers::NONE)];
     let (response, _, _) = composer(&ctx, &mut draft, to_end, Modifiers::NONE);
-    assert_eq!(caret(&ctx, &response), 6);
+    assert_eq!(caret(&ctx, &response), 5);
     for modifiers in [Modifiers::CTRL, Modifiers::ALT] {
         for pressed in [Key::Delete, Key::ArrowRight] {
             let (response, _, _) =
                 composer(&ctx, &mut draft, vec![key(pressed, modifiers)], modifiers);
             assert_eq!(draft, "\u{1E25}asan");
-            assert_eq!(caret(&ctx, &response), 6, "{pressed:?} {modifiers:?}");
+            assert_eq!(caret(&ctx, &response), 5, "{pressed:?} {modifiers:?}");
         }
     }
 }
@@ -1376,22 +1528,14 @@ fn chat_text() -> impl Strategy<Value = String> {
 // keep egui's own rule, where a caret between a letter and a combining accent
 // the font draws over it sits inside the letter, so there only the index is
 // checked.
-//
-// Plex has no glyph of its own for some rarer letters, among them the dotted
-// ones of Arabic transliteration, and the shaper builds each from a letter
-// and its accent: two glyphs for one char, as in egui 0.36.2, which puts the
-// caret one place off after such a letter. Text with one of those skips the
-// count.
-fn check_rows(galley: &Galley, pieced: bool) -> Result<(), TestCaseError> {
+fn check_rows(galley: &Galley) -> Result<(), TestCaseError> {
     let text = galley.text();
     let counted: usize = galley
         .rows
         .iter()
         .map(|row| row.char_count_including_newline().0)
         .sum();
-    if !pieced {
-        prop_assert_eq!(counted, text.chars().count(), "{:?}", text);
-    }
+    prop_assert_eq!(counted, text.chars().count(), "{:?}", text);
     for row in &galley.rows {
         let glyph_left = row.glyphs.iter().map(|g| g.pos.x).fold(0.0, f32::min);
         let glyph_right = row
@@ -1436,19 +1580,6 @@ fn with_previous(row: &Row, index: usize) -> bool {
         })
 }
 
-// Whether the fonts draw this char from more than one glyph.
-fn pieced(ui: &Ui, c: char) -> bool {
-    let galley = ui
-        .painter()
-        .layout_no_wrap(c.to_string(), theme::body(), CHALK);
-    galley
-        .rows
-        .iter()
-        .map(|row| row.glyphs.len())
-        .sum::<usize>()
-        > 1
-}
-
 // Laying out needs fonts, and a context gets them on its first frame; one
 // context serves every case.
 fn shared_context() -> &'static Context {
@@ -1477,15 +1608,16 @@ proptest! {
     // as a name cut to one row, it never panics, keeps one glyph per
     // character, and every caret place lies on its row. Selected anywhere,
     // it paints without a panic, rows with no right-to-left letter come out
-    // as 0.36.2 paints them, and with one glyph per character the highlight
-    // on the other rows is exactly the selected letters.
+    // as 0.36.2 paints them but for where a hung row's highlight starts, and
+    // with one glyph per character the highlight on the other rows is
+    // exactly the selected letters.
     #[test]
     fn any_chat_text(
         text in chat_text(),
         selections in prop::collection::vec(selection(), 1..4),
     ) {
         let ctx = shared_context();
-        let ((name, galleys, any_pieced), _, _) = frame(ctx, Vec::new(), Modifiers::NONE, |ui| {
+        let ((name, galleys), _, _) = frame(ctx, Vec::new(), Modifiers::NONE, |ui| {
             let format = TextFormat::simple(theme::body(), CHALK);
             let mut composer_job = LayoutJob::single_section(text.clone(), format.clone());
             composer_job.wrap.max_width = 336.0;
@@ -1502,12 +1634,11 @@ proptest! {
                 body_galley(ui, &text, 90.0),
                 ui.painter().layout_job(composer_job),
             ];
-            let any_pieced = text.chars().any(|c| pieced(ui, c));
-            (ui.painter().layout_job(name_job), galleys, any_pieced)
+            (ui.painter().layout_job(name_job), galleys)
         });
         prop_assert!(name.rows.len() <= 1);
         for galley in &galleys {
-            check_rows(galley, any_pieced)?;
+            check_rows(galley)?;
         }
         let visuals = ctx.global_style().visuals.clone();
         let len = text.chars().count();
@@ -1517,15 +1648,15 @@ proptest! {
             let [min, max] = range.sorted_cursors();
             let selected = min.index.0.min(len)..max.index.0.min(len);
             for galley in &galleys {
-                // Not check_row_highlight on those: 0.36.2 leaves the spaces
-                // an aligned row starts with, which the layout hangs left of
-                // the row, out of the highlight, and can lay a sliver over
-                // them.
+                // Not check_row_highlight on those: they keep 0.36.2's
+                // rectangle from caret to caret, which can hold nothing but
+                // a mark or a control character, and stops short of the
+                // spaces an aligned row ends with.
                 compare_left_to_right_rows(galley, &visuals, range, &text);
                 let (painted, _) = paint_with(paint_text_selection, galley, &visuals, range);
                 let mut start = 0;
                 for placed in &painted.rows {
-                    if !any_pieced && placed.glyphs.iter().any(Glyph::is_rtl) {
+                    if placed.glyphs.iter().any(Glyph::is_rtl) {
                         check_row_highlight(&text, placed, start, &selected);
                     }
                     start += placed.char_count_including_newline().0;

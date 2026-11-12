@@ -1049,18 +1049,63 @@ impl Row {
     /// [`Self::x_offset`] of cursor position `i` in a row with right-to-left
     /// text, `i <= glyphs.len()`.
     fn bidi_x(&self, i: usize) -> f32 {
-        let after_previous = match (i.checked_sub(1), self.glyphs.get(i)) {
-            (Some(previous), Some(next)) => next.bidi_level < self.glyphs[previous].bidi_level,
-            (Some(_), None) => true,
-            (None, _) => false,
-        };
-        if after_previous {
+        if self.after_previous(i) {
             let (_, far) = self.bidi_block_edges(&self.bidi_block(i - 1));
             return far;
         }
         let block = self.bidi_block(i);
         let (near, far) = self.bidi_block_edges(&block);
         if i == block.start { near } else { far }
+    }
+
+    /// Whether cursor position `i` goes with the text before it: at the end
+    /// of the row, or where the level drops.
+    fn after_previous(&self, i: usize) -> bool {
+        match (i.checked_sub(1), self.glyphs.get(i)) {
+            (Some(previous), Some(next)) => next.bidi_level < self.glyphs[previous].bidi_level,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+
+    /// The cursor positions of the row in the order they are drawn from left
+    /// to right. In a row with right-to-left text that is block by block in x
+    /// order, and inside a block, where a letter's marks give positions one x,
+    /// in the order its text reads.
+    fn columns_left_to_right(&self) -> Vec<usize> {
+        if !self.has_rtl() {
+            return (0..=self.glyphs.len()).collect();
+        }
+        let mut columns: Vec<(f32, bool, isize, isize, usize)> = (0..=self.glyphs.len())
+            .map(|i| {
+                // The block whose edge bidi_x draws position i on, and how far
+                // reading has come through it there.
+                let (block, rank) = if self.after_previous(i) {
+                    let block = self.bidi_block(i - 1);
+                    let rank = block.len();
+                    (block, rank)
+                } else {
+                    let block = self.bidi_block(i);
+                    (block.clone(), i - block.start)
+                };
+                let first = &self.glyphs[block.start];
+                let sign = if first.is_rtl() { -1 } else { 1 };
+                (
+                    first.pos.x,
+                    0.0 < first.advance_width,
+                    sign * block.start as isize,
+                    sign * rank as isize,
+                    i,
+                )
+            })
+            .collect();
+        columns.sort_by(|a, b| {
+            a.0.total_cmp(&b.0)
+                .then(a.1.cmp(&b.1))
+                .then(a.2.cmp(&b.2))
+                .then(a.3.cmp(&b.3))
+        });
+        columns.into_iter().map(|column| column.4).collect()
     }
 
     /// The glyphs around glyph `i` that are placed as one: an advancing glyph
@@ -1451,6 +1496,110 @@ impl Galley {
             index: (cursor.index + 1).min(self.end().index),
             prefer_next_row: true, // default to this when navigating. It is more often useful to put cursor at the beginning of a row than at the end.
         }
+    }
+
+    /// The cursor position left of `cursor` on screen, for the Left arrow.
+    ///
+    /// With no right-to-left text this is [`Self::cursor_left_one_character`].
+    /// Otherwise the cursor takes the positions of its row in the order they
+    /// are drawn, so inside Arabic it goes to the next char. Past the left end
+    /// of a row it goes to the right end of the row its paragraph goes on to
+    /// that way: the one above in a left-to-right paragraph, the one below in
+    /// a right-to-left one. Across a newline it goes to the char next to it.
+    pub fn cursor_left_on_screen(&self, cursor: &CCursor) -> CCursor {
+        self.cursor_on_screen(cursor, true)
+    }
+
+    /// The cursor position right of `cursor` on screen, for the Right arrow.
+    /// See [`Self::cursor_left_on_screen`].
+    pub fn cursor_right_on_screen(&self, cursor: &CCursor) -> CCursor {
+        self.cursor_on_screen(cursor, false)
+    }
+
+    fn cursor_on_screen(&self, cursor: &CCursor, leftwards: bool) -> CCursor {
+        if !self.rows.iter().any(|placed| placed.has_rtl()) {
+            return if leftwards {
+                self.cursor_left_one_character(cursor)
+            } else {
+                self.cursor_right_one_character(cursor)
+            };
+        }
+        let LayoutCursor { mut row, column } = self.layout_from_cursor(*cursor);
+        let mut columns = self.rows[row].columns_left_to_right();
+        let mut at = columns
+            .iter()
+            .position(|&c| CharIndex(c) == column)
+            .unwrap_or(0);
+        // The end of a wrapped row and the start of the next one are the same
+        // char index, so a step from one to the other takes one more.
+        for _ in 0..2 {
+            if leftwards && 0 < at {
+                at -= 1;
+            } else if !leftwards && at + 1 < columns.len() {
+                at += 1;
+            } else {
+                let below = leftwards == self.paragraph_is_rtl(row);
+                let next = if below {
+                    Some(row + 1)
+                } else {
+                    row.checked_sub(1)
+                };
+                let Some(next) = next.filter(|&next| next < self.rows.len()) else {
+                    break;
+                };
+                let newline = self.rows[row.min(next)].ends_with_newline;
+                row = next;
+                columns = self.rows[row].columns_left_to_right();
+                at = if newline {
+                    // The next paragraph may read the other way, so the cursor
+                    // goes to the char next to the newline.
+                    let column = if below {
+                        0
+                    } else {
+                        self.rows[row].glyphs.len()
+                    };
+                    columns.iter().position(|&c| c == column).unwrap_or(0)
+                } else if leftwards {
+                    columns.len() - 1
+                } else {
+                    0
+                };
+            }
+            let next = self.cursor_from_layout(LayoutCursor {
+                row,
+                column: CharIndex(columns[at]),
+            });
+            if next.index != cursor.index {
+                return next;
+            }
+        }
+        self.clamp_cursor(cursor)
+    }
+
+    /// Whether the paragraph `cursor` is in reads right to left, so that going
+    /// on through its text goes left on screen.
+    pub fn is_rtl_paragraph_at(&self, cursor: &CCursor) -> bool {
+        !self.rows.is_empty() && self.paragraph_is_rtl(self.layout_from_cursor(*cursor).row)
+    }
+
+    /// Whether the paragraph of row `row` reads right to left: its lowest bidi
+    /// level is odd. Its first strong char gives it that level, and so does
+    /// the whitespace each of its rows ends with (UAX #9 rule L1).
+    fn paragraph_is_rtl(&self, row: usize) -> bool {
+        let start = self.rows[..row]
+            .iter()
+            .rposition(|placed| placed.ends_with_newline)
+            .map_or(0, |i| i + 1);
+        let end = self.rows[row..]
+            .iter()
+            .position(|placed| placed.ends_with_newline)
+            .map_or(self.rows.len(), |i| row + i + 1);
+        self.rows[start..end]
+            .iter()
+            .flat_map(|placed| &placed.glyphs)
+            .map(|glyph| glyph.bidi_level)
+            .min()
+            .is_some_and(|level| level % 2 == 1)
     }
 
     pub fn clamp_cursor(&self, cursor: &CCursor) -> CCursor {

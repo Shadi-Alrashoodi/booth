@@ -1,6 +1,6 @@
 egui 0.36.2 from crates.io, with a selection highlight and AccessKit
-positions for right-to-left rows, and word keys that work on a cursor
-past the last char.
+positions for right-to-left rows, arrow keys that move by what is on
+screen, and word keys that work on a cursor past the last char.
 
 Why
 egui 0.36.2 draws a selection as one rectangle per row, from the caret at
@@ -12,15 +12,18 @@ the rectangle covered the wrong part, and selected letters outside it
 turned ink on the panel colour and all but disappeared. A two-row Arabic
 message selected whole showed no highlight at all. Copy was right in
 every case. 0.36.2 also gives AccessKit the positions of a right-to-left
-row as if it ran left to right. Its word keys fail on a cursor past the
-last char, a place the galley has when IBM Plex Sans builds a letter of
-the text from two glyphs: Ctrl+Delete there crashes Booth, in release
-builds too. That place comes from 0.36.2's layout, not from bidi (see
-vendor/epaint/PATCHED.txt). This folder is 0.36.2 with its selection
-painter, its AccessKit text positions and its word keys changed, used
-through [patch.crates-io] in the workspace Cargo.toml. Drop the folder and
-the patch line only once an egui release fixes all three. The selection
-fix will likely come first, with the release that lays bidi text out
+row as if it ran left to right. Its arrow keys step by char index, so Left
+moves right inside Arabic. Its word keys fail on a cursor past the last
+char, a place 0.36.2's layout gives the galley when IBM Plex Sans builds a
+letter of the text from two glyphs: Ctrl+Delete there crashes Booth, in
+release builds too. The vendored epaint makes that place only for a letter
+under a pile of marks or past the letter bitmaps it keeps (see
+vendor/epaint/PATCHED.txt), and the word keys stay safe on one.
+This folder is 0.36.2 with its selection painter, its AccessKit text
+positions, its arrow keys and its word keys changed, used through
+[patch.crates-io] in the workspace Cargo.toml. Drop the folder and the
+patch line only once an egui release fixes all four. The selection fix
+will likely come first, with the release that lays bidi text out
 (vendor/epaint), and dropping the folder then could bring the Ctrl+Delete
 crash back.
 
@@ -47,10 +50,10 @@ Changed in src/text_selection/visuals.rs
   own vertices, from its first vertex to the next glyph's.
 - A newline selected after such a row shows as in 0.36.2, half the row's
   height wide, but at the end its paragraph reads towards: on the left of
-  a right-to-left paragraph. That end is where the row's letters end on
-  that side, not the row's width: while the vendored epaint gave a
-  right-to-left row with vowel marks a width short of its letters, a
-  newline put there landed on an unselected word. The paragraph's
+  a right-to-left paragraph. That end is the row's edge on that side, or
+  where its letters end when they reach further: while the vendored epaint
+  gave a right-to-left row with vowel marks a width short of its letters,
+  a newline put at the edge landed on an unselected word. The paragraph's
   direction is the lowest bidi level among its glyphs, which its first
   strong letter has, and so does the whitespace at the end of each of its
   rows (UAX #9 rule L1); the vendored epaint does not keep the paragraph
@@ -61,16 +64,33 @@ Changed in src/text_selection/visuals.rs
 - Rows with no right-to-left glyph keep 0.36.2's code: one rectangle from
   caret to caret, the colour over the chars between them. The part that
   puts a rectangle into a row's mesh behind its glyphs moved, unchanged,
-  into a function that both kinds of row use. That keeps 0.36.2's slip on
-  a right-aligned row that starts with a space, which the layout hangs
-  left of the row: the space stays out of the highlight, and a selection
-  that ends where that row starts lays a sliver over it.
+  into a function that both kinds of row use. One change: on a row below
+  the one the selection starts on, the rectangle starts at the row's first
+  glyph when the layout hangs it left of the row, as it does the spaces an
+  aligned row starts with. 0.36.2 starts it at 0, which leaves such a
+  space out of the highlight and, when the selection ends where the row
+  starts, lays a sliver over it.
 - An empty selection, the cursor and the IME underlines are as in 0.36.2.
+
+Changed in src/text_selection/cursor_range.rs
+- Left and Right move the cursor by what is on screen, through
+  Galley::cursor_left_on_screen and cursor_right_on_screen of the vendored
+  epaint: inside Arabic Left goes on to the next letter, and across a
+  mixed row each press goes to the next cursor position on that side. In
+  text with no right-to-left letter they step by char as in 0.36.2.
+- Ctrl+Left and Ctrl+Right (Alt on a Mac) still go by words in text order,
+  but on through the text in a right-to-left paragraph and back through it
+  in a left-to-right one, so Ctrl+Left goes left in both.
+- Left and Right with a selection leave the cursor at the selection's left
+  and right end as its paragraph reads: at its start and end in a
+  left-to-right paragraph, at its end and start in a right-to-left one.
+- Home and End, Up and Down, and Ctrl+B and Ctrl+F on a Mac are as in
+  0.36.2.
 
 Changed in src/text_selection/text_cursor_state.rs
 - ccursor_previous_word clamps the cursor to the text's char count before
   taking it from the end. A letter IBM Plex Sans builds from two glyphs,
-  such as U+01E9, gives the galley one more cursor place than the text
+  such as U+01E9, gave 0.36.2's galley one more cursor place than the text
   has chars, and a double click or Ctrl+Left there underflowed, which a
   debug build stops on.
 - ccursor_next_word never returns a place behind the cursor. From that same
@@ -119,8 +139,12 @@ crate's own tests. The highlight is tested on Booth's fonts in
 crates/app/src/screens/chat/bidi_tests.rs (cargo test -p app --locked):
 inside an Arabic row, on mixed rows, from an Arabic row into an English
 one, over two Arabic rows, a newline after Arabic with vowel marks, a mark
-selected without its letter, in the composer, any selection of the
-property test's texts, and against a copy of 0.36.2's painter, unchanged
-but for its name and with its comments left out, which every row with no
-right-to-left glyph must still match. The word keys past the last char are
-tested there too, in the composer, and the positions AccessKit is given.
+selected without its letter, a space hung left of an English row under an
+Arabic one, in the composer, any selection of the property test's texts,
+and against a copy of 0.36.2's painter, unchanged but for its name and
+with its comments left out, which every row with no right-to-left glyph
+must still match, but for where a hung row's rectangle starts. The arrow
+keys in Arabic and across a mixed row, Ctrl+Left and Ctrl+Right in
+Arabic, Left and Right with a selection, and the word keys at the end of
+the text are tested there too, in the composer, and the positions
+AccessKit is given.

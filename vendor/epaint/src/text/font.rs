@@ -192,6 +192,40 @@ impl GlyphCacheKey {
     }
 }
 
+/// The most cluster bitmaps a face keeps. A new cluster past it is laid out
+/// glyph by glyph, so text cannot keep filling the atlas with them.
+pub(crate) const MOST_CLUSTERS: usize = 2048;
+
+/// Every glyph of a cluster and where it sits, kept whole rather than hashed
+/// and in a map of its own, so a cluster's bitmap can never be found for a
+/// single glyph or for another cluster.
+#[derive(Hash, PartialEq, Eq)]
+struct ClusterCacheKey {
+    glyphs: Vec<(GlyphId, u32, u32)>,
+    pixels_per_point: u32,
+    px_scale_factor: u32,
+    bin: SubpixelBin,
+    location_hash: LocationHash,
+}
+
+impl ClusterCacheKey {
+    fn new(glyphs: &[ClusterGlyph], metrics: &StyledMetrics, bin: SubpixelBin) -> Self {
+        Self {
+            glyphs: glyphs
+                .iter()
+                .map(|glyph| {
+                    let offset = glyph.offset_px;
+                    (glyph.glyph_id, offset.x.to_bits(), offset.y.to_bits())
+                })
+                .collect(),
+            pixels_per_point: metrics.pixels_per_point.to_bits(),
+            px_scale_factor: metrics.px_scale_factor.to_bits(),
+            bin,
+            location_hash: metrics.location_hash,
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 
 struct DependentFontData<'a> {
@@ -217,51 +251,67 @@ impl FontCell {
         scale / units_per_em
     }
 
+    /// `glyphs` is one glyph, or a cluster to draw as one bitmap.
     fn allocate_glyph_uncached(
         &mut self,
         atlas: &mut TextureAtlas,
         metrics: &StyledMetrics,
-        glyph_id: GlyphId,
+        glyphs: &[ClusterGlyph],
         bin: SubpixelBin,
         location: skrifa::instance::LocationRef<'_>,
         hinting_target: skrifa::outline::Target,
     ) -> Option<GlyphAllocation> {
-        debug_assert!(
-            glyph_id != skrifa::GlyphId::NOTDEF,
-            "Can't allocate glyph for id 0"
-        );
-
         let mut path = kurbo::BezPath::new();
-        let mut pen = VelloPen {
-            path: &mut path,
-            x_offset: bin.as_float() as f64,
-        };
+        for &ClusterGlyph {
+            glyph_id,
+            offset_px,
+        } in glyphs
+        {
+            debug_assert!(
+                glyph_id != skrifa::GlyphId::NOTDEF,
+                "Can't allocate glyph for id 0"
+            );
 
-        self.with_dependent_mut(|_, font_data| {
-            let outline = font_data.outline_glyphs.get(glyph_id)?;
+            let start = path.elements().len();
+            let mut pen = VelloPen {
+                path: &mut path,
+                x_offset: (bin.as_float() + offset_px.x) as f64,
+            };
 
-            if let Some(hinting_instance) = &mut font_data.hinting_instance {
-                let size = skrifa::instance::Size::new(metrics.scale);
-                if hinting_instance.size() != size
-                    || hinting_instance.location().coords() != location.coords()
-                    || hinting_instance.target() != hinting_target
-                {
-                    hinting_instance
-                        .reconfigure(&font_data.outline_glyphs, size, location, hinting_target)
-                        .ok()?;
+            self.with_dependent_mut(|_, font_data| {
+                let outline = font_data.outline_glyphs.get(glyph_id)?;
+
+                if let Some(hinting_instance) = &mut font_data.hinting_instance {
+                    let size = skrifa::instance::Size::new(metrics.scale);
+                    if hinting_instance.size() != size
+                        || hinting_instance.location().coords() != location.coords()
+                        || hinting_instance.target() != hinting_target
+                    {
+                        hinting_instance
+                            .reconfigure(&font_data.outline_glyphs, size, location, hinting_target)
+                            .ok()?;
+                    }
+                    let draw_settings =
+                        skrifa::outline::DrawSettings::hinted(hinting_instance, false);
+                    outline.draw(draw_settings, &mut pen).ok()?;
+                } else {
+                    let draw_settings = skrifa::outline::DrawSettings::unhinted(
+                        skrifa::instance::Size::new(metrics.scale),
+                        location,
+                    );
+                    outline.draw(draw_settings, &mut pen).ok()?;
                 }
-                let draw_settings = skrifa::outline::DrawSettings::hinted(hinting_instance, false);
-                outline.draw(draw_settings, &mut pen).ok()?;
-            } else {
-                let draw_settings = skrifa::outline::DrawSettings::unhinted(
-                    skrifa::instance::Size::new(metrics.scale),
-                    location,
-                );
-                outline.draw(draw_settings, &mut pen).ok()?;
-            }
 
-            Some(())
-        })?;
+                Some(())
+            })?;
+
+            if offset_px.y != 0.0 {
+                let down = kurbo::Affine::translate((0.0, offset_px.y as f64));
+                for element in &mut path.elements_mut()[start..] {
+                    *element = down * *element;
+                }
+            }
+        }
 
         let bounds = path.control_box().expand();
         let width = bounds.width() as u16;
@@ -373,6 +423,8 @@ pub struct FontFace {
     advance_width_cache: ahash::HashMap<(char, LocationHash), OrderedFloat<f32>>,
 
     glyph_alloc_cache: ahash::HashMap<GlyphCacheKey, GlyphAllocation>,
+
+    cluster_alloc_cache: ahash::HashMap<ClusterCacheKey, GlyphAllocation>,
 }
 
 impl FontFace {
@@ -436,6 +488,7 @@ impl FontFace {
             glyph_id_cache: Default::default(),
             advance_width_cache: Default::default(),
             glyph_alloc_cache: Default::default(),
+            cluster_alloc_cache: Default::default(),
         })
     }
 
@@ -619,13 +672,7 @@ impl FontFace {
             return (GlyphAllocation::default(), h_pos.round() as i32);
         }
 
-        let (h_pos_round, bin) = if self.subpixel_binning && !is_cjk {
-            SubpixelBin::new(h_pos)
-        } else {
-            // CJK scripts contain a lot of characters and could hog the glyph atlas
-            // if we stored 4 subpixel offsets per glyph.
-            (h_pos.round() as i32, SubpixelBin::Zero)
-        };
+        let (h_pos_round, bin) = self.bin(h_pos, is_cjk);
 
         let cache_key = GlyphCacheKey::new(glyph_id, metrics, bin);
 
@@ -635,7 +682,10 @@ impl FontFace {
                 .allocate_glyph_uncached(
                     atlas,
                     metrics,
-                    glyph_id,
+                    &[ClusterGlyph {
+                        glyph_id,
+                        offset_px: Vec2::ZERO,
+                    }],
                     bin,
                     (&metrics.location).into(),
                     hinting_target,
@@ -645,6 +695,63 @@ impl FontFace {
 
         (alloc, h_pos_round)
     }
+
+    /// One bitmap for a cluster the shaper made from more glyphs than chars,
+    /// such as a letter the font builds from a base and an accent, so the
+    /// cluster can be one glyph. `h_pos` is the cluster's origin. `None` for a
+    /// new cluster once the face has [`MOST_CLUSTERS`] of them.
+    pub(crate) fn allocate_cluster(
+        &mut self,
+        atlas: &mut TextureAtlas,
+        metrics: &StyledMetrics,
+        glyphs: &[ClusterGlyph],
+        h_pos: f32,
+        is_cjk: bool,
+    ) -> Option<(GlyphAllocation, i32)> {
+        let (h_pos_round, bin) = self.bin(h_pos, is_cjk);
+        let cache_key = ClusterCacheKey::new(glyphs, metrics, bin);
+        if let Some(&alloc) = self.cluster_alloc_cache.get(&cache_key) {
+            return Some((alloc, h_pos_round));
+        }
+        if MOST_CLUSTERS <= self.cluster_alloc_cache.len() {
+            return None;
+        }
+
+        let hinting_target = self.tweak.hinting_target.into();
+        let alloc = self
+            .font
+            .allocate_glyph_uncached(
+                atlas,
+                metrics,
+                glyphs,
+                bin,
+                (&metrics.location).into(),
+                hinting_target,
+            )
+            .unwrap_or_default();
+        self.cluster_alloc_cache.insert(cache_key, alloc);
+
+        Some((alloc, h_pos_round))
+    }
+
+    fn bin(&self, h_pos: f32, is_cjk: bool) -> (i32, SubpixelBin) {
+        if self.subpixel_binning && !is_cjk {
+            SubpixelBin::new(h_pos)
+        } else {
+            // CJK scripts contain a lot of characters and could hog the glyph atlas
+            // if we stored 4 subpixel offsets per glyph.
+            (h_pos.round() as i32, SubpixelBin::Zero)
+        }
+    }
+}
+
+/// One glyph of a cluster drawn as a single bitmap.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClusterGlyph {
+    pub glyph_id: GlyphId,
+
+    /// Where its origin sits from the cluster's, in physical pixels, y down.
+    pub offset_px: Vec2,
 }
 
 /// Positioning info for a single glyph, ready for atlas allocation.
