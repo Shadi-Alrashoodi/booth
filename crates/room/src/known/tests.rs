@@ -1,6 +1,7 @@
 use std::fs;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV6};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::thread;
 
 use invite::CandidateKind;
 use proptest::collection::vec;
@@ -289,6 +290,18 @@ fn unclean_name_refused() {
     let name_at = 5 + 2 + 32 + 32 + 8 + 8 + 1;
     bytes[name_at] = b' ';
     assert!(parse_devices(&bytes).is_err());
+    bytes[name_at] = 0xFF;
+    assert_eq!(
+        parse_devices(&bytes).err(),
+        Some(Malformed::Shape(
+            "a name in it is not one Booth would have written"
+        ))
+    );
+    bytes.truncate(name_at + 1);
+    assert_eq!(
+        parse_devices(&bytes).err(),
+        Some(Malformed::Shape("it is cut short"))
+    );
 }
 
 #[test]
@@ -401,7 +414,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(2048))]
 
     #[test]
-    fn random_bytes_parse_back_exactly(
+    fn random_bytes_never_panic(
         body in vec(any::<u8>(), 0..400),
         tag in 0..3u8,
     ) {
@@ -485,6 +498,49 @@ fn unreadable_list_put_aside() {
         folder.names(),
         ["devices.bin.bad", "hosts.bin.bad", "hosts.bin.bad2"]
     );
+}
+
+#[test]
+fn late_save_never_put_aside() {
+    let folder = Folder::new("late-save");
+    let hosts_path = folder.0.join(List::Hosts.file_name());
+    fs::write(&hosts_path, b"junk").unwrap();
+    save(&folder.0, List::Devices, &encode_devices(&full_devices())).unwrap();
+    // Held as a room's late save holds them.
+    let hosts_turn = turn_for(&hosts_path);
+    let devices_turn = turn_for(&folder.0.join(List::Devices.file_name()));
+    let hosts_held = lock(&hosts_turn);
+    let devices_held = lock(&devices_turn);
+
+    let dir = folder.0.clone();
+    let hosts_read = thread::spawn(move || {
+        hosts(&dir)
+            .map(|list| list.len())
+            .map_err(|err| err.to_string())
+    });
+    let dir = folder.0.clone();
+    let devices_read = thread::spawn(move || {
+        devices(&dir)
+            .map(|list| list.devices.len())
+            .map_err(|err| err.to_string())
+    });
+    let started = Instant::now();
+    while !devices_read.is_finished() && started.elapsed() < Duration::from_secs(5) {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        devices_read.is_finished(),
+        "a good list waited for the turn"
+    );
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(folder.names(), ["devices.bin", "hosts.bin"]);
+
+    save(&folder.0, List::Hosts, &encode_hosts(&full_hosts())).unwrap();
+    drop(hosts_held);
+    drop(devices_held);
+    assert_eq!(hosts_read.join().unwrap(), Ok(3));
+    assert_eq!(devices_read.join().unwrap(), Ok(2));
+    assert_eq!(folder.names(), ["devices.bin", "hosts.bin"]);
 }
 
 #[test]
@@ -586,6 +642,20 @@ fn a_list_from_a_newer_booth_is_left_alone() {
     let err = devices(&folder.0).expect_err("damaged");
     assert_eq!(err.damaged().unwrap().kept_as, "devices.bin.bad");
     assert!(matches!(err.problem(), Some(ListProblem::Damaged(_))));
+
+    // Nor the file around it.
+    fs::write(folder.0.join("devices.bin"), b"BOOTHKEY\0x").unwrap();
+    let err = devices(&folder.0).expect_err("damaged");
+    assert_eq!(err.damaged().unwrap().kept_as, "devices.bin.bad2");
+    assert!(
+        err.to_string()
+            .contains("(it is not a file Booth wrote, or it is damaged)"),
+        "{err}"
+    );
+    assert_eq!(
+        folder.names(),
+        ["devices.bin.bad", "devices.bin.bad2", "hosts.bin"]
+    );
 }
 
 #[test]

@@ -186,7 +186,8 @@ struct LogFile {
     path: PathBuf,
     old: PathBuf,
     role: &'static str,
-    out: BufWriter<File>,
+    // None once a pending delete took the file and no new one would open.
+    out: Option<BufWriter<File>>,
     size: u64,
     rotate_after: u64,
 }
@@ -201,7 +202,7 @@ impl LogFile {
             path: path.to_path_buf(),
             old: PathBuf::from(old),
             role,
-            out: BufWriter::new(file),
+            out: Some(BufWriter::new(file)),
             size,
             rotate_after,
         })
@@ -215,16 +216,23 @@ impl LogFile {
     }
 
     // A write that fails (a full disk) loses that line; there is nowhere
-    // better to say so than the file that failed.
+    // better to say so than the file that failed. With no file the line still
+    // counts, so the next try at one comes after rotate_after bytes.
     fn put(&mut self, at: SystemTime, text: &str) {
         let line = format!("{} {:<6} {}\r\n", stamp(at), self.role, printable(text));
-        if self.out.write_all(line.as_bytes()).is_ok() {
+        if self
+            .out
+            .as_mut()
+            .is_none_or(|out| out.write_all(line.as_bytes()).is_ok())
+        {
             self.size += line.len() as u64;
         }
     }
 
     fn flush(&mut self) {
-        let _ = self.out.flush();
+        if let Some(out) = &mut self.out {
+            let _ = out.flush();
+        }
     }
 
     fn rotate(&mut self) {
@@ -234,7 +242,7 @@ impl LogFile {
         let note = match fs::rename(&self.path, &self.old) {
             Ok(()) => match append(&self.path) {
                 Ok(file) => {
-                    self.out = BufWriter::new(file);
+                    self.out = Some(BufWriter::new(file));
                     None
                 }
                 Err(err) => Some(format!(
@@ -258,11 +266,22 @@ impl LogFile {
                 };
                 match fresh {
                     Ok(file) => {
-                        self.out = BufWriter::new(file);
+                        self.out = Some(BufWriter::new(file));
                         Some(if gone {
                             format!("{path} was not there to move to {old}; started a new one")
                         } else {
                             format!("could not move the log to {old}: {moved}; started {path} over")
+                        })
+                    }
+                    // Refused: most likely a delete left the name pending until
+                    // its last handle closes, which can be this one.
+                    Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+                        drop(self.out.take());
+                        self.out = append(&self.path).ok().map(BufWriter::new);
+                        self.out.is_some().then(|| {
+                            format!(
+                                "could not move the log to {old}: {moved}; could not reopen {path}: {err}; closed it and started a new one"
+                            )
                         })
                     }
                     Err(err) => Some(format!(
@@ -987,6 +1006,82 @@ mod tests {
         assert!(new.ends_with(" over\r\n"), "{new}");
         assert!(!new.contains("line 0"), "{new}");
         assert_eq!(fs::read_to_string(&old).unwrap(), "kept\r\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Deleted through a handle that deletes on close: the name stays, and
+    // refuses every open, until the last handle on the file closes.
+    #[cfg(windows)]
+    fn delete_on_close(path: &Path) {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const DELETE: u32 = 0x0001_0000;
+        const SHARE_ALL: u32 = 7;
+        const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+
+        drop(
+            OpenOptions::new()
+                .access_mode(DELETE)
+                .share_mode(SHARE_ALL)
+                .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+                .open(path)
+                .unwrap(),
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn log_after_pending_delete() {
+        let dir = fresh_dir("pending");
+        let path = dir.join("booth.log");
+        let mut file = LogFile::open(&path, "host", ROTATE_AFTER).unwrap();
+        file.write(UNIX_EPOCH + AT, "before");
+        file.flush();
+        delete_on_close(&path);
+        let refused = OpenOptions::new().append(true).open(&path);
+        assert_eq!(
+            refused.err().map(|err| err.kind()),
+            Some(io::ErrorKind::PermissionDenied),
+            "the name is pending delete"
+        );
+        file.rotate();
+        file.write(UNIX_EPOCH + AT, "after");
+        file.flush();
+        drop(file);
+
+        let new = fs::read_to_string(&path).expect("booth.log is back");
+        assert!(new.contains("closed it and started a new one"), "{new}");
+        assert!(!new.contains("before"), "{new}");
+        assert!(new.ends_with("host   after\r\n"), "{new}");
+        assert!(!dir.join("booth.log.1").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Another handle on the pending file gets the retry refused too. Lines with
+    // no file still count toward the next rotation, which starts a new one.
+    #[cfg(windows)]
+    #[test]
+    fn log_after_refused_retry() {
+        let dir = fresh_dir("refused");
+        let path = dir.join("booth.log");
+        let mut file = LogFile::open(&path, "host", ROTATE_AFTER).unwrap();
+        file.write(UNIX_EPOCH + AT, "before");
+        file.flush();
+        let held = File::open(&path).unwrap();
+        delete_on_close(&path);
+        file.rotate();
+        assert!(file.out.is_none(), "the retry was refused");
+        drop(held);
+        file.write(UNIX_EPOCH + AT, &"lost ".repeat(ROTATE_AFTER as usize / 5));
+        file.write(UNIX_EPOCH + AT, "after");
+        file.flush();
+        drop(file);
+
+        let new = fs::read_to_string(&path).expect("booth.log is back");
+        assert!(new.contains("was not there to move to"), "{new}");
+        assert!(!new.contains("before") && !new.contains("lost"), "{new}");
+        assert!(new.ends_with("host   after\r\n"), "{new}");
+        assert!(!dir.join("booth.log.1").exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 

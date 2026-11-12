@@ -65,7 +65,7 @@ pub(crate) enum Malformed {
     Shape(&'static str),
 }
 
-// Words for the log, after "could not be read: ".
+// Words for the line about the list, inside "could not be read (...)".
 impl fmt::Display for Malformed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -83,6 +83,7 @@ fn shape(why: &'static str) -> Malformed {
 }
 
 const CUT_SHORT: &str = "it is cut short";
+const NOT_A_NAME: &str = "a name in it is not one Booth would have written";
 
 pub(crate) fn encode_devices(list: &KnownDevices) -> Zeroizing<Vec<u8>> {
     let devices = kept_devices(list);
@@ -335,9 +336,12 @@ fn u64_le(r: &mut Reader) -> Result<u64, Malformed> {
 // Names are written cleaned, so one that cleaning would change was not. One
 // written before cleaning cut stacked marks loads with them cut.
 fn clean_text(r: &mut Reader) -> Result<String, Malformed> {
-    let text = control::drop_stacked_marks(r.text().ok_or(shape(CUT_SHORT))?);
+    let len = usize::from(r.u8().ok_or(shape(CUT_SHORT))?);
+    let bytes = r.bytes(len).ok_or(shape(CUT_SHORT))?;
+    let text = std::str::from_utf8(bytes).map_err(|_| shape(NOT_A_NAME))?;
+    let text = control::drop_stacked_marks(text);
     if text.is_empty() || control::clean(&text, "") != text {
-        return Err(shape("a name in it is not one Booth would have written"));
+        return Err(shape(NOT_A_NAME));
     }
     Ok(text)
 }

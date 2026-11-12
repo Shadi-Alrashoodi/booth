@@ -171,12 +171,39 @@ fn parse(bytes: &[u8]) -> Result<&[u8], Malformed> {
     Ok(blob)
 }
 
+const TMP_TRIES: u32 = 8;
+
 // The data goes to a temp file next to the target first and is renamed over
 // it, so the target only ever holds a whole file. On failure the error
-// carries the path that actually failed.
+// carries the path that actually failed. A name that is taken was left by an
+// earlier process with the same id, and is skipped, never opened or removed.
 fn write_tmp(path: &Path, contents: &[u8], file: FileKind) -> Result<PathBuf, KeyError> {
-    let tmp = tmp_path(path);
-    if let Err(source) = write_synced(&tmp, contents) {
+    let mut tries = 1;
+    let (tmp, created) = loop {
+        let tmp = tmp_path(path);
+        match File::create_new(&tmp) {
+            Ok(created) => break (tmp, created),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && tries < TMP_TRIES => tries += 1,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(KeyError::Write {
+                    file,
+                    path: tmp,
+                    source: io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("{TMP_TRIES} temporary names in a row are taken"),
+                    ),
+                });
+            }
+            Err(source) => {
+                return Err(KeyError::Write {
+                    file,
+                    path: tmp,
+                    source,
+                });
+            }
+        }
+    };
+    if let Err(source) = write_synced(created, contents) {
         let _ = fs::remove_file(&tmp);
         return Err(KeyError::Write {
             file,
@@ -187,8 +214,7 @@ fn write_tmp(path: &Path, contents: &[u8], file: FileKind) -> Result<PathBuf, Ke
     Ok(tmp)
 }
 
-fn write_synced(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let mut file = File::create(path)?;
+fn write_synced(mut file: File, contents: &[u8]) -> io::Result<()> {
     file.write_all(contents)?;
     file.sync_all()
 }

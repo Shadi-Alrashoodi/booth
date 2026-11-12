@@ -185,8 +185,8 @@ mod tests {
         dir
     }
 
-    // A burst of changes costs at most two writes, the one under way and
-    // the newest, and the newest is the one on disk once the room closes.
+    // A burst that comes in while a write holds the list's turn costs at most
+    // two writes, and the newest is the one on disk once the room closes.
     #[test]
     fn burst_writes_the_newest() {
         let dir = folder("burst");
@@ -194,9 +194,12 @@ mod tests {
         let (_, turn) = known::room_devices(&dir);
         let mut saver = Saver::start(turn, log).expect("the saver starts");
         let handle = saver.handle();
+        let current = known::turn_for(&dir.join(List::Devices.file_name()));
+        let held = current.lock().unwrap();
         for count in 1..=20 {
             handle.save(devices(count));
         }
+        drop(held);
         finish_and_wait(&mut saver);
         let lines = captured.lines();
         assert!(!lines.is_empty() && lines.len() <= 2, "{lines:?}");

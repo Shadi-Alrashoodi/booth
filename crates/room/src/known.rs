@@ -362,47 +362,66 @@ impl<T: Default> Opened<T> {
     }
 }
 
-fn open<T: Default>(
+// Moves nothing.
+fn read_list<T: Default>(
     dir: &Path,
     list: List,
     parse: fn(&[u8]) -> Result<T, format::Malformed>,
-) -> Opened<T> {
+) -> Result<Opened<T>, String> {
     let path = dir.join(list.file_name());
     let why = match keys::read_protected(&path) {
         Ok(plain) => match parse(&plain) {
             Ok(found) => {
-                return Opened {
+                return Ok(Opened {
                     list: found,
                     problem: None,
                     writable: true,
-                };
+                });
             }
             Err(format::Malformed::Version(version)) if version > format::VERSION => {
-                return Opened::empty(Some(KnownError::Newer { list, path }), false);
+                return Ok(Opened::empty(Some(KnownError::Newer { list, path }), false));
             }
             Err(bad) => bad.to_string(),
         },
         Err(KeyError::Read { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-            return Opened::empty(None, true);
+            return Ok(Opened::empty(None, true));
         }
         Err(source @ KeyError::Read { .. }) => {
-            return Opened::empty(Some(KnownError::Read { list, source }), false);
+            return Ok(Opened::empty(
+                Some(KnownError::Read { list, source }),
+                false,
+            ));
+        }
+        // Short, since the line around it names the file and says what to
+        // do. No Booth ever wrote format 0.
+        Err(KeyError::NotAKeyFile { .. } | KeyError::UnknownVersion { version: 0, .. }) => {
+            String::from("it is not a file Booth wrote, or it is damaged")
         }
         // The file around the list is in a format this Booth does not know,
         // which no Booth has written but a newer one.
         Err(KeyError::UnknownVersion { .. }) => {
-            return Opened::empty(Some(KnownError::Newer { list, path }), false);
-        }
-        // Short, since the line around it names the file and says what to
-        // do.
-        Err(KeyError::NotAKeyFile { .. }) => {
-            String::from("it is not a file Booth wrote, or it is damaged")
+            return Ok(Opened::empty(Some(KnownError::Newer { list, path }), false));
         }
         Err(KeyError::Decrypt { source, .. }) => format!(
             "Windows could not decrypt it, so another Windows user or another PC made it, or it is damaged: {source}"
         ),
         Err(err) => err.without_folders(),
     };
+    Err(why)
+}
+
+// Under the list's turn, so no room's save lands between the read and the
+// put aside.
+fn open<T: Default>(
+    dir: &Path,
+    list: List,
+    parse: fn(&[u8]) -> Result<T, format::Malformed>,
+) -> Opened<T> {
+    let why = match read_list(dir, list, parse) {
+        Ok(opened) => return opened,
+        Err(why) => why,
+    };
+    let path = dir.join(list.file_name());
     match keys::put_aside(&path) {
         Ok(kept_as) => Opened::empty(Some(KnownError::Damaged { list, kept_as, why }), true),
         Err(source) if source.kind() == io::ErrorKind::NotFound => Opened::empty(None, true),
@@ -418,12 +437,27 @@ fn open<T: Default>(
     }
 }
 
+// Takes the turn only for a file it would put aside, and reads again under
+// it, so a good list never waits and a late save's list never goes aside.
+fn open_for_panel<T: Default>(
+    dir: &Path,
+    list: List,
+    parse: fn(&[u8]) -> Result<T, format::Malformed>,
+) -> Opened<T> {
+    if let Ok(opened) = read_list(dir, list, parse) {
+        return opened;
+    }
+    let current = turn_for(&dir.join(list.file_name()));
+    let _turn = lock(&current);
+    open(dir, list, parse)
+}
+
 pub(crate) fn open_devices(dir: &Path) -> Opened<KnownDevices> {
-    open(dir, List::Devices, format::parse_devices)
+    open_for_panel(dir, List::Devices, format::parse_devices)
 }
 
 pub(crate) fn open_hosts(dir: &Path) -> Opened<Vec<KnownHost>> {
-    open(dir, List::Hosts, format::parse_hosts)
+    open_for_panel(dir, List::Hosts, format::parse_hosts)
 }
 
 pub(crate) fn save(dir: &Path, list: List, bytes: &[u8]) -> Result<(), KnownError> {
@@ -441,7 +475,7 @@ pub(crate) fn save(dir: &Path, list: List, bytes: &[u8]) -> Result<(), KnownErro
 // middle of the other.
 static TURNS: Mutex<Vec<(PathBuf, Arc<Mutex<u64>>)>> = Mutex::new(Vec::new());
 
-fn turn_for(path: &Path) -> Arc<Mutex<u64>> {
+pub(crate) fn turn_for(path: &Path) -> Arc<Mutex<u64>> {
     let mut turns = lock(&TURNS);
     if let Some((_, turn)) = turns.iter().find(|(known, _)| known == path) {
         return Arc::clone(turn);
