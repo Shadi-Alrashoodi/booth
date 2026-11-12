@@ -98,12 +98,12 @@ pub(crate) struct Clock {
 
 impl Clock {
     pub(crate) fn new(epoch: Instant) -> Clock {
-        let wall_at_epoch = SystemTime::now()
+        let wall = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_micros() as u64);
         Clock {
             epoch,
-            wall_at_epoch,
+            wall_at_epoch: wall.saturating_sub(epoch.elapsed().as_micros() as u64),
         }
     }
 
@@ -840,6 +840,27 @@ pub(crate) fn random<const N: usize>() -> [u8; N] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A join takes its epoch before its setup, so the clock is made later.
+    #[test]
+    fn counts_from_epoch() {
+        let wall = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("the clock is past 1970")
+                .as_micros() as u64
+        };
+        let before = wall();
+        let epoch = Instant::now();
+        let after = wall();
+        std::thread::sleep(Duration::from_millis(50));
+        let at = Clock::new(epoch).micros(epoch);
+        // A thread switch inside new can only put the clock behind.
+        assert!(
+            before - 20_000 <= at && at <= after + 1_000,
+            "{at} read against {before} to {after}"
+        );
+    }
 
     // The pong echoes our send time, so a peer can claim a round trip of
     // years. Fed to the estimator, that held the control stream's timer at
