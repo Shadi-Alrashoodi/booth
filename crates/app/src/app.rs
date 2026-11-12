@@ -1365,7 +1365,7 @@ fn start_tray(
         Ok(tray) => {
             if !tray.on_taskbar() {
                 backlog.add(String::from(
-                    "tray: windows did not take the icon, which goes on when explorer starts again",
+                    "tray: windows did not take the icon, which is tried again until it goes on",
                 ));
             }
             Some(tray)

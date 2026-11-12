@@ -34,8 +34,7 @@ pub const LINK_NOT_BOOTH: &str =
     "This is not a Booth invite link. Ask your friend to send the invite again.";
 pub const LINK_IN_ROOM: &str = "Booth is in a room. Leave the room, then open the link again.";
 pub const LINK_OLDER: &str = "The Booth that is open is older than 1.4.0 and cannot open invite links. Close it, then open the link again.";
-pub const LINK_NO_ANSWER: &str =
-    "Booth is open but did not take the link. Close Booth, then open the link again.";
+pub const LINK_NO_ANSWER: &str = "Booth is open but did not answer in time. If the invite does not show in Booth, close Booth, then open the link again.";
 
 pub fn link_from(known_room: Option<&str>) -> String {
     match known_room {
@@ -662,6 +661,10 @@ pub fn wants_control(name: &str) -> String {
 pub fn controlling_this_pc(name: &str) -> String {
     format!("{} is controlling this PC.", isolated(name))
 }
+
+// In the tray icon's tooltip. Of the share, like share_has_pc_sound, so it
+// stays true while the share is paused.
+pub const YOUR_SHARE_HAS_PC_SOUND: &str = "Your share has PC sound.";
 
 pub fn panic_stops(key: &str) -> String {
     format!("{key} stops it at any time.")
@@ -1636,6 +1639,11 @@ mod tests {
         ] {
             assert_sentences(text);
         }
+        // Windows may still deliver the link after the wait.
+        assert_eq!(
+            LINK_NO_ANSWER,
+            "Booth is open but did not answer in time. If the invite does not show in Booth, close Booth, then open the link again."
+        );
         for room in [None, Some(""), Some("Tuesday night")] {
             assert_sentences(&link_from(room));
         }

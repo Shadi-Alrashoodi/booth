@@ -17,11 +17,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 use std::{mem, ptr};
 
 use eframe::egui::Color32;
 use room::view::{Level, LinkState, Strip, View};
-use windows_sys::Win32::Foundation::{ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{
+    ERROR_CLASS_ALREADY_EXISTS, ERROR_NOT_ENOUGH_QUOTA, HWND, LPARAM, LRESULT, WPARAM,
+};
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
@@ -30,9 +33,10 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateIconFromResourceEx, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow,
-    DispatchMessageW, GetMessageW, GetSystemMetrics, HICON, LR_DEFAULTCOLOR, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SM_CXSMICON, WM_APP, WM_CLOSE,
-    WM_COPYDATA, WM_DESTROY, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    DispatchMessageW, GetMessageW, GetSystemMetrics, HICON, KillTimer, LR_DEFAULTCOLOR, MSG,
+    PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SM_CXSMICON, SetTimer,
+    WM_APP, WM_CLOSE, WM_COPYDATA, WM_DESTROY, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use crate::theme::{AMBER, ASH, CHALK, INK, SAGE, WARN};
@@ -53,6 +57,12 @@ const ICON_ID: u32 = 1;
 // What CreateIconFromResourceEx wants for an icon made from bytes.
 const ICON_FORMAT: u32 = 0x0003_0000;
 const TIP_UNITS: usize = 127;
+// The timer that tries a refused icon call again until it works.
+const RETRY: usize = 1;
+const RETRY_MS: u32 = 2000;
+
+// Shell_NotifyIconW, or a stand-in in tests. True if it worked.
+type Shell = Box<dyn Fn(NOTIFY_ICON_MESSAGE, &NOTIFYICONDATAW) -> bool + Send>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mark {
@@ -87,14 +97,23 @@ pub fn look(view: Option<&View>, control_offered: bool) -> Look {
     let control = &view.share.control;
     let controlled_by = control.controlled_by.as_ref().filter(|_| control_offered);
     let asked_by = control.asked_by.as_ref().filter(|_| control_offered);
-    let (mark, tip) = if let Some(party) = controlled_by {
-        let said = messages::controlling_this_pc(&party.name);
-        (Mark::Filled, format!("Booth: {said}"))
+    let mut said = Vec::new();
+    let mark = if let Some(party) = controlled_by {
+        said.push(messages::controlling_this_pc(&party.name));
+        Mark::Filled
     } else if let Some(asked) = asked_by {
-        let said = messages::wants_control(&asked.name);
-        (Mark::Hollow, format!("Booth: {said}"))
+        said.push(messages::wants_control(&asked.name));
+        Mark::Hollow
     } else {
-        (link_mark(&view.strip), String::from("Booth"))
+        link_mark(&view.strip)
+    };
+    if view.share.own_sound.on {
+        said.push(messages::YOUR_SHARE_HAS_PC_SOUND.to_owned());
+    }
+    let tip = if said.is_empty() {
+        String::from("Booth")
+    } else {
+        format!("Booth: {}", said.join(" "))
     };
     Look {
         mark,
@@ -196,6 +215,14 @@ impl Tray {
         click: impl Fn() + Send + 'static,
         link: impl Fn(&[u8]) -> LRESULT + Send + 'static,
     ) -> io::Result<Tray> {
+        Tray::with_shell(click, link, Box::new(shell))
+    }
+
+    fn with_shell(
+        click: impl Fn() + Send + 'static,
+        link: impl Fn(&[u8]) -> LRESULT + Send + 'static,
+        shell: Shell,
+    ) -> io::Result<Tray> {
         let wanted = Arc::new(Mutex::new(look(None, false)));
         let added = Arc::new(AtomicBool::new(false));
         let (ready, opened) = mpsc::channel();
@@ -208,6 +235,7 @@ impl Tray {
                     wanted: thread_wanted,
                     added: thread_added,
                     click: Box::new(click),
+                    shell,
                     icon: ptr::null_mut(),
                     hwnd: ptr::null_mut(),
                     taskbar_created: 0,
@@ -252,8 +280,8 @@ impl Tray {
         unsafe { PostMessageW(self.window as HWND, UPDATE, 0, 0) };
     }
 
-    // Whether the icon is on the taskbar. False while Explorer is not
-    // running; it goes back when Explorer starts again.
+    // Whether Windows took the icon's last add or change. Nothing says when
+    // Explorer exits, so it stays true then.
     pub fn on_taskbar(&self) -> bool {
         self.added.load(Ordering::Acquire)
     }
@@ -263,7 +291,15 @@ impl Drop for Tray {
     fn drop(&mut self) {
         // SAFETY: as in show. WM_CLOSE takes the icon off and ends the
         // thread's loop.
-        unsafe { PostMessageW(self.window as HWND, WM_CLOSE, 0, 0) };
+        while unsafe { PostMessageW(self.window as HWND, WM_CLOSE, 0, 0) } == 0 {
+            // A full queue takes it once the thread catches up; any other
+            // refusal means the window and its thread are gone.
+            let error = io::Error::last_os_error().raw_os_error();
+            if error != Some(ERROR_NOT_ENOUGH_QUOTA as i32) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -275,6 +311,7 @@ struct Here {
     wanted: Arc<Mutex<Look>>,
     added: Arc<AtomicBool>,
     click: Box<dyn Fn() + Send>,
+    shell: Shell,
     icon: HICON,
     hwnd: HWND,
     // Sent to every top-level window when Explorer starts, so the icon
@@ -402,32 +439,53 @@ impl Here {
     fn add(&mut self) {
         let old = self.new_icon();
         let data = self.data();
-        // SAFETY: `data` carries its own size and lives across both calls.
-        let added = unsafe { Shell_NotifyIconW(NIM_ADD, &data) } != 0;
+        let added = (self.shell)(NIM_ADD, &data);
         if added {
-            // SAFETY: as above.
-            unsafe { Shell_NotifyIconW(NIM_SETVERSION, &data) };
+            (self.shell)(NIM_SETVERSION, &data);
         }
         self.added.store(added, Ordering::Release);
+        self.retry(!added);
         destroy(old);
     }
 
     fn update(&mut self) {
+        if !self.added.load(Ordering::Acquire) {
+            // The icon can still be on after a refused call, and Windows
+            // then refuses the add.
+            self.notify(NIM_DELETE);
+            self.add();
+            return;
+        }
         let old = self.new_icon();
-        self.notify(NIM_MODIFY);
+        let updated = self.notify(NIM_MODIFY);
+        // Tried again as a new add, which also puts back an icon lost to an
+        // Explorer restart this window did not hear about.
+        self.added.store(updated, Ordering::Release);
+        self.retry(!updated);
         destroy(old);
     }
 
     fn remove(&mut self) {
-        if self.added.swap(false, Ordering::AcqRel) {
-            self.notify(NIM_DELETE);
+        // Also after a refused add, which Windows may have carried out.
+        if self.notify(NIM_DELETE) {
+            self.added.store(false, Ordering::Release);
         }
     }
 
-    fn notify(&self, message: NOTIFY_ICON_MESSAGE) {
-        let data = self.data();
-        // SAFETY: `data` carries its own size and lives across the call.
-        unsafe { Shell_NotifyIconW(message, &data) };
+    fn notify(&self, message: NOTIFY_ICON_MESSAGE) -> bool {
+        (self.shell)(message, &self.data())
+    }
+
+    fn retry(&self, again: bool) {
+        // SAFETY: this thread's own window. Setting the timer again restarts
+        // it, and killing one that is not set does nothing.
+        unsafe {
+            if again {
+                SetTimer(self.hwnd, RETRY, RETRY_MS, None);
+            } else {
+                KillTimer(self.hwnd, RETRY);
+            }
+        }
     }
 
     // The icon for the look wanted now. Returns the one it replaces, to be
@@ -467,6 +525,11 @@ impl Drop for Here {
     fn drop(&mut self) {
         destroy(self.icon);
     }
+}
+
+fn shell(message: NOTIFY_ICON_MESSAGE, data: &NOTIFYICONDATAW) -> bool {
+    // SAFETY: `data` carries its own size and lives across the call.
+    unsafe { Shell_NotifyIconW(message, data) != 0 }
 }
 
 // An icon this thread made that the tray no longer shows: Windows copies
@@ -537,8 +600,8 @@ unsafe extern "system" fn window_proc(
         });
     }
     let handled = HERE.with(|slot| {
-        // A message sent while a call below is still running (DestroyWindow
-        // sends WM_DESTROY) finds the state borrowed, and gets the default.
+        // A message sent while a call below is still running finds the
+        // state borrowed, and gets the default.
         let Ok(mut here) = slot.try_borrow_mut() else {
             return false;
         };
@@ -555,6 +618,10 @@ unsafe extern "system" fn window_proc(
                 true
             }
             UPDATE => {
+                here.update();
+                true
+            }
+            WM_TIMER if wparam == RETRY => {
                 here.update();
                 true
             }
@@ -604,6 +671,7 @@ fn context(what: &str, err: io::Error) -> io::Error {
 mod tests {
     use super::*;
     use room::view::{ControlRequest, ControlView, Party, ShareView, Voice};
+    use std::time::Instant;
     use zeroize::Zeroizing;
 
     type Inbox = Arc<Mutex<Option<Zeroizing<Vec<u8>>>>>;
@@ -882,6 +950,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn tip_names_pc_sound() {
+        let mut view = room(LinkState::Live, ControlView::default());
+        assert_eq!(look(Some(&view), ON).tip, "Booth");
+        view.share.own = room::view::OwnShare::Sharing { number: 1, fps: 60 };
+        view.share.running = Some(room::view::RunningShare {
+            software: false,
+            paused: None,
+            held: false,
+        });
+        assert_eq!(look(Some(&view), ON).tip, "Booth");
+        view.share.own_sound.on = true;
+        let sound = "Booth: Your share has PC sound.";
+        let shown = look(Some(&view), ON);
+        assert_eq!((shown.mark, shown.slash), (Mark::Flat, false));
+        assert_eq!(shown.tip, sound);
+        view.share.running.as_mut().unwrap().held = true;
+        assert_eq!(look(Some(&view), ON).tip, sound);
+        view.share.running.as_mut().unwrap().paused = Some(room::view::Paused::SecureDesktop);
+        view.share.own_sound.lost = Some(String::from("lost"));
+        assert_eq!(look(Some(&view), ON).tip, sound);
+
+        // Control first, and the longest name still leaves room for both:
+        // longest in the UTF-16 units the tip is cut by, within the 32
+        // characters and 64 bytes a name keeps.
+        let name = format!("{}{}", "\u{20000}".repeat(11), "W".repeat(20));
+        view.share.control.asked_by = Some(ControlRequest {
+            number: 3,
+            key: [9; 32],
+            name: name.clone(),
+        });
+        let both = look(Some(&view), ON);
+        let asked = format!("\u{2068}{name}\u{2069} wants to control your screen.");
+        assert_eq!(both.mark, Mark::Hollow);
+        assert_eq!(both.tip, format!("Booth: {asked} Your share has PC sound."));
+        assert!(both.tip.encode_utf16().count() <= TIP_UNITS);
+        assert_eq!(look(Some(&view), OFF).tip, sound);
+
+        view.share.control = ControlView {
+            controller: Some([9; 32]),
+            controlled_by: Some(Party {
+                key: [9; 32],
+                name: String::from("Tom"),
+            }),
+            ..ControlView::default()
+        };
+        let both = look(Some(&view), ON);
+        assert_eq!(both.mark, Mark::Filled);
+        assert_eq!(
+            both.tip,
+            "Booth: \u{2068}Tom\u{2069} is controlling this PC. Your share has PC sound."
+        );
+    }
+
     fn at(image: &[[u8; 4]], size: u32, x: u32, y: u32) -> Color32 {
         let [r, g, b, a] = image[(y * size + x) as usize];
         Color32::from_rgba_premultiplied(r, g, b, a)
@@ -921,6 +1043,8 @@ mod tests {
             // over the filled square.
             let slashed = drawn(Mark::Filled, true, size);
             assert_eq!(at(&slashed, size, 8 * k, 8 * k), CHALK);
+            assert_eq!(at(&slashed, size, 9 * k, 8 * k), INK);
+            assert_eq!(at(&slashed, size, 5 * k, 8 * k), INK);
             assert_eq!(at(&slashed, size, 10 * k, 10 * k), AMBER);
         }
     }
@@ -939,20 +1063,28 @@ mod tests {
         // The first colour row is the bottom one: ink, opaque.
         let [r, g, b, a] = INK.to_array();
         assert_eq!(&bytes[40..44], &[b, g, r, a]);
+        // The flat line, which is not the same upside down, is on row 11
+        // from the top: row 4 from the bottom.
+        let flat = icon_bytes(&drawn(Mark::Flat, false, size), size);
+        let line = 40 + 4 * 16 * 4 + 8 * 4;
+        let [r, g, b, a] = SAGE.to_array();
+        assert_eq!(&flat[line..line + 4], &[b, g, r, a]);
     }
 
-    // The one test that touches the real tray: the icon goes on when the
-    // tray starts, takes a new look, shows the panel when a second copy
-    // asks, and comes off when it is dropped.
+    // On the real taskbar: the icon goes on when the tray starts, takes a
+    // new look, shows the panel when a second copy asks, and comes off when
+    // it is dropped.
     #[test]
     fn icon_on_and_off_the_taskbar() {
         let _tray = TRAYS.lock().unwrap_or_else(PoisonError::into_inner);
         let (clicked, click) = mpsc::channel();
-        let mut tray = Tray::start(
+        let (real, calls) = recorded(shell);
+        let mut tray = Tray::with_shell(
             move || {
                 let _ = clicked.send(());
             },
             |_| 0,
+            real,
         )
         .expect("the tray starts");
         assert!(tray.on_taskbar(), "Explorer took the icon");
@@ -965,13 +1097,221 @@ mod tests {
             "a second copy's ask reached the panel in {:?}",
             asked.elapsed()
         );
+        let tip = String::from("Booth: a test of the tray icon");
         tray.show(Look {
             mark: Mark::Hollow,
             slash: true,
-            tip: String::from("Booth: a test of the tray icon"),
+            tip: tip.clone(),
         });
         let added = Arc::clone(&tray.added);
         drop(tray);
         assert!(!added.load(Ordering::Acquire), "the icon came off");
+        let calls = calls.lock().unwrap();
+        let modified = (NIM_MODIFY, tip.clone(), true);
+        assert!(calls.contains(&modified), "{calls:?}");
+        assert_eq!(calls.last(), Some(&(NIM_DELETE, tip, true)));
+    }
+
+    type Calls = Arc<Mutex<Vec<(NOTIFY_ICON_MESSAGE, String, bool)>>>;
+
+    // A shell that answers as `answer` does and keeps each call: what was
+    // asked, the tip and the answer.
+    fn recorded(
+        answer: impl Fn(NOTIFY_ICON_MESSAGE, &NOTIFYICONDATAW) -> bool + Send + 'static,
+    ) -> (Shell, Calls) {
+        let calls = Calls::default();
+        let kept = Arc::clone(&calls);
+        let shell: Shell = Box::new(move |message, data: &NOTIFYICONDATAW| {
+            let answered = answer(message, data);
+            let tip = String::from_utf16_lossy(&data.szTip);
+            let call = (message, tip.trim_end_matches('\0').to_owned(), answered);
+            kept.lock().unwrap().push(call);
+            answered
+        });
+        (shell, calls)
+    }
+
+    // Refuses the first call that asks for `refused` and takes every other.
+    fn refusing_once(
+        refused: NOTIFY_ICON_MESSAGE,
+    ) -> impl Fn(NOTIFY_ICON_MESSAGE, &NOTIFYICONDATAW) -> bool + Send + 'static {
+        let refused_once = AtomicBool::new(false);
+        move |message, _| message != refused || refused_once.swap(true, Ordering::AcqRel)
+    }
+
+    fn within_retries(done: impl Fn() -> bool) -> bool {
+        let until = Instant::now() + 3 * Duration::from_millis(RETRY_MS.into());
+        while !done() {
+            if Instant::now() > until {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    #[test]
+    fn retries_refused_add() {
+        let _tray = TRAYS.lock().unwrap_or_else(PoisonError::into_inner);
+        let (shell, calls) = recorded(refusing_once(NIM_ADD));
+        let tray = Tray::with_shell(|| {}, |_| 0, shell).unwrap();
+        assert!(!tray.on_taskbar());
+        let added = within_retries(|| tray.on_taskbar());
+        assert!(added, "the add was not tried again");
+        // Once it worked, the timer is gone.
+        thread::sleep(Duration::from_millis(RETRY_MS.into()) * 3 / 2);
+        drop(tray);
+        let call = |message, answer| (message, String::from("Booth"), answer);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                call(NIM_ADD, false),
+                call(NIM_DELETE, true),
+                call(NIM_ADD, true),
+                call(NIM_SETVERSION, true),
+                call(NIM_DELETE, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn retries_refused_modify() {
+        let _tray = TRAYS.lock().unwrap_or_else(PoisonError::into_inner);
+        let (shell, calls) = recorded(refusing_once(NIM_MODIFY));
+        let mut tray = Tray::with_shell(|| {}, |_| 0, shell).unwrap();
+        let tip = String::from("Booth: a new look");
+        tray.show(Look {
+            mark: Mark::Flat,
+            slash: true,
+            tip: tip.clone(),
+        });
+        let readded = (NIM_ADD, tip.clone(), true);
+        let tried = within_retries(|| calls.lock().unwrap().contains(&readded));
+        assert!(tried, "the look was not tried again");
+        // Once it worked, the timer is gone.
+        thread::sleep(Duration::from_millis(RETRY_MS.into()) * 3 / 2);
+        drop(tray);
+        let booth = String::from("Booth");
+        let call = |message, answer| (message, tip.clone(), answer);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                (NIM_ADD, booth.clone(), true),
+                (NIM_SETVERSION, booth, true),
+                call(NIM_MODIFY, false),
+                call(NIM_DELETE, true),
+                readded,
+                call(NIM_SETVERSION, true),
+                call(NIM_DELETE, true),
+            ]
+        );
+    }
+
+    // Explorer started again and the tray never heard: the icon is gone, and
+    // only a new add puts it back.
+    #[test]
+    fn vanished_icon_comes_back() {
+        let _tray = TRAYS.lock().unwrap_or_else(PoisonError::into_inner);
+        let on = Arc::new(AtomicBool::new(false));
+        let explorer = Arc::clone(&on);
+        let (shell, calls) = recorded(move |message, _| match message {
+            NIM_ADD => !explorer.swap(true, Ordering::AcqRel),
+            NIM_DELETE => explorer.swap(false, Ordering::AcqRel),
+            _ => explorer.load(Ordering::Acquire),
+        });
+        let mut tray = Tray::with_shell(|| {}, |_| 0, shell).unwrap();
+        on.store(false, Ordering::Release);
+        let tip = String::from("Booth: after a restart");
+        tray.show(Look {
+            mark: Mark::Ring,
+            slash: false,
+            tip: tip.clone(),
+        });
+        let readded = (NIM_ADD, tip, true);
+        let back = within_retries(|| calls.lock().unwrap().contains(&readded));
+        drop(tray);
+        assert!(back, "the icon stayed off");
+    }
+
+    // A close refused by a full queue is posted again until the thread takes
+    // it, so the drop does not wait for good.
+    #[test]
+    fn drop_with_full_queue() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_NULL;
+        let _tray = TRAYS.lock().unwrap_or_else(PoisonError::into_inner);
+        let (inside, entered) = mpsc::channel();
+        let (release, held) = mpsc::channel::<()>();
+        let tray = Tray::with_shell(
+            move || {
+                let _ = inside.send(());
+                let _ = held.recv();
+            },
+            |_| 0,
+            recorded(|_, _| true).0,
+        )
+        .unwrap();
+        let window = tray.window as HWND;
+        // SAFETY: the tray's window, which lives until the drop below.
+        assert_ne!(unsafe { PostMessageW(window, show_message(), 0, 0) }, 0);
+        let held_in_click = entered.recv_timeout(Duration::from_secs(2)).is_ok();
+        // SAFETY: as above; a full queue refuses the post.
+        let full = (0..100_000).any(|_| unsafe { PostMessageW(window, WM_NULL, 0, 0) } == 0);
+        let error = io::Error::last_os_error().raw_os_error();
+        let (dropped, done) = mpsc::channel();
+        thread::spawn(move || {
+            drop(tray);
+            let _ = dropped.send(());
+        });
+        // Long enough for the drop's first post to find the queue full.
+        thread::sleep(Duration::from_millis(200));
+        release.send(()).unwrap();
+        let ended = done.recv_timeout(Duration::from_secs(5)).is_ok();
+        // Checked only now: a tray dropped while its click is held never ends.
+        assert!(held_in_click);
+        assert!(full);
+        assert_eq!(error, Some(ERROR_NOT_ENOUGH_QUOTA as i32));
+        assert!(ended, "the drop never ended");
+    }
+
+    #[test]
+    fn drop_after_window_closed() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::IsWindow;
+        let _tray = TRAYS.lock().unwrap_or_else(PoisonError::into_inner);
+        let tray = Tray::with_shell(|| {}, |_| 0, recorded(|_, _| true).0).unwrap();
+        let window = tray.window as HWND;
+        // SAFETY: the tray's window; a post to it fails once it is gone.
+        assert_ne!(unsafe { PostMessageW(window, WM_CLOSE, 0, 0) }, 0);
+        // SAFETY: a plain query.
+        let closed = within_retries(|| unsafe { IsWindow(window) } == 0);
+        assert!(closed, "the window stayed");
+        let (dropped, done) = mpsc::channel();
+        thread::spawn(move || {
+            drop(tray);
+            let _ = dropped.send(());
+        });
+        let ended = done.recv_timeout(Duration::from_secs(5)).is_ok();
+        assert!(ended, "the drop never ended");
+    }
+
+    #[test]
+    fn drop_deletes_refused_add() {
+        let _tray = TRAYS.lock().unwrap_or_else(PoisonError::into_inner);
+        let (shell, calls) = recorded(refusing_once(NIM_ADD));
+        drop(Tray::with_shell(|| {}, |_| 0, shell).unwrap());
+        let call = |message, answer| (message, String::from("Booth"), answer);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [call(NIM_ADD, false), call(NIM_DELETE, true)]
+        );
+    }
+
+    #[test]
+    fn refused_delete_keeps_icon() {
+        let _tray = TRAYS.lock().unwrap_or_else(PoisonError::into_inner);
+        let shell = Box::new(refusing_once(NIM_DELETE));
+        let tray = Tray::with_shell(|| {}, |_| 0, shell).unwrap();
+        let added = Arc::clone(&tray.added);
+        drop(tray);
+        assert!(added.load(Ordering::Acquire), "the icon was taken as off");
     }
 }
