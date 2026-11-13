@@ -68,7 +68,7 @@ pub(super) struct Live {
     pub sharer: [u8; 32],
     // Their name when the share began, for the line when it ends after
     // they left.
-    name: String,
+    pub name: String,
     pub fps: u8,
     recovered: VecDeque<(u32, u32, Instant)>,
     // The newest frame passed on from a friend's share: a recover request

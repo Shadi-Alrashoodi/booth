@@ -4596,6 +4596,211 @@ fn rejoin_keeps_limits_round_all_of_an_invites_keys() {
     assert!(lines < burst, "{lines}");
 }
 
+// Bo, watching Ana's share, asks to control it and she allows it. The
+// share and the host's number for the grant, which her words name.
+fn controlled(rig: &mut Rig, ana: &mut Guest, bo: &mut Guest, now: Instant) -> (u32, u32) {
+    let share = granted(rig, ana, now);
+    let watch = Message::Watch {
+        share,
+        on: true,
+        hevc: true,
+    };
+    bo.say(rig, &watch, now);
+    bo.say(rig, &Message::ControlAsk { share, ask: 1 }, now);
+    let number = allowed(rig, ana, share, now);
+    bo.heard(now);
+    (share, number)
+}
+
+// Ana allows the ask the host passed on to her. The number it named.
+fn allowed(rig: &mut Rig, ana: &mut Guest, share: u32, now: Instant) -> u32 {
+    let number = ana
+        .heard(now)
+        .into_iter()
+        .find_map(|message| match message {
+            Message::ControlAsked { control, .. } => Some(control),
+            _ => None,
+        })
+        .expect("the ask passed on to Ana");
+    let allow = Message::ControlAnswer {
+        share,
+        number,
+        answer: control::ControlAnswer::Allow,
+    };
+    ana.say(rig, &allow, now);
+    number
+}
+
+// Ana leaves while Bo controls her share: the host's line names her,
+// as the one after it does.
+#[test]
+fn ended_control_names_gone_sharer() {
+    let start = Instant::now();
+    let mut rig = Rig::new(start);
+    let mut ana = Guest::new();
+    ana.join(&mut rig, "Ana", start);
+    let mut bo = Guest::new();
+    bo.join(&mut rig, "Bo", start);
+    controlled(&mut rig, &mut ana, &mut bo, start);
+    ana.say(&mut rig, &Message::Bye, start);
+    let chat = rig.host.view(start, 0).chat;
+    let lines = texts(&chat);
+    assert!(
+        lines.contains(&("Ana", "Control of Ana's PC ended: the share ended.", false)),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&("Ana", "Ana stopped sharing", false)),
+        "{lines:?}"
+    );
+}
+
+// Bo controls Ana's share, and her PC said an administrator window came
+// and went until her bucket for those words is empty. Makes her next
+// word.
+fn paused_spent(
+    rig: &mut Rig,
+    ana: &mut Guest,
+    bo: &mut Guest,
+    now: Instant,
+) -> impl Fn(bool) -> Message + use<> {
+    let (share, number) = controlled(rig, ana, bo, now);
+    let word = move |paused| Message::ControlPaused {
+        share,
+        number,
+        paused,
+    };
+    for _ in 0..remote::PAUSED_BURST as usize / 2 {
+        ana.say(rig, &word(true), now);
+        ana.say(rig, &word(false), now);
+    }
+    bo.heard(now);
+    word
+}
+
+fn paused_in(messages: Vec<Message>) -> Vec<bool> {
+    messages
+        .into_iter()
+        .filter_map(|message| match message {
+            Message::ControlPaused { paused, .. } => Some(paused),
+            _ => None,
+        })
+        .collect()
+}
+
+// The window comes to the front and goes again before the bucket has
+// room for the second word: Bo hears it went once there is.
+#[test]
+fn held_paused_word_goes_later() {
+    let start = Instant::now();
+    let mut rig = Rig::new(start);
+    let mut ana = Guest::new();
+    ana.join(&mut rig, "Ana", start);
+    let mut bo = Guest::new();
+    bo.join(&mut rig, "Bo", start);
+    let word = paused_spent(&mut rig, &mut ana, &mut bo, start);
+
+    let soon = start + Duration::from_millis(150);
+    ana.say(&mut rig, &word(true), soon);
+    ana.say(&mut rig, &word(false), soon);
+    assert_eq!(paused_in(bo.heard(soon)), [true]);
+    let due = rig.host.control_deadline().expect("the word held back");
+    assert!(due <= start + Duration::from_millis(200));
+
+    rig.tick(due);
+    assert_eq!(paused_in(bo.heard(due)), [false]);
+    assert_eq!(rig.host.control_deadline(), None);
+    // The held word took the one token there was room for.
+    ana.say(&mut rig, &word(true), due);
+    assert!(paused_in(bo.heard(due)).is_empty());
+    assert!(rig.host.control_deadline().is_some());
+}
+
+// A word the bucket lets through takes the place of the one held back,
+// so Bo hears it once.
+#[test]
+fn passed_word_clears_held() {
+    let start = Instant::now();
+    let mut rig = Rig::new(start);
+    let mut ana = Guest::new();
+    ana.join(&mut rig, "Ana", start);
+    let mut bo = Guest::new();
+    bo.join(&mut rig, "Bo", start);
+    let word = paused_spent(&mut rig, &mut ana, &mut bo, start);
+
+    let soon = start + Duration::from_millis(150);
+    ana.say(&mut rig, &word(true), soon);
+    ana.say(&mut rig, &word(false), soon);
+    bo.heard(soon);
+
+    let later = start + Duration::from_millis(300);
+    ana.say(&mut rig, &word(false), later);
+    assert_eq!(paused_in(bo.heard(later)), [false]);
+    assert_eq!(rig.host.control_deadline(), None);
+    rig.tick(later);
+    assert!(paused_in(bo.heard(later)).is_empty());
+}
+
+// The host controls Ana's share. The timer pass that sends the word her
+// bucket held back redraws the host's panel; the pass before has
+// nothing to show.
+#[test]
+fn held_paused_word_redraws_panel() {
+    let start = Instant::now();
+    let mut rig = Rig::new(start);
+    let mut ana = Guest::new();
+    ana.join(&mut rig, "Ana", start);
+    let share = granted(&mut rig, &mut ana, start);
+    assert!(rig.host.watch(share, true, start, &rig.socket));
+    assert!(rig.host.ask_control(share, start, &rig.socket));
+    let number = allowed(&mut rig, &mut ana, share, start);
+    let word = |paused| Message::ControlPaused {
+        share,
+        number,
+        paused,
+    };
+    for _ in 0..remote::PAUSED_BURST as usize / 2 {
+        ana.say(&mut rig, &word(true), start);
+        ana.say(&mut rig, &word(false), start);
+    }
+
+    let soon = start + Duration::from_millis(150);
+    ana.say(&mut rig, &word(true), soon);
+    ana.say(&mut rig, &word(false), soon);
+    // Whatever else is due, a ping among it, goes on this pass.
+    rig.tick(soon);
+    let due = rig.host.control_deadline().expect("the word held back");
+    let almost = due - Duration::from_millis(1);
+    assert!(!rig.host.on_timer(almost, &rig.socket));
+    assert!(rig.host.view(almost, 0).share.control.paused);
+    assert!(rig.host.on_timer(due, &rig.socket));
+    assert!(!rig.host.view(due, 0).share.control.paused);
+}
+
+// A word back to what Bo was told takes the place of the one held
+// back, so he hears nothing more.
+#[test]
+fn paused_word_back_clears_held() {
+    let start = Instant::now();
+    let mut rig = Rig::new(start);
+    let mut ana = Guest::new();
+    ana.join(&mut rig, "Ana", start);
+    let mut bo = Guest::new();
+    bo.join(&mut rig, "Bo", start);
+    let word = paused_spent(&mut rig, &mut ana, &mut bo, start);
+
+    let soon = start + Duration::from_millis(150);
+    ana.say(&mut rig, &word(true), soon);
+    ana.say(&mut rig, &word(false), soon);
+    ana.say(&mut rig, &word(true), soon);
+    assert_eq!(paused_in(bo.heard(soon)), [true]);
+    assert_eq!(rig.host.control_deadline(), None);
+
+    let later = start + Duration::from_millis(300);
+    rig.tick(later);
+    assert!(paused_in(bo.heard(later)).is_empty());
+}
+
 // A client watching hears of a new frame rate from the roster; this
 // host's own viewer has to be told.
 #[test]

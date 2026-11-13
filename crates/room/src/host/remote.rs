@@ -36,12 +36,14 @@ pub(super) struct Grant {
     pub allowed: bool,
     // What the controller was last told of an administrator window.
     paused: bool,
+    // A newer word the sharer's bucket held back, and when it has room.
+    held: Option<(bool, Instant)>,
 }
 
 // An administrator window comes to the front or goes as fast as someone
 // switches windows. Each word goes on to the controller's control stream.
 const PAUSED_PER_SECOND: f64 = 10.0;
-const PAUSED_BURST: f64 = 10.0;
+pub(super) const PAUSED_BURST: f64 = 10.0;
 
 // What a friend may send of remote control.
 pub(super) struct PeerControl {
@@ -561,7 +563,7 @@ impl Host {
     ) -> bool {
         let key = self.peers[i].key;
         // A share that ended while the word was on its way.
-        let Some(live) = self.live.as_ref().filter(|live| live.number == share) else {
+        let Some(live) = self.live.as_mut().filter(|live| live.number == share) else {
             return false;
         };
         if live.sharer != key {
@@ -570,23 +572,64 @@ impl Host {
         }
         let Some(grant) = live
             .control
-            .as_ref()
-            .filter(|grant| grant.allowed && grant.number == number && grant.paused != paused)
+            .as_mut()
+            .filter(|grant| grant.allowed && grant.number == number)
         else {
             return false;
         };
-        let (controller, ask) = (grant.controller, grant.ask);
-        if !self.peers[i]
-            .control
-            .paused
-            .take(now, PAUSED_PER_SECOND, PAUSED_BURST)
-        {
+        if grant.paused == paused {
+            grant.held = None;
+            return false;
+        }
+        let bucket = &mut self.peers[i].control.paused;
+        if !bucket.take(now, PAUSED_PER_SECOND, PAUSED_BURST) {
+            // The sharer says each change once, so the newest word waits for
+            // room rather than being lost.
+            let wait = bucket.wait_for(now, 1.0, PAUSED_PER_SECOND, PAUSED_BURST);
+            grant.held = Some((paused, now + wait));
             self.screen.dropped += 1;
             return false;
         }
-        if let Some(grant) = self.grant_numbered_mut(share, number) {
-            grant.paused = paused;
+        self.pass_paused(paused, now, socket)
+    }
+
+    // A word held back for the sharer's bucket, once it has room.
+    fn pass_held(&mut self, now: Instant, socket: &Socket) -> bool {
+        let Some(live) = self.live.as_mut() else {
+            return false;
+        };
+        let sharer = live.sharer;
+        let Some(grant) = live.control.as_mut() else {
+            return false;
+        };
+        let Some((paused, _)) = grant.held.take_if(|(_, due)| *due <= now) else {
+            return false;
+        };
+        let Some(peer) = self.peers.iter_mut().find(|peer| peer.key == sharer) else {
+            return false;
+        };
+        let bucket = &mut peer.control.paused;
+        if !bucket.take(now, PAUSED_PER_SECOND, PAUSED_BURST) {
+            let wait = bucket.wait_for(now, 1.0, PAUSED_PER_SECOND, PAUSED_BURST);
+            grant.held = Some((paused, now + wait));
+            return false;
         }
+        self.pass_paused(paused, now, socket)
+    }
+
+    // The sharer's word on an administrator window, which its bucket let
+    // through, goes on to the controller.
+    fn pass_paused(&mut self, paused: bool, now: Instant, socket: &Socket) -> bool {
+        let Some(live) = self.live.as_mut() else {
+            return false;
+        };
+        let share = live.number;
+        let Some(grant) = live.control.as_mut() else {
+            return false;
+        };
+        grant.paused = paused;
+        grant.held = None;
+        let (number, controller, ask) = (grant.number, grant.controller, grant.ask);
         log!(
             self.log,
             "control {number}: an administrator window in front on the sharer's pc: {}",
@@ -638,8 +681,9 @@ impl Host {
     }
 
     // Every timer pass: CUTOFF without input lets go of what this host's
-    // injector holds.
-    pub(super) fn control_step(&mut self, now: Instant) {
+    // injector holds, and a word held back for the sharer's bucket goes
+    // once it has room. True when this host's own view changed.
+    pub(super) fn control_step(&mut self, now: Instant, socket: &Socket) -> bool {
         if self.screen.remote.step(now) {
             log!(
                 self.log,
@@ -647,10 +691,16 @@ impl Host {
                 remote::CUTOFF.as_millis()
             );
         }
+        self.pass_held(now, socket)
     }
 
     pub(super) fn control_deadline(&self) -> Option<Instant> {
-        self.screen.remote.deadline()
+        let held = self
+            .live
+            .as_ref()
+            .and_then(|live| live.control.as_ref()?.held)
+            .map(|(_, due)| due);
+        self.screen.remote.deadline().into_iter().chain(held).min()
     }
 
     // Someone left the room or started their link over: their control, or
@@ -690,7 +740,11 @@ impl Host {
         };
         let (share, sharer) = (live.number, live.sharer);
         let own = *self.identity.public();
-        let sharer_name = self.name_of(&sharer);
+        let sharer_name = self
+            .peers
+            .iter()
+            .find(|peer| peer.key == sharer)
+            .map_or_else(|| live.name.clone(), |peer| peer.name.clone());
         let controller = grant.name.as_str();
         if grant.controller == own {
             if self
@@ -813,6 +867,7 @@ impl Host {
                 ask,
                 allowed: false,
                 paused: false,
+                held: None,
             });
         }
         number

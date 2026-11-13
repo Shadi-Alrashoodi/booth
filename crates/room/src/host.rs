@@ -1195,7 +1195,7 @@ impl Host {
             self.share_reports(now, socket);
         }
         changed |= self.share_step(now, socket);
-        self.control_step(now);
+        changed |= self.control_step(now, socket);
 
         changed |= someone_left;
         if someone_left || self.roster_due.is_some_and(|at| now >= at) {
