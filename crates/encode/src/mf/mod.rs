@@ -54,6 +54,11 @@ fn macroblocks(width: u32, height: u32) -> u64 {
 /// The size and rate the software encoder takes for a share of this size,
 /// or None when it takes this one as it is.
 pub(crate) fn software_fit(width: u32, height: u32, fps: u32) -> Option<Fit> {
+    // Opening refuses such a size (check_request in lib.rs), and the width
+    // worked out below would divide by the height.
+    if width == 0 || height == 0 {
+        return None;
+    }
     let (max_width, max_height, max_fps) = SOFTWARE_MAX;
     let fits = |w: u32, h: u32| {
         macroblocks(w, h) <= macroblocks(max_width, max_height) && w.max(h) <= SOFTWARE_MAX_SIDE
@@ -63,16 +68,14 @@ pub(crate) fn software_fit(width: u32, height: u32, fps: u32) -> Option<Fit> {
     }
     let (mut fit_width, mut fit_height) = (width, height);
     if !fits(width, height) {
-        // The caller asks capture for this fit's width, height and rate
-        // (crate::software_fit says why both sides). Capture scales the side
-        // further past its limit to it and works the other out, rounded to
-        // the nearest even number; this works the width out the same way,
-        // from each even height down until the picture fits.
+        // The width is worked out as capture does it, rounded to the nearest
+        // even number, from each even height down until the picture fits
+        // (crate::software_fit says why). No height over SOFTWARE_MAX_SIDE fits.
         let width_at = |h: u32| {
             let exact = u64::from(width) * u64::from(h);
             (((exact + u64::from(height)) / (2 * u64::from(height)) * 2) as u32).max(2)
         };
-        fit_height = (height & !1).max(2);
+        fit_height = (height & !1).clamp(2, SOFTWARE_MAX_SIDE);
         while fit_height > 2 && !fits(width_at(fit_height), fit_height) {
             fit_height -= 2;
         }
@@ -151,7 +154,9 @@ fn subtype(codec: Codec) -> GUID {
 }
 
 /// The encoder's output: the codec at Booth's bitrate, H.264 in High
-/// profile for CABAC and 8x8 transforms and HEVC in Main, as with NVENC.
+/// profile and HEVC in Main, as with NVENC. High allows CABAC and 8x8
+/// transforms, which each encoder uses or not as it likes: Windows' software
+/// encoder leaves CABAC off unless asked.
 fn output_type(
     fns: &Functions,
     codec: Codec,
@@ -179,13 +184,11 @@ fn output_type(
 /// How an encoder is given its buffer.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Buffer {
-    /// A VBV of one frame's bits, so no frame bursts past the next.
+    /// bitrate / fps: one frame of the rate, counted in bits.
     OneFrame,
     /// The size the encoder picks itself when its types are set, read back
-    /// for the notes. Windows' software encoder picks 0.375 s of the bitrate.
-    /// On the test pattern at 8 Mbit/s and 1080p60, a buffer of 1 to 3
-    /// frames sent 37 Mbit/s, 4 to 12 frames 2.4 to 4.4, and 30 to 45
-    /// frames 9.9; its own 7.7.
+    /// for the notes. Windows' software encoder picks 3 s of the rate; a
+    /// smaller one threw its rate control off.
     EncodersOwn,
 }
 
@@ -205,10 +208,10 @@ fn configure(api: &mut CodecApi, fps: u32, bitrate: u32, preset: Preset, buffer:
         &CODECAPI_AVEncCommonMeanBitRate,
         VARIANT::from(bitrate),
     );
-    // In bits, which neither the header nor the documentation says. The
-    // same frame counted in bytes, an eighth of the number, made NVIDIA's
-    // encoder run over at 17.2 Mbit/s against 15; in bits it stays under.
-    // The software encoder's own is read back after the types are set.
+    // bitrate / fps, though Microsoft gives the size in bytes for H.264 and
+    // for its own HEVC encoder: an eighth of it made NVIDIA's encoder run
+    // over its rate, and what other drivers read is not known. The software
+    // encoder's own is read back after the types are set.
     if buffer == Buffer::OneFrame {
         api.setting(
             "VBV of one frame".to_string(),
@@ -216,9 +219,9 @@ fn configure(api: &mut CodecApi, fps: u32, bitrate: u32, preset: Preset, buffer:
             VARIANT::from(bitrate / fps),
         );
     }
-    // The largest GOP there is. 0 would mean "no scheduled IDR" by the
-    // property's definition, but Windows' software encoder reads it as one
-    // IDR a second; neither encoder here reports a range to pick from.
+    // The largest GOP there is: 0 leaves the GOP to the encoder, and Windows'
+    // software encoder then makes an IDR a second. Neither encoder here
+    // reports a range to pick from.
     api.setting(
         "no scheduled IDRs".to_string(),
         &CODECAPI_AVEncMPVGOPSize,
@@ -243,36 +246,45 @@ fn configure(api: &mut CodecApi, fps: u32, bitrate: u32, preset: Preset, buffer:
     );
 }
 
-/// A new bitrate from the next frame on, with a buffer of `buffer_bits`
-/// where the encoder takes one.
+/// Asks for a new bitrate, with a buffer of `buffer` where the encoder takes
+/// one. Only a refused rate fails it: an encoder that took the rate runs at
+/// it, so a buffer refused after it comes back as Some.
 fn change_bitrate(
     api: &CodecApi,
     bitrate: u32,
-    buffer_bits: Option<u32>,
-) -> windows::core::Result<()> {
+    buffer: Option<u32>,
+) -> windows::core::Result<Option<windows::core::Error>> {
     api.set(&CODECAPI_AVEncCommonMeanBitRate, &VARIANT::from(bitrate))?;
-    if let Some(bits) = buffer_bits
+    if let Some(buffer) = buffer
         && api.supports(&CODECAPI_AVEncCommonBufferSize)
     {
-        api.set(&CODECAPI_AVEncCommonBufferSize, &VARIANT::from(bits))?;
+        return Ok(api
+            .set(&CODECAPI_AVEncCommonBufferSize, &VARIANT::from(buffer))
+            .err());
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Notes the buffer the encoder picked for itself, read back once its types
 /// are set.
 fn note_own_buffer(api: &mut CodecApi, bitrate: u32) {
-    let size = match api.value(&CODECAPI_AVEncCommonBufferSize) {
-        Some(bits) => format!(
-            "{bits} bits, {:.2} s at {:.1} Mbit/s",
-            f64::from(bits) / f64::from(bitrate),
-            f64::from(bitrate) / 1e6
-        ),
-        None => "size, which it does not report".to_string(),
-    };
+    let size = own_buffer(api.value(&CODECAPI_AVEncCommonBufferSize), bitrate);
     api.note(format!(
         "VBV left at the encoder's own {size}, since a smaller one throws its rate control off"
     ));
+}
+
+// In bytes: it is read from Windows' software encoder alone, and Microsoft
+// gives that encoder's size in bytes.
+fn own_buffer(bytes: Option<u32>, bitrate: u32) -> String {
+    match bytes {
+        Some(bytes) => format!(
+            "{bytes} bytes, {:.2} s at {:.1} Mbit/s",
+            f64::from(bytes) * 8.0 / f64::from(bitrate),
+            f64::from(bitrate) / 1e6
+        ),
+        None => "size, which it does not report".to_string(),
+    }
 }
 
 /// These encoders answer a loss with an IDR (the software one when it cannot
@@ -527,6 +539,7 @@ fn sample_time(index: u64, fps: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::time::{Duration, Instant};
 
     use windows::Win32::Foundation::E_UNEXPECTED;
 
@@ -564,6 +577,35 @@ mod tests {
         assert_eq!(fit(1440, 2560, 60), Some((1080, 1920, 60)));
         assert_eq!(fit(2160, 3840, 120), Some((1080, 1920, 60)));
         assert_eq!(fit(1440, 5120, 60), Some((766, 2720, 60)));
+    }
+
+    // Left to opening to refuse, with a side past the limit as well.
+    #[test]
+    fn software_fit_zero_side() {
+        assert_eq!(software_fit(5000, 0, 60), None);
+        assert_eq!(software_fit(0, 5000, 60), None);
+        assert_eq!(software_fit(0, 0, 120), None);
+    }
+
+    // The search starts at the tallest height that can fit, not at the share's.
+    #[test]
+    fn software_fit_huge() {
+        let fit = |w, h, fps| software_fit(w, h, fps).map(|f| (f.width, f.height, f.fps));
+        let started = Instant::now();
+        let tall = fit(2, 4_000_000_000, 60);
+        let huge = fit(4_000_000_000, 4_000_000_000, 60);
+        let took = started.elapsed();
+        assert_eq!(tall, Some((2, 4208, 60)));
+        assert_eq!(huge, Some((1440, 1440, 60)));
+        assert!(took < Duration::from_secs(1), "{took:?}");
+    }
+
+    #[test]
+    fn own_buffer_in_bytes() {
+        assert_eq!(
+            own_buffer(Some(5_625_000), 15_000_000),
+            "5625000 bytes, 3.00 s at 15.0 Mbit/s"
+        );
     }
 
     #[test]

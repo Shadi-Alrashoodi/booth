@@ -35,8 +35,10 @@ cc.workspace = true
 
 [dev-dependencies]
 # The leak test in tests/mf_leaks.rs reads handle count, thread count and
-# private bytes of the test process.
+# private bytes of the test process. The stand-in event generator in
+# src/mf/hardware.rs's tests takes a PROPVARIANT.
 windows = { workspace = true, features = [
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",

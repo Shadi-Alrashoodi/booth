@@ -131,10 +131,19 @@ fn functions() -> Result<Functions, EncodeError> {
     }
 }
 
-// Live encoders. MFStartup runs when the first one opens and MFShutdown
-// when the last one is dropped, so the calls always pair up and nothing of
-// Media Foundation runs between shares.
+// Live encoders, and the event threads of the hardware ones, which can
+// outlive their encoder. MFStartup runs when the first one starts and
+// MFShutdown when the last one is gone, so the calls always pair up, and
+// nothing of Media Foundation runs between shares unless a driver kept an
+// event thread waiting.
 static USERS: Mutex<usize> = Mutex::new(0);
+
+#[cfg(test)]
+pub(crate) fn users() -> usize {
+    *USERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Media Foundation, started for as long as this lives.
 pub(crate) struct Mf {

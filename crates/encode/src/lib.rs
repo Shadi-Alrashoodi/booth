@@ -144,7 +144,8 @@ pub struct Fit {
 
 /// What the software encoder takes instead of `width` x `height` at `fps`,
 /// or None when it takes that as it is. It holds shares to 1080p60's
-/// macroblock count and 60 fps, whatever their shape.
+/// macroblock count and 60 fps, whatever their shape. A side of 0 gets None
+/// too: opening an encoder refuses that size.
 ///
 /// To get that size from capture, ask it for `max_width: fit.width`,
 /// `max_height: fit.height` and `max_fps: fit.fps` (capture::Options).
@@ -262,19 +263,21 @@ pub trait Encoder: Send {
         ""
     }
 
-    /// Shuts the encoder down now rather than when it is dropped, and says
-    /// for the log what did not go: a Media Foundation hardware encoder
-    /// whose driver stopped answering can keep its event thread, and with
-    /// it the encoder, past the 2 s it is given. None when all of it went.
-    /// Nothing is encoded after it.
+    /// Called just before the encoder is dropped, and says for the log what
+    /// did not go. The Media Foundation hardware encoder shuts down here: a
+    /// driver that stopped answering can keep its event thread, and with it
+    /// the encoder, past the 2 s it is given. The others shut down when
+    /// dropped, so they do nothing here and say None. Nothing is encoded
+    /// after it.
     fn shut_down(&mut self) -> Option<String> {
         None
     }
 
     fn encode(&mut self, frame: &Frame<'_>) -> Result<AccessUnit, EncodeError>;
 
-    /// Takes effect on the next frame, never with an IDR. A ceiling, like
-    /// [`Settings::bitrate`].
+    /// Asks for this rate from the next frame on, never with an IDR. A
+    /// ceiling, like [`Settings::bitrate`]. Windows' software encoder keeps
+    /// to the old rate for several frames first.
     fn set_bitrate(&mut self, bits_per_second: u32) -> Result<(), EncodeError>;
 
     /// A viewer lost frame `lost_frame_index`. Several frames lost together

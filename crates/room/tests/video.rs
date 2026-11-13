@@ -693,7 +693,7 @@ fn watcher_without_hevc_switches_to_h264_and_back() {
 // and its viewer goes on in H.264, as with any codec change. The host's
 // share, and a friend's, whose rate reaches the roster through the host.
 //
-// At 720p and 2 Mbit/s: the software encoder's IDRs can take 0.375 s of the
+// At 720p and 2 Mbit/s: the software encoder's IDRs can take 3 s of the
 // rate, and a debug build seals one of 500 KB, its 1080p IDR at 15 Mbit/s,
 // so slowly that the send thread lets the next frames go, and each costs the
 // watcher another IDR. A release build sent that share whole at 60 fps.

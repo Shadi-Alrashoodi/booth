@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
-use windows::Win32::Foundation::{E_FAIL, E_NOTIMPL, E_UNEXPECTED, HMODULE};
+use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_NOTIMPL, E_UNEXPECTED, HMODULE, S_FALSE};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
@@ -16,6 +16,7 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::MediaFoundation::{
+    CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonMeanBitRate,
     CODECAPI_AVEncVideoForceKeyFrame, ICodecAPI, ICodecAPI_Impl, IMFAttributes, IMFMediaEvent,
     IMFMediaType, IMFTransform_Impl, MFT_INPUT_STREAM_INFO, MFT_MESSAGE_TYPE,
     MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
@@ -79,6 +80,14 @@ struct State {
     // It asks on every start of stream, though it has a request out.
     asks_on_every_start: bool,
     refuses_drain: bool,
+    // It takes a new bitrate and refuses the buffer that goes with it.
+    refuses_buffer: bool,
+    // It answers S_FALSE, not supported, when asked for the buffer, and
+    // refuses one sent all the same.
+    lacks_buffer: bool,
+    // It answers S_FALSE, read-only, when this one is set.
+    read_only: Option<GUID>,
+    mean_bitrate: Option<u32>,
     fed: Vec<Fed>,
     refused: u32,
     starts: u32,
@@ -376,7 +385,11 @@ impl IMFTransform_Impl for Transform_Impl {
 }
 
 impl ICodecAPI_Impl for Transform_Impl {
-    fn IsSupported(&self, _: *const GUID) -> windows::core::Result<()> {
+    fn IsSupported(&self, api: *const GUID) -> windows::core::Result<()> {
+        // SAFETY: CodecApi::supports passes a valid GUID.
+        if unsafe { *api } == CODECAPI_AVEncCommonBufferSize && self.0.state.borrow().lacks_buffer {
+            return Err(S_FALSE.into());
+        }
         Ok(())
     }
 
@@ -411,12 +424,22 @@ impl ICodecAPI_Impl for Transform_Impl {
         not_scripted()
     }
 
-    fn SetValue(&self, api: *const GUID, _: *const VARIANT) -> windows::core::Result<()> {
-        // SAFETY: CodecApi::set passes a valid GUID.
-        if unsafe { *api } == CODECAPI_AVEncVideoForceKeyFrame {
-            let mut state = self.0.state.borrow_mut();
+    fn SetValue(&self, api: *const GUID, value: *const VARIANT) -> windows::core::Result<()> {
+        // SAFETY: CodecApi::set passes a valid GUID and VARIANT.
+        let (api, value) = unsafe { (*api, &*value) };
+        let mut state = self.0.state.borrow_mut();
+        if state.read_only == Some(api) {
+            return Err(S_FALSE.into());
+        }
+        if api == CODECAPI_AVEncVideoForceKeyFrame {
             state.idr_asks += 1;
             state.idr_due = !state.ignores_idr_asks;
+        } else if api == CODECAPI_AVEncCommonMeanBitRate {
+            state.mean_bitrate = u32::try_from(value).ok();
+        } else if api == CODECAPI_AVEncCommonBufferSize
+            && (state.refuses_buffer || state.lacks_buffer)
+        {
+            return Err(E_INVALIDARG.into());
         }
         Ok(())
     }
@@ -619,6 +642,10 @@ fn rig(mode: Mode) -> Option<Rig> {
             asked_after_refusal: None,
             asks_on_every_start: false,
             refuses_drain: false,
+            refuses_buffer: false,
+            lacks_buffer: false,
+            read_only: None,
+            mean_bitrate: None,
             fed: Vec::new(),
             refused: 0,
             starts: 0,
@@ -672,6 +699,7 @@ fn rig(mode: Mode) -> Option<Rig> {
         discarded_late_output: false,
         format_change_logged: false,
         drain_logged: false,
+        buffer_kept_logged: false,
         idr_next: true,
         last_index: None,
         encoded: 0,
@@ -902,6 +930,29 @@ fn a_late_output_after_the_request_is_not_the_next_frame() {
     assert_eq!(next.data, coded(true, 2), "not frame 1's, and an IDR");
     assert_eq!(next.index, 2);
     assert!(next.idr);
+    assert!(
+        rig.encoder.notes().contains("Discarded the output"),
+        "{}",
+        rig.encoder.notes()
+    );
+    let after = rig.encode(3).unwrap_or_else(|e| panic!("frame 3: {e}"));
+    assert_eq!(after.data, coded(false, 3));
+}
+
+// The other order, from an encoder that asks only once its output is taken.
+#[test]
+fn late_output_first() {
+    let Some(mut rig) = rig(Mode::Prompt) else {
+        return;
+    };
+    rig.first_frame();
+    rig.script.set_mode(Mode::Silent);
+    rig.give_up_on(1);
+
+    rig.script.set_mode(Mode::Prompt);
+    rig.script.release();
+    let next = rig.encode(2).unwrap_or_else(|e| panic!("frame 2: {e}"));
+    assert_eq!(next.data, coded(true, 2), "not frame 1's, and an IDR");
     assert!(
         rig.encoder.notes().contains("Discarded the output"),
         "{}",
@@ -1170,4 +1221,92 @@ fn a_recovery_the_encoder_ignores_fails_it() {
         rig.encode(3),
         Err(EncodeError::EncoderMisbehaved { .. })
     ));
+}
+
+// An encoder that takes a new rate and refuses the buffer with it runs at the
+// new rate, so the change has not failed, and the notes say what it kept, once.
+#[test]
+fn refused_buffer_keeps_rate() {
+    let Some(mut rig) = rig(Mode::Prompt) else {
+        return;
+    };
+    rig.first_frame();
+    rig.script.state.borrow_mut().refuses_buffer = true;
+    for rate in [5_000_000, 4_000_000] {
+        rig.encoder
+            .set_bitrate(rate)
+            .unwrap_or_else(|e| panic!("{rate}: {e}"));
+        assert_eq!(rig.script.state.borrow().mean_bitrate, Some(rate));
+    }
+    let notes = rig.encoder.notes();
+    assert_eq!(notes.matches("kept the one it had").count(), 1, "{notes}");
+    assert!(notes.contains("At 5000 kbit/s"), "{notes}");
+    let code = format!(" ({:#010x})", E_INVALIDARG.0 as u32);
+    assert!(notes.ends_with(&code), "{notes}");
+    assert!(!notes.contains(&format!(".{code}")), "{notes}");
+    rig.encode(1).unwrap_or_else(|e| panic!("frame 1: {e}"));
+}
+
+// S_FALSE from IsSupported means not supported, so no buffer is sent.
+#[test]
+fn s_false_buffer_not_sent() {
+    let Some(mut rig) = rig(Mode::Prompt) else {
+        return;
+    };
+    rig.first_frame();
+    rig.script.state.borrow_mut().lacks_buffer = true;
+    rig.encoder
+        .set_bitrate(5_000_000)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(rig.script.state.borrow().mean_bitrate, Some(5_000_000));
+    let notes = rig.encoder.notes();
+    assert!(!notes.contains("refused"), "{notes}");
+}
+
+// S_FALSE from SetValue means read-only, so the buffer was not taken.
+#[test]
+fn read_only_buffer() {
+    let Some(mut rig) = rig(Mode::Prompt) else {
+        return;
+    };
+    rig.first_frame();
+    rig.script.state.borrow_mut().read_only = Some(CODECAPI_AVEncCommonBufferSize);
+    rig.encoder
+        .set_bitrate(5_000_000)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let notes = rig.encoder.notes();
+    assert!(
+        notes.ends_with("kept the one it had: the property is read-only (0x00000001)"),
+        "{notes}"
+    );
+}
+
+// A read-only rate is refused at open and fails a change of rate.
+#[test]
+fn read_only_rate() {
+    let Some(mut rig) = rig(Mode::Prompt) else {
+        return;
+    };
+    rig.script.state.borrow_mut().read_only = Some(CODECAPI_AVEncCommonMeanBitRate);
+    configure(
+        &mut rig.encoder.api,
+        FPS,
+        8_000_000,
+        crate::Preset::P1,
+        Buffer::OneFrame,
+    );
+    let report = rig.encoder.api.report();
+    let (taken, refused) = report.split_once("; refused: ").expect("a report");
+    assert_eq!(refused, "8.0 Mbit/s (the property is read-only)");
+    assert!(!taken.contains("Mbit/s"), "{taken}");
+
+    rig.first_frame();
+    match rig.encoder.set_bitrate(5_000_000) {
+        Err(e) => assert_eq!(
+            e.to_string(),
+            "Media Foundation could not change the hardware encoder's bitrate: the property is read-only (0x00000001)"
+        ),
+        Ok(()) => panic!("a read-only rate was changed"),
+    }
+    assert_eq!(rig.script.state.borrow().mean_bitrate, None);
 }

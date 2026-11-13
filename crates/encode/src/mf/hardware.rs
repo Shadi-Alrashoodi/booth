@@ -121,6 +121,29 @@ fn pump(generator: Generator, events: Sender<Event>) {
     }
 }
 
+// The thread keeps Media Foundation started for itself: when a driver ignores
+// the shutdown, the thread outlives the Hardware that started it and still
+// holds the driver's encoder through the generator, which has to be released
+// before MFShutdown runs.
+fn start_pump(
+    generator: IMFMediaEventGenerator,
+) -> Result<(Receiver<Event>, JoinHandle<()>), EncodeError> {
+    let mf = Mf::start()?;
+    let (sender, receiver) = mpsc::channel();
+    let generator = Generator(generator);
+    let pump = thread::Builder::new()
+        .name("encoder events".to_string())
+        .spawn(move || {
+            pump(generator, sender);
+            drop(mf);
+        })
+        .map_err(|e| EncodeError::MediaFoundation {
+            action: "start the thread that waits for the hardware encoder",
+            source: windows::core::Error::from(e),
+        })?;
+    Ok((receiver, pump))
+}
+
 /// The activated encoder and its event thread, shut down together however
 /// far opening got.
 struct Mft {
@@ -227,6 +250,7 @@ pub(crate) struct Hardware {
     discarded_late_output: bool,
     format_change_logged: bool,
     drain_logged: bool,
+    buffer_kept_logged: bool,
     idr_next: bool,
     last_index: Option<u64>,
     // Frames returned by encode().
@@ -357,16 +381,8 @@ impl Hardware {
         let generator: IMFMediaEventGenerator = transform
             .cast()
             .map_err(mf_error("reach the hardware encoder's events"))?;
-        let (sender, receiver) = mpsc::channel();
-        let generator = Generator(generator);
-        let pump = thread::Builder::new()
-            .name("encoder events".to_string())
-            .spawn(move || pump(generator, sender))
-            .map_err(|e| EncodeError::MediaFoundation {
-                action: "start the thread that waits for the hardware encoder",
-                source: windows::core::Error::from(e),
-            })?;
-        mft.events = Some(receiver);
+        let (events, pump) = start_pump(generator)?;
+        mft.events = Some(events);
         mft.pump = Some(pump);
 
         // SAFETY: the types are set, so the encoder may start.
@@ -407,6 +423,7 @@ impl Hardware {
             discarded_late_output: false,
             format_change_logged: false,
             drain_logged: false,
+            buffer_kept_logged: false,
             idr_next: true,
             last_index: None,
             encoded: 0,
@@ -829,8 +846,22 @@ impl Encoder for Hardware {
             });
         }
         platform::com()?;
-        change_bitrate(&self.api, bits_per_second, Some(bits_per_second / self.fps))
+        let buffer = bits_per_second / self.fps;
+        let refused = change_bitrate(&self.api, bits_per_second, Some(buffer))
             .map_err(mf_error("change the hardware encoder's bitrate"))?;
+        // Logged once, so an encoder that refuses it at every change does not
+        // fill the notes.
+        if let Some(refusal) = refused
+            && !self.buffer_kept_logged
+        {
+            self.buffer_kept_logged = true;
+            self.notes.push_str(&format!(
+                ". At {} kbit/s the encoder refused a VBV of one frame, {buffer}, and kept the one it had: {} ({:#010x})",
+                bits_per_second / 1000,
+                refusal.message().trim_end_matches(['.', '\r', '\n']),
+                refusal.code().0 as u32
+            ));
+        }
         Ok(())
     }
 
@@ -953,7 +984,9 @@ mod scripted;
 
 #[cfg(test)]
 mod tests {
-    use windows::Win32::Foundation::{E_UNEXPECTED, HMODULE};
+    use std::sync::Mutex;
+
+    use windows::Win32::Foundation::{E_NOTIMPL, E_UNEXPECTED, HMODULE};
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_FLAG,
@@ -963,8 +996,135 @@ mod tests {
     use windows::Win32::Graphics::Dxgi::{
         CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter, IDXGIFactory1,
     };
+    use windows::Win32::Media::MediaFoundation::{
+        IMFAsyncCallback, IMFAsyncResult, IMFMediaEvent, IMFMediaEventGenerator_Impl, MF_E_SHUTDOWN,
+    };
+    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+    use windows::core::{GUID, IUnknown, Ref, implement};
 
     use super::*;
+
+    const OWN_PROCESS: &str = "BOOTH_ENCODE_OWN_PROCESS";
+
+    // A generator whose GetEvent waits until the test lets it go, as one whose
+    // driver ignores the shutdown does, and that says when it is released how
+    // many hold Media Foundation started.
+    #[implement(IMFMediaEventGenerator)]
+    struct Stuck {
+        gate: Mutex<Receiver<()>>,
+        released: Sender<usize>,
+    }
+
+    impl IMFMediaEventGenerator_Impl for Stuck_Impl {
+        fn GetEvent(
+            &self,
+            _: MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS,
+        ) -> windows::core::Result<IMFMediaEvent> {
+            let _ = self.gate.lock().map(|gate| gate.recv());
+            Err(MF_E_SHUTDOWN.into())
+        }
+
+        fn BeginGetEvent(
+            &self,
+            _: Ref<IMFAsyncCallback>,
+            _: Ref<IUnknown>,
+        ) -> windows::core::Result<()> {
+            Err(E_NOTIMPL.into())
+        }
+
+        fn EndGetEvent(&self, _: Ref<IMFAsyncResult>) -> windows::core::Result<IMFMediaEvent> {
+            Err(E_NOTIMPL.into())
+        }
+
+        fn QueueEvent(
+            &self,
+            _: u32,
+            _: *const GUID,
+            _: HRESULT,
+            _: *const PROPVARIANT,
+        ) -> windows::core::Result<()> {
+            Err(E_NOTIMPL.into())
+        }
+    }
+
+    impl Drop for Stuck {
+        fn drop(&mut self) {
+            let _ = self.released.send(platform::users());
+        }
+    }
+
+    // Media Foundation's count of users is the whole process's, and the other
+    // tests here start it too, so this runs in a process of its own.
+    #[test]
+    fn event_thread_holds_mf() {
+        let exe = std::env::current_exe().expect("the test exe's path");
+        let output = std::process::Command::new(exe)
+            .args([
+                "mf::hardware::tests::stuck_event_thread",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(OWN_PROCESS, "1")
+            .output()
+            .expect("run the test exe again");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("1 passed"), "{stdout}");
+    }
+
+    // An event thread a driver keeps waiting holds Media Foundation started
+    // after the encoder that started it is gone, until it lets go of the
+    // generator.
+    #[test]
+    #[ignore = "run by event_thread_holds_mf in a process of its own"]
+    fn stuck_event_thread() {
+        // Run with the other tests, as --include-ignored does, the count is
+        // theirs too and says nothing.
+        if std::env::var_os(OWN_PROCESS).is_none() {
+            return;
+        }
+        let mf = match Mf::start() {
+            Ok(mf) => mf,
+            Err(e @ EncodeError::MediaFoundationMissing) => {
+                println!("skipped: {e}");
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        };
+        let (gate, waiting) = mpsc::channel();
+        let (released, on_release) = mpsc::channel();
+        let generator: IMFMediaEventGenerator = Stuck {
+            gate: Mutex::new(waiting),
+            released,
+        }
+        .into();
+        let (events, pump) = start_pump(generator).unwrap_or_else(|e| panic!("{e}"));
+        drop(events);
+        drop(pump);
+        drop(mf);
+        assert_eq!(platform::users(), 1, "stopped under the event thread");
+
+        drop(gate);
+        let users = on_release
+            .recv_timeout(GIVE_UP)
+            .expect("the event thread let go of the generator");
+        assert_eq!(users, 1, "stopped before the generator was released");
+        let deadline = Instant::now() + GIVE_UP;
+        while platform::users() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the event thread kept it started"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
 
     /// A device on the first GPU that is not Windows' software rasterizer,
     /// of any vendor.
@@ -1062,21 +1222,22 @@ mod tests {
             .unwrap_or_else(|e| panic!("frame 0: {e}"));
         assert!(first.idr);
 
-        // No encoder answers in 0 ms, so frame 1 is given up on the way a
-        // frame stuck behind a GPU stall is after 2 s, and its output comes
-        // out later.
+        // Frame 1's events are kept from encode() until it has given up on it,
+        // as behind a GPU stall, so its output comes out later.
+        encoder
+            .wait_for_request(1)
+            .unwrap_or_else(|e| panic!("frame 1: {e}"));
+        let (_held, silent) = mpsc::channel();
+        let events = encoder.mft.events.replace(silent);
         encoder.output_wait = Duration::ZERO;
-        match encoder.encode(&frame(1)) {
+        let given_up = encoder.encode(&frame(1));
+        encoder.mft.events = events;
+        encoder.output_wait = GIVE_UP;
+        match given_up {
             Err(EncodeError::NoOutput { .. }) => {}
-            Ok(_) => {
-                println!(
-                    "skipped: this encoder asks for the next frame before the last is out, so frame 1 was drained out instead of given up on"
-                );
-                return;
-            }
+            Ok(_) => panic!("frame 1 came back with no event"),
             Err(e) => panic!("frame 1: {e}"),
         }
-        encoder.output_wait = GIVE_UP;
 
         for i in 2..6 {
             let unit = encoder
